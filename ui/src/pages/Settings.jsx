@@ -19,7 +19,11 @@ import {
     TableRow,
     Chip,
     Alert,
-    CircularProgress
+    CircularProgress,
+    Select,
+    MenuItem,
+    FormControl,
+    InputLabel
 } from '@mui/material';
 import { 
     Add as AddIcon, 
@@ -28,7 +32,14 @@ import {
     PlayArrow as StartIcon,
     Stop as StopIcon
 } from '@mui/icons-material';
-import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer } from '../services/mcpService';
+import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer, getMCPInputValues, updateMCPInputValue } from '../services/mcpService';
+import { getLLMs, addLLM, updateLLM, deleteLLM } from '../services/llmService';
+
+// Helper to extract ${input:...} variables from args string
+const extractInputVariables = (argsString) => {
+    const matches = argsString.match(/\$\{input:([^}]+)\}/g) || [];
+    return matches.map(m => m.match(/\$\{input:([^}]+)\}/)[1]);
+};
 
 const Settings = () => {
     const [servers, setServers] = useState({});
@@ -43,7 +54,24 @@ const Settings = () => {
         description: '',
         env: ''
     });
+    const [detectedInputVars, setDetectedInputVars] = useState([]);
+    const [inputVarValues, setInputVarValues] = useState({});
     const [saveMessage, setSaveMessage] = useState('');
+    
+    // LLM state
+    const [llms, setLLMs] = useState({});
+    const [openLLMDialog, setOpenLLMDialog] = useState(false);
+    const [editingLLM, setEditingLLM] = useState(null);
+    const [llmFormData, setLLMFormData] = useState({
+        name: '',
+        provider: 'OpenAI',
+        model: '',
+        icon: '🧠',
+        description: '',
+        apiKey: '',
+        endpoint: '',
+        baseUrl: ''
+    });
     
     // Docker state
     const [dockerAvailable, setDockerAvailable] = useState(false);
@@ -51,9 +79,14 @@ const Settings = () => {
     const [dockerContainers, setDockerContainers] = useState([]);
     const [dockerError, setDockerError] = useState(null);
 
-    // Load MCP servers on mount
+    // MCP Input values state (for server variable configuration)
+    const [mcpInputValues, setMCPInputValues] = useState({});
+
+    // Load MCP servers and LLMs on mount
     useEffect(() => {
         loadServers();
+        loadLLMConfigs();
+        loadMCPInputValuesData();
         if (window.electronAPI) {
             checkDockerStatus();
         }
@@ -62,6 +95,16 @@ const Settings = () => {
     const loadServers = async () => {
         const mcpServers = await getMCPServers();
         setServers(mcpServers);
+    };
+
+    const loadLLMConfigs = async () => {
+        const llmConfigs = await getLLMs();
+        setLLMs(llmConfigs);
+    };
+
+    const loadMCPInputValuesData = async () => {
+        const values = await getMCPInputValues();
+        setMCPInputValues(values);
     };
 
     const checkDockerStatus = async () => {
@@ -122,20 +165,28 @@ const Settings = () => {
         }
     };
 
-    const handleOpenDialog = (serverName = null) => {
+    const handleOpenDialog = async (serverName = null) => {
+        // Load current input values
+        const currentInputValues = await getMCPInputValues();
+        
         if (serverName) {
             // Edit mode
             const server = servers[serverName];
+            const argsString = Array.isArray(server.args) ? server.args.join(', ') : '';
+            const vars = extractInputVariables(argsString);
+            
             setEditingServer(serverName);
             setFormData({
                 name: serverName,
                 command: server.command || '',
-                args: Array.isArray(server.args) ? server.args.join(', ') : '',
+                args: argsString,
                 type: server.type || 'stdio',
                 icon: server.icon || '🔧',
                 description: server.description || '',
                 env: server.env ? JSON.stringify(server.env, null, 2) : ''
             });
+            setDetectedInputVars(vars);
+            setInputVarValues(currentInputValues);
         } else {
             // Add mode
             setEditingServer(null);
@@ -148,17 +199,34 @@ const Settings = () => {
                 description: '',
                 env: ''
             });
+            setDetectedInputVars([]);
+            setInputVarValues(currentInputValues);
         }
         setOpenDialog(true);
+    };
+
+    // Update detected variables when args change
+    const handleArgsChange = (value) => {
+        setFormData({ ...formData, args: value });
+        const vars = extractInputVariables(value);
+        setDetectedInputVars(vars);
     };
 
     const handleCloseDialog = () => {
         setOpenDialog(false);
         setEditingServer(null);
+        setDetectedInputVars([]);
     };
 
     const handleSave = async () => {
         try {
+            // Save input variable values first
+            for (const varName of detectedInputVars) {
+                if (inputVarValues[varName]) {
+                    await updateMCPInputValue(varName, inputVarValues[varName]);
+                }
+            }
+            
             // Parse args and env
             const args = formData.args
                 .split(',')
@@ -195,6 +263,7 @@ const Settings = () => {
             }
 
             await loadServers();
+            await loadMCPInputValuesData(); // Refresh input values
             handleCloseDialog();
 
             // Clear message after 3 seconds
@@ -216,6 +285,108 @@ const Settings = () => {
                 console.error('Error deleting server:', error);
                 alert('Failed to delete server');
             }
+        }
+    };
+
+    // LLM Dialog handlers
+    const handleOpenLLMDialog = (llmName = null) => {
+        if (llmName) {
+            const llm = llms[llmName];
+            setEditingLLM(llmName);
+            setLLMFormData({
+                name: llmName,
+                provider: llm.provider || 'OpenAI',
+                model: llm.model || '',
+                icon: llm.icon || '🧠',
+                description: llm.description || '',
+                apiKey: llm.apiKey || '',
+                endpoint: llm.endpoint || '',
+                baseUrl: llm.baseUrl || ''
+            });
+        } else {
+            setEditingLLM(null);
+            setLLMFormData({
+                name: '',
+                provider: 'OpenAI',
+                model: '',
+                icon: '🧠',
+                description: '',
+                apiKey: '',
+                endpoint: '',
+                baseUrl: ''
+            });
+        }
+        setOpenLLMDialog(true);
+    };
+
+    const handleCloseLLMDialog = () => {
+        setOpenLLMDialog(false);
+        setEditingLLM(null);
+    };
+
+    const handleSaveLLM = async () => {
+        try {
+            const llmConfig = {
+                provider: llmFormData.provider,
+                model: llmFormData.model,
+                icon: llmFormData.icon,
+                description: llmFormData.description,
+                ...(llmFormData.apiKey && { apiKey: llmFormData.apiKey }),
+                ...(llmFormData.endpoint && { endpoint: llmFormData.endpoint }),
+                ...(llmFormData.baseUrl && { baseUrl: llmFormData.baseUrl })
+            };
+
+            if (editingLLM) {
+                await updateLLM(llmFormData.name, llmConfig);
+                setSaveMessage(`Updated LLM: ${llmFormData.name}`);
+            } else {
+                await addLLM(llmFormData.name, llmConfig);
+                setSaveMessage(`Added new LLM: ${llmFormData.name}`);
+            }
+
+            await loadLLMConfigs();
+            handleCloseLLMDialog();
+            setTimeout(() => setSaveMessage(''), 3000);
+        } catch (error) {
+            console.error('Error saving LLM:', error);
+            alert('Failed to save LLM configuration');
+        }
+    };
+
+    const handleDeleteLLM = async (llmName) => {
+        if (window.confirm(`Are you sure you want to delete "${llmName}"?`)) {
+            try {
+                await deleteLLM(llmName);
+                setSaveMessage(`Deleted LLM: ${llmName}`);
+                await loadLLMConfigs();
+                setTimeout(() => setSaveMessage(''), 3000);
+            } catch (error) {
+                console.error('Error deleting LLM:', error);
+                alert('Failed to delete LLM');
+            }
+        }
+    };
+
+    const PROVIDERS = ['OpenAI', 'Groq', 'Anthropic', 'Google', 'Azure OpenAI', 'Ollama', 'Custom'];
+
+    const getModelOptions = (provider) => {
+        switch (provider) {
+            case 'OpenAI':
+                return ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo', 'o1', 'o1-mini', 'o1-preview'];
+            case 'Groq':
+                return ['llama-3.3-70b-versatile', 'llama-3.1-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768', 'gemma2-9b-it'];
+            case 'Anthropic':
+                return ['claude-sonnet-4-20250514', 'claude-opus-4-20250514', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-opus-20240229'];
+            case 'Google':
+                return ['gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash', 'gemini-1.0-pro'];
+            case 'Azure OpenAI':
+                return ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-35-turbo'];
+            case 'Ollama':
+                return ['llama3.2', 'llama3.1', 'mistral', 'mixtral', 'codellama', 'phi3', 'gemma2'];
+            case 'Custom':
+                return [];
+            default:
+                return [];
         }
     };
 
@@ -423,7 +594,82 @@ const Settings = () => {
                     </TableContainer>
                 </Paper>
 
-                {/* Add/Edit Dialog */}
+                {/* LLM Configuration Section */}
+                <Paper sx={{ p: 3, mb: 3 }}>
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                        <Typography variant="h6" sx={{ fontWeight: 500 }}>
+                            Language Models (LLMs)
+                        </Typography>
+                        <Button
+                            variant="contained"
+                            startIcon={<AddIcon />}
+                            onClick={() => handleOpenLLMDialog()}
+                        >
+                            Add LLM
+                        </Button>
+                    </Box>
+
+                    <TableContainer>
+                        <Table>
+                            <TableHead>
+                                <TableRow>
+                                    <TableCell>Icon</TableCell>
+                                    <TableCell>Name</TableCell>
+                                    <TableCell>Provider</TableCell>
+                                    <TableCell>Model</TableCell>
+                                    <TableCell>Description</TableCell>
+                                    <TableCell align="right">Actions</TableCell>
+                                </TableRow>
+                            </TableHead>
+                            <TableBody>
+                                {Object.entries(llms).map(([name, config]) => (
+                                    <TableRow key={name}>
+                                        <TableCell>{config.icon || '🧠'}</TableCell>
+                                        <TableCell>
+                                            <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                                                {name}
+                                            </Typography>
+                                        </TableCell>
+                                        <TableCell>
+                                            <Chip label={config.provider} size="small" color="primary" variant="outlined" />
+                                        </TableCell>
+                                        <TableCell>
+                                            <code style={{ fontSize: '0.85em' }}>{config.model}</code>
+                                        </TableCell>
+                                        <TableCell>{config.description || '-'}</TableCell>
+                                        <TableCell align="right">
+                                            <IconButton
+                                                size="small"
+                                                onClick={() => handleOpenLLMDialog(name)}
+                                                color="primary"
+                                            >
+                                                <EditIcon fontSize="small" />
+                                            </IconButton>
+                                            <IconButton
+                                                size="small"
+                                                onClick={() => handleDeleteLLM(name)}
+                                                color="error"
+                                            >
+                                                <DeleteIcon fontSize="small" />
+                                            </IconButton>
+                                        </TableCell>
+                                    </TableRow>
+                                ))}
+                                {Object.keys(llms).length === 0 && (
+                                    <TableRow>
+                                        <TableCell colSpan={6} align="center">
+                                            <Typography variant="body2" color="text.secondary">
+                                                No LLMs configured. Click "Add LLM" to get started.
+                                            </Typography>
+                                        </TableCell>
+                                    </TableRow>
+                                )}
+                            </TableBody>
+                        </Table>
+                    </TableContainer>
+                </Paper>
+
+                {/* Add/Edit MCP Server Dialog */}
                 <Dialog open={openDialog} onClose={handleCloseDialog} maxWidth="md" fullWidth>
                     <DialogTitle>
                         {editingServer ? `Edit Server: ${editingServer}` : 'Add New MCP Server'}
@@ -468,12 +714,57 @@ const Settings = () => {
                             <TextField
                                 label="Arguments"
                                 value={formData.args}
-                                onChange={(e) => setFormData({ ...formData, args: e.target.value })}
+                                onChange={(e) => {
+                                    const newArgs = e.target.value;
+                                    setFormData({ ...formData, args: newArgs });
+                                    // Detect input variables and update state
+                                    const vars = extractInputVariables(newArgs);
+                                    setDetectedInputVars(vars);
+                                    if (vars.length > 0) {
+                                        const newInputVarValues = { ...inputVarValues };
+                                        vars.forEach(v => {
+                                            if (!(v in newInputVarValues)) {
+                                                newInputVarValues[v] = '';
+                                            }
+                                        });
+                                        setInputVarValues(newInputVarValues);
+                                    }
+                                }}
                                 fullWidth
                                 multiline
                                 rows={2}
-                                helperText="Comma-separated arguments (e.g., '-y, @playwright/mcp@latest')"
+                                helperText="Comma-separated arguments. Use ${input:var_name} for configurable values"
                             />
+
+                            {/* Dynamic input variable fields */}
+                            {detectedInputVars.length > 0 && (
+                                <Box sx={{ 
+                                    p: 2, 
+                                    bgcolor: 'action.hover', 
+                                    borderRadius: 1,
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: 2
+                                }}>
+                                    <Typography variant="subtitle2" color="text.secondary">
+                                        Configure Input Variables
+                                    </Typography>
+                                    {detectedInputVars.map((varName) => (
+                                        <TextField
+                                            key={varName}
+                                            label={varName}
+                                            value={inputVarValues[varName] || ''}
+                                            onChange={(e) => setInputVarValues({ 
+                                                ...inputVarValues, 
+                                                [varName]: e.target.value 
+                                            })}
+                                            fullWidth
+                                            size="small"
+                                            helperText={`Value for \${input:${varName}}`}
+                                        />
+                                    ))}
+                                </Box>
+                            )}
 
                             <TextField
                                 label="Type"
@@ -498,6 +789,123 @@ const Settings = () => {
                         <Button onClick={handleCloseDialog}>Cancel</Button>
                         <Button onClick={handleSave} variant="contained" disabled={!formData.name || !formData.command}>
                             {editingServer ? 'Update' : 'Add'}
+                        </Button>
+                    </DialogActions>
+                </Dialog>
+
+                {/* Add/Edit LLM Dialog */}
+                <Dialog open={openLLMDialog} onClose={handleCloseLLMDialog} maxWidth="sm" fullWidth>
+                    <DialogTitle>
+                        {editingLLM ? `Edit LLM: ${editingLLM}` : 'Add New LLM'}
+                    </DialogTitle>
+                    <DialogContent>
+                        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 2 }}>
+                            <TextField
+                                label="Display Name"
+                                value={llmFormData.name}
+                                onChange={(e) => setLLMFormData({ ...llmFormData, name: e.target.value })}
+                                disabled={!!editingLLM}
+                                fullWidth
+                                required
+                                helperText="A friendly name for this LLM configuration"
+                            />
+
+                            <TextField
+                                label="Icon"
+                                value={llmFormData.icon}
+                                onChange={(e) => setLLMFormData({ ...llmFormData, icon: e.target.value })}
+                                fullWidth
+                                helperText="Emoji icon (e.g., 🧠, ⚡, 🤖)"
+                            />
+
+                            <FormControl fullWidth>
+                                <InputLabel>Provider</InputLabel>
+                                <Select
+                                    value={llmFormData.provider}
+                                    label="Provider"
+                                    onChange={(e) => setLLMFormData({ 
+                                        ...llmFormData, 
+                                        provider: e.target.value,
+                                        model: '' // Reset model when provider changes
+                                    })}
+                                >
+                                    {PROVIDERS.map(provider => (
+                                        <MenuItem key={provider} value={provider}>{provider}</MenuItem>
+                                    ))}
+                                </Select>
+                            </FormControl>
+
+                            {llmFormData.provider === 'Custom' || llmFormData.provider === 'Ollama' ? (
+                                <TextField
+                                    label="Model Name"
+                                    value={llmFormData.model}
+                                    onChange={(e) => setLLMFormData({ ...llmFormData, model: e.target.value })}
+                                    fullWidth
+                                    placeholder={llmFormData.provider === 'Ollama' ? 'e.g., llama3.2:latest' : 'Enter custom model name'}
+                                    helperText={llmFormData.provider === 'Ollama' ? 'Enter any model name available in your Ollama installation' : 'Enter the model identifier'}
+                                />
+                            ) : (
+                                <FormControl fullWidth>
+                                    <InputLabel>Model</InputLabel>
+                                    <Select
+                                        value={llmFormData.model}
+                                        label="Model"
+                                        onChange={(e) => setLLMFormData({ ...llmFormData, model: e.target.value })}
+                                    >
+                                        {getModelOptions(llmFormData.provider).map(model => (
+                                            <MenuItem key={model} value={model}>{model}</MenuItem>
+                                        ))}
+                                    </Select>
+                                </FormControl>
+                            )}
+
+                            {llmFormData.provider === 'Azure OpenAI' && (
+                                <TextField
+                                    label="Endpoint URL"
+                                    value={llmFormData.endpoint || ''}
+                                    onChange={(e) => setLLMFormData({ ...llmFormData, endpoint: e.target.value })}
+                                    fullWidth
+                                    placeholder="https://your-resource.openai.azure.com"
+                                    helperText="Your Azure OpenAI endpoint URL"
+                                />
+                            )}
+
+                            {llmFormData.provider === 'Ollama' && (
+                                <TextField
+                                    label="Base URL"
+                                    value={llmFormData.baseUrl || 'http://localhost:11434'}
+                                    onChange={(e) => setLLMFormData({ ...llmFormData, baseUrl: e.target.value })}
+                                    fullWidth
+                                    helperText="Ollama server URL (default: http://localhost:11434)"
+                                />
+                            )}
+
+                            <TextField
+                                label="Description"
+                                value={llmFormData.description}
+                                onChange={(e) => setLLMFormData({ ...llmFormData, description: e.target.value })}
+                                fullWidth
+                                helperText="Brief description of this LLM configuration"
+                            />
+
+                            <TextField
+                                label="API Key (Optional)"
+                                type="password"
+                                value={llmFormData.apiKey}
+                                onChange={(e) => setLLMFormData({ ...llmFormData, apiKey: e.target.value })}
+                                fullWidth
+                                helperText="API key for this provider (stored securely)"
+                            />
+                        </Box>
+                    </DialogContent>
+                    <DialogActions>
+                        <Button onClick={handleCloseLLMDialog}>Cancel</Button>
+                        <Button 
+                            onClick={handleSaveLLM} 
+                            variant="contained" 
+                            disabled={!llmFormData.name || !llmFormData.model}
+                        >
+                            {editingLLM ? 'Update' : 'Add'}
                         </Button>
                     </DialogActions>
                 </Dialog>

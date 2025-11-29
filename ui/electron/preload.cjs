@@ -10,6 +10,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // MCP config management
   loadMCPConfig: () => ipcRenderer.invoke('mcp-config:load'),
   saveMCPConfig: (config) => ipcRenderer.invoke('mcp-config:save', config),
+  // LLM config management
+  loadLLMConfig: () => ipcRenderer.invoke('llm-config:load'),
+  saveLLMConfig: (config) => ipcRenderer.invoke('llm-config:save', config),
   saveSqlFile: (filename, content) => ipcRenderer.invoke('sql:save', filename, content),
   loadSqlFile: (relativePath) => ipcRenderer.invoke('sql:load', relativePath),
   loadWorkflowRuns: () => ipcRenderer.invoke('workflow-runs:load'),

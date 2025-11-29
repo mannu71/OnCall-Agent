@@ -1,7 +1,25 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { getLLMs } from '../../services/llmService';
 
 const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
   const [config, setConfig] = useState(node?.data || {});
+  const [availableLLMs, setAvailableLLMs] = useState({});
+  const [isLoadingLLMs, setIsLoadingLLMs] = useState(true);
+
+  // Load configured LLMs from settings
+  useEffect(() => {
+    const loadConfiguredLLMs = async () => {
+      try {
+        const llms = await getLLMs();
+        setAvailableLLMs(llms);
+      } catch (error) {
+        console.error('Error loading LLMs:', error);
+      } finally {
+        setIsLoadingLLMs(false);
+      }
+    };
+    loadConfiguredLLMs();
+  }, []);
 
   if (!node) return null;
 
@@ -55,67 +73,87 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
         );
       
       case 'llm':
-        // Check if this is a GPT Models node from OpenAI
-        const isGPTModelsNode = config.provider === 'OpenAI' && config.label === 'GPT Models';
-        
         return (
           <>
-            {/* Show Model Name dropdown only for GPT Models */}
-            {isGPTModelsNode && (
-              <div className="config-field">
-                <label>Model Name</label>
+            <div className="config-field">
+              <label>Select LLM</label>
+              {isLoadingLLMs ? (
+                <p style={{ color: '#888', fontSize: '12px' }}>Loading...</p>
+              ) : Object.keys(availableLLMs).length === 0 ? (
+                <p style={{ color: '#888', fontSize: '12px' }}>No LLMs configured. Add them in Settings.</p>
+              ) : (
                 <select
-                  value={config.model || 'gpt-4o'}
-                  onChange={(e) => handleConfigChange('model', e.target.value)}
+                  value={config.llmName || ''}
+                  onChange={(e) => {
+                    const llmName = e.target.value;
+                    const selectedLLM = availableLLMs[llmName];
+                    if (selectedLLM) {
+                      handleConfigChange('llmName', llmName);
+                      handleConfigChange('label', llmName);
+                      handleConfigChange('provider', selectedLLM.provider);
+                      handleConfigChange('model', selectedLLM.model);
+                      handleConfigChange('agent', selectedLLM.provider.toLowerCase());
+                      handleConfigChange('apiKey', selectedLLM.apiKey || '');
+                      handleConfigChange('status', 'Available');
+                    } else {
+                      handleConfigChange('llmName', '');
+                      handleConfigChange('label', 'LLM');
+                      handleConfigChange('status', 'Select LLM');
+                    }
+                  }}
                 >
-                  <option value="gpt-4o">GPT-4o</option>
-                  <option value="gpt-4o-mini">GPT-4o Mini</option>
-                  <option value="gpt-3.5-turbo">GPT-3.5 Turbo</option>
-                  <option value="gpt-4-turbo">GPT-4 Turbo</option>
-                  <option value="gpt-4">GPT-4</option>
+                  <option value="">-- Select LLM --</option>
+                  {Object.entries(availableLLMs).map(([name, llm]) => (
+                    <option key={name} value={name}>
+                      {name} ({llm.provider} - {llm.model})
+                    </option>
+                  ))}
                 </select>
-              </div>
+              )}
+            </div>
+            {config.llmName && (
+              <>
+                <div className="config-field">
+                  <label>Provider</label>
+                  <input
+                    type="text"
+                    value={config.provider || ''}
+                    disabled
+                    style={{ backgroundColor: '#333', color: '#888' }}
+                  />
+                </div>
+                <div className="config-field">
+                  <label>Model</label>
+                  <input
+                    type="text"
+                    value={config.model || ''}
+                    disabled
+                    style={{ backgroundColor: '#333', color: '#888' }}
+                  />
+                </div>
+                <div className="config-field">
+                  <label>Temperature</label>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.1"
+                    value={config.temperature || 0.7}
+                    onChange={(e) => handleConfigChange('temperature', parseFloat(e.target.value))}
+                  />
+                  <span>{config.temperature || 0.7}</span>
+                </div>
+                <div className="config-field">
+                  <label>Max Tokens</label>
+                  <input
+                    type="number"
+                    value={config.maxTokens || 1000}
+                    onChange={(e) => handleConfigChange('maxTokens', parseInt(e.target.value))}
+                    placeholder="Maximum tokens"
+                  />
+                </div>
+              </>
             )}
-            <div className="config-field">
-              <label>Agent Provider</label>
-              <select
-                value={config.agent || (isGPTModelsNode ? 'openai' : 'groq')}
-                onChange={(e) => handleConfigChange('agent', e.target.value)}
-              >
-                <option value="groq">Groq</option>
-                <option value="openai">OpenAI</option>
-              </select>
-            </div>
-            <div className="config-field">
-              <label>API Key</label>
-              <input
-                type="password"
-                value={config.apiKey || ''}
-                onChange={(e) => handleConfigChange('apiKey', e.target.value)}
-                placeholder="Enter API key"
-              />
-            </div>
-            <div className="config-field">
-              <label>Temperature</label>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.1"
-                value={config.temperature || 0.7}
-                onChange={(e) => handleConfigChange('temperature', parseFloat(e.target.value))}
-              />
-              <span>{config.temperature || 0.7}</span>
-            </div>
-            <div className="config-field">
-              <label>Max Tokens</label>
-              <input
-                type="number"
-                value={config.maxTokens || 1000}
-                onChange={(e) => handleConfigChange('maxTokens', parseInt(e.target.value))}
-                placeholder="Maximum tokens"
-              />
-            </div>
           </>
         );
       

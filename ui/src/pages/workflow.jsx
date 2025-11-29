@@ -33,6 +33,7 @@ import {
   Select
 } from '@mui/material';
 import WorkflowEditor from '../components/workflow/WorkflowEditor.jsx';
+import { validateWorkflow } from '../utils/workflowValidation.js';
 
 function Workflow() {
   const [workflows, setWorkflows] = useState([]);
@@ -48,8 +49,7 @@ function Workflow() {
   const [workflowType, setWorkflowType] = useState('workflow');
   const [currentWorkflowData, setCurrentWorkflowData] = useState(null);
   const [workflowEditorData, setWorkflowEditorData] = useState({ nodes: [], edges: [] });
-  const [message, setMessage] = useState('');
-  const [messageType, setMessageType] = useState('info');
+  const [messages, setMessages] = useState([]);
   const workflowEditorRef = useRef(null);
 
   useEffect(() => {
@@ -80,9 +80,15 @@ function Workflow() {
   };
 
   const showMessage = (msg, type = 'info') => {
-    setMessage(msg);
-    setMessageType(type);
-    setTimeout(() => setMessage(''), 3000);
+    const id = Date.now();
+    setMessages(prev => [...prev, { id, msg, type }]);
+    setTimeout(() => {
+      setMessages(prev => prev.filter(m => m.id !== id));
+    }, 3000);
+  };
+
+  const removeMessage = (id) => {
+    setMessages(prev => prev.filter(m => m.id !== id));
   };
 
 
@@ -177,6 +183,13 @@ function Workflow() {
         showMessage('Cannot save empty workflow. Please add at least one node.', 'error');
         return;
       }
+
+      // Validate workflow based on type
+      const validation = validateWorkflow(workflowType, nodes, edges);
+      if (!validation.isValid) {
+        showMessage(validation.error, 'error');
+        return;
+      }
       
       // Create a new workflow object with the design data
       const newWorkflow = {
@@ -255,20 +268,35 @@ function Workflow() {
   return (
     <div className="min-h-screen bg-gray-50">
       {showWorkflowEditor ? (
-        <div className="h-screen flex flex-col">
+        <div className="h-screen flex flex-col relative">
+          {messages.length > 0 && (
+            <div style={{ 
+              position: 'absolute', 
+              top: '70px', 
+              left: '50%', 
+              transform: 'translateX(-50%)', 
+              zIndex: 1000, 
+              display: 'flex', 
+              flexDirection: 'column', 
+              gap: '8px',
+              width: 'fit-content'
+            }}>
+              {messages.map((m) => (
+                <div 
+                  key={m.id}
+                  className={`connection-message ${m.type}`}
+                  style={{ position: 'relative', cursor: 'pointer' }}
+                  onClick={() => removeMessage(m.id)}
+                >
+                  {m.type === 'success' ? '✅' : m.type === 'error' ? '❌' : 'ℹ️'} {m.msg}
+                </div>
+              ))}
+            </div>
+          )}
           {/* Editor Header */}
           <div className="bg-white border-b border-gray-200 px-6 py-4 flex justify-between items-center">
             <div className="flex-1">
               <h2 className="text-xl font-semibold text-gray-900">{workflowName || 'New Workflow'}</h2>
-              {message && (
-                <Alert 
-                  severity={messageType} 
-                  sx={{ mt: 2, maxWidth: '600px' }}
-                  onClose={() => setMessage('')}
-                >
-                  {message}
-                </Alert>
-              )}
             </div>
             <div className="flex">
               <Button
@@ -308,16 +336,6 @@ function Workflow() {
       ) : (
         <div className="p-8">
           <div className="max-w-7xl mx-auto">
-            {message && (
-              <Alert 
-                severity={messageType} 
-                className="mb-4"
-                onClose={() => setMessage('')}
-              >
-                {message}
-              </Alert>
-            )}
-
             {/* Header */}
             <div className="mb-6 flex justify-between items-center">
               <div>

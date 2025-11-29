@@ -1,147 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { getMCPServers, convertServersToNodeItems } from '../../services/mcpService';
+import { getLLMs, convertLLMsToNodeItems } from '../../services/llmService';
 
 const NodeSidebar = () => {
-  const [languageModels, setLanguageModels] = useState([]);
-  const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [mcpServers, setMcpServers] = useState([]);
   const [isLoadingMCP, setIsLoadingMCP] = useState(true);
+  const [llmModels, setLLMModels] = useState([]);
+  const [isLoadingLLM, setIsLoadingLLM] = useState(true);
 
-  // Fetch language models on component mount
-  useEffect(() => {
-    const loadModels = async () => {
-      try {
-        setIsLoadingModels(true);
-        const models = [];
-        
-        const transformedModels = [];
-
-        // Add GPT models to the list (Note: requires OpenAI API key and quota)
-        const gptModels = [
-          {
-            type: 'llm',
-            icon: '⚡',
-            title: 'GPT Models',
-            description: 'OpenAI GPT Models - Requires API quota',
-            data: { 
-              label: 'gpt-4o-mini', 
-              model: 'gpt-4o-mini', 
-              status: 'Available',
-              provider: 'OpenAI',
-              agent: 'openai',
-              contextWindow: 128000,
-              maxTokens: 16384
-            }
-          }
-        ];
-        
-        // Prioritize Groq models first, then add GPT models
-        setLanguageModels([...transformedModels, ...gptModels]);
-      } catch (error) {
-        console.error('Failed to load language models:', error);
-        // Fallback models when API fails
-        const fallbackModels = [
-          {
-            type: 'llm',
-            icon: '🤖',
-            title: 'Mixtral 8x7B',
-            description: 'Mixtral 8x7B 32K context',
-            data: { 
-              label: 'Mixtral 8x7B', 
-              model: 'mixtral-8x7b-32768', 
-              status: 'Available',
-              provider: 'Groq',
-              agent: 'groq'
-            }
-          },
-          {
-            type: 'llm',
-            icon: '⚡',
-            title: 'Llama 3.1 70B',
-            description: 'Llama 3.1 70B Versatile',
-            data: { 
-              label: 'Llama 3.1 70B', 
-              model: 'llama-3.1-70b-versatile', 
-              status: 'Available',
-              provider: 'Groq',
-              agent: 'groq'
-            }
-          },
-          {
-            type: 'llm',
-            icon: '🚀',
-            title: 'Llama 3.1 8B',
-            description: 'Llama 3.1 8B Instant',
-            data: { 
-              label: 'Llama 3.1 8B', 
-              model: 'llama-3.1-8b-instant', 
-              status: 'Available',
-              provider: 'Groq',
-              agent: 'groq'
-            }
-          },
-          {
-            type: 'llm',
-            icon: '💬',
-            title: 'Gemma 2 9B',
-            description: 'Gemma 2 9B IT',
-            data: { 
-              label: 'Gemma 2 9B', 
-              model: 'gemma2-9b-it', 
-              status: 'Available',
-              provider: 'Groq',
-              agent: 'groq'
-            }
-          },
-          // Add GPT models as fallback too
-          {
-            type: 'llm',
-            icon: '🧠',
-            title: 'GPT-4o',
-            description: 'OpenAI GPT-4o - Most capable model',
-            data: { 
-              label: 'GPT-4o', 
-              model: 'gpt-4o', 
-              status: 'Available',
-              provider: 'OpenAI',
-              agent: 'openai'
-            }
-          },
-          {
-            type: 'llm',
-            icon: '⚡',
-            title: 'GPT-4o Mini',
-            description: 'OpenAI GPT-4o Mini - Fast and efficient',
-            data: { 
-              label: 'GPT-4o Mini', 
-              model: 'gpt-4o-mini', 
-              status: 'Available',
-              provider: 'OpenAI',
-              agent: 'openai'
-            }
-          },
-          {
-            type: 'llm',
-            icon: '💬',
-            title: 'GPT-3.5 Turbo',
-            description: 'OpenAI GPT-3.5 Turbo - Fast and cost-effective',
-            data: { 
-              label: 'GPT-3.5 Turbo', 
-              model: 'gpt-3.5-turbo', 
-              status: 'Available',
-              provider: 'OpenAI',
-              agent: 'openai'
-            }
-          }
-        ];
-        setLanguageModels(fallbackModels);
-      } finally {
-        setIsLoadingModels(false);
-      }
-    };
-
-    loadModels();
-  }, []);
   // Fetch MCP servers on component mount
   useEffect(() => {
     const loadMCPServers = async () => {
@@ -159,6 +25,25 @@ const NodeSidebar = () => {
     };
 
     loadMCPServers();
+  }, []);
+
+  // Fetch LLM configurations on component mount
+  useEffect(() => {
+    const loadLLMConfigs = async () => {
+      try {
+        setIsLoadingLLM(true);
+        const llms = await getLLMs();
+        const nodeItems = convertLLMsToNodeItems(llms);
+        setLLMModels(nodeItems);
+      } catch (error) {
+        console.error('Failed to load LLM configs:', error);
+        setLLMModels([]);
+      } finally {
+        setIsLoadingLLM(false);
+      }
+    };
+
+    loadLLMConfigs();
   }, []);
 
 
@@ -230,25 +115,25 @@ const NodeSidebar = () => {
     },
     {
       title: 'Language Models',
-      items: isLoadingModels 
+      items: isLoadingLLM
         ? [
             {
               type: 'llm',
               icon: '⏳',
               title: 'Loading...',
-              description: 'Fetching models from Groq API',
-              data: { label: 'Loading...', model: 'loading', status: 'Loading' }
+              description: 'Loading LLM configurations',
+              data: { label: 'Loading...', model: '', status: 'Loading' }
             }
           ]
-        : languageModels.length > 0 
-          ? languageModels
+        : llmModels.length > 0
+          ? llmModels
           : [
               {
                 type: 'llm',
                 icon: '❌',
-                title: 'No Models',
-                description: 'Failed to load models',
-                data: { label: 'No Models', model: 'none', status: 'Error' }
+                title: 'No LLMs',
+                description: 'Add LLMs in Settings',
+                data: { label: 'No LLMs', model: '', status: 'Empty' }
               }
             ]
     },

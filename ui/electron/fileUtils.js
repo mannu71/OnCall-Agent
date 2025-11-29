@@ -34,6 +34,7 @@ const configDir = path.join(agentDir, 'data', 'config');
 const schedulesPath = path.join(configDir, 'schedules.json');
 const workflowsPath = path.join(configDir, 'workflows.json');
 const mcpConfigPath = path.join(configDir, 'mcp-servers.json');
+const llmConfigPath = path.join(configDir, 'llm-config.json');
 const sqlFilesDir = path.join(configDir, 'sql');
 const triggersDir = path.join(configDir, 'triggers');
 const outputDir = path.join(agentDir, 'output');
@@ -484,6 +485,49 @@ function loadMCPConfigFromFile() {
   }
 }
 
+// Function to save LLM configuration to JSON file
+function saveLLMConfigToFile(config) {
+  try {
+    const dataDir = path.dirname(llmConfigPath);
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    
+    if (typeof config !== 'object' || config === null) {
+      throw new Error('LLM config must be an object');
+    }
+    
+    fs.writeFileSync(llmConfigPath, JSON.stringify(config, null, 2));
+    console.log('fileUtils: LLM config saved to:', llmConfigPath);
+    return { success: true, path: llmConfigPath };
+  } catch (error) {
+    console.error('Error saving LLM config:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+// Function to load LLM configuration from JSON file
+function loadLLMConfigFromFile() {
+  try {
+    console.log('fileUtils: Loading LLM config from:', llmConfigPath);
+    if (fs.existsSync(llmConfigPath)) {
+      const data = fs.readFileSync(llmConfigPath, 'utf-8').trim();
+      if (!data) {
+        console.log('LLM config file is empty, returning default');
+        return { llms: {} };
+      }
+      const parsed = JSON.parse(data);
+      console.log('fileUtils: LLM config loaded successfully');
+      return parsed;
+    }
+    console.log('fileUtils: LLM config file does not exist, returning default');
+    return { llms: {} };
+  } catch (error) {
+    console.error('Error loading LLM config:', error);
+    return { llms: {} };
+  }
+}
+
 // Function to get debug info about paths
 function getPathsInfo() {
   return {
@@ -510,6 +554,8 @@ export {
   loadWorkflowsFromFile,
   saveMCPConfigToFile,
   loadMCPConfigFromFile,
+  saveLLMConfigToFile,
+  loadLLMConfigFromFile,
   triggerWorkflow,
   cleanupTriggers,
   saveSqlFile,
@@ -522,5 +568,6 @@ export {
   schedulesPath,
   workflowsPath,
   mcpConfigPath,
+  llmConfigPath,
   sqlFilesDir
 };

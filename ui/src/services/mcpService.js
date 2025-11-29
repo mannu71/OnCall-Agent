@@ -102,3 +102,32 @@ export const convertServersToNodeItems = (servers) => {
             }
         }));
 };
+
+/**
+ * Get input values (the actual values set by user)
+ */
+export const getMCPInputValues = async () => {
+    const config = await loadMCPConfig();
+    return config.inputValues || {};
+};
+
+/**
+ * Set input values
+ */
+export const setMCPInputValues = async (inputValues) => {
+    const config = await loadMCPConfig();
+    config.inputValues = inputValues;
+    await saveMCPConfig(config);
+    return config;
+};
+
+/**
+ * Update a single input value
+ */
+export const updateMCPInputValue = async (inputId, value) => {
+    const config = await loadMCPConfig();
+    config.inputValues = config.inputValues || {};
+    config.inputValues[inputId] = value;
+    await saveMCPConfig(config);
+    return config;
+};

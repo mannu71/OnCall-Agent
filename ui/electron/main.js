@@ -11,7 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Import file utilities
-import { saveSchedulesToFile, loadSchedulesFromFile, saveWorkflowsToFile, loadWorkflowsFromFile, saveMCPConfigToFile, loadMCPConfigFromFile, triggerWorkflow, saveSqlFile, loadSqlFile, loadWorkflowRuns, loadLatestWorkflowResult, loadWorkflowResult, clearWorkflowOutputs, getPathsInfo } from './fileUtils.js';
+import { saveSchedulesToFile, loadSchedulesFromFile, saveWorkflowsToFile, loadWorkflowsFromFile, saveMCPConfigToFile, loadMCPConfigFromFile, saveLLMConfigToFile, loadLLMConfigFromFile, triggerWorkflow, saveSqlFile, loadSqlFile, loadWorkflowRuns, loadLatestWorkflowResult, loadWorkflowResult, clearWorkflowOutputs, getPathsInfo } from './fileUtils.js';
 
 // IPC handlers for schedule operations
 ipcMain.handle('schedules:load', async () => {
@@ -85,6 +85,27 @@ ipcMain.handle('mcp-config:save', async (event, config) => {
     return result;
   } catch (error) {
     console.error('Error saving MCP config:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// IPC handlers for LLM configuration
+ipcMain.handle('llm-config:load', async () => {
+  try {
+    const config = loadLLMConfigFromFile();
+    return config;
+  } catch (error) {
+    console.error('Error loading LLM config:', error);
+    return { llms: {} };
+  }
+});
+
+ipcMain.handle('llm-config:save', async (event, config) => {
+  try {
+    const result = saveLLMConfigToFile(config);
+    return result;
+  } catch (error) {
+    console.error('Error saving LLM config:', error);
     return { success: false, error: error.message };
   }
 });

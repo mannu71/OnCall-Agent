@@ -7,7 +7,9 @@ import Sidebar from './components/sidebar/Sidebar';
 import Dashboard from './pages/Dashboard';
 import Scheduler from './pages/Scheduler';
 import Workflow from './pages/workflow';
+import Chat from './pages/Chat';
 import Settings from './pages/Settings';
+import Analytics from './pages/Analytics';
 import './App.css';
 
 // Use HashRouter for Electron, BrowserRouter for web
@@ -81,10 +83,11 @@ const AppRoutes = () => {
           <Route path="/" element={<Dashboard />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/scheduler" element={<Scheduler />} />
+          <Route path="/chat" element={<Chat />} />
           <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
           <Route path="/workflow" element={<Workflow />} />
           <Route path="/alerts" element={<PlaceholderPage title="Alerts" />} />
-          <Route path="/analytics" element={<PlaceholderPage title="Analytics" />} />
+          <Route path="/analytics" element={<Analytics />} />
           <Route path="/emergency" element={<PlaceholderPage title="Emergency Contact" />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="*" element={<Dashboard />} />

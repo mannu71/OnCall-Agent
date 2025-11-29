@@ -3,10 +3,10 @@ import {
   AccountTree,
   Assignment,
   Schedule,
-  Notifications,
   Settings,
   Analytics,
-  Phone
+  Phone,
+  Chat
 } from '@mui/icons-material';
 
 export const navigationItems = [
@@ -23,16 +23,16 @@ export const navigationItems = [
     icon: Schedule,
   },
   {
+    id: 'chat',
+    title: 'Agent Chat',
+    path: '/chat',
+    icon: Chat,
+  },
+  {
     id: 'workflow',
     title: 'Workflow',
     path: '/workflow',
     icon: AccountTree,
-  },
-  {
-    id: 'alerts',
-    title: 'Alerts',
-    path: '/alerts',
-    icon: Notifications,
   },
   {
     id: 'analytics',
