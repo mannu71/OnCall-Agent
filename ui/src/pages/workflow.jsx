@@ -1,0 +1,512 @@
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Button,
+  TextField,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Paper,
+  Chip,
+  IconButton,
+  Menu,
+  MenuItem,
+  Alert
+} from '@mui/material';
+import {
+  Add as AddIcon,
+  Edit as EditIcon,
+  Delete as DeleteIcon,
+  MoreVert as MoreVertIcon,
+  Close as CloseIcon,
+  Save as SaveIcon
+} from '@mui/icons-material';
+import {
+  FormControl,
+  InputLabel,
+  Select
+} from '@mui/material';
+import WorkflowEditor from '../components/workflow/WorkflowEditor.jsx';
+
+function Workflow() {
+  const [workflows, setWorkflows] = useState([]);
+  const [showDialog, setShowDialog] = useState(false);
+  const [showWorkflowEditor, setShowWorkflowEditor] = useState(false);
+  const [editingWorkflow, setEditingWorkflow] = useState(null);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [anchorEl, setAnchorEl] = useState(null);
+  const [selectedWorkflow, setSelectedWorkflow] = useState(null);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [workflowToDelete, setWorkflowToDelete] = useState(null);
+  const [workflowName, setWorkflowName] = useState('');
+  const [workflowType, setWorkflowType] = useState('workflow');
+  const [currentWorkflowData, setCurrentWorkflowData] = useState(null);
+  const [workflowEditorData, setWorkflowEditorData] = useState({ nodes: [], edges: [] });
+  const [message, setMessage] = useState('');
+  const [messageType, setMessageType] = useState('info');
+  const workflowEditorRef = useRef(null);
+
+  useEffect(() => {
+    loadWorkflows();
+  }, []);
+
+  const loadWorkflows = async () => {
+    try {
+      if (window.electronAPI && window.electronAPI.loadWorkflows) {
+        const data = await window.electronAPI.loadWorkflows();
+        setWorkflows(Array.isArray(data) ? data : []);
+      } else {
+        // For dev mode, try to load from a workflows collection file
+        const response = await fetch('../../../agent/workflows/workflows.json');
+        if (response.ok) {
+          const data = await response.json();
+          setWorkflows(Array.isArray(data) ? data : []);
+        } else {
+          // If workflows.json doesn't exist yet, start with empty array
+          setWorkflows([]);
+        }
+      }
+    } catch (error) {
+      console.error('Error loading workflows:', error);
+      setWorkflows([]);
+      showMessage('Failed to load workflows', 'error');
+    }
+  };
+
+  const showMessage = (msg, type = 'info') => {
+    setMessage(msg);
+    setMessageType(type);
+    setTimeout(() => setMessage(''), 3000);
+  };
+
+
+
+
+
+  const handleDeleteWorkflow = async (workflow) => {
+    setWorkflowToDelete(workflow);
+    setDeleteDialogOpen(true);
+    handleMenuClose();
+  };
+
+  const confirmDelete = async () => {
+    if (!workflowToDelete) return;
+
+    try {
+      const updatedWorkflows = workflows.filter(w => w.id !== workflowToDelete.id);
+      
+      if (window.electronAPI && window.electronAPI.saveWorkflows) {
+        const result = await window.electronAPI.saveWorkflows(updatedWorkflows);
+        if (result.success) {
+          setWorkflows(updatedWorkflows);
+          showMessage('Workflow deleted', 'success');
+        } else {
+          showMessage('Failed to delete workflow', 'error');
+        }
+      } else {
+        setWorkflows(updatedWorkflows);
+        showMessage('Workflow deleted (dev mode)', 'warning');
+      }
+    } catch (error) {
+      console.error('Error deleting workflow:', error);
+      showMessage('Failed to delete workflow', 'error');
+    } finally {
+      setDeleteDialogOpen(false);
+      setWorkflowToDelete(null);
+    }
+  };
+
+  const handleMenuOpen = (event, workflow) => {
+    setAnchorEl(event.currentTarget);
+    setSelectedWorkflow(workflow);
+  };
+
+  const handleMenuClose = () => {
+    setAnchorEl(null);
+    setSelectedWorkflow(null);
+  };
+
+  const openEditDialog = (workflow) => {
+    setEditingWorkflow(workflow);
+    setWorkflowName(workflow.name);
+    setWorkflowType(workflow.type || 'workflow');
+    setCurrentWorkflowData(workflow);
+    // Set the workflow editor data to the specific workflow's nodes and edges
+    setWorkflowEditorData({
+      nodes: workflow.nodes || [],
+      edges: workflow.edges || []
+    });
+    setShowWorkflowEditor(true);
+    handleMenuClose();
+  };
+
+  const openAddDialog = () => {
+    setWorkflowName('');
+    setWorkflowType('workflow');
+    setCurrentWorkflowData(null);
+    setShowDialog(true);
+  };
+
+  const handleProceedToEditor = () => {
+    if (!workflowName) {
+      showMessage('Please enter workflow name', 'error');
+      return;
+    }
+    // For new workflows, start with empty editor data
+    setWorkflowEditorData({ nodes: [], edges: [] });
+    setShowDialog(false);
+    setShowWorkflowEditor(true);
+  };
+
+  const handleSaveWorkflowData = async (nodes, edges) => {
+    try {
+      
+      if (!workflowName) {
+        showMessage('Please enter workflow name', 'error');
+        return;
+      }
+      
+      // Validate that workflow has at least one node
+      if (!nodes || nodes.length === 0) {
+        showMessage('Cannot save empty workflow. Please add at least one node.', 'error');
+        return;
+      }
+      
+      // Create a new workflow object with the design data
+      const newWorkflow = {
+        id: currentWorkflowData?.id || Date.now().toString(),
+        name: workflowName,
+        type: workflowType,
+        nodes: nodes,
+        edges: edges,
+        createdAt: currentWorkflowData?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      
+      // Load existing workflows and update/add the current one
+      let existingWorkflows = [...workflows];
+      const existingIndex = existingWorkflows.findIndex(w => w.id === newWorkflow.id);
+      
+      if (existingIndex >= 0) {
+        existingWorkflows[existingIndex] = newWorkflow;
+      } else {
+        existingWorkflows.push(newWorkflow);
+      }
+      
+      if (window.electronAPI && window.electronAPI.saveWorkflows) {
+        // Save all workflows
+        const workflowResult = await window.electronAPI.saveWorkflows(existingWorkflows);
+        
+        if (workflowResult.success) {
+          setWorkflows(existingWorkflows);
+          setShowWorkflowEditor(false);
+          setCurrentWorkflowData(null);
+          setWorkflowName('');
+          setWorkflowType('workflow');
+          showMessage('Workflow saved successfully', 'success');
+        } else {
+          showMessage('Failed to save workflow', 'error');
+        }
+      } else {
+        setWorkflows(existingWorkflows);
+        setShowWorkflowEditor(false);
+        setCurrentWorkflowData(null);
+        setWorkflowName('');
+        setWorkflowType('workflow');
+        showMessage('Workflow saved (dev mode)', 'warning');
+      }
+    } catch (error) {
+      console.error('Error saving workflow:', error);
+      showMessage('Failed to save workflow', 'error');
+    }
+  };
+
+  const handleCancelEditor = () => {
+    setShowWorkflowEditor(false);
+    setCurrentWorkflowData(null);
+    setWorkflowName('');
+    setWorkflowType('workflow');
+  };
+
+
+
+  const filteredWorkflows = workflows.filter(workflow => {
+    const searchLower = searchTerm.toLowerCase();
+    const name = (workflow.name || '').toLowerCase();
+    return name.includes(searchLower);
+  });
+
+  const formatDate = (dateString) => {
+    const date = new Date(dateString);
+    return date.toLocaleDateString('en-US', {
+      weekday: 'short',
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    });
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {showWorkflowEditor ? (
+        <div className="h-screen flex flex-col">
+          {/* Editor Header */}
+          <div className="bg-white border-b border-gray-200 px-6 py-4 flex justify-between items-center">
+            <div className="flex-1">
+              <h2 className="text-xl font-semibold text-gray-900">{workflowName || 'New Workflow'}</h2>
+              {message && (
+                <Alert 
+                  severity={messageType} 
+                  sx={{ mt: 2, maxWidth: '600px' }}
+                  onClose={() => setMessage('')}
+                >
+                  {message}
+                </Alert>
+              )}
+            </div>
+            <div className="flex">
+              <Button
+                variant="outlined"
+                startIcon={<CloseIcon />}
+                onClick={handleCancelEditor}
+                sx={{ marginRight: '0.5rem' }}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="contained"
+                startIcon={<SaveIcon />}
+                onClick={() => {
+                  if (workflowEditorRef.current) {
+                    const { nodes, edges } = workflowEditorRef.current.getWorkflowData();
+                    handleSaveWorkflowData(nodes, edges);
+                  } else {
+                    showMessage('Workflow editor not ready', 'error');
+                  }
+                }}
+              >
+                Save Workflow
+              </Button>
+            </div>
+          </div>
+          
+          {/* Workflow Editor */}
+          <div className="flex-1">
+            <WorkflowEditor 
+              ref={workflowEditorRef}
+              initialNodes={workflowEditorData?.nodes}
+              initialEdges={workflowEditorData?.edges}
+            />
+          </div>
+        </div>
+      ) : (
+        <div className="p-8">
+          <div className="max-w-7xl mx-auto">
+            {message && (
+              <Alert 
+                severity={messageType} 
+                className="mb-4"
+                onClose={() => setMessage('')}
+              >
+                {message}
+              </Alert>
+            )}
+
+            {/* Header */}
+            <div className="mb-6 flex justify-between items-center">
+              <div>
+                <h1 className="text-3xl font-semibold text-gray-900 mb-2">
+                  Workflow Management
+                </h1>
+                <p className="text-gray-600">
+                  Manage and organize your automated workflows
+                </p>
+              </div>
+              
+              <Button
+                variant="contained"
+                startIcon={<AddIcon />}
+                onClick={openAddDialog}
+              >
+                Add Workflow
+              </Button>
+            </div>
+
+            {/* Search */}
+            <div className="mb-6">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <div className="col-span-1">
+                  <TextField
+                    fullWidth
+                    label="Search workflows"
+                    variant="outlined"
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                    size="small"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Workflow Table */}
+            {filteredWorkflows.length === 0 ? (
+              <Alert severity="info">
+                {workflows.length === 0
+                  ? "No workflows created yet. Click 'Add Workflow' to create your first workflow."
+                  : "No workflows match your search."
+                }
+              </Alert>
+            ) : (
+              <div>
+                <p className="text-sm text-gray-600 mb-4">
+                  Showing {filteredWorkflows.length} of {workflows.length} workflows
+                </p>
+
+                <TableContainer component={Paper} className="shadow-md">
+                  <Table>
+                    <TableHead className="bg-gradient-to-r from-purple-600 to-purple-800">
+                      <TableRow>
+                        <TableCell className="text-white font-semibold">Name</TableCell>
+                        <TableCell className="text-white font-semibold">Type</TableCell>
+                        <TableCell className="text-white font-semibold">Created</TableCell>
+                        <TableCell className="text-white font-semibold">Last Updated</TableCell>
+                        <TableCell align="right" className="text-white font-semibold">Actions</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {filteredWorkflows.map((workflow) => (
+                        <TableRow key={workflow.id} hover className="hover:bg-gray-50 transition-colors">
+                          <TableCell>
+                            <span className="font-semibold text-gray-900">
+                              {workflow.name}
+                            </span>
+                          </TableCell>
+                          <TableCell>
+                            <Chip 
+                              label={workflow.type === 'agent' ? 'Agent' : 'Workflow'}
+                              color={workflow.type === 'agent' ? 'secondary' : 'primary'}
+                              size="small"
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <span className="text-sm text-gray-600">
+                              {formatDate(workflow.createdAt)}
+                            </span>
+                          </TableCell>
+                          <TableCell>
+                            <span className="text-sm text-gray-600">
+                              {formatDate(workflow.updatedAt)}
+                            </span>
+                          </TableCell>
+                          <TableCell align="right">
+                            <IconButton
+                              size="small"
+                              onClick={(e) => handleMenuOpen(e, workflow)}
+                            >
+                              <MoreVertIcon />
+                            </IconButton>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </div>
+            )}
+
+            {/* Action Menu */}
+            <Menu
+              anchorEl={anchorEl}
+              open={Boolean(anchorEl)}
+              onClose={handleMenuClose}
+            >
+              <MenuItem onClick={() => openEditDialog(selectedWorkflow)}>
+                <div className="flex items-center gap-2">
+                  <EditIcon fontSize="small" />
+                  <span>Edit</span>
+                </div>
+              </MenuItem>
+              <MenuItem onClick={() => handleDeleteWorkflow(selectedWorkflow)} className="text-red-600">
+                <div className="flex items-center gap-2">
+                  <DeleteIcon fontSize="small" />
+                  <span>Delete</span>
+                </div>
+              </MenuItem>
+            </Menu>
+
+            {/* Delete Confirmation Dialog */}
+            <Dialog
+              open={deleteDialogOpen}
+              onClose={() => setDeleteDialogOpen(false)}
+            >
+              <DialogTitle>Confirm Delete</DialogTitle>
+              <DialogContent>
+                <p className="text-gray-700">
+                  Are you sure you want to delete the workflow "{workflowToDelete?.name}"?
+                  This action cannot be undone.
+                </p>
+              </DialogContent>
+              <DialogActions>
+                <Button onClick={() => setDeleteDialogOpen(false)}>Cancel</Button>
+                <Button onClick={confirmDelete} color="error" variant="contained">
+                  Delete
+                </Button>
+              </DialogActions>
+            </Dialog>
+
+            {/* Add Workflow Dialog - Name and Schedule */}
+            <Dialog 
+              open={showDialog} 
+              onClose={() => setShowDialog(false)}
+              maxWidth="sm"
+              fullWidth
+            >
+              <DialogTitle className="text-xl font-semibold">
+                Create New Workflow
+              </DialogTitle>
+              <DialogContent sx={{ pt: 3 }}>
+                <TextField
+                  fullWidth
+                  label="Workflow Name"
+                  value={workflowName}
+                  onChange={(e) => setWorkflowName(e.target.value)}
+                  placeholder="e.g., daily-report"
+                  required
+                  autoFocus
+                  sx={{ mt: 1 }}
+                />
+                <FormControl fullWidth sx={{ mt: 2 }}>
+                  <InputLabel id="workflow-type-label">Type</InputLabel>
+                  <Select
+                    labelId="workflow-type-label"
+                    value={workflowType}
+                    label="Type"
+                    onChange={(e) => setWorkflowType(e.target.value)}
+                    native
+                  >
+                    <option value="workflow">Workflow</option>
+                    <option value="agent">Agent</option>
+                  </Select>
+                </FormControl>
+              </DialogContent>
+              <DialogActions>
+                <Button onClick={() => setShowDialog(false)}>Cancel</Button>
+                <Button onClick={handleProceedToEditor} variant="contained">
+                  Continue to Editor
+                </Button>
+              </DialogActions>
+            </Dialog>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default Workflow;
