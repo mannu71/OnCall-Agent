@@ -53,6 +53,7 @@
     "files": [
       "dist/**/*",
       "electron/**/*",
+      "public/**/*",
       "package.json"
     ],
     "extraResources": [
@@ -66,8 +67,7 @@
     ],
     "win": {
       "target": "portable",
-      "icon": "public/favicon.ico",
-      "signAndEditExecutable": false
+      "icon": "public/favicon.ico"
     },
     "nsis": {
       "oneClick": false,
