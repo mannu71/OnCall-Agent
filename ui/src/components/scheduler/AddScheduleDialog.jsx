@@ -94,28 +94,32 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
     try {
       const timeObj = new Date(formData.startTime);
       const now = new Date();
-      // Get local time for cron schedule
-      const hour = timeObj.getHours().toString();
-      const minute = timeObj.getMinutes().toString();
-      const dayOfMonth = now.getDate().toString();
       
-      // Generate cron schedule based on recurrence (in local time)
+      // Convert local time to UTC for cron schedule (backend uses UTC)
+      const utcHour = timeObj.getUTCHours().toString();
+      const utcMinute = timeObj.getUTCMinutes().toString();
+      const dayOfMonth = now.getUTCDate().toString();
+      
+      // Generate cron schedule in UTC
       let cronSchedule;
       if (formData.recurrence === 'weekly') {
-        const dow = now.getDay(); // 0-6 (0=Sunday)
-        cronSchedule = `${minute} ${hour} * * ${dow}`;
+        const dow = now.getUTCDay(); // 0-6 (0=Sunday)
+        cronSchedule = `${utcMinute} ${utcHour} * * ${dow}`;
       } else if (formData.recurrence === 'monthly') {
-        cronSchedule = `${minute} ${hour} ${dayOfMonth} * *`;
+        cronSchedule = `${utcMinute} ${utcHour} ${dayOfMonth} * *`;
       } else {
         // Daily
-        cronSchedule = `${minute} ${hour} * * *`;
+        cronSchedule = `${utcMinute} ${utcHour} * * *`;
       }
+
+      // Store local time for display purposes
+      const localTimeStr = timeObj.toTimeString().split(' ')[0].substring(0, 5);
 
       const scheduleData = {
         title: formData.title,
         workflow: formData.workflow,
         recurrence: formData.recurrence,
-        startTime: timeObj.toTimeString().split(' ')[0].substring(0, 5),
+        startTime: localTimeStr,
         schedule: cronSchedule
       };
 

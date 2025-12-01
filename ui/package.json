@@ -66,7 +66,8 @@
     ],
     "win": {
       "target": "portable",
-      "icon": "public/favicon.ico"
+      "icon": "public/favicon.ico",
+      "signAndEditExecutable": false
     },
     "nsis": {
       "oneClick": false,
