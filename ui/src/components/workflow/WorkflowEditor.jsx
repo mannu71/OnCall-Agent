@@ -345,10 +345,10 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
                            targetNode.data?.agent || 
                            'groq';
               
-              // Get API key from the connected LLM node
-              const apiKey = connectedLLMNode?.data?.apiKey || 
-                            targetNode.data?.apiKey || 
-                            process.env.REACT_APP_GROQ_API_KEY;
+              // Get API key env var name from the connected LLM node
+              const apiKeyEnvVar = connectedLLMNode?.data?.apiKeyEnvVar || 
+                            targetNode.data?.apiKeyEnvVar || 
+                            'GROQ_API_KEY';
               
               // Find connected tools for this agent
               const connectedToolEdges = edges.filter(edge => 
@@ -362,12 +362,11 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
               console.log("🔍 Using model from LLM node:", agentModel);
               console.log("🤖 Using agent provider:", agent);
               console.log("🛠️ Connected tools for agent:", connectedTools);
-              console.log("🔑 Using API key from:", connectedLLMNode?.data?.apiKey ? "LLM node" : 
-                         targetNode.data?.apiKey ? "Agent node" : "Environment variable");
+              console.log("🔑 Using API key env var:", apiKeyEnvVar);
               
-              // Check if API key is available
-              if (!apiKey) {
-                showMessage('No API key found. Please configure the API key in the LLM node.', 'error', 4000);
+              // Check if API key env var is configured
+              if (!apiKeyEnvVar) {
+                showMessage('No API key environment variable configured. Please set it in the LLM node settings.', 'error', 4000);
                 continue; // Skip this agent and continue with others
               }
               
@@ -644,11 +643,11 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
           // Initialize the agent with the connected LLM model
           try {
             const selectedModel = sourceNode.data?.model || sourceNode.data?.label || 'llama3-8b-8192';
-            const llmApiKey = sourceNode.data?.apiKey;
+            const llmApiKeyEnvVar = sourceNode.data?.apiKeyEnvVar;
             
-            // Check if LLM node has API key configured
-            if (!llmApiKey) {
-              showMessage('Warning: LLM node has no API key configured. Please add an API key in the LLM node settings.', 'warning', 5000);
+            // Check if LLM node has API key env var configured
+            if (!llmApiKeyEnvVar) {
+              showMessage('Warning: LLM node has no API key environment variable configured. Please set it in the LLM node settings.', 'warning', 5000);
             }
             
             // Set agent to initializing state
@@ -836,10 +835,10 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
                          targetNode.data?.agent || 
                          'groq';
             
-            // Get API key from the connected LLM node
-            const apiKey = connectedLLMNode?.data?.apiKey || 
-                          targetNode.data?.apiKey || 
-                          process.env.REACT_APP_GROQ_API_KEY;
+            // Get API key env var from the connected LLM node
+            const apiKeyEnvVar = connectedLLMNode?.data?.apiKeyEnvVar || 
+                          targetNode.data?.apiKeyEnvVar || 
+                          'GROQ_API_KEY';
             
             // Find connected tools for this agent
             const connectedToolEdges = edges.filter(edge => 
@@ -853,12 +852,11 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
             console.log("🔍 Using model from LLM node:", agentModel);
             console.log("🤖 Using agent provider:", agent);
             console.log("🛠️ Connected tools for agent:", connectedTools);
-            console.log("🔑 Using API key from:", connectedLLMNode?.data?.apiKey ? "LLM node" : 
-                       targetNode.data?.apiKey ? "Agent node" : "Environment variable");
+            console.log("🔑 Using API key env var:", apiKeyEnvVar);
             
-            // Check if API key is available
-            if (!apiKey) {
-              showMessage('No API key found. Please configure the API key in the LLM node.', 'error', 4000);
+            // Check if API key env var is configured
+            if (!apiKeyEnvVar) {
+              showMessage('No API key environment variable configured. Please set it in the LLM node settings.', 'error', 4000);
               continue; // Skip this agent and continue with others
             }
             

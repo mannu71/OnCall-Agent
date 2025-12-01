@@ -27,14 +27,39 @@ export class MultiServerMCPClient {
                 await client.connect(transport);
                 this.servers[name] = client;
 
-                // Discover tools
+                // Discover tools with retry for slow-starting servers
                 try {
+                    // Give the server a moment to fully initialize
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                    
                     const toolsResp = await client.listTools();
                     this.tools[name] = (toolsResp?.tools || []).map(t => t.name);
                     console.log(`✅ Connected MCP Server: ${name} (${this.tools[name].length} tools)`);
                 } catch (e) {
-                    console.log(`✅ Connected MCP Server: ${name} (tools discovery failed)`);
-                    this.tools[name] = [];
+                    // CloudWatch server has a JSON schema issue - provide known tools as fallback
+                    if (name.includes('cloudwatch') && e.message.includes("can't resolve reference")) {
+                        console.log(`✅ Connected MCP Server: ${name} (using known CloudWatch tools)`);
+                        // Actual tool names from AWS CloudWatch MCP Server documentation
+                        this.tools[name] = [
+                            // CloudWatch Metrics tools
+                            'get_metric_data',
+                            'get_metric_metadata',
+                            'get_recommended_metric_alarms',
+                            'analyze_metric',
+                            // CloudWatch Alarms tools
+                            'get_active_alarms',
+                            'get_alarm_history',
+                            // CloudWatch Logs tools
+                            'describe_log_groups',
+                            'analyze_log_group',
+                            'execute_log_insights_query',
+                            'get_logs_insight_query_results',
+                            'cancel_logs_insight_query'
+                        ];
+                    } else {
+                        console.log(`✅ Connected MCP Server: ${name} (tools discovery failed: ${e.message})`);
+                        this.tools[name] = [];
+                    }
                 }
             } catch (err) {
                 console.error(`❌ Failed to connect to MCP server ${name}:`, err.message);

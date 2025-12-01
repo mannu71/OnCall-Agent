@@ -11,7 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Import file utilities
-import { saveSchedulesToFile, loadSchedulesFromFile, saveWorkflowsToFile, loadWorkflowsFromFile, saveMCPConfigToFile, loadMCPConfigFromFile, saveLLMConfigToFile, loadLLMConfigFromFile, triggerWorkflow, saveSqlFile, loadSqlFile, loadWorkflowRuns, loadLatestWorkflowResult, loadWorkflowResult, clearWorkflowOutputs, getPathsInfo } from './fileUtils.js';
+import { saveSchedulesToFile, loadSchedulesFromFile, saveWorkflowsToFile, loadWorkflowsFromFile, saveMCPConfigToFile, loadMCPConfigFromFile, saveLLMConfigToFile, loadLLMConfigFromFile, setLLMApiKey, getLLMApiKeyMasked, hasLLMApiKey, deleteLLMApiKey, triggerWorkflow, runAgentWorkflow, saveSqlFile, loadSqlFile, loadWorkflowRuns, loadLatestWorkflowResult, loadWorkflowResult, clearWorkflowOutputs, getPathsInfo } from './fileUtils.js';
 
 // IPC handlers for schedule operations
 ipcMain.handle('schedules:load', async () => {
@@ -68,6 +68,17 @@ ipcMain.handle('workflows:trigger', async (event, workflowName) => {
   }
 });
 
+// IPC to run an agent with a user query
+ipcMain.handle('agent:run', async (event, workflowName, userQuery) => {
+  try {
+    const result = await runAgentWorkflow(workflowName, userQuery);
+    return result;
+  } catch (error) {
+    console.error('Error running agent:', error);
+    return { success: false, error: error.message };
+  }
+});
+
 // IPC handlers for MCP server configuration
 ipcMain.handle('mcp-config:load', async () => {
   try {
@@ -106,6 +117,47 @@ ipcMain.handle('llm-config:save', async (event, config) => {
     return result;
   } catch (error) {
     console.error('Error saving LLM config:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// IPC handlers for LLM API key management (stored in LLM config)
+ipcMain.handle('llm-config:set-api-key', async (event, llmName, apiKey) => {
+  try {
+    const result = setLLMApiKey(llmName, apiKey);
+    return result;
+  } catch (error) {
+    console.error('Error setting API key:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('llm-config:get-api-key-masked', async (event, llmName) => {
+  try {
+    const masked = getLLMApiKeyMasked(llmName);
+    return { success: true, masked };
+  } catch (error) {
+    console.error('Error getting masked API key:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('llm-config:has-api-key', async (event, llmName) => {
+  try {
+    const exists = hasLLMApiKey(llmName);
+    return { success: true, exists };
+  } catch (error) {
+    console.error('Error checking API key:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('llm-config:delete-api-key', async (event, llmName) => {
+  try {
+    const result = deleteLLMApiKey(llmName);
+    return result;
+  } catch (error) {
+    console.error('Error deleting API key:', error);
     return { success: false, error: error.message };
   }
 });

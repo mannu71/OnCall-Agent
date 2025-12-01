@@ -1,6 +1,11 @@
 // LLM Configuration Service
 // Manages loading and saving LLM configurations via Electron file API
 
+// Cache for config to reduce file reads
+let configCache = null;
+let cacheTimestamp = 0;
+const CACHE_TTL_MS = 5000; // 5 second cache
+
 const DEFAULT_LLMS = {
   'gpt-4o-mini': {
     provider: 'OpenAI',
@@ -11,13 +16,29 @@ const DEFAULT_LLMS = {
 };
 
 /**
+ * Invalidate the config cache
+ */
+export const invalidateCache = () => {
+  configCache = null;
+  cacheTimestamp = 0;
+};
+
+/**
  * Load LLM configuration from file via Electron API
+ * Uses caching to prevent excessive file reads
  */
 export const loadLLMConfig = async () => {
+  const now = Date.now();
+  if (configCache && (now - cacheTimestamp) < CACHE_TTL_MS) {
+    return configCache;
+  }
+
   try {
     if (window.electronAPI?.loadLLMConfig) {
       const config = await window.electronAPI.loadLLMConfig();
-      return config || { llms: DEFAULT_LLMS };
+      configCache = config || { llms: DEFAULT_LLMS };
+      cacheTimestamp = now;
+      return configCache;
     }
     console.warn('Electron API not available, using defaults');
     return { llms: DEFAULT_LLMS };
@@ -34,6 +55,11 @@ export const saveLLMConfig = async (config) => {
   try {
     if (window.electronAPI?.saveLLMConfig) {
       const result = await window.electronAPI.saveLLMConfig(config);
+      if (result.success) {
+        // Update cache on successful save
+        configCache = config;
+        cacheTimestamp = Date.now();
+      }
       return result.success;
     }
     console.error('Electron API not available');
@@ -91,6 +117,9 @@ export const deleteLLM = async (name) => {
  * Convert LLMs to node items for the sidebar
  */
 export const convertLLMsToNodeItems = (llms) => {
+  if (!llms || typeof llms !== 'object') {
+    return [];
+  }
   return Object.entries(llms).map(([name, config]) => ({
     type: 'llm',
     icon: config.icon || '🧠',
@@ -101,7 +130,8 @@ export const convertLLMsToNodeItems = (llms) => {
       model: config.model,
       provider: config.provider,
       agent: config.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq',
-      apiKey: config.apiKey || '',
+      // Use environment variable reference instead of hardcoded key
+      apiKeyEnvVar: config.apiKeyEnvVar || '',
       status: 'Available'
     }
   }));

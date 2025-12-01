@@ -66,7 +66,7 @@ function mergeApiKeyFromConfig(agent, llmConfigs) {
 async function main() {
     // Get workflow name from command line args, default to first one
     const workflowName = process.argv[2];
-    const userQuery = process.argv[3] || "check why schedules failed";
+    const userQuery = process.argv[3];
 
     // Load workflows and LLM config
     const workflows = JSON.parse(fs.readFileSync(workflowsPath, "utf-8"));

@@ -9,6 +9,9 @@ import {
   Chat
 } from '@mui/icons-material';
 
+// Check if we're in development mode
+const isDevelopment = import.meta.env.DEV;
+
 export const navigationItems = [
   {
     id: 'dashboard',
@@ -27,6 +30,7 @@ export const navigationItems = [
     title: 'Agent Chat',
     path: '/chat',
     icon: Chat,
+    devOnly: true, // Only show in development mode
   },
   {
     id: 'workflow',
@@ -39,6 +43,7 @@ export const navigationItems = [
     title: 'Analytics',
     path: '/analytics',
     icon: Analytics,
+    devOnly: true, // Only show in development mode
   },
   {
     id: 'settings',
@@ -46,4 +51,4 @@ export const navigationItems = [
     path: '/settings',
     icon: Settings,
   },
-];
+].filter(item => !item.devOnly || isDevelopment);

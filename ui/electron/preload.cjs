@@ -7,12 +7,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   loadWorkflows: () => ipcRenderer.invoke('workflows:load'),
   saveWorkflows: (workflows) => ipcRenderer.invoke('workflows:save', workflows),
   triggerWorkflow: (workflowName) => ipcRenderer.invoke('workflows:trigger', workflowName),
+  runAgent: (workflowName, userQuery) => ipcRenderer.invoke('agent:run', workflowName, userQuery),
   // MCP config management
   loadMCPConfig: () => ipcRenderer.invoke('mcp-config:load'),
   saveMCPConfig: (config) => ipcRenderer.invoke('mcp-config:save', config),
   // LLM config management
   loadLLMConfig: () => ipcRenderer.invoke('llm-config:load'),
   saveLLMConfig: (config) => ipcRenderer.invoke('llm-config:save', config),
+  setApiKey: (llmName, apiKey) => ipcRenderer.invoke('llm-config:set-api-key', llmName, apiKey),
+  getApiKeyMasked: (llmName) => ipcRenderer.invoke('llm-config:get-api-key-masked', llmName),
+  hasApiKey: (llmName) => ipcRenderer.invoke('llm-config:has-api-key', llmName),
+  deleteApiKey: (llmName) => ipcRenderer.invoke('llm-config:delete-api-key', llmName),
   saveSqlFile: (filename, content) => ipcRenderer.invoke('sql:save', filename, content),
   loadSqlFile: (relativePath) => ipcRenderer.invoke('sql:load', relativePath),
   loadWorkflowRuns: () => ipcRenderer.invoke('workflow-runs:load'),

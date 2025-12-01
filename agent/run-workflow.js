@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const WORKFLOWS_FILE = path.join(__dirname, 'src', 'workflows', 'workflows.json');
+const WORKFLOWS_FILE = path.join(__dirname, 'data', 'config', 'workflows.json');
 const OUTPUT_DIR = path.join(__dirname, 'output');
 
 async function runWorkflow(workflowName) {

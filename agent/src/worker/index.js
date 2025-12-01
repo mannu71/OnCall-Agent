@@ -21,6 +21,9 @@ class WorkerService {
         this.workflowParser = new WorkflowParser(WORKFLOWS_FILE);
         this.watcher = null;
         this.isProcessing = false;
+        this.pendingTriggers = [];
+        this.pollingInterval = null;
+        this.isShuttingDown = false;
     }
 
     /**
@@ -103,7 +106,11 @@ class WorkerService {
         }
 
         if (this.isProcessing) {
-            logger.info(`Already processing a workflow, queuing: ${filePath}`);
+            // Queue the trigger instead of dropping it
+            if (!this.pendingTriggers.includes(filePath)) {
+                this.pendingTriggers.push(filePath);
+                logger.info(`Queued trigger for later processing: ${filePath}`);
+            }
             return;
         }
 
@@ -136,6 +143,24 @@ class WorkerService {
             logger.error('Error handling trigger file:', error);
         } finally {
             this.isProcessing = false;
+            // Process next queued trigger if any
+            await this.processNextQueuedTrigger();
+        }
+    }
+
+    /**
+     * Process the next queued trigger
+     */
+    async processNextQueuedTrigger() {
+        if (this.isShuttingDown || this.pendingTriggers.length === 0) {
+            return;
+        }
+        const nextTrigger = this.pendingTriggers.shift();
+        if (nextTrigger && fs.existsSync(nextTrigger)) {
+            await this.handleTriggerFile(nextTrigger);
+        } else if (this.pendingTriggers.length > 0) {
+            // Skip non-existent files and try next
+            await this.processNextQueuedTrigger();
         }
     }
 
@@ -165,7 +190,8 @@ class WorkerService {
             if (result.success) {
                 logger.info(`Workflow executed successfully: ${workflowName}`);
             } else {
-                logger.error(`Workflow execution failed: ${workflowName}`, result.error);
+                // Log error as object to prevent Winston splat from spreading string characters
+                logger.error(`Workflow execution failed: ${workflowName}`, { error: result.error });
             }
 
             return result;
@@ -225,12 +251,15 @@ class WorkerService {
                 error: result.error
             };
 
-            fs.writeFileSync(filePath, JSON.stringify(output, null, 2));
+            const outputJson = JSON.stringify(output, null, 2);
+            await Promise.all([
+                fs.promises.writeFile(filePath, outputJson),
+                fs.promises.writeFile(
+                    path.join(OUTPUT_DIR, `${workflowName.replace(/\s+/g, '_')}_latest.json`),
+                    outputJson
+                )
+            ]);
             logger.info(`Output saved: ${fileName}`);
-
-            // Also save as latest
-            const latestPath = path.join(OUTPUT_DIR, `${workflowName.replace(/\s+/g, '_')}_latest.json`);
-            fs.writeFileSync(latestPath, JSON.stringify(output, null, 2));
 
         } catch (error) {
             logger.error('Failed to save output:', error);
@@ -242,9 +271,12 @@ class WorkerService {
      */
     async stop() {
         logger.info('Stopping worker service');
+        this.isShuttingDown = true;
+        this.pendingTriggers = [];
 
         if (this.pollingInterval) {
             clearInterval(this.pollingInterval);
+            this.pollingInterval = null;
         }
 
         logger.info('Worker service stopped');

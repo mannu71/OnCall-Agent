@@ -5,13 +5,10 @@ import { SQLASTParser } from './sql-ast-parser.js';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { TEMPLATE_VAR_REGEX, ISO_DATE_REGEX } from '../shared/constants.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Cached regex patterns for performance
-const TEMPLATE_VAR_REGEX = /\{\{\s*([^}]+?)\s*\}\}/g;
-const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
 /* -----------------------
    Helper: Format value for SQL interpolation

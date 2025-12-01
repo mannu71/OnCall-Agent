@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   Button,
   TextField,
@@ -35,12 +35,23 @@ import {
 import WorkflowEditor from '../components/workflow/WorkflowEditor.jsx';
 import { validateWorkflow } from '../utils/workflowValidation.js';
 
+// Debounce hook for search optimization
+const useDebounce = (value, delay) => {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+  useEffect(() => {
+    const handler = setTimeout(() => setDebouncedValue(value), delay);
+    return () => clearTimeout(handler);
+  }, [value, delay]);
+  return debouncedValue;
+};
+
 function Workflow() {
   const [workflows, setWorkflows] = useState([]);
   const [showDialog, setShowDialog] = useState(false);
   const [showWorkflowEditor, setShowWorkflowEditor] = useState(false);
   const [editingWorkflow, setEditingWorkflow] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
+  const debouncedSearchTerm = useDebounce(searchTerm, 300);
   const [anchorEl, setAnchorEl] = useState(null);
   const [selectedWorkflow, setSelectedWorkflow] = useState(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
@@ -249,13 +260,17 @@ function Workflow() {
 
 
 
-  const filteredWorkflows = workflows.filter(workflow => {
-    const searchLower = searchTerm.toLowerCase();
-    const name = (workflow.name || '').toLowerCase();
-    return name.includes(searchLower);
-  });
+  // Memoize filtered workflows to prevent unnecessary re-renders
+  const filteredWorkflows = useMemo(() => {
+    const searchLower = debouncedSearchTerm.toLowerCase();
+    return workflows.filter(workflow => {
+      const name = (workflow.name || '').toLowerCase();
+      return name.includes(searchLower);
+    });
+  }, [workflows, debouncedSearchTerm]);
 
-  const formatDate = (dateString) => {
+  // Memoize date formatter to avoid recreation on each render
+  const formatDate = useCallback((dateString) => {
     const date = new Date(dateString);
     return date.toLocaleDateString('en-US', {
       weekday: 'short',
@@ -263,7 +278,7 @@ function Workflow() {
       month: 'short',
       day: 'numeric'
     });
-  };
+  }, []);
 
   return (
     <div className="min-h-screen bg-gray-50">

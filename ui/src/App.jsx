@@ -15,6 +15,9 @@ import './App.css';
 // Use HashRouter for Electron, BrowserRouter for web
 const Router = window.electronAPI ? HashRouter : BrowserRouter;
 
+// Check if we're in development mode
+const isDevelopment = import.meta.env.DEV;
+
 const theme = createTheme({
   palette: {
     mode: 'light',
@@ -83,11 +86,11 @@ const AppRoutes = () => {
           <Route path="/" element={<Dashboard />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/scheduler" element={<Scheduler />} />
-          <Route path="/chat" element={<Chat />} />
+          {isDevelopment && <Route path="/chat" element={<Chat />} />}
           <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
           <Route path="/workflow" element={<Workflow />} />
           <Route path="/alerts" element={<PlaceholderPage title="Alerts" />} />
-          <Route path="/analytics" element={<Analytics />} />
+          {isDevelopment && <Route path="/analytics" element={<Analytics />} />}
           <Route path="/emergency" element={<PlaceholderPage title="Emergency Contact" />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="*" element={<Dashboard />} />

@@ -216,6 +216,68 @@ function triggerWorkflow(workflowName) {
   }
 }
 
+// Run an agent workflow with a user query
+async function runAgentWorkflow(workflowName, userQuery) {
+  try {
+    const { spawn } = await import('child_process');
+    
+    return new Promise((resolve, reject) => {
+      // Run the agent using node
+      const agentPath = path.join(agentDir, 'src', 'agents', 'run.js');
+      
+      const child = spawn('node', [agentPath, workflowName, userQuery], {
+        cwd: agentDir,
+        env: { ...process.env },
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      
+      let stdout = '';
+      let stderr = '';
+      
+      child.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+      
+      child.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+      
+      child.on('close', (code) => {
+        if (code === 0) {
+          // Extract the final answer from the output
+          const finalAnswerMatch = stdout.match(/🔥 FINAL ANSWER:\s*([\s\S]*)/);
+          const answer = finalAnswerMatch ? finalAnswerMatch[1].trim() : stdout;
+          
+          resolve({ 
+            success: true, 
+            answer: answer,
+            fullOutput: stdout
+          });
+        } else {
+          resolve({ 
+            success: false, 
+            error: stderr || `Agent exited with code ${code}`,
+            fullOutput: stdout + stderr
+          });
+        }
+      });
+      
+      child.on('error', (err) => {
+        resolve({ success: false, error: err.message });
+      });
+      
+      // Timeout after 5 minutes
+      setTimeout(() => {
+        child.kill();
+        resolve({ success: false, error: 'Agent execution timed out after 5 minutes' });
+      }, 5 * 60 * 1000);
+    });
+  } catch (error) {
+    console.error('Error running agent workflow:', error);
+    return { success: false, error: error.message };
+  }
+}
+
 // Clean up trigger files for deleted schedules
 function cleanupTriggers(currentSchedules) {
   try {
@@ -547,6 +609,59 @@ function getPathsInfo() {
   };
 }
 
+// Function to set API key for an LLM (stores in llm-config.json)
+function setLLMApiKey(llmName, apiKey) {
+  try {
+    const config = loadLLMConfigFromFile();
+    if (!config.llms) {
+      config.llms = {};
+    }
+    if (!config.llms[llmName]) {
+      return { success: false, error: `LLM '${llmName}' not found` };
+    }
+    if (apiKey) {
+      config.llms[llmName].apiKey = apiKey;
+    } else {
+      delete config.llms[llmName].apiKey;
+    }
+    return saveLLMConfigToFile(config);
+  } catch (error) {
+    console.error('Error setting LLM API key:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+// Function to get masked API key for an LLM
+function getLLMApiKeyMasked(llmName) {
+  try {
+    const config = loadLLMConfigFromFile();
+    const key = config.llms?.[llmName]?.apiKey;
+    if (!key) return null;
+    // Return masked version: show first 4 and last 4 chars
+    if (key.length <= 8) return '****';
+    return key.substring(0, 4) + '****' + key.substring(key.length - 4);
+  } catch (error) {
+    console.error('Error getting LLM API key:', error);
+    return null;
+  }
+}
+
+// Function to check if an LLM has an API key
+function hasLLMApiKey(llmName) {
+  try {
+    const config = loadLLMConfigFromFile();
+    return !!config.llms?.[llmName]?.apiKey;
+  } catch (error) {
+    console.error('Error checking LLM API key:', error);
+    return false;
+  }
+}
+
+// Function to delete an LLM's API key
+function deleteLLMApiKey(llmName) {
+  return setLLMApiKey(llmName, null);
+}
+
 export {
   saveSchedulesToFile,
   loadSchedulesFromFile,
@@ -556,7 +671,12 @@ export {
   loadMCPConfigFromFile,
   saveLLMConfigToFile,
   loadLLMConfigFromFile,
+  setLLMApiKey,
+  getLLMApiKeyMasked,
+  hasLLMApiKey,
+  deleteLLMApiKey,
   triggerWorkflow,
+  runAgentWorkflow,
   cleanupTriggers,
   saveSqlFile,
   loadSqlFile,

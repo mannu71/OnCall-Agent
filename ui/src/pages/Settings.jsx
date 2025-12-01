@@ -23,14 +23,20 @@ import {
     Select,
     MenuItem,
     FormControl,
-    InputLabel
+    InputLabel,
+    InputAdornment,
+    Autocomplete
 } from '@mui/material';
 import { 
     Add as AddIcon, 
     Edit as EditIcon, 
     Delete as DeleteIcon,
     PlayArrow as StartIcon,
-    Stop as StopIcon
+    Stop as StopIcon,
+    Visibility as VisibilityIcon,
+    VisibilityOff as VisibilityOffIcon,
+    Key as KeyIcon,
+    Check as CheckIcon
 } from '@mui/icons-material';
 import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer, getMCPInputValues, updateMCPInputValue } from '../services/mcpService';
 import { getLLMs, addLLM, updateLLM, deleteLLM } from '../services/llmService';
@@ -68,10 +74,12 @@ const Settings = () => {
         model: '',
         icon: '🧠',
         description: '',
-        apiKey: '',
+        apiKey: '', // Direct API key input
         endpoint: '',
         baseUrl: ''
     });
+    const [showApiKey, setShowApiKey] = useState(false);
+    const [existingApiKey, setExistingApiKey] = useState(null); // To show if key exists
     
     // Docker state
     const [dockerAvailable, setDockerAvailable] = useState(false);
@@ -289,7 +297,10 @@ const Settings = () => {
     };
 
     // LLM Dialog handlers
-    const handleOpenLLMDialog = (llmName = null) => {
+    const handleOpenLLMDialog = async (llmName = null) => {
+        setShowApiKey(false);
+        setExistingApiKey(null);
+        
         if (llmName) {
             const llm = llms[llmName];
             setEditingLLM(llmName);
@@ -299,10 +310,18 @@ const Settings = () => {
                 model: llm.model || '',
                 icon: llm.icon || '🧠',
                 description: llm.description || '',
-                apiKey: llm.apiKey || '',
+                apiKey: '', // Don't load actual key, just check if exists
                 endpoint: llm.endpoint || '',
                 baseUrl: llm.baseUrl || ''
             });
+            
+            // Check if API key exists for this LLM
+            if (window.electronAPI?.getApiKeyMasked) {
+                const result = await window.electronAPI.getApiKeyMasked(llmName);
+                if (result.success && result.masked) {
+                    setExistingApiKey(result.masked);
+                }
+            }
         } else {
             setEditingLLM(null);
             setLLMFormData({
@@ -322,6 +341,8 @@ const Settings = () => {
     const handleCloseLLMDialog = () => {
         setOpenLLMDialog(false);
         setEditingLLM(null);
+        setShowApiKey(false);
+        setExistingApiKey(null);
     };
 
     const handleSaveLLM = async () => {
@@ -331,18 +352,26 @@ const Settings = () => {
                 model: llmFormData.model,
                 icon: llmFormData.icon,
                 description: llmFormData.description,
-                ...(llmFormData.apiKey && { apiKey: llmFormData.apiKey }),
                 ...(llmFormData.endpoint && { endpoint: llmFormData.endpoint }),
                 ...(llmFormData.baseUrl && { baseUrl: llmFormData.baseUrl })
             };
 
+            // First save the LLM config
             if (editingLLM) {
                 await updateLLM(llmFormData.name, llmConfig);
-                setSaveMessage(`Updated LLM: ${llmFormData.name}`);
             } else {
                 await addLLM(llmFormData.name, llmConfig);
-                setSaveMessage(`Added new LLM: ${llmFormData.name}`);
             }
+
+            // Then save API key if provided (LLM must exist first)
+            if (llmFormData.apiKey && window.electronAPI?.setApiKey) {
+                const keyResult = await window.electronAPI.setApiKey(llmFormData.name, llmFormData.apiKey);
+                if (!keyResult.success) {
+                    console.error('Failed to save API key:', keyResult.error);
+                }
+            }
+
+            setSaveMessage(editingLLM ? `Updated LLM: ${llmFormData.name}` : `Added new LLM: ${llmFormData.name}`);
 
             await loadLLMConfigs();
             handleCloseLLMDialog();
@@ -835,28 +864,31 @@ const Settings = () => {
                                 </Select>
                             </FormControl>
 
-                            {llmFormData.provider === 'Custom' || llmFormData.provider === 'Ollama' ? (
+                            {llmFormData.provider === 'Custom' ? (
                                 <TextField
                                     label="Model Name"
                                     value={llmFormData.model}
                                     onChange={(e) => setLLMFormData({ ...llmFormData, model: e.target.value })}
                                     fullWidth
-                                    placeholder={llmFormData.provider === 'Ollama' ? 'e.g., llama3.2:latest' : 'Enter custom model name'}
-                                    helperText={llmFormData.provider === 'Ollama' ? 'Enter any model name available in your Ollama installation' : 'Enter the model identifier'}
+                                    placeholder="Enter custom model name"
+                                    helperText="Enter the model identifier"
                                 />
                             ) : (
-                                <FormControl fullWidth>
-                                    <InputLabel>Model</InputLabel>
-                                    <Select
-                                        value={llmFormData.model}
-                                        label="Model"
-                                        onChange={(e) => setLLMFormData({ ...llmFormData, model: e.target.value })}
-                                    >
-                                        {getModelOptions(llmFormData.provider).map(model => (
-                                            <MenuItem key={model} value={model}>{model}</MenuItem>
-                                        ))}
-                                    </Select>
-                                </FormControl>
+                                <Autocomplete
+                                    freeSolo
+                                    options={getModelOptions(llmFormData.provider)}
+                                    value={llmFormData.model}
+                                    onChange={(e, newValue) => setLLMFormData({ ...llmFormData, model: newValue || '' })}
+                                    onInputChange={(e, newInputValue) => setLLMFormData({ ...llmFormData, model: newInputValue })}
+                                    renderInput={(params) => (
+                                        <TextField
+                                            {...params}
+                                            label="Model"
+                                            placeholder={llmFormData.provider === 'Ollama' ? 'e.g., llama3.2:latest' : 'Select or type model name'}
+                                            helperText="Select from suggestions or type a custom model name"
+                                        />
+                                    )}
+                                />
                             )}
 
                             {llmFormData.provider === 'Azure OpenAI' && (
@@ -888,14 +920,66 @@ const Settings = () => {
                                 helperText="Brief description of this LLM configuration"
                             />
 
-                            <TextField
-                                label="API Key (Optional)"
-                                type="password"
-                                value={llmFormData.apiKey}
-                                onChange={(e) => setLLMFormData({ ...llmFormData, apiKey: e.target.value })}
-                                fullWidth
-                                helperText="API key for this provider (stored securely)"
-                            />
+                            {/* API Key Section */}
+                            {llmFormData.provider !== 'Ollama' && (
+                                <Box sx={{ 
+                                    p: 2, 
+                                    bgcolor: 'action.hover', 
+                                    borderRadius: 1,
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: 2
+                                }}>
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                        <KeyIcon fontSize="small" color="primary" />
+                                        <Typography variant="subtitle2">
+                                            API Key
+                                        </Typography>
+                                    </Box>
+                                    
+                                    {existingApiKey ? (
+                                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                                            <Chip 
+                                                icon={<CheckIcon />}
+                                                label={`Key configured: ${existingApiKey}`}
+                                                size="small" 
+                                                color="success" 
+                                                variant="outlined" 
+                                            />
+                                            <Button 
+                                                size="small" 
+                                                onClick={() => setExistingApiKey(null)}
+                                            >
+                                                Update Key
+                                            </Button>
+                                        </Box>
+                                    ) : (
+                                        <TextField
+                                            label="API Key"
+                                            value={llmFormData.apiKey}
+                                            onChange={(e) => setLLMFormData({ ...llmFormData, apiKey: e.target.value })}
+                                            fullWidth
+                                            size="small"
+                                            type={showApiKey ? 'text' : 'password'}
+                                            placeholder="sk-..."
+                                            helperText="Your API key will be securely stored locally"
+                                            InputProps={{
+                                                endAdornment: (
+                                                    <InputAdornment position="end">
+                                                        <IconButton
+                                                            onClick={() => setShowApiKey(!showApiKey)}
+                                                            edge="end"
+                                                            size="small"
+                                                        >
+                                                            {showApiKey ? <VisibilityOffIcon /> : <VisibilityIcon />}
+                                                        </IconButton>
+                                                    </InputAdornment>
+                                                ),
+                                            }}
+                                        />
+                                    )}
+                                </Box>
+                            )}
                         </Box>
                     </DialogContent>
                     <DialogActions>

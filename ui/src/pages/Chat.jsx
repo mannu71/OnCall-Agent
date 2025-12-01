@@ -25,8 +25,8 @@ import {
 } from '@mui/icons-material';
 import { isAgentWorkflowValid } from '../utils/workflowValidation.js';
 
-// Development mode flag - set to true to enable the chat functionality
-const DEV_MODE = false;
+// Use Vite's environment check for development mode
+const DEV_MODE = import.meta.env.DEV;
 
 // Message types
 const MESSAGE_TYPES = {
@@ -84,7 +84,7 @@ function Chat() {
     {
       id: 1,
       type: MESSAGE_TYPES.SYSTEM,
-      content: 'Welcome! Select an agent from the sidebar, then click the play button or type "run" to trigger it.',
+      content: 'Welcome! Select an agent from the sidebar, then ask any question.',
       timestamp: new Date().toISOString()
     }
   ]);
@@ -143,7 +143,7 @@ function Chat() {
   // Select agent (without triggering)
   const handleSelectAgent = (agent) => {
     setSelectedAgent(agent);
-    addMessage(MESSAGE_TYPES.SYSTEM, `Selected agent: ${agent.name}. Type "run" or click the play button to trigger it.`);
+    addMessage(MESSAGE_TYPES.SYSTEM, `Selected agent: ${agent.name}. Ask any question to get started.`);
   };
 
   // Trigger the selected agent
@@ -197,41 +197,61 @@ function Chat() {
     
     addMessage(MESSAGE_TYPES.USER, userMessage);
     
-    // Check if user just typed "run" to trigger selected agent
-    if (userMessage.toLowerCase() === 'run' && selectedAgent) {
-      await triggerAgent(selectedAgent);
+    // If no agent selected, prompt user to select one
+    if (!selectedAgent) {
+      if (agents.length === 0) {
+        addMessage(MESSAGE_TYPES.ASSISTANT, 'No agents available. Please create an agent workflow first.');
+        return;
+      }
+      // Auto-select first agent if none selected
+      const firstAgent = agents[0];
+      setSelectedAgent(firstAgent);
+      addMessage(MESSAGE_TYPES.SYSTEM, `Auto-selected agent: ${firstAgent.name}`);
+      await askAgent(firstAgent, userMessage);
       return;
     }
     
-    // Check if user wants to run an agent by name
-    const runMatch = userMessage.toLowerCase().match(/^(run|execute|start|trigger)\s+(.+)$/i);
-    if (runMatch) {
-      const agentName = runMatch[2].trim();
-      const matchingAgent = agents.find(a => 
-        a.name.toLowerCase() === agentName.toLowerCase() ||
-        a.name.toLowerCase().includes(agentName.toLowerCase())
-      );
-      if (matchingAgent) {
-        await triggerAgent(matchingAgent);
-        return;
-      } else {
-        addMessage(MESSAGE_TYPES.ASSISTANT, `Agent "${agentName}" not found. Available agents:\n${agents.map(a => `• ${a.name}`).join('\n') || 'No agents configured.'}`);
-        return;
-      }
-    }
+    // Send the question to the selected agent
+    await askAgent(selectedAgent, userMessage);
+  };
 
-    // Default response - list available agents
-    const agentList = agents.length > 0 
-      ? agents.map(a => `• ${a.name}`).join('\n')
-      : 'No agents configured yet. Create a workflow with type "Agent".';
+  // Ask the agent a question
+  const askAgent = async (agent, question) => {
+    const thinkingId = addMessage(MESSAGE_TYPES.ASSISTANT, `Thinking...`, { isLoading: true });
+    setIsLoading(true);
     
-    const selectedInfo = selectedAgent 
-      ? `\n\nCurrently selected: ${selectedAgent.name} (type "run" to trigger)`
-      : '';
-    
-    addMessage(MESSAGE_TYPES.ASSISTANT, 
-      `To trigger an agent, type "run [agent name]" or select one from the sidebar and type "run".\n\nAvailable agents:\n${agentList}${selectedInfo}`
-    );
+    try {
+      if (window.electronAPI?.runAgent) {
+        const result = await window.electronAPI.runAgent(agent.name, question);
+        
+        if (result?.success) {
+          updateMessage(thinkingId, { 
+            content: result.answer || 'Agent completed successfully.',
+            isLoading: false 
+          });
+        } else {
+          updateMessage(thinkingId, { 
+            content: `Error: ${result?.error || 'Unknown error'}`,
+            isLoading: false,
+            isError: true
+          });
+        }
+      } else {
+        updateMessage(thinkingId, { 
+          content: 'Agent execution is only available in the desktop app.',
+          isLoading: false,
+          isError: true
+        });
+      }
+    } catch (error) {
+      updateMessage(thinkingId, { 
+        content: `Error: ${error.message}`,
+        isLoading: false,
+        isError: true
+      });
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleKeyPress = (e) => {
@@ -259,7 +279,8 @@ function Chat() {
             display: 'flex',
             flexDirection: isUser ? 'row-reverse' : 'row',
             alignItems: 'flex-start',
-            maxWidth: '80%',
+            maxWidth: '100%',
+            width: '100%',
             gap: 1
           }}
         >
@@ -282,7 +303,8 @@ function Chat() {
           <Paper
             elevation={1}
             sx={{
-              p: 2,
+              py: 1,
+              px: 2,
               bgcolor: isUser ? 'primary.light' : isSystem ? 'grey.100' : 'background.paper',
               color: isUser ? 'primary.contrastText' : 'text.primary',
               borderRadius: 2,

@@ -1,6 +1,11 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import logger from '../shared/logger.js';
+import { DEFAULT_CLIENT_META } from '../shared/constants.js';
+
+// Constants for better maintainability
+const DEFAULT_DISCOVERY_TIMEOUT_MS = 10_000;
+const DEFAULT_RAW_CAPTURE_TIMEOUT_MS = 5_000;
 
 /**
  * Hybrid functional MCP client factory
@@ -9,9 +14,9 @@ import logger from '../shared/logger.js';
  */
 export function createMCPClient(serverConfig, opts = {}) {
   // config & defaults
-  const meta = opts.clientMeta || { name: 'oncall-agent', version: '1.0.0' };
-  const discoveryTimeoutMs = opts.discoveryTimeoutMs ?? 10_000;
-  const rawCaptureTimeoutMs = opts.rawCaptureTimeoutMs ?? 5_000;
+  const meta = opts.clientMeta || DEFAULT_CLIENT_META;
+  const discoveryTimeoutMs = opts.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS;
+  const rawCaptureTimeoutMs = opts.rawCaptureTimeoutMs ?? DEFAULT_RAW_CAPTURE_TIMEOUT_MS;
 
   // internal state
   let client = null;

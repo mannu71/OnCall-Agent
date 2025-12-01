@@ -1,16 +1,37 @@
 // MCP Server Configuration Service
 // Manages loading and saving MCP server configurations via Electron file API
 
+// Cache for config to reduce file reads
+let configCache = null;
+let cacheTimestamp = 0;
+const CACHE_TTL_MS = 5000; // 5 second cache
+
+/**
+ * Invalidate the config cache
+ */
+export const invalidateCache = () => {
+    configCache = null;
+    cacheTimestamp = 0;
+};
+
 /**
  * Load MCP configuration from file via Electron API
+ * Uses caching to prevent excessive file reads
  */
 export const loadMCPConfig = async () => {
+    const now = Date.now();
+    if (configCache && (now - cacheTimestamp) < CACHE_TTL_MS) {
+        return configCache;
+    }
+
     try {
         if (window.electronAPI?.loadMCPConfig) {
             const config = await window.electronAPI.loadMCPConfig();
-            return config || { servers: {}, inputs: [] };
+            configCache = config || { servers: {}, inputs: [] };
+            cacheTimestamp = now;
+            return configCache;
         }
-        console.error('Electron API not available');
+        console.warn('Electron API not available, using defaults');
         return { servers: {}, inputs: [] };
     } catch (error) {
         console.error('Error loading MCP config:', error);
@@ -25,6 +46,11 @@ export const saveMCPConfig = async (config) => {
     try {
         if (window.electronAPI?.saveMCPConfig) {
             const result = await window.electronAPI.saveMCPConfig(config);
+            if (result.success) {
+                // Update cache on successful save
+                configCache = config;
+                cacheTimestamp = Date.now();
+            }
             return result.success;
         }
         console.error('Electron API not available');

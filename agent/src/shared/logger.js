@@ -12,8 +12,10 @@ if (!fs.existsSync(logsDir)) {
     fs.mkdirSync(logsDir, { recursive: true });
 }
 
+const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+
 const logger = winston.createLogger({
-    level: process.env.LOG_LEVEL || 'info',
+    level: LOG_LEVEL,
     format: winston.format.combine(
         winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
         winston.format.errors({ stack: true }),
@@ -32,12 +34,19 @@ const logger = winston.createLogger({
         // Write all logs to file
         new winston.transports.File({
             filename: path.join(logsDir, 'error.log'),
-            level: 'error'
+            level: 'error',
+            maxsize: 5242880, // 5MB
+            maxFiles: 5
         }),
         new winston.transports.File({
-            filename: path.join(logsDir, 'agent.log')
+            filename: path.join(logsDir, 'agent.log'),
+            maxsize: 10485760, // 10MB
+            maxFiles: 10
         }),
     ],
 });
+
+// Add helper method for checking debug level
+logger.isDebugEnabled = () => LOG_LEVEL === 'debug';
 
 export default logger;

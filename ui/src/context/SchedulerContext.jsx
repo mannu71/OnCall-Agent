@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 
 const SchedulerContext = createContext();
 
@@ -13,6 +13,8 @@ export const useScheduler = () => {
 export const SchedulerProvider = ({ children }) => {
   const [schedules, setSchedules] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
+  const initialLoadDone = useRef(false);
+  const saveTimeoutRef = useRef(null);
 
   const isElectron = Boolean(typeof window !== 'undefined' && window?.electronAPI);
 
@@ -113,24 +115,39 @@ export const SchedulerProvider = ({ children }) => {
         });
         console.log('Setting schedules (normalized):', normalized);
         setSchedules(normalized);
+        initialLoadDone.current = true;
       } catch (error) {
         console.error('Error loading schedules:', error);
         setSchedules([]);
+        initialLoadDone.current = true;
       } finally {
         setIsLoading(false);
       }
     };
 
     loadSchedules();
+    
+    // Cleanup on unmount
+    return () => {
+      if (saveTimeoutRef.current) {
+        clearTimeout(saveTimeoutRef.current);
+      }
+    };
   }, [isElectron]);
 
-  // Save schedules whenever schedules change
+  // Save schedules with debouncing to prevent excessive writes
   useEffect(() => {
-    if (isLoading) {
+    if (isLoading || !initialLoadDone.current) {
       return; // Don't save during initial load
     }
     
-    const saveSchedules = async () => {
+    // Clear any pending save
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current);
+    }
+    
+    // Debounce saves by 500ms
+    saveTimeoutRef.current = setTimeout(async () => {
       try {
         console.log('saveSchedules called, isElectron:', isElectron, 'schedules count:', schedules.length);
         const workflowPayload = schedules.map(toWorkflow);
@@ -149,12 +166,10 @@ export const SchedulerProvider = ({ children }) => {
       } catch (error) {
         console.error('Error saving schedules:', error);
       }
-    };
-
-    saveSchedules();
+    }, 500);
   }, [schedules, isLoading, isElectron]);
 
-  const addSchedule = (schedule) => {
+  const addSchedule = useCallback((schedule) => {
     const newSchedule = {
       id: Date.now().toString(),
       ...schedule,
@@ -162,38 +177,37 @@ export const SchedulerProvider = ({ children }) => {
       updatedAt: new Date().toISOString()
     };
     setSchedules(prev => [...prev, newSchedule]);
-  };
+  }, []);
 
-  const updateSchedule = (id, updatedSchedule) => {
+  const updateSchedule = useCallback((id, updatedSchedule) => {
     setSchedules(prev => prev.map(schedule => 
       schedule.id === id 
         ? { ...schedule, ...updatedSchedule, updatedAt: new Date().toISOString() }
         : schedule
     ));
-  };
+  }, []);
 
-  const deleteSchedule = (id) => {
+  const deleteSchedule = useCallback((id) => {
     console.log('deleteSchedule called with id:', id);
-    console.log('Current schedules:', schedules);
     setSchedules(prev => {
       const filtered = prev.filter(schedule => schedule.id !== id);
       console.log('Schedules after delete:', filtered);
       return filtered;
     });
-  };
+  }, []);
 
-  const getSchedule = (id) => {
+  const getSchedule = useCallback((id) => {
     return schedules.find(schedule => schedule.id === id);
-  };
+  }, [schedules]);
 
-  const getSchedulesByDate = (date) => {
+  const getSchedulesByDate = useCallback((date) => {
     const targetDate = new Date(date).toDateString();
     return schedules.filter(schedule => 
       new Date(schedule.date).toDateString() === targetDate
     );
-  };
+  }, [schedules]);
 
-  const value = {
+  const value = useMemo(() => ({
     schedules,
     isLoading,
     addSchedule,
@@ -201,7 +215,7 @@ export const SchedulerProvider = ({ children }) => {
     deleteSchedule,
     getSchedule,
     getSchedulesByDate
-  };
+  }), [schedules, isLoading, addSchedule, updateSchedule, deleteSchedule, getSchedule, getSchedulesByDate]);
 
   return (
     <SchedulerContext.Provider value={value}>

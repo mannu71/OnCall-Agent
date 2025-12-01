@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState } from 'react';
+import React, { createContext, useContext, useState, useCallback, useMemo } from 'react';
 
 const SidebarContext = createContext();
 
@@ -14,28 +14,28 @@ export const SidebarProvider = ({ children }) => {
   const [isOpen, setIsOpen] = useState(true);
   const [isMobileOpen, setIsMobileOpen] = useState(false);
 
-  const toggleSidebar = () => {
-    setIsOpen(!isOpen);
-  };
+  const toggleSidebar = useCallback(() => {
+    setIsOpen(prev => !prev);
+  }, []);
 
-  const toggleMobileSidebar = () => {
-    setIsMobileOpen(!isMobileOpen);
-  };
+  const toggleMobileSidebar = useCallback(() => {
+    setIsMobileOpen(prev => !prev);
+  }, []);
 
-  const closeMobileSidebar = () => {
+  const closeMobileSidebar = useCallback(() => {
     setIsMobileOpen(false);
-  };
+  }, []);
+
+  const value = useMemo(() => ({
+    isOpen,
+    isMobileOpen,
+    toggleSidebar,
+    toggleMobileSidebar,
+    closeMobileSidebar,
+  }), [isOpen, isMobileOpen, toggleSidebar, toggleMobileSidebar, closeMobileSidebar]);
 
   return (
-    <SidebarContext.Provider
-      value={{
-        isOpen,
-        isMobileOpen,
-        toggleSidebar,
-        toggleMobileSidebar,
-        closeMobileSidebar,
-      }}
-    >
+    <SidebarContext.Provider value={value}>
       {children}
     </SidebarContext.Provider>
   );
