@@ -1,0 +1,62 @@
+# Dependencies
+node_modules/
+*/node_modules/
+**/node_modules/
+package-lock.json
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# Build artifacts
+dist/
+build/
+*.pyc
+__pycache__/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Output and runtime files
+output/
+agent/output/
+agent/logs/
+agent/data/config/triggers/*.flag
+scheduler/triggers/*.flag
+worker/output/
+
+# Configuration files with sensitive data
+agent/data/config/workflows.json
+agent/data/config/schedules.json
+agent/data/config/sql/
+
+# Temporary files
+tmp/
+temp/
+*.tmp

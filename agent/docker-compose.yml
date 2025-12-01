@@ -1,0 +1,27 @@
+services:
+  agent:
+    build: .
+    container_name: oncall-agent
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - LOG_LEVEL=info
+      - WORKFLOWS_FILE=/app/data/config/workflows.json
+      - TRIGGER_DIR=/app/data/config/triggers
+      - OUTPUT_DIR=/app/output
+      - SCHEDULER_FILE=/app/data/config/schedules.json
+    volumes:
+      # Mount data directory for config (schedules, workflows, triggers, sql)
+      - ./data:/app/data
+      
+      # Mount output directory
+      - ./output:/app/output
+      
+      # Mount logs directory
+      - ./logs:/app/logs
+    networks:
+      - oncall-network
+
+networks:
+  oncall-network:
+    driver: bridge
