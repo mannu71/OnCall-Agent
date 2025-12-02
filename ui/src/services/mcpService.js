@@ -80,15 +80,86 @@ export const addMCPServer = async (serverName, serverConfig) => {
 };
 
 /**
- * Update an existing MCP server
+ * Update an existing MCP server and sync to workflows
  */
-export const updateMCPServer = async (serverName, serverConfig) => {
+export const updateMCPServer = async (serverName, serverConfig, newServerName = null) => {
+    // Invalidate cache first to ensure we get fresh data
+    invalidateCache();
     const config = await loadMCPConfig();
-    if (config.servers[serverName]) {
-        config.servers[serverName] = { ...config.servers[serverName], ...serverConfig };
-        await saveMCPConfig(config);
+    
+    const actualNewName = newServerName || serverName;
+    
+    // If renaming, delete old and add new
+    if (newServerName && newServerName !== serverName) {
+        delete config.servers[serverName];
+        config.servers[newServerName] = serverConfig;
+    } else if (config.servers[serverName]) {
+        // Fully replace the server config (don't merge, to ensure args are properly updated)
+        config.servers[serverName] = serverConfig;
+    } else {
+        console.warn('updateMCPServer: server not found:', serverName);
+        return config;
     }
+    
+    const success = await saveMCPConfig(config);
+    console.log('updateMCPServer:', serverName, '->', actualNewName, 'success:', success, 'config:', serverConfig);
+    
+    // Also update workflows that use this MCP server
+    if (success) {
+        await syncMCPServerToWorkflows(serverName, serverConfig, actualNewName);
+    }
+    
     return config;
+};
+
+/**
+ * Sync MCP server config changes to all workflows that use it
+ */
+export const syncMCPServerToWorkflows = async (oldServerName, serverConfig, newServerName = null) => {
+    const actualNewName = newServerName || oldServerName;
+    
+    try {
+        if (!window.electronAPI?.loadWorkflows || !window.electronAPI?.saveWorkflows) {
+            console.warn('Electron API not available for workflow sync');
+            return false;
+        }
+        
+        const workflows = await window.electronAPI.loadWorkflows();
+        if (!workflows || !Array.isArray(workflows)) {
+            return false;
+        }
+        
+        let updated = false;
+        
+        for (const workflow of workflows) {
+            if (!workflow.nodes) continue;
+            
+            for (const node of workflow.nodes) {
+                // Check if this node is a tool that uses the MCP server
+                if (node.type === 'tool' && 
+                    node.data?.toolType === 'mcp-server' && 
+                    node.data?.label === oldServerName) {
+                    
+                    // Update the node's label and mcpConfig
+                    node.data.label = actualNewName;
+                    node.data.mcpConfig = { ...serverConfig };
+                    updated = true;
+                    console.log(`Synced MCP server "${oldServerName}" -> "${actualNewName}" in workflow "${workflow.name}"`);
+                }
+            }
+        }
+        
+        if (updated) {
+            const result = await window.electronAPI.saveWorkflows(workflows);
+            console.log('Workflows synced with MCP server changes:', result);
+            return result?.success || result === true;
+        }
+        
+        return true;
+    } catch (error) {
+        console.error('Error syncing MCP server to workflows:', error);
+        return false;
+    }
 };
 
 /**

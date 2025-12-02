@@ -38,7 +38,7 @@ import {
     Key as KeyIcon,
     Check as CheckIcon
 } from '@mui/icons-material';
-import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer, getMCPInputValues, updateMCPInputValue } from '../services/mcpService';
+import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer, getMCPInputValues, updateMCPInputValue, invalidateCache } from '../services/mcpService';
 import { getLLMs, addLLM, updateLLM, deleteLLM } from '../services/llmService';
 
 // Helper to extract ${input:...} variables from args string
@@ -101,6 +101,7 @@ const Settings = () => {
     }, []);
 
     const loadServers = async () => {
+        invalidateCache(); // Ensure fresh data
         const mcpServers = await getMCPServers();
         setServers(mcpServers);
     };
@@ -180,7 +181,7 @@ const Settings = () => {
         if (serverName) {
             // Edit mode
             const server = servers[serverName];
-            const argsString = Array.isArray(server.args) ? server.args.join(', ') : '';
+            const argsString = Array.isArray(server.args) ? server.args.join('\n') : '';
             const vars = extractInputVariables(argsString);
             
             setEditingServer(serverName);
@@ -235,9 +236,9 @@ const Settings = () => {
                 }
             }
             
-            // Parse args and env
+            // Parse args and env (newline-separated to support connection strings with commas)
             const args = formData.args
-                .split(',')
+                .split('\n')
                 .map(arg => arg.trim())
                 .filter(arg => arg.length > 0);
 
@@ -257,13 +258,17 @@ const Settings = () => {
                 type: formData.type,
                 icon: formData.icon,
                 description: formData.description,
-                ...(Object.keys(env).length > 0 && { env })
+                env: env  // Always include env (even if empty, to clear old values)
             };
 
             if (editingServer) {
-                // Update existing server
-                await updateMCPServer(formData.name, serverConfig);
-                setSaveMessage(`Updated server: ${formData.name}`);
+                // Update existing server (handles rename and syncs to workflows)
+                await updateMCPServer(editingServer, serverConfig, formData.name !== editingServer ? formData.name : null);
+                if (editingServer !== formData.name) {
+                    setSaveMessage(`Renamed server: ${editingServer} → ${formData.name}`);
+                } else {
+                    setSaveMessage(`Updated server: ${formData.name}`);
+                }
             } else {
                 // Add new server
                 await addMCPServer(formData.name, serverConfig);
@@ -761,8 +766,8 @@ const Settings = () => {
                                 }}
                                 fullWidth
                                 multiline
-                                rows={2}
-                                helperText="Comma-separated arguments. Use ${input:var_name} for configurable values"
+                                rows={3}
+                                helperText="One argument per line. Use ${input:var_name} for configurable values"
                             />
 
                             {/* Dynamic input variable fields */}
