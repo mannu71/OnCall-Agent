@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain } from "electron";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { exec } from "child_process";
+import { exec, spawn } from "child_process";
 import { promisify } from "util";
 
 const execAsync = promisify(exec);
@@ -87,6 +87,137 @@ ipcMain.handle('mcp-config:load', async () => {
   } catch (error) {
     console.error('Error loading MCP config:', error);
     return { servers: {}, inputs: [] };
+  }
+});
+
+// IPC handler for testing MCP server connection
+ipcMain.handle('mcp-server:test', async (event, serverName, serverConfig) => {
+  try {
+    console.log(`Testing connection to MCP server: ${serverName}`);
+    
+    const { command, args = [], env = {} } = serverConfig;
+    
+    if (!command) {
+      return { success: false, error: 'No command specified' };
+    }
+    
+    // Create a promise that spawns the process and checks if it starts successfully
+    return new Promise((resolve) => {
+      const processEnv = { ...process.env, ...env };
+      const child = spawn(command, args, { 
+        env: processEnv,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: true
+      });
+      
+      let stdout = '';
+      let stderr = '';
+      let resolved = false;
+      
+      // Set a timeout for the connection test (5 seconds to allow for slower connections)
+      const timeout = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          child.kill();
+          // If process was running for 5 seconds without error, consider it successful
+          resolve({ 
+            success: true, 
+            message: `Connected`,
+            output: stdout || 'Connection established'
+          });
+        }
+      }, 5000);
+      
+      child.stdout.on('data', (data) => {
+        stdout += data.toString();
+        console.log(`[${serverName}] stdout:`, data.toString().substring(0, 200));
+      });
+      
+      child.stderr.on('data', (data) => {
+        stderr += data.toString();
+        console.log(`[${serverName}] stderr:`, data.toString().substring(0, 200));
+        
+        // Check for common error patterns
+        const errStr = stderr.toLowerCase();
+        if (errStr.includes('enoent') || errStr.includes('not found') || errStr.includes('cannot find')) {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeout);
+            child.kill();
+            resolve({ success: false, error: `Command not found: ${command}` });
+          }
+        } else if (errStr.includes('econnrefused') || errStr.includes('connection refused')) {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeout);
+            child.kill();
+            resolve({ success: false, error: 'Connection refused - check host/port' });
+          }
+        } else if (errStr.includes('authentication') || errStr.includes('password') || errStr.includes('denied')) {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeout);
+            child.kill();
+            resolve({ success: false, error: 'Authentication failed' });
+          }
+        } else if (errStr.includes('certificate') || errStr.includes('ssl') || errStr.includes('tls')) {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeout);
+            child.kill();
+            resolve({ success: false, error: 'SSL/Certificate error - check NODE_EXTRA_CA_CERTS' });
+          }
+        } else if (errStr.includes('timeout') || errStr.includes('timed out')) {
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeout);
+            child.kill();
+            resolve({ success: false, error: 'Connection timeout' });
+          }
+        }
+      });
+      
+      child.on('error', (err) => {
+        console.log(`[${serverName}] error:`, err.message);
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timeout);
+          resolve({ success: false, error: err.message });
+        }
+      });
+      
+      child.on('exit', (code) => {
+        console.log(`[${serverName}] exit code:`, code, 'stderr:', stderr.substring(0, 300));
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timeout);
+          if (code === 0 || code === null) {
+            resolve({ 
+              success: true, 
+              message: `Connected`,
+              output: stdout
+            });
+          } else {
+            // Try to extract a meaningful error from stderr
+            let errorMsg = `Exit code ${code}`;
+            if (stderr) {
+              // Get the last meaningful line from stderr
+              const lines = stderr.trim().split('\n').filter(l => l.trim());
+              if (lines.length > 0) {
+                errorMsg = lines[lines.length - 1].substring(0, 50);
+              }
+            }
+            resolve({ 
+              success: false, 
+              error: errorMsg
+            });
+          }
+        }
+      });
+    });
+  } catch (error) {
+    console.error('Error testing MCP server:', error);
+    return { success: false, error: error.message };
   }
 });
 

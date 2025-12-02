@@ -7,17 +7,23 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Cron parser compatibility wrapper
-async function parseCron(expression) {
+async function parseCron(expression, options = {}) {
   const mod = await import('cron-parser');
+  
+  // Merge default options with provided options
+  const parseOptions = { tz: 'UTC', ...options };
+
+  if (mod.CronExpressionParser?.parse)
+    return mod.CronExpressionParser.parse(expression, parseOptions);
 
   if (mod.default?.CronExpressionParser?.parse)
-    return mod.default.CronExpressionParser.parse(expression);
+    return mod.default.CronExpressionParser.parse(expression, parseOptions);
 
   if (typeof mod.default?.parseExpression === 'function')
-    return mod.default.parseExpression(expression);
+    return mod.default.parseExpression(expression, parseOptions);
 
   if (typeof mod.parseExpression === 'function')
-    return mod.parseExpression(expression);
+    return mod.parseExpression(expression, parseOptions);
 
   throw new Error('Unsupported cron-parser API');
 }
@@ -47,20 +53,12 @@ function loadSchedules() {
 
 // Should run this minute?
 async function shouldRun(schedule) {
-  let expr;
-
-  try {
-    expr = await parseCron(schedule);
-  } catch (e) {
-    logger.warn('Invalid cron:', schedule, e.message);
-    return false;
-  }
-
   const now = new Date();
   const windowStart = new Date(now.getTime() - 60 * 1000);
 
   try {
-    if (expr.reset) expr.reset(windowStart);
+    // Parse cron with currentDate set to windowStart to get next occurrence from that point
+    const expr = await parseCron(schedule, { currentDate: windowStart });
 
     const nextDate = expr.next();
 
@@ -71,9 +69,16 @@ async function shouldRun(schedule) {
         ? nextDate.toDate()
         : new Date(nextDate.toString());
 
-    return candidate > windowStart && candidate <= now;
+    const shouldTrigger = candidate > windowStart && candidate <= now;
+    
+    if (shouldTrigger) {
+      logger.info(`Schedule match: ${schedule} - Next: ${candidate.toISOString()}, Window: ${windowStart.toISOString()} - ${now.toISOString()}`);
+    }
+    
+    return shouldTrigger;
 
-  } catch {
+  } catch (e) {
+    logger.warn('Invalid cron expression:', schedule, e.message);
     return false;
   }
 }

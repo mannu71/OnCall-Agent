@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // MCP config management
   loadMCPConfig: () => ipcRenderer.invoke('mcp-config:load'),
   saveMCPConfig: (config) => ipcRenderer.invoke('mcp-config:save', config),
+  testMCPServer: (serverName, serverConfig) => ipcRenderer.invoke('mcp-server:test', serverName, serverConfig),
   // LLM config management
   loadLLMConfig: () => ipcRenderer.invoke('llm-config:load'),
   saveLLMConfig: (config) => ipcRenderer.invoke('llm-config:save', config),

@@ -36,9 +36,13 @@ import {
     Visibility as VisibilityIcon,
     VisibilityOff as VisibilityOffIcon,
     Key as KeyIcon,
-    Check as CheckIcon
+    Check as CheckIcon,
+    Refresh as RefreshIcon,
+    CheckCircle as CheckCircleIcon,
+    Error as ErrorIcon,
+    HourglassEmpty as HourglassEmptyIcon
 } from '@mui/icons-material';
-import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer, getMCPInputValues, updateMCPInputValue } from '../services/mcpService';
+import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer, getMCPInputValues, updateMCPInputValue, invalidateCache } from '../services/mcpService';
 import { getLLMs, addLLM, updateLLM, deleteLLM } from '../services/llmService';
 
 // Helper to extract ${input:...} variables from args string
@@ -63,6 +67,9 @@ const Settings = () => {
     const [detectedInputVars, setDetectedInputVars] = useState([]);
     const [inputVarValues, setInputVarValues] = useState({});
     const [saveMessage, setSaveMessage] = useState('');
+    
+    // Connection status state for MCP servers
+    const [connectionStatus, setConnectionStatus] = useState({}); // { serverName: { status: 'untested' | 'testing' | 'connected' | 'error', message: '' } }
     
     // LLM state
     const [llms, setLLMs] = useState({});
@@ -101,8 +108,51 @@ const Settings = () => {
     }, []);
 
     const loadServers = async () => {
+        invalidateCache(); // Ensure fresh data
         const mcpServers = await getMCPServers();
         setServers(mcpServers);
+    };
+
+    // Test MCP server connection
+    const testServerConnection = async (serverName, serverConfig) => {
+        if (!window.electronAPI?.testMCPServer) {
+            setSaveMessage('Connection test is only available in the desktop app');
+            setTimeout(() => setSaveMessage(''), 3000);
+            return;
+        }
+
+        setConnectionStatus(prev => ({
+            ...prev,
+            [serverName]: { status: 'testing', message: 'Testing connection...' }
+        }));
+
+        try {
+            const result = await window.electronAPI.testMCPServer(serverName, serverConfig);
+            
+            if (result.success) {
+                setConnectionStatus(prev => ({
+                    ...prev,
+                    [serverName]: { status: 'connected', message: result.message || 'Connected' }
+                }));
+            } else {
+                setConnectionStatus(prev => ({
+                    ...prev,
+                    [serverName]: { status: 'error', message: result.error || 'Connection failed' }
+                }));
+            }
+        } catch (error) {
+            setConnectionStatus(prev => ({
+                ...prev,
+                [serverName]: { status: 'error', message: error.message || 'Connection test failed' }
+            }));
+        }
+    };
+
+    // Test all servers
+    const testAllConnections = async () => {
+        for (const [name, config] of Object.entries(servers)) {
+            await testServerConnection(name, config);
+        }
     };
 
     const loadLLMConfigs = async () => {
@@ -180,7 +230,7 @@ const Settings = () => {
         if (serverName) {
             // Edit mode
             const server = servers[serverName];
-            const argsString = Array.isArray(server.args) ? server.args.join(', ') : '';
+            const argsString = Array.isArray(server.args) ? server.args.join('\n') : '';
             const vars = extractInputVariables(argsString);
             
             setEditingServer(serverName);
@@ -235,11 +285,51 @@ const Settings = () => {
                 }
             }
             
-            // Parse args and env
-            const args = formData.args
-                .split(',')
+            // Parse args - support both newline-separated and comma-separated formats
+            // But be careful: connection strings contain commas, so only split on ", " (comma+space)
+            // at the beginning of args (like "-y, @package, url")
+            let args = formData.args
+                .split('\n')
                 .map(arg => arg.trim())
                 .filter(arg => arg.length > 0);
+            
+            // If we have a single arg that looks like comma-separated npx args, split it
+            // Pattern: starts with -y, followed by package name, followed by connection string
+            if (args.length === 1 && args[0].includes(', ')) {
+                const singleArg = args[0];
+                // Check if it looks like: "-y, @package, url" format
+                if (singleArg.startsWith('-y, ') || singleArg.startsWith('-y,')) {
+                    // Split carefully - only split the first two comma-space occurrences
+                    // because the URL might contain commas
+                    const parts = [];
+                    let remaining = singleArg;
+                    
+                    // Extract -y
+                    const firstComma = remaining.indexOf(',');
+                    if (firstComma !== -1) {
+                        parts.push(remaining.substring(0, firstComma).trim());
+                        remaining = remaining.substring(firstComma + 1).trim();
+                        
+                        // Extract package name (up to next comma-space, but before any ://)
+                        const urlStart = remaining.indexOf('://');
+                        const secondComma = remaining.indexOf(', ');
+                        
+                        if (secondComma !== -1 && (urlStart === -1 || secondComma < urlStart)) {
+                            parts.push(remaining.substring(0, secondComma).trim());
+                            remaining = remaining.substring(secondComma + 1).trim();
+                        }
+                        
+                        // Rest is the connection string
+                        if (remaining) {
+                            parts.push(remaining);
+                        }
+                    }
+                    
+                    if (parts.length >= 2) {
+                        args = parts;
+                    }
+                }
+            }
 
             let env = {};
             if (formData.env.trim()) {
@@ -257,13 +347,19 @@ const Settings = () => {
                 type: formData.type,
                 icon: formData.icon,
                 description: formData.description,
-                ...(Object.keys(env).length > 0 && { env })
+                env: env  // Always include env (even if empty, to clear old values)
             };
 
+            const serverNameToTest = formData.name;
+            
             if (editingServer) {
-                // Update existing server
-                await updateMCPServer(formData.name, serverConfig);
-                setSaveMessage(`Updated server: ${formData.name}`);
+                // Update existing server (handles rename and syncs to workflows)
+                await updateMCPServer(editingServer, serverConfig, formData.name !== editingServer ? formData.name : null);
+                if (editingServer !== formData.name) {
+                    setSaveMessage(`Renamed server: ${editingServer} → ${formData.name}`);
+                } else {
+                    setSaveMessage(`Updated server: ${formData.name}`);
+                }
             } else {
                 // Add new server
                 await addMCPServer(formData.name, serverConfig);
@@ -273,6 +369,9 @@ const Settings = () => {
             await loadServers();
             await loadMCPInputValuesData(); // Refresh input values
             handleCloseDialog();
+
+            // Auto-test connection for the saved server
+            testServerConnection(serverNameToTest, serverConfig);
 
             // Clear message after 3 seconds
             setTimeout(() => setSaveMessage(''), 3000);
@@ -554,13 +653,23 @@ const Settings = () => {
                         <Typography variant="h6" sx={{ fontWeight: 500 }}>
                             MCP Servers
                         </Typography>
-                        <Button
-                            variant="contained"
-                            startIcon={<AddIcon />}
-                            onClick={() => handleOpenDialog()}
-                        >
-                            Add Server
-                        </Button>
+                        <Box sx={{ display: 'flex', gap: 1 }}>
+                            <Button
+                                variant="outlined"
+                                startIcon={<RefreshIcon />}
+                                onClick={testAllConnections}
+                                disabled={Object.keys(servers).length === 0}
+                            >
+                                Test All
+                            </Button>
+                            <Button
+                                variant="contained"
+                                startIcon={<AddIcon />}
+                                onClick={() => handleOpenDialog()}
+                            >
+                                Add Server
+                            </Button>
+                        </Box>
                     </Box>
 
                     <TableContainer>
@@ -571,12 +680,14 @@ const Settings = () => {
                                     <TableCell>Name</TableCell>
                                     <TableCell>Description</TableCell>
                                     <TableCell>Command</TableCell>
-                                    <TableCell>Type</TableCell>
+                                    <TableCell>Status</TableCell>
                                     <TableCell align="right">Actions</TableCell>
                                 </TableRow>
                             </TableHead>
                             <TableBody>
-                                {Object.entries(servers).map(([name, config]) => (
+                                {Object.entries(servers).map(([name, config]) => {
+                                    const status = connectionStatus[name];
+                                    return (
                                     <TableRow key={name}>
                                         <TableCell>{config.icon || '🔧'}</TableCell>
                                         <TableCell>
@@ -589,26 +700,71 @@ const Settings = () => {
                                             <code style={{ fontSize: '0.85em' }}>{config.command}</code>
                                         </TableCell>
                                         <TableCell>
-                                            <Chip label={config.type} size="small" />
+                                            {status?.status === 'testing' && (
+                                                <Chip
+                                                    icon={<HourglassEmptyIcon fontSize="small" />}
+                                                    label="Testing..."
+                                                    size="small"
+                                                    color="info"
+                                                />
+                                            )}
+                                            {status?.status === 'connected' && (
+                                                <Chip
+                                                    icon={<CheckCircleIcon fontSize="small" />}
+                                                    label="Connected"
+                                                    size="small"
+                                                    color="success"
+                                                />
+                                            )}
+                                            {status?.status === 'error' && (
+                                                <Chip
+                                                    icon={<ErrorIcon fontSize="small" />}
+                                                    label={status.message?.substring(0, 20) || 'Error'}
+                                                    size="small"
+                                                    color="error"
+                                                    title={status.message}
+                                                />
+                                            )}
+                                            {!status && (
+                                                <Chip
+                                                    label="Not tested"
+                                                    size="small"
+                                                    variant="outlined"
+                                                />
+                                            )}
                                         </TableCell>
                                         <TableCell align="right">
-                                            <IconButton
-                                                size="small"
-                                                onClick={() => handleOpenDialog(name)}
-                                                color="primary"
-                                            >
-                                                <EditIcon fontSize="small" />
-                                            </IconButton>
-                                            <IconButton
-                                                size="small"
-                                                onClick={() => handleDelete(name)}
-                                                color="error"
-                                            >
-                                                <DeleteIcon fontSize="small" />
-                                            </IconButton>
+                                            <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 0.5 }}>
+                                                <IconButton
+                                                    size="small"
+                                                    onClick={() => testServerConnection(name, config)}
+                                                    color="info"
+                                                    title="Test Connection"
+                                                    disabled={status?.status === 'testing'}
+                                                >
+                                                    <RefreshIcon fontSize="small" />
+                                                </IconButton>
+                                                <IconButton
+                                                    size="small"
+                                                    onClick={() => handleOpenDialog(name)}
+                                                    color="primary"
+                                                    title="Edit"
+                                                >
+                                                    <EditIcon fontSize="small" />
+                                                </IconButton>
+                                                <IconButton
+                                                    size="small"
+                                                    onClick={() => handleDelete(name)}
+                                                    color="error"
+                                                    title="Delete"
+                                                >
+                                                    <DeleteIcon fontSize="small" />
+                                                </IconButton>
+                                            </Box>
                                         </TableCell>
                                     </TableRow>
-                                ))}
+                                    );
+                                })}
                                 {Object.keys(servers).length === 0 && (
                                     <TableRow>
                                         <TableCell colSpan={6} align="center">
@@ -761,8 +917,8 @@ const Settings = () => {
                                 }}
                                 fullWidth
                                 multiline
-                                rows={2}
-                                helperText="Comma-separated arguments. Use ${input:var_name} for configurable values"
+                                rows={3}
+                                helperText="One argument per line. Use ${input:var_name} for configurable values"
                             />
 
                             {/* Dynamic input variable fields */}
