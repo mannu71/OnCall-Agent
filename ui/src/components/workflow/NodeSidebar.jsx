@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import { getMCPServers, convertServersToNodeItems } from '../../services/mcpService';
-import { getLLMs, convertLLMsToNodeItems } from '../../services/llmService';
+import React, { useState, useEffect, useCallback } from 'react';
+import { getMCPServers, convertServersToNodeItems, invalidateCache as invalidateMCPCache } from '../../services/mcpService';
+import { getLLMs, convertLLMsToNodeItems, invalidateCache as invalidateLLMCache } from '../../services/llmService';
 
 const NodeSidebar = () => {
   const [mcpServers, setMcpServers] = useState([]);
@@ -8,43 +8,58 @@ const NodeSidebar = () => {
   const [llmModels, setLLMModels] = useState([]);
   const [isLoadingLLM, setIsLoadingLLM] = useState(true);
 
+  // Function to load MCP servers
+  const loadMCPServers = useCallback(async () => {
+    try {
+      setIsLoadingMCP(true);
+      invalidateMCPCache(); // Force fresh data from file
+      const servers = await getMCPServers();
+      const nodeItems = convertServersToNodeItems(servers);
+      setMcpServers(nodeItems);
+    } catch (error) {
+      console.error('Failed to load MCP servers:', error);
+      setMcpServers([]);
+    } finally {
+      setIsLoadingMCP(false);
+    }
+  }, []);
+
+  // Function to load LLM configurations
+  const loadLLMConfigs = useCallback(async () => {
+    try {
+      setIsLoadingLLM(true);
+      invalidateLLMCache(); // Force fresh data from file
+      const llms = await getLLMs();
+      const nodeItems = convertLLMsToNodeItems(llms);
+      setLLMModels(nodeItems);
+    } catch (error) {
+      console.error('Failed to load LLM configs:', error);
+      setLLMModels([]);
+    } finally {
+      setIsLoadingLLM(false);
+    }
+  }, []);
+
   // Fetch MCP servers on component mount
   useEffect(() => {
-    const loadMCPServers = async () => {
-      try {
-        setIsLoadingMCP(true);
-        const servers = await getMCPServers();
-        const nodeItems = convertServersToNodeItems(servers);
-        setMcpServers(nodeItems);
-      } catch (error) {
-        console.error('Failed to load MCP servers:', error);
-        setMcpServers([]);
-      } finally {
-        setIsLoadingMCP(false);
-      }
-    };
-
     loadMCPServers();
-  }, []);
+  }, [loadMCPServers]);
 
   // Fetch LLM configurations on component mount
   useEffect(() => {
-    const loadLLMConfigs = async () => {
-      try {
-        setIsLoadingLLM(true);
-        const llms = await getLLMs();
-        const nodeItems = convertLLMsToNodeItems(llms);
-        setLLMModels(nodeItems);
-      } catch (error) {
-        console.error('Failed to load LLM configs:', error);
-        setLLMModels([]);
-      } finally {
-        setIsLoadingLLM(false);
-      }
+    loadLLMConfigs();
+  }, [loadLLMConfigs]);
+
+  // Refresh configs when window gains focus (user might have changed settings)
+  useEffect(() => {
+    const handleFocus = () => {
+      loadMCPServers();
+      loadLLMConfigs();
     };
 
-    loadLLMConfigs();
-  }, []);
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, [loadMCPServers, loadLLMConfigs]);
 
 
   const onDragStart = (event, nodeType, nodeData) => {

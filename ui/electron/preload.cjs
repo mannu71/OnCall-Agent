@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getApiKeyMasked: (llmName) => ipcRenderer.invoke('llm-config:get-api-key-masked', llmName),
   hasApiKey: (llmName) => ipcRenderer.invoke('llm-config:has-api-key', llmName),
   deleteApiKey: (llmName) => ipcRenderer.invoke('llm-config:delete-api-key', llmName),
+  testLLM: (llmName, llmConfig) => ipcRenderer.invoke('llm:test', llmName, llmConfig),
   saveSqlFile: (filename, content) => ipcRenderer.invoke('sql:save', filename, content),
   loadSqlFile: (relativePath) => ipcRenderer.invoke('sql:load', relativePath),
   loadWorkflowRuns: () => ipcRenderer.invoke('workflow-runs:load'),

@@ -662,6 +662,17 @@ function deleteLLMApiKey(llmName) {
   return setLLMApiKey(llmName, null);
 }
 
+// Function to get actual API key for an LLM (for testing)
+function getLLMApiKey(llmName) {
+  try {
+    const config = loadLLMConfigFromFile();
+    return config.llms?.[llmName]?.apiKey || null;
+  } catch (error) {
+    console.error('Error getting LLM API key:', error);
+    return null;
+  }
+}
+
 export {
   saveSchedulesToFile,
   loadSchedulesFromFile,
@@ -673,6 +684,7 @@ export {
   loadLLMConfigFromFile,
   setLLMApiKey,
   getLLMApiKeyMasked,
+  getLLMApiKey,
   hasLLMApiKey,
   deleteLLMApiKey,
   triggerWorkflow,
