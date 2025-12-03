@@ -1,7 +1,7 @@
 // generic-multi-step-workflow.js
 import { StateGraph, MessagesAnnotation, END, START } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
-import { DynamicStructuredTool } from "@langchain/core/tools";
+import { DynamicStructuredTool, tool } from "@langchain/core/tools";
 import { z } from "zod";
 import { AIMessage } from "@langchain/core/messages";
 import { MultiServerMCPClient } from "./multiserver-mcp-client.js";
@@ -25,21 +25,9 @@ function createLangChainTools(mcpClient, toolsByServer, opts = {}) {
     for (const toolName of toolNames) {
       const uniqueToolName = `${serverName}__${toolName}`.replace(/[^a-zA-Z0-9_]/g, '_');
 
-      // a minimal zod schema placeholder - you can replace per-tool with a real schema registry
-      const schema = z.record(z.any()).describe("Parameters to pass to the MCP tool");
-
       const wrappedFunc = async (params = {}) => {
         const cid = params._cid || makeCorrelationId();
         const start = Date.now();
-        // validate params (won't throw on unknown keys if schema is broad)
-        try {
-          schema.parse(params);
-        } catch (e) {
-          const errMsg = `Invalid params for ${uniqueToolName}: ${e.message}`;
-          console.warn(JSON.stringify({ ts: new Date().toISOString(), event: "tool.validation.fail", tool: uniqueToolName, message: errMsg, cid }));
-          // return structured error for agent to reason about
-          return JSON.stringify({ tool_error: true, message: errMsg });
-        }
 
         // perform call with mcp client's built-in retry/timeout
         try {
@@ -56,11 +44,11 @@ function createLangChainTools(mcpClient, toolsByServer, opts = {}) {
         }
       };
 
-      const langchainTool = new DynamicStructuredTool({
+      // Use the tool() helper with a simple Zod object schema (Zod v3/v4 compatible)
+      const langchainTool = tool(wrappedFunc, {
         name: uniqueToolName,
-        description: `MCP Tool: ${toolName} on server ${serverName}. Use this to interact with ${serverName}. For database queries, pass {"sql": "SELECT ..."} (this agent enforces timeouts/retries).`,
-        schema,
-        func: wrappedFunc
+        description: `MCP Tool: ${toolName} on server ${serverName}. Use this to interact with ${serverName}. Pass parameters as a JSON object.`,
+        schema: z.object({}).passthrough() // Accept any object with any properties
       });
 
       tools.push(langchainTool);
@@ -153,21 +141,29 @@ Think step by step and use tools as needed to answer the question thoroughly.`;
   const compiledGraph = graph.compile();
   console.log(JSON.stringify({ ts: new Date().toISOString(), event: "workflow.compiled" }));
 
+  const MAX_ITERATIONS = 15; // Prevent infinite loops
+
   const workflow = {
     async invoke({ userQuery }) {
       const cid = makeCorrelationId();
       console.log(JSON.stringify({ ts: new Date().toISOString(), event: "workflow.invoke.start", userQuery: userQuery?.slice?.(0,200), cid }));
 
-      const result = await compiledGraph.invoke({
-        messages: [{ role: "user", content: userQuery }]
-      });
+      try {
+        const result = await compiledGraph.invoke(
+          { messages: [{ role: "user", content: userQuery }] },
+          { recursionLimit: MAX_ITERATIONS }
+        );
 
-      const messages = result.messages || [];
-      const lastMessage = messages[messages.length - 1];
-      const finalAnswer = lastMessage?.content || "No response generated";
+        const messages = result.messages || [];
+        const lastMessage = messages[messages.length - 1];
+        const finalAnswer = lastMessage?.content || "No response generated";
 
-      console.log(JSON.stringify({ ts: new Date().toISOString(), event: "workflow.invoke.done", cid }));
-      return { userQuery, messages, finalAnswer, cid };
+        console.log(JSON.stringify({ ts: new Date().toISOString(), event: "workflow.invoke.done", cid, messageCount: messages.length }));
+        return { userQuery, messages, finalAnswer, cid };
+      } catch (err) {
+        console.error(JSON.stringify({ ts: new Date().toISOString(), event: "workflow.invoke.error", cid, message: err?.message }));
+        throw err;
+      }
     }
   };
 

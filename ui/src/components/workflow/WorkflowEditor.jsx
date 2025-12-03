@@ -1014,7 +1014,7 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
       });
 
       const newNode = {
-        id: `${nodeData.type}-${Date.now()}`,
+        id: `${nodeData.type}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         type: nodeData.type,
         position,
         data: nodeData.data,

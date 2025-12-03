@@ -8,6 +8,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveWorkflows: (workflows) => ipcRenderer.invoke('workflows:save', workflows),
   triggerWorkflow: (workflowName) => ipcRenderer.invoke('workflows:trigger', workflowName),
   runAgent: (workflowName, userQuery) => ipcRenderer.invoke('agent:run', workflowName, userQuery),
+  // Subscribe to agent progress events
+  onAgentProgress: (callback) => {
+    const handler = (event, data) => callback(data);
+    ipcRenderer.on('agent:progress', handler);
+    return () => ipcRenderer.removeListener('agent:progress', handler);
+  },
   // MCP config management
   loadMCPConfig: () => ipcRenderer.invoke('mcp-config:load'),
   saveMCPConfig: (config) => ipcRenderer.invoke('mcp-config:save', config),

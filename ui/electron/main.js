@@ -71,7 +71,17 @@ ipcMain.handle('workflows:trigger', async (event, workflowName) => {
 // IPC to run an agent with a user query
 ipcMain.handle('agent:run', async (event, workflowName, userQuery) => {
   try {
-    const result = await runAgentWorkflow(workflowName, userQuery);
+    // Get the sender window to send progress events
+    const senderWindow = BrowserWindow.fromWebContents(event.sender);
+    
+    // Progress callback that sends events to the renderer
+    const progressCallback = (progress) => {
+      if (senderWindow && !senderWindow.isDestroyed()) {
+        senderWindow.webContents.send('agent:progress', progress);
+      }
+    };
+    
+    const result = await runAgentWorkflow(workflowName, userQuery, progressCallback);
     return result;
   } catch (error) {
     console.error('Error running agent:', error);
