@@ -87,6 +87,7 @@ const Settings = () => {
     });
     const [showApiKey, setShowApiKey] = useState(false);
     const [existingApiKey, setExistingApiKey] = useState(null); // To show if key exists
+    const [llmConnectionStatus, setLLMConnectionStatus] = useState({}); // { llmName: { status: 'untested' | 'testing' | 'connected' | 'error', message: '' } }
     
     // Docker state
     const [dockerAvailable, setDockerAvailable] = useState(false);
@@ -158,6 +159,41 @@ const Settings = () => {
     const loadLLMConfigs = async () => {
         const llmConfigs = await getLLMs();
         setLLMs(llmConfigs);
+    };
+
+    // Test LLM connection
+    const testLLMConnection = async (llmName, llmConfig) => {
+        if (!window.electronAPI?.testLLM) {
+            setSaveMessage('LLM connection test is only available in the desktop app');
+            setTimeout(() => setSaveMessage(''), 3000);
+            return;
+        }
+
+        setLLMConnectionStatus(prev => ({
+            ...prev,
+            [llmName]: { status: 'testing', message: 'Testing connection...' }
+        }));
+
+        try {
+            const result = await window.electronAPI.testLLM(llmName, llmConfig);
+            
+            if (result.success) {
+                setLLMConnectionStatus(prev => ({
+                    ...prev,
+                    [llmName]: { status: 'connected', message: result.message || 'Connected' }
+                }));
+            } else {
+                setLLMConnectionStatus(prev => ({
+                    ...prev,
+                    [llmName]: { status: 'error', message: result.error || 'Connection failed' }
+                }));
+            }
+        } catch (error) {
+            setLLMConnectionStatus(prev => ({
+                ...prev,
+                [llmName]: { status: 'error', message: error.message || 'Connection test failed' }
+            }));
+        }
     };
 
     const loadMCPInputValuesData = async () => {
@@ -408,7 +444,6 @@ const Settings = () => {
                 provider: llm.provider || 'OpenAI',
                 model: llm.model || '',
                 icon: llm.icon || '🧠',
-                description: llm.description || '',
                 apiKey: '', // Don't load actual key, just check if exists
                 endpoint: llm.endpoint || '',
                 baseUrl: llm.baseUrl || ''
@@ -428,7 +463,6 @@ const Settings = () => {
                 provider: 'OpenAI',
                 model: '',
                 icon: '🧠',
-                description: '',
                 apiKey: '',
                 endpoint: '',
                 baseUrl: ''
@@ -450,7 +484,6 @@ const Settings = () => {
                 provider: llmFormData.provider,
                 model: llmFormData.model,
                 icon: llmFormData.icon,
-                description: llmFormData.description,
                 ...(llmFormData.endpoint && { endpoint: llmFormData.endpoint }),
                 ...(llmFormData.baseUrl && { baseUrl: llmFormData.baseUrl })
             };
@@ -802,12 +835,14 @@ const Settings = () => {
                                     <TableCell>Name</TableCell>
                                     <TableCell>Provider</TableCell>
                                     <TableCell>Model</TableCell>
-                                    <TableCell>Description</TableCell>
+                                    <TableCell>Status</TableCell>
                                     <TableCell align="right">Actions</TableCell>
                                 </TableRow>
                             </TableHead>
                             <TableBody>
-                                {Object.entries(llms).map(([name, config]) => (
+                                {Object.entries(llms).map(([name, config]) => {
+                                    const status = llmConnectionStatus[name];
+                                    return (
                                     <TableRow key={name}>
                                         <TableCell>{config.icon || '🧠'}</TableCell>
                                         <TableCell>
@@ -821,8 +856,29 @@ const Settings = () => {
                                         <TableCell>
                                             <code style={{ fontSize: '0.85em' }}>{config.model}</code>
                                         </TableCell>
-                                        <TableCell>{config.description || '-'}</TableCell>
+                                        <TableCell>
+                                            {status?.status === 'testing' && (
+                                                <Chip icon={<HourglassEmptyIcon />} label="Testing..." size="small" color="default" />
+                                            )}
+                                            {status?.status === 'connected' && (
+                                                <Chip icon={<CheckCircleIcon />} label={status.message} size="small" color="success" />
+                                            )}
+                                            {status?.status === 'error' && (
+                                                <Chip icon={<ErrorIcon />} label={status.message} size="small" color="error" title={status.message} />
+                                            )}
+                                            {!status && (
+                                                <Chip label="Not tested" size="small" color="default" variant="outlined" />
+                                            )}
+                                        </TableCell>
                                         <TableCell align="right">
+                                            <IconButton
+                                                size="small"
+                                                onClick={() => testLLMConnection(name, config)}
+                                                color="default"
+                                                title="Test Connection"
+                                            >
+                                                <RefreshIcon fontSize="small" />
+                                            </IconButton>
                                             <IconButton
                                                 size="small"
                                                 onClick={() => handleOpenLLMDialog(name)}
@@ -839,7 +895,8 @@ const Settings = () => {
                                             </IconButton>
                                         </TableCell>
                                     </TableRow>
-                                ))}
+                                    );
+                                })}
                                 {Object.keys(llms).length === 0 && (
                                     <TableRow>
                                         <TableCell colSpan={6} align="center">
@@ -1067,14 +1124,6 @@ const Settings = () => {
                                     helperText="Ollama server URL (default: http://localhost:11434)"
                                 />
                             )}
-
-                            <TextField
-                                label="Description"
-                                value={llmFormData.description}
-                                onChange={(e) => setLLMFormData({ ...llmFormData, description: e.target.value })}
-                                fullWidth
-                                helperText="Brief description of this LLM configuration"
-                            />
 
                             {/* API Key Section */}
                             {llmFormData.provider !== 'Ollama' && (

@@ -90,15 +90,79 @@ export const addLLM = async (name, llmConfig) => {
 };
 
 /**
- * Update an existing LLM configuration
+ * Update an existing LLM configuration and sync to workflows
  */
-export const updateLLM = async (name, llmConfig) => {
+export const updateLLM = async (name, llmConfig, newName = null) => {
+  invalidateCache();
   const config = await loadLLMConfig();
-  if (config.llms && config.llms[name]) {
+  
+  const actualNewName = newName || name;
+  
+  // If renaming, delete old and add new
+  if (newName && newName !== name) {
+    delete config.llms[name];
+    config.llms[newName] = llmConfig;
+  } else if (config.llms && config.llms[name]) {
     config.llms[name] = { ...config.llms[name], ...llmConfig };
-    await saveLLMConfig(config);
   }
+  
+  const success = await saveLLMConfig(config);
+  
+  // Sync LLM changes to workflows
+  if (success) {
+    await syncLLMToWorkflows(name, llmConfig, actualNewName);
+  }
+  
   return config;
+};
+
+/**
+ * Sync LLM config changes to all workflows that use it
+ */
+export const syncLLMToWorkflows = async (oldName, llmConfig, newName = null) => {
+  const actualNewName = newName || oldName;
+  
+  try {
+    if (!window.electronAPI?.loadWorkflows || !window.electronAPI?.saveWorkflows) {
+      console.warn('Electron API not available for workflow sync');
+      return false;
+    }
+    
+    const workflows = await window.electronAPI.loadWorkflows();
+    if (!workflows || !Array.isArray(workflows)) {
+      return false;
+    }
+    
+    let updated = false;
+    
+    for (const workflow of workflows) {
+      if (!workflow.nodes) continue;
+      
+      for (const node of workflow.nodes) {
+        // Check if this node is an LLM that uses this configuration
+        if (node.type === 'llm' && node.data?.label === oldName) {
+          // Update the node's label and LLM config
+          node.data.label = actualNewName;
+          node.data.model = llmConfig.model;
+          node.data.provider = llmConfig.provider;
+          node.data.agent = llmConfig.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq';
+          updated = true;
+          console.log(`Synced LLM "${oldName}" -> "${actualNewName}" in workflow "${workflow.name}"`);
+        }
+      }
+    }
+    
+    if (updated) {
+      const result = await window.electronAPI.saveWorkflows(workflows);
+      console.log('Workflows synced with LLM changes:', result);
+      return result?.success || result === true;
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('Error syncing LLM to workflows:', error);
+    return false;
+  }
 };
 
 /**

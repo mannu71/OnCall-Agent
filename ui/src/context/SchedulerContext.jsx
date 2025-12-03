@@ -180,7 +180,7 @@ export const SchedulerProvider = ({ children }) => {
 
   const addSchedule = useCallback((schedule) => {
     const newSchedule = {
-      id: Date.now().toString(),
+      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       ...schedule,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()

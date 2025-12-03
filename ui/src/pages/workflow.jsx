@@ -91,7 +91,7 @@ function Workflow() {
   };
 
   const showMessage = (msg, type = 'info') => {
-    const id = Date.now();
+    const id = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     setMessages(prev => [...prev, { id, msg, type }]);
     setTimeout(() => {
       setMessages(prev => prev.filter(m => m.id !== id));

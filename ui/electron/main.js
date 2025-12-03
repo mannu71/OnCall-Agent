@@ -11,7 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Import file utilities
-import { saveSchedulesToFile, loadSchedulesFromFile, saveWorkflowsToFile, loadWorkflowsFromFile, saveMCPConfigToFile, loadMCPConfigFromFile, saveLLMConfigToFile, loadLLMConfigFromFile, setLLMApiKey, getLLMApiKeyMasked, hasLLMApiKey, deleteLLMApiKey, triggerWorkflow, runAgentWorkflow, saveSqlFile, loadSqlFile, loadWorkflowRuns, loadLatestWorkflowResult, loadWorkflowResult, clearWorkflowOutputs, getPathsInfo } from './fileUtils.js';
+import { saveSchedulesToFile, loadSchedulesFromFile, saveWorkflowsToFile, loadWorkflowsFromFile, saveMCPConfigToFile, loadMCPConfigFromFile, saveLLMConfigToFile, loadLLMConfigFromFile, setLLMApiKey, getLLMApiKeyMasked, getLLMApiKey, hasLLMApiKey, deleteLLMApiKey, triggerWorkflow, runAgentWorkflow, saveSqlFile, loadSqlFile, loadWorkflowRuns, loadLatestWorkflowResult, loadWorkflowResult, clearWorkflowOutputs, getPathsInfo } from './fileUtils.js';
 
 // IPC handlers for schedule operations
 ipcMain.handle('schedules:load', async () => {
@@ -71,7 +71,17 @@ ipcMain.handle('workflows:trigger', async (event, workflowName) => {
 // IPC to run an agent with a user query
 ipcMain.handle('agent:run', async (event, workflowName, userQuery) => {
   try {
-    const result = await runAgentWorkflow(workflowName, userQuery);
+    // Get the sender window to send progress events
+    const senderWindow = BrowserWindow.fromWebContents(event.sender);
+    
+    // Progress callback that sends events to the renderer
+    const progressCallback = (progress) => {
+      if (senderWindow && !senderWindow.isDestroyed()) {
+        senderWindow.webContents.send('agent:progress', progress);
+      }
+    };
+    
+    const result = await runAgentWorkflow(workflowName, userQuery, progressCallback);
     return result;
   } catch (error) {
     console.error('Error running agent:', error);
@@ -289,6 +299,125 @@ ipcMain.handle('llm-config:delete-api-key', async (event, llmName) => {
     return result;
   } catch (error) {
     console.error('Error deleting API key:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// IPC handler for testing LLM connection
+ipcMain.handle('llm:test', async (event, llmName, llmConfig) => {
+  try {
+    console.log(`Testing LLM connection: ${llmName}`);
+    
+    const { provider, model, endpoint, baseUrl } = llmConfig;
+    const apiKey = getLLMApiKey(llmName);
+    
+    // Ollama doesn't require an API key
+    if (provider !== 'Ollama' && !apiKey) {
+      return { success: false, error: 'No API key configured' };
+    }
+    
+    let testUrl;
+    let headers = { 'Content-Type': 'application/json' };
+    let body;
+    
+    switch (provider) {
+      case 'OpenAI':
+        testUrl = 'https://api.openai.com/v1/models';
+        headers['Authorization'] = `Bearer ${apiKey}`;
+        break;
+        
+      case 'Anthropic':
+        // Use a HEAD-like request that validates API key without burning tokens
+        // We make a request with invalid content to trigger auth check before usage
+        testUrl = 'https://api.anthropic.com/v1/messages';
+        headers['x-api-key'] = apiKey;
+        headers['anthropic-version'] = '2023-06-01';
+        // Send empty messages to validate API key - will return 400 if key valid, 401 if invalid
+        body = JSON.stringify({
+          model: model || 'claude-3-5-sonnet-20241022',
+          max_tokens: 1,
+          messages: []
+        });
+        break;
+        
+      case 'Groq':
+        testUrl = 'https://api.groq.com/openai/v1/models';
+        headers['Authorization'] = `Bearer ${apiKey}`;
+        break;
+        
+      case 'Google':
+        testUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+        break;
+        
+      case 'Azure OpenAI':
+        if (!endpoint) {
+          return { success: false, error: 'Azure endpoint URL is required' };
+        }
+        testUrl = `${endpoint}/openai/models?api-version=2024-02-01`;
+        headers['api-key'] = apiKey;
+        break;
+        
+      case 'Ollama':
+        const ollamaUrl = baseUrl || 'http://localhost:11434';
+        testUrl = `${ollamaUrl}/api/tags`;
+        break;
+        
+      default:
+        return { success: false, error: `Unknown provider: ${provider}` };
+    }
+    
+    // Use built-in fetch (Node.js 18+)
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
+    const fetchOptions = {
+      method: body ? 'POST' : 'GET',
+      headers,
+      signal: controller.signal
+    };
+    
+    if (body) {
+      fetchOptions.body = body;
+    }
+    
+    try {
+      const response = await fetch(testUrl, fetchOptions);
+      clearTimeout(timeoutId);
+      
+      if (response.ok) {
+        return { success: true, message: `Connected to ${provider}` };
+      } else {
+        const errorText = await response.text();
+        let errorMsg = `HTTP ${response.status}`;
+        try {
+          const errorJson = JSON.parse(errorText);
+          errorMsg = errorJson.error?.message || errorJson.message || errorMsg;
+        } catch {
+          errorMsg = errorText.substring(0, 100) || errorMsg;
+        }
+        
+        // For Anthropic, a 400 error with valid API key means connection works
+        // (we send empty messages intentionally to avoid burning tokens)
+        if (provider === 'Anthropic' && response.status === 400) {
+          return { success: true, message: `Connected to ${provider}` };
+        }
+        
+        return { success: false, error: errorMsg };
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  } catch (error) {
+    console.error('Error testing LLM:', error);
+    if (error.name === 'AbortError') {
+      return { success: false, error: 'Connection timeout' };
+    }
+    if (error.code === 'ECONNREFUSED') {
+      return { success: false, error: 'Connection refused - check if service is running' };
+    }
+    if (error.code === 'ENOTFOUND') {
+      return { success: false, error: 'Host not found - check endpoint URL' };
+    }
     return { success: false, error: error.message };
   }
 });
