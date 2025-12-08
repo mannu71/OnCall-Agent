@@ -35,17 +35,6 @@ const OrchestratorNode = ({ data, id }) => {
             </div>
           )}
         </div>
-
-        {/* Variables */}
-        {data.vars && Object.keys(JSON.parse(data.vars || '{}')).length > 0 && (
-          <div className="vars-indicator">
-            <span className="vars-icon">⚙️</span>
-            <span className="vars-count">
-              {Object.keys(JSON.parse(data.vars)).length} variable
-              {Object.keys(JSON.parse(data.vars)).length !== 1 ? 's' : ''}
-            </span>
-          </div>
-        )}
       </div>
 
       {/* Status */}

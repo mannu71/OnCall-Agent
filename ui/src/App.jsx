@@ -3,6 +3,7 @@ import { ThemeProvider, createTheme, CssBaseline, Box, Typography, Container } f
 import { BrowserRouter, HashRouter, Routes, Route } from 'react-router-dom';
 import { SidebarProvider, useSidebar } from './context/SidebarContext';
 import { SchedulerProvider } from './context/SchedulerContext';
+import { WorkflowStatusProvider } from './context/WorkflowStatusContext';
 import Sidebar from './components/sidebar/Sidebar';
 import Dashboard from './pages/Dashboard';
 import Scheduler from './pages/Scheduler';
@@ -106,9 +107,11 @@ export default function App() {
       <CssBaseline />
       <SidebarProvider>
         <SchedulerProvider>
-          <Router>
-            <AppRoutes />
-          </Router>
+          <WorkflowStatusProvider>
+            <Router>
+              <AppRoutes />
+            </Router>
+          </WorkflowStatusProvider>
         </SchedulerProvider>
       </SidebarProvider>
     </ThemeProvider>

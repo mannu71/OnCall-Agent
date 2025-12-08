@@ -11,6 +11,15 @@ function clampTemperature(t) {
   return Math.max(0, Math.min(1, n));
 }
 
+// OpenAI reasoning models that don't support temperature parameter
+const REASONING_MODELS = ['o1', 'o1-mini', 'o1-preview', 'o3', 'o3-mini', 'o4-mini'];
+
+function isReasoningModel(model) {
+  if (!model) return false;
+  const modelLower = model.toLowerCase();
+  return REASONING_MODELS.some(rm => modelLower.startsWith(rm));
+}
+
 export function loadLLM(llmNode) {
   if (!llmNode || !llmNode.data) {
     console.log("⚠️ No LLM node found, using default GPT-4o-mini");
@@ -27,11 +36,17 @@ export function loadLLM(llmNode) {
   switch (provider) {
     case "openai":
       if (!model) throw new Error("Missing 'model' for OpenAI provider in LLM node");
-      return new ChatOpenAI({
+      // Reasoning models (o1, o3, o4-mini, etc.) don't support temperature
+      const openaiConfig = {
         model,
-        temperature,
         ...(apiKey && { apiKey })
-      });
+      };
+      if (!isReasoningModel(model)) {
+        openaiConfig.temperature = temperature;
+      } else {
+        console.log(`ℹ️ Reasoning model ${model} detected - skipping temperature parameter`);
+      }
+      return new ChatOpenAI(openaiConfig);
 
     case "anthropic":
       if (!model) throw new Error("Missing 'model' for Anthropic provider in LLM node");

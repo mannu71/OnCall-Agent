@@ -488,7 +488,7 @@ function Chat() {
               ref={inputRef}
               fullWidth
               variant="outlined"
-              placeholder="Type 'run [agent name]' to trigger an agent..."
+              placeholder="Enter message"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               onKeyPress={handleKeyPress}

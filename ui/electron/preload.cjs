@@ -4,6 +4,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('electronAPI', {
   loadSchedules: () => ipcRenderer.invoke('schedules:load'),
   saveSchedules: (schedules) => ipcRenderer.invoke('schedules:save', schedules),
+  getSchedulesInProgress: () => ipcRenderer.invoke('schedules:inProgress'),
   loadWorkflows: () => ipcRenderer.invoke('workflows:load'),
   saveWorkflows: (workflows) => ipcRenderer.invoke('workflows:save', workflows),
   triggerWorkflow: (workflowName) => ipcRenderer.invoke('workflows:trigger', workflowName),

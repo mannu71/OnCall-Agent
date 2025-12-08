@@ -59,7 +59,7 @@ export class MultiServerMCPClient {
     this.servers = {};
     this.tools = {}; // Map server -> tool names
     this.circuit = {}; // server -> CircuitBreaker
-    this.defaultTimeout = opts.defaultTimeout ?? 20_000; // default 20s
+    this.defaultTimeout = opts.defaultTimeout ?? 900_000; // default 15 minutes for long DB queries
     this.defaultRetries = opts.defaultRetries ?? 2; // retry twice
     this.backoffBase = opts.backoffBase ?? 300; // ms
   }
@@ -77,7 +77,10 @@ export class MultiServerMCPClient {
 
         const client = new Client(
           { name, version: "1.0" },
-          { capabilities: {} }
+          { 
+            capabilities: {},
+            requestTimeoutMs: this.defaultTimeout  // Override SDK's default 60s timeout
+          }
         );
 
         // protect connect with timeout
@@ -146,8 +149,16 @@ export class MultiServerMCPClient {
       const start = Date.now();
       try {
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "mcp.call.start", server: serverName, tool: toolName, attempt }));
-        // call the tool with timeout
-        const raw = await withTimeout(client.callTool({ name: toolName, arguments: params }), timeoutMs);
+        // Pass timeout directly to SDK's callTool to override the default 60s timeout
+        const raw = await client.callTool(
+          { name: toolName, arguments: params },
+          undefined,  // resultSchema - use default
+          { 
+            timeout: timeoutMs,
+            maxTotalTimeout: timeoutMs,
+            resetTimeoutOnProgress: true
+          }
+        );
         const duration = Date.now() - start;
         circuit?.recordSuccess();
         // try to extract text safely

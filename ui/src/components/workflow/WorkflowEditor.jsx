@@ -632,7 +632,7 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
             strokeWidth: 2,
             stroke: getEdgeColor(params.source)
           },
-          type: 'bezier'
+          type: 'default'
         }, eds));
         
         // Check if this is an LLM connecting to an Agent's model handle
@@ -725,8 +725,8 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
   const onNodeClick = useCallback((event, node) => {
     setSelectedNode(node);
     setSelectedEdge(null);
-    // Don't show config panel for chat nodes, output nodes, and tool nodes
-    if (node.type !== 'chat' && node.type !== 'output' && node.type !== 'tool') {
+    // Don't show config panel for chat nodes, output nodes, tool nodes, and llm nodes
+    if (node.type !== 'chat' && node.type !== 'output' && node.type !== 'tool' && node.type !== 'llm') {
       setShowConfigPanel(true);
     } else {
       setShowConfigPanel(false);
@@ -973,11 +973,6 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
     window.triggerTeamsNode = triggerTeamsNode;
     window.listTeamsNodes = listTeamsNodes;
     
-    // Log availability message
-    console.log("🛠️ Teams node trigger functions available:");
-    console.log("   • triggerTeamsNode(nodeId, message) - Trigger a Teams node by ID");
-    console.log("   • listTeamsNodes() - List all available Teams nodes");
-    
     // Cleanup on unmount
     return () => {
       delete window.triggerTeamsNode;
@@ -1067,7 +1062,7 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
           defaultEdgeOptions={{
             animated: true,
             style: { strokeWidth: 2 },
-            type: 'bezier',
+            type: 'default',
           }}
           connectionLineStyle={{ 
             strokeWidth: 2, 

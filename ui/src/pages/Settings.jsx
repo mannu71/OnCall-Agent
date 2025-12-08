@@ -83,8 +83,17 @@ const Settings = () => {
         description: '',
         apiKey: '', // Direct API key input
         endpoint: '',
-        baseUrl: ''
+        baseUrl: '',
+        temperature: 0
     });
+
+    // OpenAI reasoning models that don't support temperature parameter
+    const REASONING_MODELS = ['o1', 'o1-mini', 'o1-preview', 'o3', 'o3-mini', 'o4-mini'];
+    const isReasoningModel = (model) => {
+        if (!model) return false;
+        const modelLower = model.toLowerCase();
+        return REASONING_MODELS.some(rm => modelLower.startsWith(rm));
+    };
     const [showApiKey, setShowApiKey] = useState(false);
     const [existingApiKey, setExistingApiKey] = useState(null); // To show if key exists
     const [llmConnectionStatus, setLLMConnectionStatus] = useState({}); // { llmName: { status: 'untested' | 'testing' | 'connected' | 'error', message: '' } }
@@ -446,7 +455,8 @@ const Settings = () => {
                 icon: llm.icon || '🧠',
                 apiKey: '', // Don't load actual key, just check if exists
                 endpoint: llm.endpoint || '',
-                baseUrl: llm.baseUrl || ''
+                baseUrl: llm.baseUrl || '',
+                temperature: llm.temperature ?? 0
             });
             
             // Check if API key exists for this LLM
@@ -465,7 +475,8 @@ const Settings = () => {
                 icon: '🧠',
                 apiKey: '',
                 endpoint: '',
-                baseUrl: ''
+                baseUrl: '',
+                temperature: 0
             });
         }
         setOpenLLMDialog(true);
@@ -484,26 +495,31 @@ const Settings = () => {
                 provider: llmFormData.provider,
                 model: llmFormData.model,
                 icon: llmFormData.icon,
+                // Only save temperature for non-reasoning models
+                ...(!isReasoningModel(llmFormData.model) && { temperature: llmFormData.temperature }),
                 ...(llmFormData.endpoint && { endpoint: llmFormData.endpoint }),
                 ...(llmFormData.baseUrl && { baseUrl: llmFormData.baseUrl })
             };
 
+            // Use model name as the identifier
+            const llmName = llmFormData.model;
+
             // First save the LLM config
             if (editingLLM) {
-                await updateLLM(llmFormData.name, llmConfig);
+                await updateLLM(editingLLM, llmConfig, llmName);
             } else {
-                await addLLM(llmFormData.name, llmConfig);
+                await addLLM(llmName, llmConfig);
             }
 
             // Then save API key if provided (LLM must exist first)
             if (llmFormData.apiKey && window.electronAPI?.setApiKey) {
-                const keyResult = await window.electronAPI.setApiKey(llmFormData.name, llmFormData.apiKey);
+                const keyResult = await window.electronAPI.setApiKey(llmName, llmFormData.apiKey);
                 if (!keyResult.success) {
                     console.error('Failed to save API key:', keyResult.error);
                 }
             }
 
-            setSaveMessage(editingLLM ? `Updated LLM: ${llmFormData.name}` : `Added new LLM: ${llmFormData.name}`);
+            setSaveMessage(editingLLM ? `Updated LLM: ${llmName}` : `Added new LLM: ${llmName}`);
 
             await loadLLMConfigs();
             handleCloseLLMDialog();
@@ -1038,20 +1054,10 @@ const Settings = () => {
                 {/* Add/Edit LLM Dialog */}
                 <Dialog open={openLLMDialog} onClose={handleCloseLLMDialog} maxWidth="sm" fullWidth>
                     <DialogTitle>
-                        {editingLLM ? `Edit LLM: ${editingLLM}` : 'Add New LLM'}
+                        {editingLLM ? `Edit LLM: ${llmFormData.model || editingLLM}` : 'Add New LLM'}
                     </DialogTitle>
                     <DialogContent>
                         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 2 }}>
-                            <TextField
-                                label="Display Name"
-                                value={llmFormData.name}
-                                onChange={(e) => setLLMFormData({ ...llmFormData, name: e.target.value })}
-                                disabled={!!editingLLM}
-                                fullWidth
-                                required
-                                helperText="A friendly name for this LLM configuration"
-                            />
-
                             <TextField
                                 label="Icon"
                                 value={llmFormData.icon}
@@ -1081,7 +1087,7 @@ const Settings = () => {
                                 <TextField
                                     label="Model Name"
                                     value={llmFormData.model}
-                                    onChange={(e) => setLLMFormData({ ...llmFormData, model: e.target.value })}
+                                    onChange={(e) => setLLMFormData({ ...llmFormData, model: e.target.value, name: e.target.value })}
                                     fullWidth
                                     placeholder="Enter custom model name"
                                     helperText="Enter the model identifier"
@@ -1091,8 +1097,8 @@ const Settings = () => {
                                     freeSolo
                                     options={getModelOptions(llmFormData.provider)}
                                     value={llmFormData.model}
-                                    onChange={(e, newValue) => setLLMFormData({ ...llmFormData, model: newValue || '' })}
-                                    onInputChange={(e, newInputValue) => setLLMFormData({ ...llmFormData, model: newInputValue })}
+                                    onChange={(e, newValue) => setLLMFormData({ ...llmFormData, model: newValue || '', name: newValue || '' })}
+                                    onInputChange={(e, newInputValue) => setLLMFormData({ ...llmFormData, model: newInputValue, name: newInputValue })}
                                     renderInput={(params) => (
                                         <TextField
                                             {...params}
@@ -1123,6 +1129,23 @@ const Settings = () => {
                                     fullWidth
                                     helperText="Ollama server URL (default: http://localhost:11434)"
                                 />
+                            )}
+
+                            {/* Temperature Setting */}
+                            {!isReasoningModel(llmFormData.model) ? (
+                                <TextField
+                                    label="Temperature"
+                                    type="number"
+                                    value={llmFormData.temperature}
+                                    onChange={(e) => setLLMFormData({ ...llmFormData, temperature: Math.max(0, Math.min(1, parseFloat(e.target.value) || 0)) })}
+                                    fullWidth
+                                    inputProps={{ min: 0, max: 1, step: 0.1 }}
+                                    helperText="Controls randomness (0 = deterministic, 1 = creative)"
+                                />
+                            ) : (
+                                <Alert severity="info" sx={{ mt: 1 }}>
+                                    Reasoning models (o1, o3, o4-mini, etc.) do not support temperature settings.
+                                </Alert>
                             )}
 
                             {/* API Key Section */}
@@ -1192,7 +1215,7 @@ const Settings = () => {
                         <Button 
                             onClick={handleSaveLLM} 
                             variant="contained" 
-                            disabled={!llmFormData.name || !llmFormData.model}
+                            disabled={!llmFormData.model}
                         >
                             {editingLLM ? 'Update' : 'Add'}
                         </Button>

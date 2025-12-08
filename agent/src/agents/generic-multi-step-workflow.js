@@ -91,7 +91,7 @@ export async function buildDynamicWorkflow(agentJSON, options = {}) {
 
   const llmWithTools = llm.bindTools(langchainTools);
 
-  const systemPrompt = `You are an expert investigator and problem solver.
+  const systemPrompt = `You are a tool-using agent.
 
 ${agentInstructions}
 
@@ -102,15 +102,21 @@ ${Object.entries(toolsByServer).map(([server, tools]) =>
         : `- Server "${server}": (no tools available - skip)`
 ).join('\n')}
 
-INSTRUCTIONS:
-1. Analyze the user's question carefully
-2. Use the available tools to gather information
-3. For database queries, use SQL in the params (e.g., {"sql": "SELECT * FROM ..."})
-4. Reason through the results step by step
-5. If a tool returns { "tool_error": true, ... } consider fallback strategies
-6. Provide a clear final answer with root cause analysis if applicable
+RULES FOR TOOL USE:
+- If the user asks for ANY factual information, run an MCP tool.
+- NEVER guess. ALWAYS call a tool when information is external.
+- When calling a tool, produce ONLY a tool call and no natural language.
+- Pass parameters as a JSON object { ... }. NEVER pass null, undefined, or empty parameters.
+- After receiving tool results, analyze them and either:
+   (a) call another tool with DIFFERENT parameters, or
+   (b) provide a final answer.
+- If a tool fails with {"tool_error": true...}, check the error message:
+   * If the error indicates missing/invalid parameters (e.g., "null or undefined"), DO NOT retry the same tool with the same parameters.
+   * If you cannot provide valid parameters, explain to the user what information is needed.
+   * If the circuit is open (server unavailable), try a different server or inform the user.
+- If you've tried the same tool 2+ times with errors, STOP and provide a final answer explaining the issue.
 
-Think step by step and use tools as needed to answer the question thoroughly.`;
+NEVER answer directly when a tool could help you answer the question, BUT ALSO never retry the same failing tool call infinitely.`;
 
   async function callModel(state) {
     const messages = state.messages;

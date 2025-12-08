@@ -10,6 +10,110 @@ const execAsync = promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Track currently running workflows
+const runningWorkflows = new Set();
+
+// Determine base path for agent files - same logic as fileUtils.js
+// In packaged app, use a writable folder in user's app data
+// In dev, agent files are in ../agent from ui folder
+const getAgentPath = () => {
+  if (app.isPackaged) {
+    return path.join(app.getPath('userData'), 'agent');
+  } else {
+    return path.join(__dirname, '..', '..', 'agent');
+  }
+};
+
+// Lazy-initialized paths (deferred until app is ready)
+let triggersDir = null;
+let outputDir = null;
+
+const getTriggersDir = () => {
+  if (!triggersDir) {
+    triggersDir = path.join(getAgentPath(), 'data', 'config', 'triggers');
+  }
+  return triggersDir;
+};
+
+const getOutputDir = () => {
+  if (!outputDir) {
+    outputDir = path.join(getAgentPath(), 'output');
+  }
+  return outputDir;
+};
+
+// Setup trigger folder watcher for automatic scheduled workflows
+function setupTriggerWatcher() {
+  const triggersDirPath = getTriggersDir();
+  const outputDirPath = getOutputDir();
+  
+  console.log('Setting up trigger watcher:', { triggersDir: triggersDirPath, outputDir: outputDirPath });
+  
+  if (!fs.existsSync(triggersDirPath)) {
+    fs.mkdirSync(triggersDirPath, { recursive: true });
+  }
+  
+  fs.watch(triggersDirPath, (eventType, filename) => {
+    if (eventType === 'rename' && filename && filename.endsWith('.flag')) {
+      const flagPath = path.join(triggersDirPath, filename);
+      const workflowName = filename.replace('.flag', '').replace(/_/g, ' ');
+      
+      // Check if file was created (not deleted)
+      if (fs.existsSync(flagPath)) {
+        // New trigger file = workflow starting
+        if (!runningWorkflows.has(workflowName)) {
+          console.log(`Workflow started (trigger watcher): ${workflowName}`);
+          runningWorkflows.add(workflowName);
+          
+          // Get baseline for output detection
+          let lastOutputTime = Date.now();
+          if (fs.existsSync(outputDirPath)) {
+            const files = fs.readdirSync(outputDirPath);
+            const latestFile = files
+              .filter(f => f.endsWith('.json'))
+              .map(f => fs.statSync(path.join(outputDirPath, f)).mtimeMs)
+              .sort((a, b) => b - a)[0];
+            if (latestFile) lastOutputTime = latestFile;
+          }
+          
+          // Poll for completion - only check for new output files
+          // NOTE: We don't check for flag file deletion because the worker deletes it
+          // immediately when it STARTS processing, not when it completes
+          const checkCompletion = setInterval(() => {
+            try {
+              // Check for new output file (the only reliable completion signal)
+              if (fs.existsSync(outputDirPath)) {
+                const files = fs.readdirSync(outputDirPath);
+                const newestFile = files
+                  .filter(f => f.endsWith('.json') && !f.includes('_latest'))
+                  .map(f => ({ name: f, time: fs.statSync(path.join(outputDirPath, f)).mtimeMs }))
+                  .sort((a, b) => b.time - a.time)[0];
+                
+                if (newestFile && newestFile.time > lastOutputTime) {
+                  console.log(`Workflow completed (new output): ${workflowName}, file: ${newestFile.name}`);
+                  runningWorkflows.delete(workflowName);
+                  clearInterval(checkCompletion);
+                }
+              }
+            } catch (err) {
+              console.error('Error checking workflow completion:', err);
+            }
+          }, 2000);
+          
+          // Safety timeout
+          setTimeout(() => {
+            console.log(`Workflow timeout: ${workflowName}`);
+            runningWorkflows.delete(workflowName);
+            clearInterval(checkCompletion);
+          }, 5 * 60 * 1000);
+        }
+      }
+    }
+  });
+}
+
+// NOTE: setupTriggerWatcher is called in app.whenReady() to ensure app.getPath() is available
+
 // Import file utilities
 import { saveSchedulesToFile, loadSchedulesFromFile, saveWorkflowsToFile, loadWorkflowsFromFile, saveMCPConfigToFile, loadMCPConfigFromFile, saveLLMConfigToFile, loadLLMConfigFromFile, setLLMApiKey, getLLMApiKeyMasked, getLLMApiKey, hasLLMApiKey, deleteLLMApiKey, triggerWorkflow, runAgentWorkflow, saveSqlFile, loadSqlFile, loadWorkflowRuns, loadLatestWorkflowResult, loadWorkflowResult, clearWorkflowOutputs, getPathsInfo } from './fileUtils.js';
 
@@ -31,6 +135,17 @@ ipcMain.handle('schedules:save', async (event, schedules) => {
   } catch (error) {
     console.error('Error saving schedules:', error);
     return { success: false, error: error.message };
+  }
+});
+
+// IPC handler to check workflows currently running (tracked in memory)
+ipcMain.handle('schedules:inProgress', async () => {
+  try {
+    const schedules = Array.from(runningWorkflows);
+    return { count: schedules.length, schedules };
+  } catch (error) {
+    console.error('Error checking workflows in progress:', error);
+    return { count: 0, schedules: [] };
   }
 });
 
@@ -60,9 +175,67 @@ ipcMain.handle('workflows:save', async (event, workflows) => {
 // IPC to trigger a specific workflow
 ipcMain.handle('workflows:trigger', async (event, workflowName) => {
   try {
+    // Track this workflow as running
+    console.log(`Workflow triggered: ${workflowName}`);
+    runningWorkflows.add(workflowName);
+    
     const result = triggerWorkflow(workflowName);
+    
+    // Watch for new output files (workflow completed when new output appears)
+    if (result.success) {
+      const outputDirPath = getOutputDir();
+      const triggersDirPath = getTriggersDir();
+      const safeName = workflowName.replace(/\s+/g, '_');
+      const flagPath = path.join(triggersDirPath, `${safeName}.flag`);
+      
+      let lastOutputTime = Date.now();
+      
+      // Check existing files to get baseline
+      if (fs.existsSync(outputDirPath)) {
+        const files = fs.readdirSync(outputDirPath);
+        const latestFile = files
+          .filter(f => f.endsWith('.json'))
+          .map(f => fs.statSync(path.join(outputDirPath, f)).mtimeMs)
+          .sort((a, b) => b - a)[0];
+        if (latestFile) lastOutputTime = latestFile;
+      }
+      
+      // Poll for new output file (the only reliable completion signal)
+      // NOTE: We don't check for flag file deletion because the worker deletes it
+      // immediately when it STARTS processing, not when it completes
+      const checkCompletion = setInterval(() => {
+        try {
+          // Check for new output file
+          if (fs.existsSync(outputDirPath)) {
+            const files = fs.readdirSync(outputDirPath);
+            const newestFile = files
+              .filter(f => f.endsWith('.json') && !f.includes('_latest'))
+              .map(f => ({ name: f, time: fs.statSync(path.join(outputDirPath, f)).mtimeMs }))
+              .sort((a, b) => b.time - a.time)[0];
+            
+            if (newestFile && newestFile.time > lastOutputTime) {
+              // New output file = workflow completed
+              console.log(`Workflow completed (new output): ${workflowName}, file: ${newestFile.name}`);
+              runningWorkflows.delete(workflowName);
+              clearInterval(checkCompletion);
+            }
+          }
+        } catch (err) {
+          console.error('Error checking workflow completion:', err);
+        }
+      }, 2000); // Check every 2 seconds
+      
+      // Safety timeout: remove from tracking after 5 minutes max
+      setTimeout(() => {
+        console.log(`Workflow timeout: ${workflowName}`);
+        runningWorkflows.delete(workflowName);
+        clearInterval(checkCompletion);
+      }, 5 * 60 * 1000);
+    }
+    
     return result;
   } catch (error) {
+    runningWorkflows.delete(workflowName);
     console.error('Error triggering workflow:', error);
     return { success: false, error: error.message };
   }
@@ -71,6 +244,9 @@ ipcMain.handle('workflows:trigger', async (event, workflowName) => {
 // IPC to run an agent with a user query
 ipcMain.handle('agent:run', async (event, workflowName, userQuery) => {
   try {
+    // Track this workflow as running
+    runningWorkflows.add(workflowName);
+    
     // Get the sender window to send progress events
     const senderWindow = BrowserWindow.fromWebContents(event.sender);
     
@@ -82,8 +258,13 @@ ipcMain.handle('agent:run', async (event, workflowName, userQuery) => {
     };
     
     const result = await runAgentWorkflow(workflowName, userQuery, progressCallback);
+    
+    // Remove from running workflows
+    runningWorkflows.delete(workflowName);
     return result;
   } catch (error) {
+    // Remove from running workflows on error too
+    runningWorkflows.delete(workflowName);
     console.error('Error running agent:', error);
     return { success: false, error: error.message };
   }
@@ -671,6 +852,9 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  // Initialize trigger watcher after app is ready (so app.getPath works)
+  setupTriggerWatcher();
+  
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
