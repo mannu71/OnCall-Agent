@@ -83,4 +83,5 @@ async function runWorkflow(workflowName) {
     }
 }
 
-runWorkflow('daily-report');
+const workflowName = process.argv[2] || 'daily-report';
+runWorkflow(workflowName);
