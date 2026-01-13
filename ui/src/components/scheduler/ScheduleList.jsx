@@ -35,10 +35,12 @@ import {
   Delete as DeleteIcon
 } from '@mui/icons-material';
 import { useScheduler } from '../../context/SchedulerContext';
+import { useWorkflowStatus } from '../../context/WorkflowStatusContext';
 import EditScheduleDialog from './EditScheduleDialog';
 
 const ScheduleList = () => {
   const { schedules, deleteSchedule, updateSchedule, isLoading } = useScheduler();
+  const { isWorkflowRunning, markWorkflowPending } = useWorkflowStatus();
   const [searchTerm, setSearchTerm] = useState('');
   // Removed type filtering
   const [editingSchedule, setEditingSchedule] = useState(null);
@@ -107,6 +109,9 @@ const ScheduleList = () => {
   const handleRunNow = async (schedule) => {
     try {
       const workflowName = schedule.workflow;
+      
+      // Mark as pending immediately for instant UI feedback
+      markWorkflowPending(workflowName);
       
       // Check if workflow exists before triggering
       if (window?.electronAPI?.loadWorkflows) {
@@ -249,15 +254,19 @@ const ScheduleList = () => {
                         </Typography>
                       </TableCell>
                       <TableCell align="center">
-                        <IconButton
-                          size="small"
-                          onClick={() => handleRunNow(schedule)}
-                          title="Run now"
-                          aria-label="Run workflow now"
-                          color="primary"
-                        >
-                          <PlayArrowIcon />
-                        </IconButton>
+                        {isWorkflowRunning(workflowName) ? (
+                          <CircularProgress size={20} />
+                        ) : (
+                          <IconButton
+                            size="small"
+                            onClick={() => handleRunNow(schedule)}
+                            title="Run now"
+                            aria-label="Run workflow now"
+                            color="primary"
+                          >
+                            <PlayArrowIcon />
+                          </IconButton>
+                        )}
                       </TableCell>
                       <TableCell align="right">
                         <IconButton

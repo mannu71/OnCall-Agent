@@ -1,10 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { getLLMs } from '../../services/llmService';
 
 const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
   const [config, setConfig] = useState(node?.data || {});
   const [availableLLMs, setAvailableLLMs] = useState({});
   const [isLoadingLLMs, setIsLoadingLLMs] = useState(true);
+  const fileInputRef = useRef(null);
 
   // Load configured LLMs from settings
   useEffect(() => {
@@ -73,89 +74,7 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
         );
       
       case 'llm':
-        return (
-          <>
-            <div className="config-field">
-              <label>Select LLM</label>
-              {isLoadingLLMs ? (
-                <p style={{ color: '#888', fontSize: '12px' }}>Loading...</p>
-              ) : Object.keys(availableLLMs).length === 0 ? (
-                <p style={{ color: '#888', fontSize: '12px' }}>No LLMs configured. Add them in Settings.</p>
-              ) : (
-                <select
-                  value={config.llmName || ''}
-                  onChange={(e) => {
-                    const llmName = e.target.value;
-                    const selectedLLM = availableLLMs[llmName];
-                    if (selectedLLM) {
-                      handleConfigChange('llmName', llmName);
-                      handleConfigChange('label', llmName);
-                      handleConfigChange('provider', selectedLLM.provider);
-                      handleConfigChange('model', selectedLLM.model);
-                      handleConfigChange('agent', selectedLLM.provider.toLowerCase());
-                      handleConfigChange('apiKey', selectedLLM.apiKey || '');
-                      handleConfigChange('status', 'Available');
-                    } else {
-                      handleConfigChange('llmName', '');
-                      handleConfigChange('label', 'LLM');
-                      handleConfigChange('status', 'Select LLM');
-                    }
-                  }}
-                >
-                  <option value="">-- Select LLM --</option>
-                  {Object.entries(availableLLMs).map(([name, llm]) => (
-                    <option key={name} value={name}>
-                      {name} ({llm.provider} - {llm.model})
-                    </option>
-                  ))}
-                </select>
-              )}
-            </div>
-            {config.llmName && (
-              <>
-                <div className="config-field">
-                  <label>Provider</label>
-                  <input
-                    type="text"
-                    value={config.provider || ''}
-                    disabled
-                    style={{ backgroundColor: '#333', color: '#888' }}
-                  />
-                </div>
-                <div className="config-field">
-                  <label>Model</label>
-                  <input
-                    type="text"
-                    value={config.model || ''}
-                    disabled
-                    style={{ backgroundColor: '#333', color: '#888' }}
-                  />
-                </div>
-                <div className="config-field">
-                  <label>Temperature</label>
-                  <input
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.1"
-                    value={config.temperature || 0.7}
-                    onChange={(e) => handleConfigChange('temperature', parseFloat(e.target.value))}
-                  />
-                  <span>{config.temperature || 0.7}</span>
-                </div>
-                <div className="config-field">
-                  <label>Max Tokens</label>
-                  <input
-                    type="number"
-                    value={config.maxTokens || 1000}
-                    onChange={(e) => handleConfigChange('maxTokens', parseInt(e.target.value))}
-                    placeholder="Maximum tokens"
-                  />
-                </div>
-              </>
-            )}
-          </>
-        );
+        return null; // LLM nodes are configured in Settings page only
       
       case 'database':
         return (
@@ -280,6 +199,7 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
             <div className="config-field">
               <label>SQL File / Workflow</label>
               <input 
+                ref={fileInputRef}
                 type="file" 
                 accept=".sql,.json" 
                 onChange={async (e) => {
@@ -296,10 +216,15 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
                         try {
                           const result = await window.electronAPI.saveSqlFile(fileName, content);
                           if (result.success) {
-                            // Store reference to file instead of content
-                            handleConfigChange('sqlFile', result.relativePath);
-                            handleConfigChange('fileName', fileName);
-                            handleConfigChange('fileType', fileType);
+                            // Store reference to file - update all at once
+                            const newConfig = {
+                              ...config,
+                              sqlFile: result.relativePath,
+                              fileName: fileName,
+                              fileType: fileType
+                            };
+                            setConfig(newConfig);
+                            onUpdate(node.id, newConfig);
                           } else {
                             alert('Failed to save SQL file: ' + result.error);
                           }
@@ -308,9 +233,14 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
                         }
                       } else {
                         // Fallback for non-Electron environment (store inline)
-                        handleConfigChange('fileContent', content);
-                        handleConfigChange('fileName', fileName);
-                        handleConfigChange('fileType', fileType);
+                        const newConfig = {
+                          ...config,
+                          fileContent: content,
+                          fileName: fileName,
+                          fileType: fileType
+                        };
+                        setConfig(newConfig);
+                        onUpdate(node.id, newConfig);
                       }
                     };
                     reader.readAsText(file);
@@ -330,47 +260,39 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
                 }}>
                   <span>📄 {config.fileName}</span>
                   <button 
-                    onClick={() => {
-                      handleConfigChange('fileContent', '');
-                      handleConfigChange('sqlFile', '');
-                      handleConfigChange('fileName', '');
-                      handleConfigChange('fileType', '');
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      e.preventDefault();
+                      // Reset file input
+                      if (fileInputRef.current) {
+                        fileInputRef.current.value = '';
+                      }
+                      const newConfig = {
+                        ...config,
+                        fileContent: '',
+                        sqlFile: '',
+                        fileName: '',
+                        fileType: '',
+                        stepCount: null
+                      };
+                      setConfig(newConfig);
+                      onUpdate(node.id, newConfig);
                     }}
                     style={{
                       background: 'none',
                       border: 'none',
                       color: '#ff4444',
                       cursor: 'pointer',
-                      fontSize: '16px',
-                      padding: '0 4px'
+                      fontSize: '18px',
+                      padding: '0 4px',
+                      lineHeight: 1
                     }}
+                    title="Remove file"
                   >
                     ×
                   </button>
                 </div>
               )}
-            </div>
-            <div className="config-field">
-              <label>Entry Variables (JSON)</label>
-              <textarea
-                value={config.vars || "{}"}
-                onChange={(e) => handleConfigChange('vars', e.target.value)}
-                placeholder='{"key1": "value1", "key2": "value2"}'
-                rows={5}
-              />
-              <div style={{ fontSize: '11px', color: '#666', marginTop: '4px' }}>
-                Variables to inject across workflow steps
-              </div>
-            </div>
-            <div className="config-field">
-              <label>Execution Mode</label>
-              <select
-                value={config.executionMode || 'sequential'}
-                onChange={(e) => handleConfigChange('executionMode', e.target.value)}
-              >
-                <option value="sequential">Sequential</option>
-                <option value="parallel">Parallel (when possible)</option>
-              </select>
             </div>
           </>
         );

@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Box, Typography, Grid, Card, CardContent, Alert, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper, Chip, IconButton, Dialog, DialogTitle, DialogContent, DialogActions, Button, TablePagination } from '@mui/material';
 import VisibilityIcon from '@mui/icons-material/Visibility';
 import DeleteSweepIcon from '@mui/icons-material/DeleteSweep';
+import { useWorkflowStatus } from '../context/WorkflowStatusContext';
 
 // Simple cron next run calculator for common patterns
 // Note: Cron expressions are stored in UTC, this converts to local time for display
@@ -76,6 +77,7 @@ export default function Dashboard() {
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(5);
   const [nextScheduleRun, setNextScheduleRun] = useState(null);
+  const { runningWorkflows, count: workflowsInProgressCount } = useWorkflowStatus();
   const [stats, setStats] = useState([
     { title: "Profiles Updated", value: "-", color: "primary.main" },
     { title: "Failed Schedules", value: "-", color: "error.main" },
@@ -100,6 +102,7 @@ export default function Dashboard() {
           let metricsRefreshValue = "No";
           let schedulesRanValue = "0";
           let searchResultsValue = "0";
+          let profilesLockedValue = "0";
 
           if (window.electronAPI?.loadLatestWorkflowResult) {
             const latestResult = await window.electronAPI.loadLatestWorkflowResult();
@@ -113,12 +116,14 @@ export default function Dashboard() {
               const metricsRefresh = latestResult.results.find(r => r.label === "Monitoring Metrics Refreshes (Today)");
               const schedulesRan = latestResult.results.find(r => r.label === "Schedules Ran Count");
               const searchResults = latestResult.results.find(r => r.label === "Search Results Count");
+              const profilesLocked = latestResult.results.find(r => r.label === "profiles locked in last 3 days");
               
               profilesUpdatedValue = profilesUpdated?.result?.[0]?.total_count || "0";
               failedSchedulesValue = failedSchedules?.result?.[0]?.count || "0";
               kycAlertsValue = profileKycAlerts?.result?.[0]?.value || "0";
               schedulesRanValue = schedulesRan?.result?.[0]?.count || "0";
               searchResultsValue = searchResults?.result?.[0]?.searchresultscount || "0";
+              profilesLockedValue = profilesLocked?.result?.[0]?.["profiles locked in last 3 days"] || "0";
               
               if (emailNotifications?.result?.[0]) {
                 const published = emailNotifications.result[0].published_count || "0";
@@ -137,7 +142,8 @@ export default function Dashboard() {
                 publishedEmails: publishedEmailsValue,
                 metricsRefresh: metricsRefreshValue,
                 schedulesRan: schedulesRanValue,
-                searchResults: searchResultsValue
+                searchResults: searchResultsValue,
+                profilesLocked: profilesLockedValue
               });
             }
           }
@@ -148,6 +154,11 @@ export default function Dashboard() {
               title: "Profiles Updated", 
               value: profilesUpdatedValue, 
               color: "primary.main" 
+            },
+            { 
+              title: "Profiles Locked (3 days)", 
+              value: profilesLockedValue, 
+              color: parseInt(profilesLockedValue) > 0 ? "warning.main" : "success.main" 
             },
             { 
               title: "Published Emails", 
@@ -167,17 +178,12 @@ export default function Dashboard() {
             { 
               title: "Failed Schedules", 
               value: failedSchedulesValue, 
-              color: "error.main" 
+              color: parseInt(failedSchedulesValue) > 0 ? "error.main" : "success.main" 
             },
             { 
               title: "Schedules Ran", 
               value: schedulesRanValue, 
               color: "primary.main" 
-            },
-            { 
-              title: "Search Results", 
-              value: searchResultsValue, 
-              color: "info.main" 
             }
           ]);
 
@@ -208,8 +214,8 @@ export default function Dashboard() {
     
     loadData();
     
-    // Auto-reload every 10 seconds
-    const interval = setInterval(loadData, 10000);
+    // Auto-reload every 3 seconds for responsive in-progress detection
+    const interval = setInterval(loadData, 3000);
     
     return () => clearInterval(interval);
   }, []);
@@ -287,22 +293,28 @@ export default function Dashboard() {
         </Box>
 
       {/* Banner OUTSIDE the grid */}
-      <Alert severity="info" sx={{ mb: 3 }}>
-        You are currently on-call. Next scheduled run: {formatNextRun(nextScheduleRun)}
-      </Alert>
+      {workflowsInProgressCount > 0 ? (
+        <Alert severity="warning" sx={{ mb: 3 }}>
+          <strong>Workflow running:</strong> {runningWorkflows?.join(', ') || 'Processing...'}
+        </Alert>
+      ) : (
+        <Alert severity="info" sx={{ mb: 3 }}>
+          You are currently on-call. Next scheduled run: {formatNextRun(nextScheduleRun)}
+        </Alert>
+      )}
 
       {/* MAIN GRID */}
       <Grid container spacing={2}>
 
         {/* --- Stats Cards --- */}
         {stats.map((stat, index) => (
-          <Grid item xs={12} sm={6} md key={index} sx={{ minWidth: 0 }}>
-            <Card sx={{ minHeight: 130, display: "flex" }}>
-              <CardContent sx={{ flexGrow: 1 }}>
-                <Typography variant="h6" color="text.secondary" gutterBottom sx={{ fontSize: '0.95rem' }}>
+          <Grid item xs={6} sm={4} md={3} lg={3} key={index}>
+            <Card sx={{ height: 120, display: "flex" }}>
+              <CardContent sx={{ flexGrow: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', textAlign: 'center', p: 2 }}>
+                <Typography variant="body2" color="text.secondary" gutterBottom sx={{ fontSize: '0.85rem', fontWeight: 500 }}>
                   {stat.title}
                 </Typography>
-                <Typography variant="h4" sx={{ color: stat.color }}>
+                <Typography variant="h4" sx={{ color: stat.color, fontWeight: 600 }}>
                   {stat.value}
                 </Typography>
               </CardContent>

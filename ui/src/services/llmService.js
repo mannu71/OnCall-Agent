@@ -136,18 +136,47 @@ export const syncLLMToWorkflows = async (oldName, llmConfig, newName = null) => 
     let updated = false;
     
     for (const workflow of workflows) {
-      if (!workflow.nodes) continue;
+      if (!workflow.nodes || !workflow.edges) continue;
       
+      // First, find and update all LLM nodes that match
+      const updatedLLMNodeIds = [];
       for (const node of workflow.nodes) {
         // Check if this node is an LLM that uses this configuration
-        if (node.type === 'llm' && node.data?.label === oldName) {
+        if (node.type === 'llm' && (node.data?.label === oldName || node.data?.model === oldName)) {
           // Update the node's label and LLM config
           node.data.label = actualNewName;
           node.data.model = llmConfig.model;
           node.data.provider = llmConfig.provider;
           node.data.agent = llmConfig.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq';
+          if (llmConfig.temperature !== undefined) {
+            node.data.temperature = llmConfig.temperature;
+          }
+          updatedLLMNodeIds.push(node.id);
           updated = true;
           console.log(`Synced LLM "${oldName}" -> "${actualNewName}" in workflow "${workflow.name}"`);
+        }
+      }
+      
+      // Now find all agents connected to the updated LLM nodes via edges
+      for (const edge of workflow.edges) {
+        if (updatedLLMNodeIds.includes(edge.source) && edge.targetHandle === 'model') {
+          // Find the target agent node
+          const agentNode = workflow.nodes.find(n => n.id === edge.target && n.type === 'agent');
+          if (agentNode) {
+            agentNode.data.model = llmConfig.model;
+            agentNode.data.agent = llmConfig.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq';
+            updated = true;
+            console.log(`Synced connected agent "${agentNode.id}" model to "${llmConfig.model}" in workflow "${workflow.name}"`);
+          }
+        }
+      }
+      
+      // Also update agent nodes that directly reference this LLM model by name
+      for (const node of workflow.nodes) {
+        if (node.type === 'agent' && node.data?.model === oldName) {
+          node.data.model = actualNewName;
+          updated = true;
+          console.log(`Synced agent node model "${oldName}" -> "${actualNewName}" in workflow "${workflow.name}"`);
         }
       }
     }
@@ -194,6 +223,7 @@ export const convertLLMsToNodeItems = (llms) => {
       model: config.model,
       provider: config.provider,
       agent: config.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq',
+      temperature: config.temperature ?? 0,
       // Use environment variable reference instead of hardcoded key
       apiKeyEnvVar: config.apiKeyEnvVar || '',
       status: 'Available'

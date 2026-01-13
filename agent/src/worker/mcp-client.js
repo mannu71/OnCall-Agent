@@ -6,6 +6,7 @@ import { DEFAULT_CLIENT_META } from '../shared/constants.js';
 // Constants for better maintainability
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 10_000;
 const DEFAULT_RAW_CAPTURE_TIMEOUT_MS = 5_000;
+const DEFAULT_CALL_TIMEOUT_MS = 900_000; // 15 minutes for long DB queries
 
 /**
  * Hybrid functional MCP client factory
@@ -17,6 +18,7 @@ export function createMCPClient(serverConfig, opts = {}) {
   const meta = opts.clientMeta || DEFAULT_CLIENT_META;
   const discoveryTimeoutMs = opts.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS;
   const rawCaptureTimeoutMs = opts.rawCaptureTimeoutMs ?? DEFAULT_RAW_CAPTURE_TIMEOUT_MS;
+  const callTimeoutMs = opts.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
 
   // internal state
   let client = null;
@@ -166,7 +168,10 @@ export function createMCPClient(serverConfig, opts = {}) {
       env: { ...process.env, ...(cfg.env || {}) }
     });
 
-    client = new Client(meta, { capabilities: {} });
+    client = new Client(meta, { 
+      capabilities: {},
+      requestTimeoutMs: callTimeoutMs  // Override SDK's default 60s timeout
+    });
 
     try {
       await client.connect(transport);
@@ -233,13 +238,15 @@ export function createMCPClient(serverConfig, opts = {}) {
     }
 
     try {
-      logger.info(`Calling tool: ${toolName} on ${serverConfig.label}`);
+      logger.info(`Calling tool: ${toolName} on ${serverConfig.label} (timeout: ${callTimeoutMs/1000}s)`);
       logger.debug('Tool params:', params);
 
-      const response = await client.callTool({
-        name: toolName,
-        arguments: params
-      });
+      // Pass timeout directly to SDK's callTool to override the default 60s timeout
+      const response = await client.callTool(
+        { name: toolName, arguments: params },
+        undefined,  // resultSchema - use default
+        { timeout: callTimeoutMs, maxTotalTimeout: callTimeoutMs }
+      );
 
       logger.info(`Tool call successful: ${toolName}`);
       return response;
