@@ -217,13 +217,19 @@ function triggerWorkflow(workflowName) {
 }
 
 // Run an agent workflow with a user query
-async function runAgentWorkflow(workflowName, userQuery) {
+async function runAgentWorkflow(workflowName, userQuery, progressCallback = null) {
   try {
     const { spawn } = await import('child_process');
     
     return new Promise((resolve, reject) => {
       // Run the agent using node
       const agentPath = path.join(agentDir, 'src', 'agents', 'run.js');
+      
+      console.log(`Running agent: node ${agentPath} "${workflowName}" "${userQuery?.slice(0, 50)}..."`);
+      
+      if (progressCallback) {
+        progressCallback({ type: 'status', message: 'Starting agent...' });
+      }
       
       const child = spawn('node', [agentPath, workflowName, userQuery], {
         cwd: agentDir,
@@ -234,19 +240,101 @@ async function runAgentWorkflow(workflowName, userQuery) {
       let stdout = '';
       let stderr = '';
       
+      // Parse JSON log lines for progress events
+      const parseLogLine = (line) => {
+        try {
+          const log = JSON.parse(line);
+          if (log.event && progressCallback) {
+            switch (log.event) {
+              case 'run.start':
+                progressCallback({ type: 'status', message: `Starting workflow: ${log.workflowName}` });
+                break;
+              case 'run.workflow.load':
+                progressCallback({ type: 'status', message: `Loaded workflow: ${log.name}` });
+                break;
+              case 'run.workflow.invoke':
+                progressCallback({ type: 'status', message: 'Invoking workflow...' });
+                break;
+              case 'mcp.connect.start':
+                progressCallback({ type: 'status', message: `Connecting to ${log.server}...` });
+                break;
+              case 'mcp.connect.success':
+                progressCallback({ type: 'status', message: `Connected to ${log.server} (${log.toolCount} tools)` });
+                break;
+              case 'workflow.tools.discovered':
+                const totalTools = Object.values(log.toolsByServer || {}).reduce((sum, arr) => sum + arr.length, 0);
+                progressCallback({ type: 'status', message: `Discovered ${totalTools} tools` });
+                break;
+              case 'workflow.compiled':
+                progressCallback({ type: 'status', message: 'Workflow compiled, starting...' });
+                break;
+              case 'workflow.invoke.start':
+                progressCallback({ type: 'status', message: 'Processing query...' });
+                break;
+              case 'agent.think.start':
+                progressCallback({ type: 'thinking', message: 'Agent is thinking...' });
+                break;
+              case 'agent.plan.tool_calls':
+                progressCallback({ type: 'planning', message: `Planning ${log.count} tool call(s)...` });
+                break;
+              case 'agent.plan.call':
+                progressCallback({ type: 'planning', message: `Will call: ${log.name}` });
+                break;
+              case 'tool.call.start':
+                progressCallback({ type: 'tool', message: `Calling tool: ${log.tool}` });
+                break;
+              case 'tool.call.success':
+                progressCallback({ type: 'tool', message: `Tool completed: ${log.tool} (${log.duration}ms)` });
+                break;
+              case 'tool.call.error':
+                progressCallback({ type: 'error', message: `Tool error: ${log.tool} - ${log.message}` });
+                break;
+              case 'workflow.invoke.done':
+                progressCallback({ type: 'status', message: 'Generating response...' });
+                break;
+              case 'run.complete':
+                progressCallback({ type: 'status', message: 'Workflow complete!' });
+                break;
+            }
+          }
+        } catch (e) {
+          // Not JSON, might be other output
+        }
+      };
+      
       child.stdout.on('data', (data) => {
-        stdout += data.toString();
+        const text = data.toString();
+        stdout += text;
+        // Parse each line for progress
+        text.split('\n').filter(l => l.trim()).forEach(parseLogLine);
       });
       
       child.stderr.on('data', (data) => {
-        stderr += data.toString();
+        const text = data.toString();
+        stderr += text;
+        console.log('[agent stderr]', text.slice(0, 200));
       });
       
       child.on('close', (code) => {
+        console.log(`Agent exited with code ${code}`);
         if (code === 0) {
           // Extract the final answer from the output
           const finalAnswerMatch = stdout.match(/🔥 FINAL ANSWER:\s*([\s\S]*)/);
-          const answer = finalAnswerMatch ? finalAnswerMatch[1].trim() : stdout;
+          let answer = finalAnswerMatch ? finalAnswerMatch[1].trim() : stdout;
+          
+          // Filter out JSON log lines from the answer
+          answer = answer
+            .split('\n')
+            .filter(line => {
+              const trimmed = line.trim();
+              // Skip lines that are JSON log objects
+              if (trimmed.startsWith('{"ts":') && trimmed.includes('"event":')) {
+                return false;
+              }
+              return true;
+            })
+            .join('\n')
+            .trim();
           
           resolve({ 
             success: true, 
@@ -263,14 +351,26 @@ async function runAgentWorkflow(workflowName, userQuery) {
       });
       
       child.on('error', (err) => {
+        console.error('Agent spawn error:', err);
         resolve({ success: false, error: err.message });
       });
       
       // Timeout after 5 minutes
-      setTimeout(() => {
+      const timeoutId = setTimeout(() => {
+        console.log('Agent timeout - killing process');
         child.kill();
-        resolve({ success: false, error: 'Agent execution timed out after 5 minutes' });
+        if (progressCallback) {
+          progressCallback({ type: 'error', message: 'Agent timed out after 5 minutes' });
+        }
+        resolve({ 
+          success: false, 
+          error: 'Agent execution timed out after 5 minutes',
+          fullOutput: stdout + '\n\n--- STDERR ---\n' + stderr
+        });
       }, 5 * 60 * 1000);
+      
+      // Clear timeout if process exits normally
+      child.on('exit', () => clearTimeout(timeoutId));
     });
   } catch (error) {
     console.error('Error running agent workflow:', error);
@@ -662,6 +762,17 @@ function deleteLLMApiKey(llmName) {
   return setLLMApiKey(llmName, null);
 }
 
+// Function to get actual API key for an LLM (for testing)
+function getLLMApiKey(llmName) {
+  try {
+    const config = loadLLMConfigFromFile();
+    return config.llms?.[llmName]?.apiKey || null;
+  } catch (error) {
+    console.error('Error getting LLM API key:', error);
+    return null;
+  }
+}
+
 export {
   saveSchedulesToFile,
   loadSchedulesFromFile,
@@ -673,6 +784,7 @@ export {
   loadLLMConfigFromFile,
   setLLMApiKey,
   getLLMApiKeyMasked,
+  getLLMApiKey,
   hasLLMApiKey,
   deleteLLMApiKey,
   triggerWorkflow,

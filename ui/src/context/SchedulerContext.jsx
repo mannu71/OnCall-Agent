@@ -18,15 +18,21 @@ export const SchedulerProvider = ({ children }) => {
 
   const isElectron = Boolean(typeof window !== 'undefined' && window?.electronAPI);
 
-  // Helper: parse simple cron (m h * * *) into HH:MM
+  // Helper: parse simple cron (m h * * *) into HH:MM (converts UTC cron to local time for display)
   const parseCronTime = (cron) => {
     if (!cron || typeof cron !== 'string') return undefined;
     const parts = cron.trim().split(/\s+/);
     if (parts.length < 2) return undefined;
     const [min, hour] = parts;
     if (isNaN(parseInt(hour)) || isNaN(parseInt(min))) return undefined;
+    
+    // Convert UTC time from cron to local time for display
+    const utcDate = new Date();
+    utcDate.setUTCHours(parseInt(hour), parseInt(min), 0, 0);
+    
     const pad = (n) => n.toString().padStart(2, '0');
-    return `${pad(hour)}:${pad(min)}`;
+    // Return local time
+    return `${pad(utcDate.getHours())}:${pad(utcDate.getMinutes())}`;
   };
 
   // Transform from workflow file object to internal schedule shape
@@ -59,18 +65,21 @@ export const SchedulerProvider = ({ children }) => {
       createdAt: sch.createdAt,
       updatedAt: sch.updatedAt,
       schedule: sch.schedule || (() => {
-        // If we have startTime and type, synthesize cron
+        // If we have startTime and type, synthesize cron in UTC
         if (sch.startTime) {
           const [hour, minute] = sch.startTime.split(':');
-          const m = minute ?? '0';
-          const h = hour ?? '0';
+          // startTime is in local time, convert to UTC for cron
+          const localDate = new Date();
+          localDate.setHours(parseInt(hour) || 0, parseInt(minute) || 0, 0, 0);
+          const utcH = localDate.getUTCHours().toString();
+          const utcM = localDate.getUTCMinutes().toString();
           if ((sch.workflow === 'weekly') && sch.date) {
-            // Use day-of-week from date
-            const dow = new Date(sch.date).getDay(); // 0-6
-            return `${m} ${h} * * ${dow}`;
+            // Use day-of-week from date (in UTC)
+            const dow = new Date(sch.date).getUTCDay(); // 0-6
+            return `${utcM} ${utcH} * * ${dow}`;
           }
           // Daily / default
-          return `${m} ${h} * * *`;
+          return `${utcM} ${utcH} * * *`;
         }
         return '*/5 * * * *'; // Fallback every 5 minutes
       })(),
@@ -171,7 +180,7 @@ export const SchedulerProvider = ({ children }) => {
 
   const addSchedule = useCallback((schedule) => {
     const newSchedule = {
-      id: Date.now().toString(),
+      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       ...schedule,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()

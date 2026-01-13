@@ -50,9 +50,11 @@
     "directories": {
       "output": "dist-electron"
     },
+    "icon": "public/favicon.ico",
     "files": [
       "dist/**/*",
       "electron/**/*",
+      "public/**/*",
       "package.json"
     ],
     "extraResources": [
@@ -66,7 +68,8 @@
     ],
     "win": {
       "target": "portable",
-      "icon": "public/favicon.ico"
+      "icon": "public/favicon.ico",
+      "signAndEditExecutable": false
     },
     "nsis": {
       "oneClick": false,

@@ -8,9 +8,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveWorkflows: (workflows) => ipcRenderer.invoke('workflows:save', workflows),
   triggerWorkflow: (workflowName) => ipcRenderer.invoke('workflows:trigger', workflowName),
   runAgent: (workflowName, userQuery) => ipcRenderer.invoke('agent:run', workflowName, userQuery),
+  // Subscribe to agent progress events
+  onAgentProgress: (callback) => {
+    const handler = (event, data) => callback(data);
+    ipcRenderer.on('agent:progress', handler);
+    return () => ipcRenderer.removeListener('agent:progress', handler);
+  },
   // MCP config management
   loadMCPConfig: () => ipcRenderer.invoke('mcp-config:load'),
   saveMCPConfig: (config) => ipcRenderer.invoke('mcp-config:save', config),
+  testMCPServer: (serverName, serverConfig) => ipcRenderer.invoke('mcp-server:test', serverName, serverConfig),
   // LLM config management
   loadLLMConfig: () => ipcRenderer.invoke('llm-config:load'),
   saveLLMConfig: (config) => ipcRenderer.invoke('llm-config:save', config),
@@ -18,6 +25,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getApiKeyMasked: (llmName) => ipcRenderer.invoke('llm-config:get-api-key-masked', llmName),
   hasApiKey: (llmName) => ipcRenderer.invoke('llm-config:has-api-key', llmName),
   deleteApiKey: (llmName) => ipcRenderer.invoke('llm-config:delete-api-key', llmName),
+  testLLM: (llmName, llmConfig) => ipcRenderer.invoke('llm:test', llmName, llmConfig),
   saveSqlFile: (filename, content) => ipcRenderer.invoke('sql:save', filename, content),
   loadSqlFile: (relativePath) => ipcRenderer.invoke('sql:load', relativePath),
   loadWorkflowRuns: () => ipcRenderer.invoke('workflow-runs:load'),

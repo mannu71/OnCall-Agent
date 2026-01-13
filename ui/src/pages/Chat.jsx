@@ -124,7 +124,7 @@ function Chat() {
 
   const addMessage = (type, content, metadata = {}) => {
     const newMessage = {
-      id: Date.now(),
+      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       type,
       content,
       timestamp: new Date().toISOString(),
@@ -217,8 +217,37 @@ function Chat() {
 
   // Ask the agent a question
   const askAgent = async (agent, question) => {
-    const thinkingId = addMessage(MESSAGE_TYPES.ASSISTANT, `Thinking...`, { isLoading: true });
+    const thinkingId = addMessage(MESSAGE_TYPES.ASSISTANT, `Starting agent...`, { isLoading: true, statusHistory: [] });
     setIsLoading(true);
+    
+    // Subscribe to progress events
+    let unsubscribe = null;
+    if (window.electronAPI?.onAgentProgress) {
+      unsubscribe = window.electronAPI.onAgentProgress((progress) => {
+        // Update the message with progress
+        setMessages(prev => prev.map(msg => {
+          if (msg.id === thinkingId) {
+            const statusHistory = [...(msg.statusHistory || [])];
+            // Add new status to history (keep last 5)
+            if (progress.message) {
+              statusHistory.push({ 
+                type: progress.type, 
+                message: progress.message, 
+                time: new Date().toLocaleTimeString() 
+              });
+              if (statusHistory.length > 8) statusHistory.shift();
+            }
+            return { 
+              ...msg, 
+              content: progress.message || msg.content,
+              currentStatus: progress,
+              statusHistory
+            };
+          }
+          return msg;
+        }));
+      });
+    }
     
     try {
       if (window.electronAPI?.runAgent) {
@@ -227,13 +256,15 @@ function Chat() {
         if (result?.success) {
           updateMessage(thinkingId, { 
             content: result.answer || 'Agent completed successfully.',
-            isLoading: false 
+            isLoading: false,
+            currentStatus: null
           });
         } else {
           updateMessage(thinkingId, { 
             content: `Error: ${result?.error || 'Unknown error'}`,
             isLoading: false,
-            isError: true
+            isError: true,
+            currentStatus: null
           });
         }
       } else {
@@ -251,6 +282,8 @@ function Chat() {
       });
     } finally {
       setIsLoading(false);
+      // Unsubscribe from progress events
+      if (unsubscribe) unsubscribe();
     }
   };
 
@@ -320,9 +353,39 @@ function Chat() {
             </Typography>
             
             {message.isLoading && (
-              <Box sx={{ display: 'flex', alignItems: 'center', mt: 1, gap: 1 }}>
-                <CircularProgress size={16} />
-                <Typography variant="caption" color="text.secondary">Processing...</Typography>
+              <Box sx={{ mt: 1 }}>
+                {/* Show status history */}
+                {message.statusHistory && message.statusHistory.length > 0 && (
+                  <Box sx={{ mb: 1, maxHeight: 150, overflowY: 'auto' }}>
+                    {message.statusHistory.map((status, idx) => (
+                      <Typography 
+                        key={idx} 
+                        variant="caption" 
+                        sx={{ 
+                          display: 'block', 
+                          color: status.type === 'error' ? 'error.main' : 'text.secondary',
+                          fontSize: '0.7rem',
+                          opacity: 0.8,
+                          pl: 1,
+                          borderLeft: '2px solid',
+                          borderColor: status.type === 'tool' ? 'info.main' : 
+                                      status.type === 'thinking' ? 'warning.main' :
+                                      status.type === 'error' ? 'error.main' : 'grey.400',
+                          mb: 0.5
+                        }}
+                      >
+                        <span style={{ opacity: 0.6, marginRight: 4 }}>{status.time}</span>
+                        {status.message}
+                      </Typography>
+                    ))}
+                  </Box>
+                )}
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <CircularProgress size={16} />
+                  <Typography variant="caption" color="text.secondary">
+                    {message.currentStatus?.message || 'Processing...'}
+                  </Typography>
+                </Box>
               </Box>
             )}
             

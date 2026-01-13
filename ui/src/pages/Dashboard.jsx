@@ -4,6 +4,7 @@ import VisibilityIcon from '@mui/icons-material/Visibility';
 import DeleteSweepIcon from '@mui/icons-material/DeleteSweep';
 
 // Simple cron next run calculator for common patterns
+// Note: Cron expressions are stored in UTC, this converts to local time for display
 const getNextRunFromCron = (cronExpression) => {
   try {
     const parts = cronExpression.trim().split(/\s+/);
@@ -11,18 +12,19 @@ const getNextRunFromCron = (cronExpression) => {
     
     const [minute, hour, dayOfMonth, month, dayOfWeek] = parts;
     const now = new Date();
-    let next = new Date(now);
     
     // Handle simple daily cron: "M H * * *"
     if (dayOfMonth === '*' && month === '*' && dayOfWeek === '*') {
-      const targetHour = parseInt(hour);
-      const targetMinute = parseInt(minute);
+      const targetHourUTC = parseInt(hour);
+      const targetMinuteUTC = parseInt(minute);
       
-      next.setHours(targetHour, targetMinute, 0, 0);
+      // Create a date in UTC and let JavaScript convert to local
+      let next = new Date();
+      next.setUTCHours(targetHourUTC, targetMinuteUTC, 0, 0);
       
-      // If the time has passed today, move to tomorrow
+      // If the time has passed today (in UTC), move to tomorrow
       if (next <= now) {
-        next.setDate(next.getDate() + 1);
+        next.setUTCDate(next.getUTCDate() + 1);
       }
       return next;
     }

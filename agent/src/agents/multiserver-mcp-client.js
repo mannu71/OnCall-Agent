@@ -1,99 +1,202 @@
+// multiserver-mcp-client.js
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
+/**
+ * Simple circuit breaker per server
+ */
+class CircuitBreaker {
+  constructor({ failureThreshold = 5, cooldownMs = 30_000 } = {}) {
+    this.failureThreshold = failureThreshold;
+    this.cooldownMs = cooldownMs;
+    this.failures = 0;
+    this.openUntil = 0;
+  }
+
+  recordSuccess() {
+    this.failures = 0;
+    this.openUntil = 0;
+  }
+
+  recordFailure() {
+    this.failures += 1;
+    if (this.failures >= this.failureThreshold) {
+      this.openUntil = Date.now() + this.cooldownMs;
+    }
+  }
+
+  isOpen() {
+    return Date.now() < this.openUntil;
+  }
+
+  getState() {
+    return { failures: this.failures, openUntil: this.openUntil };
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Timeout helper using Promise.race
+ */
+function withTimeout(promise, ms, onTimeout) {
+  if (ms == null) return promise;
+  let timeout;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeout = setTimeout(() => {
+      if (onTimeout) onTimeout();
+      reject(new Error(`Operation timed out after ${ms}ms`));
+    }, ms);
+  });
+  return Promise.race([promise.finally(() => clearTimeout(timeout)), timeoutPromise]);
+}
+
 export class MultiServerMCPClient {
-    constructor(config = {}) {
-        this.config = config;
-        this.servers = {};
-        this.tools = {};  // Map server -> tool names
-    }
+  constructor(config = {}, opts = {}) {
+    this.config = config;
+    this.servers = {};
+    this.tools = {}; // Map server -> tool names
+    this.circuit = {}; // server -> CircuitBreaker
+    this.defaultTimeout = opts.defaultTimeout ?? 20_000; // default 20s
+    this.defaultRetries = opts.defaultRetries ?? 2; // retry twice
+    this.backoffBase = opts.backoffBase ?? 300; // ms
+  }
 
-    async connectAll() {
-        for (const [name, cfg] of Object.entries(this.config)) {
-            console.log(`🔌 Starting MCP Server: ${name}`);
+  async connectAll() {
+    for (const [name, cfg] of Object.entries(this.config)) {
+      console.log(JSON.stringify({ ts: new Date().toISOString(), event: "mcp.connect.start", server: name }));
 
-            try {
-                const transport = new StdioClientTransport({
-                    command: cfg.command,
-                    args: cfg.args || [],
-                    env: { ...process.env, ...(cfg.env || {}) }
-                });
+      try {
+        const transport = new StdioClientTransport({
+          command: cfg.command,
+          args: cfg.args || [],
+          env: { ...process.env, ...(cfg.env || {}) }
+        });
 
-                const client = new Client(
-                    { name, version: "1.0" },
-                    { capabilities: {} }
-                );
+        const client = new Client(
+          { name, version: "1.0" },
+          { capabilities: {} }
+        );
 
-                await client.connect(transport);
-                this.servers[name] = client;
+        // protect connect with timeout
+        await withTimeout(client.connect(transport), 15_000, () => {
+          console.warn(`⚠️ MCP connect timeout for ${name}`);
+        });
 
-                // Discover tools with retry for slow-starting servers
-                try {
-                    // Give the server a moment to fully initialize
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                    
-                    const toolsResp = await client.listTools();
-                    this.tools[name] = (toolsResp?.tools || []).map(t => t.name);
-                    console.log(`✅ Connected MCP Server: ${name} (${this.tools[name].length} tools)`);
-                } catch (e) {
-                    // CloudWatch server has a JSON schema issue - provide known tools as fallback
-                    if (name.includes('cloudwatch') && e.message.includes("can't resolve reference")) {
-                        console.log(`✅ Connected MCP Server: ${name} (using known CloudWatch tools)`);
-                        // Actual tool names from AWS CloudWatch MCP Server documentation
-                        this.tools[name] = [
-                            // CloudWatch Metrics tools
-                            'get_metric_data',
-                            'get_metric_metadata',
-                            'get_recommended_metric_alarms',
-                            'analyze_metric',
-                            // CloudWatch Alarms tools
-                            'get_active_alarms',
-                            'get_alarm_history',
-                            // CloudWatch Logs tools
-                            'describe_log_groups',
-                            'analyze_log_group',
-                            'execute_log_insights_query',
-                            'get_logs_insight_query_results',
-                            'cancel_logs_insight_query'
-                        ];
-                    } else {
-                        console.log(`✅ Connected MCP Server: ${name} (tools discovery failed: ${e.message})`);
-                        this.tools[name] = [];
-                    }
-                }
-            } catch (err) {
-                console.error(`❌ Failed to connect to MCP server ${name}:`, err.message);
-            }
-        }
-    }
+        this.servers[name] = client;
+        this.circuit[name] = new CircuitBreaker();
 
-    async call(serverName, toolName, params = {}) {
-        const client = this.servers[serverName];
-        if (!client) throw new Error(`❌ Server not found: ${serverName}`);
-
-        console.log(`🚀 Executing ${toolName} on ${serverName}`);
-        
+        // discover tools with small retry & timeout
         try {
-            const res = await client.callTool({ name: toolName, arguments: params });
-            return res?.content?.[0]?.text || JSON.stringify(res);
-        } catch (err) {
-            console.error(`❌ Tool call failed:`, err.message);
-            throw err;
+          await sleep(500); // give server time to start
+          const toolsResp = await withTimeout(client.listTools(), 8_000);
+          this.tools[name] = (toolsResp?.tools || []).map(t => t.name);
+          console.log(JSON.stringify({ ts: new Date().toISOString(), event: "mcp.connect.success", server: name, toolCount: this.tools[name].length }));
+        } catch (e) {
+          // fallback for known CloudWatch schema issue (backwards compatibility)
+          if (name.includes('cloudwatch') && e.message && e.message.includes("can't resolve reference")) {
+            console.log(JSON.stringify({ ts: new Date().toISOString(), event: "mcp.connect.fallback", server: name, reason: e.message }));
+            this.tools[name] = [
+              'get_metric_data',
+              'get_metric_metadata',
+              'get_recommended_metric_alarms',
+              'analyze_metric',
+              'get_active_alarms',
+              'get_alarm_history',
+              'describe_log_groups',
+              'analyze_log_group',
+              'execute_log_insights_query',
+              'get_logs_insight_query_results',
+              'cancel_logs_insight_query'
+            ];
+          } else {
+            console.log(JSON.stringify({ ts: new Date().toISOString(), event: "mcp.connect.partial", server: name, reason: e.message }));
+            this.tools[name] = [];
+          }
         }
+      } catch (err) {
+        console.error(JSON.stringify({ ts: new Date().toISOString(), event: "mcp.connect.fail", server: name, message: err?.message }));
+      }
+    }
+  }
+
+  /**
+   * Main call helper - retries + timeout + circuit breaker
+   * @param {string} serverName
+   * @param {string} toolName
+   * @param {object} params
+   * @param {object} options - optional timeout/retries
+   */
+  async call(serverName, toolName, params = {}, options = {}) {
+    const client = this.servers[serverName];
+    if (!client) throw new Error(`Server not found: ${serverName}`);
+
+    const circuit = this.circuit[serverName];
+    if (circuit?.isOpen()) {
+      const state = circuit.getState();
+      throw new Error(`Circuit open for ${serverName} (failures=${state.failures}, openUntil=${new Date(state.openUntil).toISOString()})`);
     }
 
-    getAvailableTools() {
-        return this.tools;
+    const timeoutMs = options.timeout ?? this.defaultTimeout;
+    const retries = options.retries ?? this.defaultRetries;
+
+    const attemptCall = async (attempt) => {
+      const start = Date.now();
+      try {
+        console.log(JSON.stringify({ ts: new Date().toISOString(), event: "mcp.call.start", server: serverName, tool: toolName, attempt }));
+        // call the tool with timeout
+        const raw = await withTimeout(client.callTool({ name: toolName, arguments: params }), timeoutMs);
+        const duration = Date.now() - start;
+        circuit?.recordSuccess();
+        // try to extract text safely
+        const content = raw?.content;
+        const maybeText = Array.isArray(content) && content[0] && (content[0].text || content[0].json) ? (content[0].text ?? content[0].json) : raw;
+        console.log(JSON.stringify({ ts: new Date().toISOString(), event: "mcp.call.success", server: serverName, tool: toolName, duration }));
+        if (typeof maybeText === 'string') return maybeText;
+        try {
+          return JSON.stringify(maybeText, null, 2);
+        } catch (e) {
+          return String(maybeText);
+        }
+      } catch (err) {
+        const duration = Date.now() - start;
+        circuit?.recordFailure();
+        console.error(JSON.stringify({ ts: new Date().toISOString(), event: "mcp.call.error", server: serverName, tool: toolName, attempt, duration, message: err?.message }));
+        throw err;
+      }
+    };
+
+    let lastErr;
+    for (let i = 0; i <= retries; i++) {
+      try {
+        return await attemptCall(i + 1);
+      } catch (err) {
+        lastErr = err;
+        // if circuit opened as result of failure, break early
+        if (this.circuit[serverName]?.isOpen()) break;
+        const backoff = this.backoffBase * Math.pow(2, i);
+        await sleep(backoff);
+      }
     }
 
-    async disconnectAll() {
-        for (const [name, client] of Object.entries(this.servers)) {
-            console.log(`🔻 Disconnecting MCP: ${name}`);
-            try {
-                await client.close();
-            } catch (e) {
-                console.log(`⚠️ Close failed for ${name}:`, e.message);
-            }
-        }
+    throw lastErr;
+  }
+
+  getAvailableTools() {
+    return this.tools;
+  }
+
+  async disconnectAll() {
+    for (const [name, client] of Object.entries(this.servers)) {
+      console.log(JSON.stringify({ ts: new Date().toISOString(), event: "mcp.disconnect.start", server: name }));
+      try {
+        await client.close();
+        console.log(JSON.stringify({ ts: new Date().toISOString(), event: "mcp.disconnect.success", server: name }));
+      } catch (e) {
+        console.warn(JSON.stringify({ ts: new Date().toISOString(), event: "mcp.disconnect.fail", server: name, message: e?.message }));
+      }
     }
+  }
 }
