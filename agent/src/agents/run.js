@@ -144,6 +144,25 @@ async function main() {
     // Merge API key from LLM config
     agent = mergeApiKeyFromConfig(agent, llmConfigs);
 
+    // Inject current date into agent instructions
+    const now = new Date();
+    const currentDateTime = now.toISOString();
+    const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const yesterdayDateTime = yesterday.toISOString();
+    
+    // Replace placeholders in instructions if they exist
+    const agentNode = agent.nodes.find(n => n.type === "agent");
+    if (agentNode && agentNode.data.instructions) {
+        let instructions = agentNode.data.instructions;
+        
+        // Replace date placeholders
+        instructions = instructions.replace(/{{current_date_time}}/g, currentDateTime);
+        instructions = instructions.replace(/{{yesterday_date_time}}/g, yesterdayDateTime);
+        instructions = instructions.replace(/{{current_date}}/g, now.toISOString().split('T')[0]);
+        
+        agentNode.data.instructions = instructions;
+    }
+
     console.log(JSON.stringify({ ts: new Date().toISOString(), event: "run.workflow.load", name: agent.name }));
     
     const { workflow, mcpClient } = await buildDynamicWorkflow(agent);
