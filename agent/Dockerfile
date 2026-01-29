@@ -22,5 +22,5 @@ ENV NODE_TLS_REJECT_UNAUTHORIZED=0
 # Expose any ports if needed (optional)
 # EXPOSE 3000
 
-# Start both scheduler and worker
-CMD ["sh", "-c", "node src/scheduler/index.js & node src/worker/index.js & wait"]
+# Start both scheduler and unified worker
+CMD ["sh", "-c", "node src/scheduler/index.js & node src/worker/index-unified.js & wait"]

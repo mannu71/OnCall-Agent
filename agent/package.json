@@ -5,11 +5,13 @@
     "main": "src/worker.js",
     "type": "module",
     "scripts": {
-        "start": "node src/scheduler/index.js & node src/worker/index.js",
+        "start": "node src/scheduler/index.js & node src/worker/index-unified.js",
         "start:scheduler": "node src/scheduler/index.js",
-        "start:worker": "node src/worker/index.js",
-        "dev": "node --watch src/scheduler/index.js & node --watch src/worker/index.js",
-        "test": "node --test tests/**/*.test.js"
+        "start:worker": "node src/worker/index-unified.js",
+        "dev": "node --watch src/scheduler/index.js & node --watch src/worker/index-unified.js",
+        "test": "node --test tests/**/*.test.js",
+        "test:unified": "node test-unified-engine.js",
+        "run:workflow": "node src/agents/run-unified.js"
     },
     "keywords": [
         "workflow",

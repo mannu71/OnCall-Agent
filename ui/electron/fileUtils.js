@@ -222,8 +222,8 @@ async function runAgentWorkflow(workflowName, userQuery, progressCallback = null
     const { spawn } = await import('child_process');
     
     return new Promise((resolve, reject) => {
-      // Run the agent using node
-      const agentPath = path.join(agentDir, 'src', 'agents', 'run.js');
+      // Run the agent using node (unified engine)
+      const agentPath = path.join(agentDir, 'src', 'agents', 'run-unified.js');
       
       console.log(`Running agent: node ${agentPath} "${workflowName}" "${userQuery?.slice(0, 50)}..."`);
       

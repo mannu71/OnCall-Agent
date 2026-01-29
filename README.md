@@ -118,12 +118,12 @@ This creates:
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           USER RUNS AGENT                                    │
-│  node src/agents/run.js "OnCall" "Why did profiles fail today?"             │
+│  node src/agents/run-unified.js "OnCall" "Why did profiles fail today?"     │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  1️⃣  run.js                                                                 │
+│  1️⃣  run-unified.js                                                         │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │ • Loads workflows.json → finds "OnCall" workflow                     │   │
 │  │ • Loads llm-config.json → merges API keys                           │   │
