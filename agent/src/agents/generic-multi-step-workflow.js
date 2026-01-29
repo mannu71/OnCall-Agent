@@ -7,6 +7,7 @@ import { AIMessage } from "@langchain/core/messages";
 import { MultiServerMCPClient } from "./multiserver-mcp-client.js";
 import { buildMCPConfigFromJSON } from "./build-mcp-config.js";
 import { loadLLM } from "./llm-loader.js";
+import { cloudWatchTools } from "../tools/cloudwatch/cloudwatch-langchain-tools.js";
 import crypto from "crypto";
 
 function makeCorrelationId() {
@@ -86,8 +87,16 @@ export async function buildDynamicWorkflow(agentJSON, options = {}) {
   const agentNode = agentJSON.nodes.find(n => n.type === "agent");
   const agentInstructions = agentNode?.data?.instructions || "";
 
-  const langchainTools = createLangChainTools(mcpClient, toolsByServer);
-  console.log(JSON.stringify({ ts: new Date().toISOString(), event: "workflow.tools.created", count: langchainTools.length }));
+  const mcpTools = createLangChainTools(mcpClient, toolsByServer);
+  const langchainTools = [...mcpTools, ...cloudWatchTools];
+  
+  console.log(JSON.stringify({ 
+    ts: new Date().toISOString(), 
+    event: "workflow.tools.created", 
+    count: langchainTools.length,
+    mcp: mcpTools.length,
+    cloudwatch: cloudWatchTools.length
+  }));
 
   const llmWithTools = llm.bindTools(langchainTools);
 
