@@ -1,5 +1,5 @@
 /* Node Styles */
-.agent-node, .llm-node, .database-node, .gmail-node, .teams-node, .tool-node, .memory-node, .chat-node, .output-node, .orchestrator-node {
+.agent-node, .llm-node, .database-node, .gmail-node, .teams-node, .tool-node, .memory-node, .chat-node, .output-node, .orchestrator-node, .scheduler-node {
   padding: 12px;
   border-radius: 8px;
   border: 2px solid #ddd;
@@ -11,7 +11,7 @@
   position: relative;
 }
 
-.agent-node:hover, .llm-node:hover, .database-node:hover, .gmail-node:hover, .teams-node:hover, .tool-node:hover, .memory-node:hover, .chat-node:hover, .output-node:hover, .orchestrator-node:hover {
+.agent-node:hover, .llm-node:hover, .database-node:hover, .gmail-node:hover, .teams-node:hover, .tool-node:hover, .memory-node:hover, .chat-node:hover, .output-node:hover, .orchestrator-node:hover, .scheduler-node:hover {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
   transform: translateY(-1px);
 }
@@ -1325,4 +1325,74 @@
   50% {
     opacity: 0.5;
   }
+}
+
+/* Scheduler Node Styles */
+.scheduler-node {
+  border-color: #9c27b0;
+  background: linear-gradient(135deg, #f3e5f5 0%, #fff 100%);
+  min-width: 200px;
+}
+
+.scheduler-node .node-icon {
+  font-size: 20px;
+}
+
+.scheduler-node .node-title {
+  font-weight: 600;
+  color: #7b1fa2;
+  font-size: 14px;
+}
+
+.scheduler-enabled-status {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: rgba(76, 175, 80, 0.1);
+  border: 1px solid rgba(76, 175, 80, 0.3);
+  border-radius: 4px;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.scheduler-enabled-status .status-icon {
+  color: #388e3c;
+}
+
+.scheduler-enabled-status .status-text {
+  color: #388e3c;
+  font-weight: 500;
+}
+
+.scheduler-disabled-status {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: rgba(158, 158, 158, 0.1);
+  border: 1px solid rgba(158, 158, 158, 0.3);
+  border-radius: 4px;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.scheduler-disabled-status .status-icon {
+  color: #757575;
+}
+
+.scheduler-disabled-status .status-text {
+  color: #757575;
+  font-weight: 500;
+}
+
+.node-cron {
+  margin-top: 4px;
+  font-size: 10px;
+  color: #7b1fa2;
+  font-family: 'Courier New', monospace;
+  background: rgba(156, 39, 176, 0.1);
+  padding: 2px 6px;
+  border-radius: 3px;
+  display: inline-block;
 }

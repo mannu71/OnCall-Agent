@@ -191,5 +191,59 @@ export const nodeConfigurations = {
       { type: 'target', position: Position.Left, id: 'input', style: { background: '#666' } }
     ],
     isCustom: true // Special handling needed for OutputNode
+  },
+
+  scheduler: {
+    icon: '⏰',
+    title: 'Scheduler',
+    className: 'scheduler-node',
+    defaultLabel: 'Scheduler',
+    defaultDescription: '',
+    handles: [
+      { type: 'source', position: Position.Right, id: 'scheduler-output', style: { background: '#9c27b0' } }
+    ],
+    hasProcessing: false,
+    getIcon: (data) => {
+      if (data?.enabled !== false) return { icon: '⏰' };
+      return { icon: '⏸️' };
+    },
+    renderStatus: (data) => {
+      const cronExpr = data?.cronExpression || '0 9 * * *';
+      const parts = cronExpr.split(' ');
+      let statusText = 'Ready';
+      
+      // Parse cron to display friendly time
+      if (parts.length >= 2) {
+        const minute = parts[0].padStart(2, '0');
+        const hour = parts[1];
+        
+        // Check recurrence type
+        const recurrence = data?.recurrence || 'daily';
+        if (recurrence === 'daily') {
+          statusText = `Daily at ${hour}:${minute}`;
+        } else if (recurrence === 'weekly') {
+          statusText = `Weekly at ${hour}:${minute}`;
+        } else if (recurrence === 'monthly') {
+          statusText = `Monthly at ${hour}:${minute}`;
+        } else if (hour !== '*') {
+          statusText = `At ${hour}:${minute}`;
+        }
+      }
+      
+      return {
+        text: statusText,
+        className: 'scheduler-enabled-status',
+        icon: '✓'
+      };
+    },
+    renderExtra: (data) => {
+      if (data?.cronExpression) {
+        return {
+          text: data.cronExpression,
+          className: 'node-cron'
+        };
+      }
+      return null;
+    }
   }
 };

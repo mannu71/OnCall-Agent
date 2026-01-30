@@ -17,6 +17,7 @@ import {
 import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
 import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
 import { TimePicker } from '@mui/x-date-pickers/TimePicker';
+import { dateToCron, dateToLocalTimeString } from '../../utils/cronUtils';
 
 const EditScheduleDialog = ({ open, schedule, onClose, onUpdate }) => {
   const [formData, setFormData] = useState({
@@ -101,34 +102,17 @@ const EditScheduleDialog = ({ open, schedule, onClose, onUpdate }) => {
     }
 
     const timeObj = new Date(formData.startTime);
-    const now = new Date();
     
-    // Convert local time to UTC for cron schedule (backend uses UTC)
-    const utcHour = timeObj.getUTCHours().toString();
-    const utcMinute = timeObj.getUTCMinutes().toString();
-    const dayOfMonth = now.getUTCDate().toString();
-    
-    // Generate cron schedule in UTC
-    let cronSchedule;
-    if (formData.recurrence === 'weekly') {
-      const dow = now.getUTCDay(); // 0-6 (0=Sunday)
-      cronSchedule = `${utcMinute} ${utcHour} * * ${dow}`;
-    } else if (formData.recurrence === 'monthly') {
-      cronSchedule = `${utcMinute} ${utcHour} ${dayOfMonth} * *`;
-    } else {
-      // Daily
-      cronSchedule = `${utcMinute} ${utcHour} * * *`;
-    }
-
-    // Store local time for display purposes
-    const localTimeStr = timeObj.toTimeString().split(' ')[0].substring(0, 5);
+    // Use utility functions for conversion
+    const localTimeStr = dateToLocalTimeString(timeObj);
+    const cronSchedule = dateToCron(timeObj, formData.recurrence);
 
     const updatedData = {
       title: formData.title,
       workflow: formData.workflow,
       recurrence: formData.recurrence,
-      startTime: localTimeStr,
-      schedule: cronSchedule
+      startTime: localTimeStr, // Local time for display
+      schedule: cronSchedule // UTC cron for backend
     };
 
     onUpdate(updatedData);

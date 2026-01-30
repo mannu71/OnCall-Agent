@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { getMCPServers, convertServersToNodeItems, invalidateCache as invalidateMCPCache } from '../../services/mcpService';
 import { getLLMs, convertLLMsToNodeItems, invalidateCache as invalidateLLMCache } from '../../services/llmService';
+import { localTimeToCron } from '../../utils/cronUtils';
 
 const NodeSidebar = () => {
   const [mcpServers, setMcpServers] = useState([]);
@@ -77,6 +78,25 @@ const NodeSidebar = () => {
           title: 'AI Agent',
           description: 'Intelligent autonomous agent',
           data: { label: 'AI Agent', description: 'Tools Agent' }
+        }
+      ]
+    },
+    {
+      title: 'Scheduling',
+      items: [
+        {
+          type: 'scheduler',
+          icon: '⏰',
+          title: 'Scheduler',
+          description: 'Trigger workflows on schedule',
+          data: { 
+            label: 'Scheduler',
+            cronExpression: localTimeToCron('09:00', 'daily'), // Convert 9:00 AM local to UTC cron
+            startTime: '09:00', // Local time for display
+            recurrence: 'daily',
+            enabled: true,
+            status: 'Ready' 
+          }
         }
       ]
     },

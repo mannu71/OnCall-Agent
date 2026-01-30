@@ -17,16 +17,19 @@ import {
 import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
 import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
 import { TimePicker } from '@mui/x-date-pickers/TimePicker';
+import { dateToCron, dateToLocalTimeString } from '../../utils/cronUtils';
 
 const AddScheduleDialog = ({ open, onClose, onAdd }) => {
   const [formData, setFormData] = useState({
     title: '',
     startTime: new Date(),
     workflow: '',
+    targetNode: '', // Added: which node to connect to
     recurrence: 'daily'
   });
 
   const [workflows, setWorkflows] = useState([]);
+  const [targetNodes, setTargetNodes] = useState([]); // Added: available nodes in selected workflow
 
   const [errors, setErrors] = useState({});
 
@@ -39,7 +42,10 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
         setWorkflows(workflowTypeOnly);
         // Auto-select first workflow when dialog opens
         if (workflowTypeOnly.length > 0) {
-          setFormData(prev => ({ ...prev, workflow: workflowTypeOnly[0].name }));
+          const firstWorkflow = workflowTypeOnly[0];
+          setFormData(prev => ({ ...prev, workflow: firstWorkflow.name }));
+          // Load target nodes for first workflow
+          loadTargetNodes(firstWorkflow);
         }
       } catch (error) {
         console.error('Error loading workflows:', error);
@@ -50,6 +56,30 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
       loadWorkflows();
     }
   }, [open]);
+
+  const loadTargetNodes = (workflow) => {
+    if (!workflow || !workflow.nodes) {
+      setTargetNodes([]);
+      return;
+    }
+
+    // Find nodes that can accept scheduler connections (orchestrator, agent)
+    const validTargets = workflow.nodes.filter(node => 
+      node.type === 'orchestrator' || node.type === 'agent'
+    ).map(node => ({
+      id: node.id,
+      type: node.type,
+      label: node.data?.label || node.type,
+      displayName: `${node.data?.label || node.type} (${node.type})`
+    }));
+
+    setTargetNodes(validTargets);
+    
+    // Auto-select first target node
+    if (validTargets.length > 0) {
+      setFormData(prev => ({ ...prev, targetNode: validTargets[0].id }));
+    }
+  };
 
   const handleChange = (field) => (event) => {
     const value = event.target ? event.target.value : event;
@@ -78,6 +108,10 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
       newErrors.workflow = 'Workflow is required';
     }
 
+    if (!formData.targetNode) {
+      newErrors.targetNode = 'Target node is required';
+    }
+
     if (!formData.startTime || isNaN(new Date(formData.startTime).getTime())) {
       newErrors.startTime = 'Valid time is required';
     }
@@ -93,34 +127,18 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
 
     try {
       const timeObj = new Date(formData.startTime);
-      const now = new Date();
       
-      // Convert local time to UTC for cron schedule (backend uses UTC)
-      const utcHour = timeObj.getUTCHours().toString();
-      const utcMinute = timeObj.getUTCMinutes().toString();
-      const dayOfMonth = now.getUTCDate().toString();
-      
-      // Generate cron schedule in UTC
-      let cronSchedule;
-      if (formData.recurrence === 'weekly') {
-        const dow = now.getUTCDay(); // 0-6 (0=Sunday)
-        cronSchedule = `${utcMinute} ${utcHour} * * ${dow}`;
-      } else if (formData.recurrence === 'monthly') {
-        cronSchedule = `${utcMinute} ${utcHour} ${dayOfMonth} * *`;
-      } else {
-        // Daily
-        cronSchedule = `${utcMinute} ${utcHour} * * *`;
-      }
-
-      // Store local time for display purposes
-      const localTimeStr = timeObj.toTimeString().split(' ')[0].substring(0, 5);
+      // Use utility functions for conversion
+      const localTimeStr = dateToLocalTimeString(timeObj);
+      const cronSchedule = dateToCron(timeObj, formData.recurrence);
 
       const scheduleData = {
         title: formData.title,
         workflow: formData.workflow,
+        targetNode: formData.targetNode,
         recurrence: formData.recurrence,
-        startTime: localTimeStr,
-        schedule: cronSchedule
+        startTime: localTimeStr, // Local time for display
+        schedule: cronSchedule // UTC cron for backend
       };
 
       onAdd(scheduleData);
@@ -136,6 +154,7 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
       title: '',
       startTime: new Date(),
       workflow: '',
+      targetNode: '',
       recurrence: 'daily'
     });
     setErrors({});
@@ -181,7 +200,15 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
               <Select
                 labelId="workflow-label"
                 value={formData.workflow}
-                onChange={handleChange('workflow')}
+                onChange={(e) => {
+                  const workflowName = e.target.value;
+                  handleChange('workflow')(e);
+                  // Load target nodes for selected workflow
+                  const selectedWorkflow = workflows.find(w => w.name === workflowName);
+                  if (selectedWorkflow) {
+                    loadTargetNodes(selectedWorkflow);
+                  }
+                }}
                 label="Workflow"
                 error={!!errors.workflow}
               >
@@ -210,7 +237,45 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
             </FormControl>
           </Grid>
 
-          <Grid item xs={12} sm={7}>
+          <Grid item xs={12} sm={4}>
+            <FormControl fullWidth>
+              <InputLabel id="target-node-label">
+                Connect To
+              </InputLabel>
+              <Select
+                labelId="target-node-label"
+                value={formData.targetNode}
+                onChange={handleChange('targetNode')}
+                label="Connect To"
+                error={!!errors.targetNode}
+                disabled={targetNodes.length === 0}
+              >
+                {targetNodes.length === 0 ? (
+                  <MenuItem value="" disabled>
+                    No target nodes available
+                  </MenuItem>
+                ) : (
+                  targetNodes.map((node) => (
+                    <MenuItem key={node.id} value={node.id}>
+                      {node.displayName}
+                    </MenuItem>
+                  ))
+                )}
+              </Select>
+              {errors.targetNode && (
+                <Typography variant="caption" color="error" sx={{ mt: 0.5, ml: 1.5 }}>
+                  {errors.targetNode}
+                </Typography>
+              )}
+              {targetNodes.length === 0 && !errors.targetNode && (
+                <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, ml: 1.5 }}>
+                  Selected workflow has no orchestrator or agent
+                </Typography>
+              )}
+            </FormControl>
+          </Grid>
+
+          <Grid item xs={12} sm={5}>
             <FormControl fullWidth>
               <InputLabel id="recurrence-label">
                 Recurrence

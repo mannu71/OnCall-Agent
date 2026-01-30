@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { updateSchedulerNodeInWorkflow, removeSchedulerNodeFromWorkflow, updateWorkflowFromSchedule } from '../utils/workflowScheduleSync';
 
 const SchedulerContext = createContext();
 
@@ -41,13 +42,17 @@ export const SchedulerProvider = ({ children }) => {
     const stableId = wf.id || `${wf.name}-${wf.name.split('').reduce((a, b) => ((a << 5) - a) + b.charCodeAt(0), 0)}`;
     return {
       id: stableId,
-      title: wf.name,
+      workflowId: wf.workflowId, // Preserve workflowId
+      nodeId: wf.nodeId, // Preserve nodeId
+      title: wf.title || wf.name,
       name: wf.name,
       workflow: wf.workflow || wf.name,
       schedule: wf.schedule,
+      recurrence: wf.recurrence, // Preserve recurrence
       enabled: wf.enabled ?? true,
       // Derive display time if cron fits pattern
-      startTime: parseCronTime(wf.schedule),
+      startTime: wf.startTime || parseCronTime(wf.schedule),
+      targetNode: wf.targetNode, // Preserve targetNode
       // Preserve date from saved data
       date: wf.date,
       createdAt: wf.createdAt || new Date().toISOString(),
@@ -59,9 +64,15 @@ export const SchedulerProvider = ({ children }) => {
   const toWorkflow = (sch) => {
     return {
       id: sch.id,
+      workflowId: sch.workflowId, // Preserve workflowId
+      nodeId: sch.nodeId, // Preserve nodeId
+      title: sch.title || sch.name || 'untitled',
       name: sch.title || sch.name || 'untitled',
       workflow: sch.workflow || 'daily',
       date: sch.date,
+      startTime: sch.startTime, // Preserve startTime
+      recurrence: sch.recurrence, // Preserve recurrence
+      targetNode: sch.targetNode, // Preserve targetNode
       createdAt: sch.createdAt,
       updatedAt: sch.updatedAt,
       schedule: sch.schedule || (() => {
@@ -188,22 +199,49 @@ export const SchedulerProvider = ({ children }) => {
     setSchedules(prev => [...prev, newSchedule]);
   }, []);
 
-  const updateSchedule = useCallback((id, updatedSchedule) => {
+  const updateSchedule = useCallback(async (id, updatedSchedule) => {
+    // Find the original schedule
+    const originalSchedule = schedules.find(s => s.id === id);
+    
+    // Update schedules state
     setSchedules(prev => prev.map(schedule => 
       schedule.id === id 
         ? { ...schedule, ...updatedSchedule, updatedAt: new Date().toISOString() }
         : schedule
     ));
-  }, []);
 
-  const deleteSchedule = useCallback((id) => {
+    // Also update scheduler node in workflow file using common utility
+    if (originalSchedule) {
+      await updateWorkflowFromSchedule(
+        { ...originalSchedule, ...updatedSchedule },
+        (workflow, schedule) => updateSchedulerNodeInWorkflow(workflow, originalSchedule, schedule),
+        window.electronAPI
+      );
+    }
+  }, [schedules]);
+
+  const deleteSchedule = useCallback(async (id) => {
     console.log('deleteSchedule called with id:', id);
+    
+    // Find the schedule being deleted
+    const scheduleToDelete = schedules.find(s => s.id === id);
+    
+    // Remove from schedules state
     setSchedules(prev => {
       const filtered = prev.filter(schedule => schedule.id !== id);
       console.log('Schedules after delete:', filtered);
       return filtered;
     });
-  }, []);
+
+    // Also remove scheduler node from workflow file using common utility
+    if (scheduleToDelete) {
+      await updateWorkflowFromSchedule(
+        scheduleToDelete,
+        (workflow, schedule) => removeSchedulerNodeFromWorkflow(workflow, schedule),
+        window.electronAPI
+      );
+    }
+  }, [schedules]);
 
   const getSchedule = useCallback((id) => {
     return schedules.find(schedule => schedule.id === id);

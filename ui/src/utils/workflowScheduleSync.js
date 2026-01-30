@@ -1,0 +1,350 @@
+/**
+ * Workflow-Schedule Synchronization Utilities
+ * Common functions for syncing between workflows and schedules
+ */
+
+import { cronToLocalTime } from './cronUtils.js';
+
+/**
+ * Clean up orphaned edges in workflow (edges that reference non-existent nodes)
+ * @param {Object} workflow - The workflow object
+ * @returns {Object} Cleaned workflow
+ */
+export const cleanOrphanedEdges = (workflow) => {
+  if (!workflow || !workflow.edges || !workflow.nodes) return workflow;
+
+  const nodeIds = new Set(workflow.nodes.map(n => n.id));
+  
+  const cleanedEdges = workflow.edges.filter(edge => {
+    const sourceExists = nodeIds.has(edge.source);
+    const targetExists = nodeIds.has(edge.target);
+    
+    if (!sourceExists || !targetExists) {
+      console.warn('Removing orphaned edge:', {
+        edgeId: edge.id,
+        source: edge.source,
+        target: edge.target,
+        sourceExists,
+        targetExists
+      });
+      return false;
+    }
+    
+    return true;
+  });
+
+  if (cleanedEdges.length !== workflow.edges.length) {
+    console.log(`Cleaned ${workflow.edges.length - cleanedEdges.length} orphaned edge(s) from workflow: ${workflow.name}`);
+    
+    return {
+      ...workflow,
+      edges: cleanedEdges,
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  return workflow;
+};
+
+/**
+ * Extract schedules from workflow scheduler nodes
+ * @param {Object} workflow - The workflow object
+ * @returns {Array} Array of schedule objects
+ */
+export const extractSchedulesFromWorkflow = (workflow) => {
+  if (!workflow || !workflow.nodes) return [];
+
+  const schedulerNodes = workflow.nodes.filter(node => node.type === 'scheduler');
+  
+  return schedulerNodes.map(node => {
+    const data = node.data || {};
+    
+    // Find the edge to determine target node
+    const edge = workflow.edges?.find(e => e.source === node.id);
+    const targetNodeId = edge?.target;
+
+    // Extract time from cron or use stored startTime
+    const startTime = data.startTime || cronToLocalTime(data.cronExpression);
+
+    return {
+      id: `${workflow.id}-${node.id}`,
+      workflowId: workflow.id,
+      nodeId: node.id,
+      name: data.label || 'Scheduler',
+      title: data.label || 'Scheduler',
+      workflow: workflow.name,
+      schedule: data.cronExpression || '0 9 * * *',
+      startTime: startTime, // Add startTime for display
+      recurrence: data.recurrence || 'daily',
+      enabled: data.enabled !== false,
+      targetNode: targetNodeId,
+      date: data.createdAt || new Date().toISOString(), // For ScheduleCard
+      createdAt: data.createdAt || new Date().toISOString(),
+      updatedAt: data.updatedAt || new Date().toISOString()
+    };
+  });
+};
+
+/**
+ * Add scheduler node to workflow
+ * @param {Object} workflow - The workflow object
+ * @param {Object} scheduleData - The schedule data
+ * @returns {Object} Updated workflow with new scheduler node and edge
+ */
+export const addSchedulerNodeToWorkflow = (workflow, scheduleData) => {
+  const newSchedulerNode = {
+    id: `scheduler-${Date.now()}`,
+    type: 'scheduler',
+    position: { 
+      x: 100, 
+      y: 100 + (workflow.nodes?.filter(n => n.type === 'scheduler').length || 0) * 150 
+    },
+    data: {
+      label: scheduleData.title,
+      cronExpression: scheduleData.schedule,
+      startTime: scheduleData.startTime, // Store startTime for display
+      recurrence: scheduleData.recurrence,
+      enabled: scheduleData.enabled !== false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }
+  };
+
+  // Create connection edge
+  const targetNode = workflow.nodes.find(n => n.id === scheduleData.targetNode);
+  const targetHandle = targetNode?.type === 'orchestrator' ? 'orchestrator-input' : 'agent-input';
+  
+  const newEdge = {
+    id: `${newSchedulerNode.id}-to-${scheduleData.targetNode}`,
+    source: newSchedulerNode.id,
+    sourceHandle: 'scheduler-output',
+    target: scheduleData.targetNode,
+    targetHandle: targetHandle,
+    type: 'default'
+  };
+
+  return {
+    ...workflow,
+    nodes: [...(workflow.nodes || []), newSchedulerNode],
+    edges: [...(workflow.edges || []), newEdge],
+    updatedAt: new Date().toISOString()
+  };
+};
+
+/**
+ * Update scheduler node in workflow
+ * @param {Object} workflow - The workflow object
+ * @param {Object} originalSchedule - The original schedule data
+ * @param {Object} updatedSchedule - The updated schedule data
+ * @returns {Object} Updated workflow with modified scheduler node
+ */
+export const updateSchedulerNodeInWorkflow = (workflow, originalSchedule, updatedSchedule) => {
+  if (!workflow || !workflow.nodes) return workflow;
+
+  console.log('updateSchedulerNodeInWorkflow called');
+  console.log('Original schedule:', originalSchedule);
+  console.log('Updated schedule:', updatedSchedule);
+  console.log('Workflow nodes:', workflow.nodes.filter(n => n.type === 'scheduler'));
+
+  // Find the scheduler node by nodeId or by matching label
+  let schedulerNode = null;
+  
+  if (originalSchedule.nodeId) {
+    schedulerNode = workflow.nodes.find(n => n.id === originalSchedule.nodeId);
+    console.log('Found by nodeId:', schedulerNode?.id);
+  }
+  
+  if (!schedulerNode) {
+    schedulerNode = workflow.nodes.find(n => 
+      n.type === 'scheduler' && 
+      n.data?.label === originalSchedule.title
+    );
+    console.log('Found by label match:', schedulerNode?.id);
+  }
+
+  if (!schedulerNode) {
+    console.warn('Scheduler node not found in workflow');
+    console.warn('Looking for nodeId:', originalSchedule.nodeId, 'or title:', originalSchedule.title);
+    return workflow;
+  }
+
+  console.log('Updating scheduler node:', schedulerNode.id);
+
+  // Update the node data
+  const updatedNodes = workflow.nodes.map(n => {
+    if (n.id === schedulerNode.id) {
+      return {
+        ...n,
+        data: {
+          ...n.data,
+          label: updatedSchedule.title || updatedSchedule.name || n.data.label,
+          cronExpression: updatedSchedule.schedule || n.data.cronExpression,
+          startTime: updatedSchedule.startTime || n.data.startTime, // Preserve startTime
+          recurrence: updatedSchedule.recurrence || n.data.recurrence,
+          enabled: updatedSchedule.enabled !== undefined ? updatedSchedule.enabled : n.data.enabled,
+          updatedAt: new Date().toISOString()
+        }
+      };
+    }
+    return n;
+  });
+
+  // If targetNode changed, update the edge
+  let updatedEdges = workflow.edges || [];
+  if (updatedSchedule.targetNode && updatedSchedule.targetNode !== originalSchedule.targetNode) {
+    // Remove old edge
+    updatedEdges = updatedEdges.filter(e => e.source !== schedulerNode.id);
+    
+    // Add new edge
+    const targetNode = workflow.nodes.find(n => n.id === updatedSchedule.targetNode);
+    const targetHandle = targetNode?.type === 'orchestrator' ? 'orchestrator-input' : 'agent-input';
+    
+    updatedEdges.push({
+      id: `${schedulerNode.id}-to-${updatedSchedule.targetNode}`,
+      source: schedulerNode.id,
+      sourceHandle: 'scheduler-output',
+      target: updatedSchedule.targetNode,
+      targetHandle: targetHandle,
+      type: 'default'
+    });
+  }
+
+  return {
+    ...workflow,
+    nodes: updatedNodes,
+    edges: updatedEdges,
+    updatedAt: new Date().toISOString()
+  };
+};
+
+/**
+ * Remove scheduler node from workflow
+ * @param {Object} workflow - The workflow object
+ * @param {Object} schedule - The schedule to remove
+ * @returns {Object} Updated workflow with scheduler node removed
+ */
+export const removeSchedulerNodeFromWorkflow = (workflow, schedule) => {
+  if (!workflow || !workflow.nodes) return workflow;
+
+  // Find the scheduler node by nodeId or by matching label
+  let schedulerNode = null;
+  
+  if (schedule.nodeId) {
+    schedulerNode = workflow.nodes.find(n => n.id === schedule.nodeId);
+  }
+  
+  if (!schedulerNode) {
+    schedulerNode = workflow.nodes.find(n => 
+      n.type === 'scheduler' && 
+      n.data?.label === (schedule.title || schedule.name)
+    );
+  }
+
+  if (!schedulerNode) {
+    console.warn('Scheduler node not found in workflow');
+    return workflow;
+  }
+
+  // Remove the node
+  const updatedNodes = workflow.nodes.filter(n => n.id !== schedulerNode.id);
+  
+  // Remove edges connected to this node
+  const updatedEdges = (workflow.edges || []).filter(e => 
+    e.source !== schedulerNode.id && e.target !== schedulerNode.id
+  );
+
+  return {
+    ...workflow,
+    nodes: updatedNodes,
+    edges: updatedEdges,
+    updatedAt: new Date().toISOString()
+  };
+};
+
+/**
+ * Sync workflow changes to schedule storage
+ * @param {Object} workflow - The workflow object
+ * @param {Function} electronAPI - The electron API object
+ * @returns {Promise<void>}
+ */
+export const syncWorkflowToSchedules = async (workflow, electronAPI) => {
+  try {
+    // Extract schedules from workflow
+    const workflowSchedules = extractSchedulesFromWorkflow(workflow);
+    
+    if (workflowSchedules.length === 0) {
+      return; // No schedulers to sync
+    }
+
+    // Load existing schedules
+    let existingSchedules = [];
+    if (electronAPI && electronAPI.loadSchedules) {
+      existingSchedules = await electronAPI.loadSchedules();
+    } else {
+      const data = localStorage.getItem('oncall-schedules');
+      existingSchedules = data ? JSON.parse(data) : [];
+    }
+
+    // Remove old schedules for this workflow (by workflowId or workflow name)
+    const otherSchedules = existingSchedules.filter(s => {
+      return s.workflowId !== workflow.id && s.workflow !== workflow.name;
+    });
+    
+    // Combine and save
+    const allSchedules = [...otherSchedules, ...workflowSchedules];
+    
+    if (electronAPI && electronAPI.saveSchedules) {
+      await electronAPI.saveSchedules(allSchedules);
+    } else {
+      localStorage.setItem('oncall-schedules', JSON.stringify(allSchedules));
+    }
+    
+    console.log(`✓ Synced ${workflowSchedules.length} scheduler(s) for workflow: ${workflow.name}`);
+  } catch (error) {
+    console.error('Error syncing workflow to schedules:', error);
+  }
+};
+
+/**
+ * Update workflow file with schedule changes
+ * @param {Object} schedule - The schedule object
+ * @param {Function} updateFn - Function to update workflow (add/update/remove)
+ * @param {Function} electronAPI - The electron API object
+ * @returns {Promise<void>}
+ */
+export const updateWorkflowFromSchedule = async (schedule, updateFn, electronAPI) => {
+  try {
+    if (!electronAPI || !electronAPI.loadWorkflows) {
+      console.warn('Electron API not available');
+      return;
+    }
+
+    console.log('updateWorkflowFromSchedule called with schedule:', schedule);
+
+    const workflows = await electronAPI.loadWorkflows();
+    const workflow = workflows.find(w => w.name === schedule.workflow || w.id === schedule.workflowId);
+    
+    if (!workflow) {
+      console.warn(`Workflow not found: ${schedule.workflow}, workflowId: ${schedule.workflowId}`);
+      console.log('Available workflows:', workflows.map(w => ({ name: w.name, id: w.id })));
+      return;
+    }
+
+    console.log(`Found workflow "${workflow.name}", updating...`);
+
+    // Apply the update function
+    const updatedWorkflow = updateFn(workflow, schedule);
+
+    console.log('Updated workflow nodes:', updatedWorkflow.nodes?.filter(n => n.type === 'scheduler'));
+
+    // Update workflows array
+    const updatedWorkflows = workflows.map(w => w.id === workflow.id ? updatedWorkflow : w);
+    
+    // Save workflows
+    await electronAPI.saveWorkflows(updatedWorkflows);
+    
+    console.log(`✓ Updated workflow "${workflow.name}" from schedule change`);
+  } catch (error) {
+    console.error('Error updating workflow from schedule:', error);
+  }
+};

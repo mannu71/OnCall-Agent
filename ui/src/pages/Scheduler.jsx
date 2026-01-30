@@ -4,13 +4,36 @@ import { Add as AddIcon } from '@mui/icons-material';
 import { SchedulerProvider, useScheduler } from '../context/SchedulerContext';
 import ScheduleList from '../components/scheduler/ScheduleList';
 import AddScheduleDialog from '../components/scheduler/AddScheduleDialog';
+import { addSchedulerNodeToWorkflow } from '../utils/workflowScheduleSync';
 
 const SchedulerContent = () => {
   const { addSchedule } = useScheduler();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
 
-  const handleAddSchedule = (scheduleData) => {
+  const handleAddSchedule = async (scheduleData) => {
+    // Add schedule to Schedule Management
     addSchedule(scheduleData);
+    
+    // Also add scheduler node to the workflow file using common utility
+    try {
+      const wf = await window.electronAPI.loadWorkflows();
+      const workflow = wf.find(w => w.name === scheduleData.workflow);
+      
+      if (workflow) {
+        // Use common utility to add scheduler node
+        const updatedWorkflow = addSchedulerNodeToWorkflow(workflow, scheduleData);
+        
+        // Update workflows array
+        const updatedWorkflows = wf.map(w => w.id === workflow.id ? updatedWorkflow : w);
+        
+        // Save workflows
+        await window.electronAPI.saveWorkflows(updatedWorkflows);
+        
+        console.log(`✓ Added scheduler node "${scheduleData.title}" to workflow "${workflow.name}"`);
+      }
+    } catch (error) {
+      console.error('Error adding scheduler to workflow:', error);
+    }
   };
 
   return (

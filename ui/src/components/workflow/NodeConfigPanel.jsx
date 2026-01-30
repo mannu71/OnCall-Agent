@@ -1,11 +1,34 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { getLLMs } from '../../services/llmService';
+import { localTimeToCron, cronToLocalTime } from '../../utils/cronUtils';
 
 const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
   const [config, setConfig] = useState(node?.data || {});
   const [availableLLMs, setAvailableLLMs] = useState({});
   const [isLoadingLLMs, setIsLoadingLLMs] = useState(true);
   const fileInputRef = useRef(null);
+  const [timeInput, setTimeInput] = useState(() => {
+    // Initialize time from startTime first (most reliable), then cronExpression, or default to current time
+    if (config.startTime) {
+      return config.startTime;
+    }
+    if (config.cronExpression) {
+      return cronToLocalTime(config.cronExpression);
+    }
+    const now = new Date();
+    return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  });
+
+  // Sync timeInput when node config changes
+  useEffect(() => {
+    if (node?.data) {
+      if (node.data.startTime) {
+        setTimeInput(node.data.startTime);
+      } else if (node.data.cronExpression) {
+        setTimeInput(cronToLocalTime(node.data.cronExpression));
+      }
+    }
+  }, [node?.id, node?.data?.startTime, node?.data?.cronExpression]);
 
   // Load configured LLMs from settings
   useEffect(() => {
@@ -293,6 +316,73 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
                   </button>
                 </div>
               )}
+            </div>
+          </>
+        );
+      
+      case 'scheduler':
+        return (
+          <>
+            <div className="config-field">
+              <label>Schedule Name</label>
+              <input
+                type="text"
+                value={config.label || ''}
+                onChange={(e) => handleConfigChange('label', e.target.value)}
+                placeholder="Enter schedule name"
+              />
+            </div>
+            
+            <div className="config-field">
+              <label>Recurrence</label>
+              <select
+                value={config.recurrence || 'daily'}
+                onChange={(e) => {
+                  const recurrence = e.target.value;
+                  
+                  // Use utility function to generate cron from local time
+                  const cronExpression = localTimeToCron(timeInput, recurrence);
+                  
+                  // Update recurrence, cron (UTC), AND preserve startTime (local)
+                  const newConfig = {
+                    ...config,
+                    recurrence: recurrence,
+                    cronExpression: cronExpression,
+                    startTime: timeInput
+                  };
+                  setConfig(newConfig);
+                  onUpdate(node.id, newConfig);
+                }}
+              >
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+              </select>
+            </div>
+            
+            <div className="config-field">
+              <label>Time</label>
+              <input
+                type="time"
+                value={timeInput}
+                onChange={(e) => {
+                  const newTime = e.target.value;
+                  setTimeInput(newTime);
+                  
+                  // Use utility function to generate cron from local time
+                  const recurrence = config.recurrence || 'daily';
+                  const cronExpression = localTimeToCron(newTime, recurrence);
+                  
+                  // Update both cronExpression (UTC) and startTime (local for display)
+                  const newConfig = {
+                    ...config,
+                    cronExpression: cronExpression,
+                    startTime: newTime
+                  };
+                  setConfig(newConfig);
+                  onUpdate(node.id, newConfig);
+                }}
+              />
             </div>
           </>
         );

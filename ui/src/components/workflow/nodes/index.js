@@ -11,6 +11,7 @@ const TeamsNode = (props) => React.createElement(NodeGenerator, { ...props, type
 const ToolNode = (props) => React.createElement(NodeGenerator, { ...props, type: "tool" });
 const MemoryNode = (props) => React.createElement(NodeGenerator, { ...props, type: "memory" });
 const ChatNode = (props) => React.createElement(NodeGenerator, { ...props, type: "chat" });
+const SchedulerNode = (props) => React.createElement(NodeGenerator, { ...props, type: "scheduler" });
 
 export const nodeTypes = {
   agent: AgentNode,
@@ -22,6 +23,7 @@ export const nodeTypes = {
   chat: ChatNode,
   output: OutputNode,
   orchestrator: OrchestratorNode,
+  scheduler: SchedulerNode,
 };
 
-export { AgentNode, LLMNode, DatabaseNode, TeamsNode, ToolNode, MemoryNode, ChatNode, OutputNode, OrchestratorNode };
+export { AgentNode, LLMNode, DatabaseNode, TeamsNode, ToolNode, MemoryNode, ChatNode, OutputNode, OrchestratorNode, SchedulerNode };

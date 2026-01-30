@@ -8,7 +8,7 @@ export const CONNECTION_MAP = {
       "agent-output": ["gmail", "teams", "chat", "output", "orchestrator"]
     },
     targetHandles: {
-      "agent-input": ["gmail", "teams", "chat"],
+      "agent-input": ["teams", "chat", "scheduler"],
       "model": ["llm"],
       "memory": ["memory"],
       "tool": ["tool", "database"]
@@ -40,13 +40,23 @@ export const CONNECTION_MAP = {
   teams: { allowedTargets: ["agent"] },
   chat: { allowedTargets: ["agent"] },
 
-  // ⭐ Updated Orchestrator rules — TOOL ONLY INPUT
-  orchestrator: {
-    allowedTargets: ["agent", "output", "orchestrator"], // outgoing
-    allowedSources: ["tool"],                            // ONLY tool allowed to connect INTO orchestrator
-    targetHandles: {
-      "tool": ["tool"]                                    // must connect via bottom tool handle
+  scheduler: {
+    allowedTargets: ["agent", "orchestrator"],
+    sourceHandles: {
+      "scheduler-output": ["agent", "orchestrator"]
     }
+  },
+
+  // ⭐ Updated Orchestrator rules — TOOL and SCHEDULER INPUT
+  orchestrator: {
+    sourceHandles: {
+      "orchestrator-output": ["agent", "output", "orchestrator"]
+    },
+    targetHandles: {
+      "orchestrator-input": ["scheduler"],               // left handle for scheduler
+      "tool": ["tool"]                                   // bottom handle for tool
+    },
+    allowedSources: ["tool", "scheduler"]                // Tool or Scheduler allowed to connect INTO orchestrator
   },
 
   output: {
@@ -65,8 +75,10 @@ export const ERROR_MESSAGES = {
   "agent-output-invalid":
     "Agent output can only connect to Gmail, Teams, Chat, Output or Orchestrator.",
   "orchestrator-input-invalid":
-    "Orchestrator can only accept input from a Tool node.",
-  "orchestrator-handle-invalid":
+    "Orchestrator can only accept Tool (bottom) or Scheduler (left) connections.",
+  "orchestrator-scheduler-handle":
+    "Scheduler must connect to the left input handle of the Orchestrator.",
+  "orchestrator-tool-handle":
     "Tool must connect to the bottom 'Tool' handle of the Orchestrator."
 };
 
@@ -91,17 +103,22 @@ export const isValidConnection = (
   const src = CONNECTION_MAP[sourceNode.type] || {};
   const tgt = CONNECTION_MAP[targetNode.type] || {};
 
-  // 🔹 Orchestrator incoming rule — ONLY Tool allowed
+  // 🔹 Orchestrator incoming rule — Tool or Scheduler allowed
   if (targetNode.type === "orchestrator") {
-    return (
-      sourceNode.type === "tool" &&
-      targetHandle === "tool" // must use bottom tool handle
-    );
+    // Scheduler must connect to left input handle
+    if (sourceNode.type === "scheduler") {
+      return targetHandle === "orchestrator-input";
+    }
+    // Tool must connect to bottom tool handle
+    if (sourceNode.type === "tool") {
+      return targetHandle === "tool";
+    }
+    return false;
   }
 
   // 🔹 Orchestrator outgoing rule
   if (sourceNode.type === "orchestrator") {
-    return CONNECTION_MAP.orchestrator.allowedTargets.includes(targetNode.type);
+    return CONNECTION_MAP.orchestrator.sourceHandles[sourceHandle]?.includes(targetNode.type) || false;
   }
 
   // 🔹 Agent handle-specific rules
@@ -153,11 +170,14 @@ export const getConnectionMessage = (
 
   // 🔹 Orchestrator message rule
   if (targetNode.type === "orchestrator") {
-    if (sourceNode.type !== "tool") {
+    if (sourceNode.type !== "tool" && sourceNode.type !== "scheduler") {
       return ERROR_MESSAGES["orchestrator-input-invalid"];
     }
-    if (targetHandle !== "tool") {
-      return ERROR_MESSAGES["orchestrator-handle-invalid"];
+    if (sourceNode.type === "scheduler" && targetHandle !== "orchestrator-input") {
+      return ERROR_MESSAGES["orchestrator-scheduler-handle"];
+    }
+    if (sourceNode.type === "tool" && targetHandle !== "tool") {
+      return ERROR_MESSAGES["orchestrator-tool-handle"];
     }
   }
 
@@ -196,7 +216,8 @@ export const nodeCategories = {
   communication: ["teams", "chat", "output"],
   tools: ["tool"],
   memory: ["memory"],
-  workflow: ["orchestrator"]
+  workflow: ["orchestrator"],
+  scheduling: ["scheduler"]
 };
 
 export const getNodeCategory = (nodeType) => {

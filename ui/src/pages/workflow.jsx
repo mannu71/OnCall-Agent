@@ -34,6 +34,7 @@ import {
 } from '@mui/material';
 import WorkflowEditor from '../components/workflow/WorkflowEditor.jsx';
 import { validateWorkflow } from '../utils/workflowValidation.js';
+import { syncWorkflowToSchedules, cleanOrphanedEdges } from '../utils/workflowScheduleSync.js';
 
 // Debounce hook for search optimization
 const useDebounce = (value, delay) => {
@@ -122,12 +123,20 @@ function Workflow() {
         const result = await window.electronAPI.saveWorkflows(updatedWorkflows);
         if (result.success) {
           setWorkflows(updatedWorkflows);
+          
+          // Remove associated schedules
+          await removeWorkflowSchedules(workflowToDelete.id);
+          
           showMessage('Workflow deleted', 'success');
         } else {
           showMessage('Failed to delete workflow', 'error');
         }
       } else {
         setWorkflows(updatedWorkflows);
+        
+        // Remove associated schedules (dev mode)
+        await removeWorkflowSchedules(workflowToDelete.id);
+        
         showMessage('Workflow deleted (dev mode)', 'warning');
       }
     } catch (error) {
@@ -136,6 +145,34 @@ function Workflow() {
     } finally {
       setDeleteDialogOpen(false);
       setWorkflowToDelete(null);
+    }
+  };
+
+  // Remove schedules associated with a workflow
+  const removeWorkflowSchedules = async (workflowId) => {
+    try {
+      // Load existing schedules
+      let existingSchedules = [];
+      if (window.electronAPI && window.electronAPI.loadSchedules) {
+        existingSchedules = await window.electronAPI.loadSchedules();
+      } else {
+        const data = localStorage.getItem('oncall-schedules');
+        existingSchedules = data ? JSON.parse(data) : [];
+      }
+
+      // Remove schedules for this workflow
+      const updatedSchedules = existingSchedules.filter(s => s.workflowId !== workflowId);
+      
+      // Save updated schedules
+      if (window.electronAPI && window.electronAPI.saveSchedules) {
+        await window.electronAPI.saveSchedules(updatedSchedules);
+      } else {
+        localStorage.setItem('oncall-schedules', JSON.stringify(updatedSchedules));
+      }
+      
+      console.log(`Removed schedules for workflow: ${workflowId}`);
+    } catch (error) {
+      console.error('Error removing workflow schedules:', error);
     }
   };
 
@@ -154,6 +191,7 @@ function Workflow() {
     setWorkflowName(workflow.name);
     setWorkflowType(workflow.type || 'workflow');
     setCurrentWorkflowData(workflow);
+    
     // Set the workflow editor data to the specific workflow's nodes and edges
     setWorkflowEditorData({
       nodes: workflow.nodes || [],
@@ -203,7 +241,7 @@ function Workflow() {
       }
       
       // Create a new workflow object with the design data
-      const newWorkflow = {
+      let newWorkflow = {
         id: currentWorkflowData?.id || Date.now().toString(),
         name: workflowName,
         type: workflowType,
@@ -212,6 +250,9 @@ function Workflow() {
         createdAt: currentWorkflowData?.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
+      
+      // Clean up any orphaned edges (edges referencing non-existent nodes)
+      newWorkflow = cleanOrphanedEdges(newWorkflow);
       
       // Load existing workflows and update/add the current one
       let existingWorkflows = [...workflows];
@@ -229,6 +270,10 @@ function Workflow() {
         
         if (workflowResult.success) {
           setWorkflows(existingWorkflows);
+          
+          // Sync scheduler nodes with Schedule Management using common utility
+          await syncWorkflowToSchedules(newWorkflow, window.electronAPI);
+          
           setShowWorkflowEditor(false);
           setCurrentWorkflowData(null);
           setWorkflowName('');
@@ -239,6 +284,10 @@ function Workflow() {
         }
       } else {
         setWorkflows(existingWorkflows);
+        
+        // Sync scheduler nodes with Schedule Management (dev mode)
+        await syncWorkflowToSchedules(newWorkflow, window.electronAPI);
+        
         setShowWorkflowEditor(false);
         setCurrentWorkflowData(null);
         setWorkflowName('');
