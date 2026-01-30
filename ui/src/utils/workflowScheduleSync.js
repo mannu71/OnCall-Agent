@@ -20,13 +20,6 @@ export const cleanOrphanedEdges = (workflow) => {
     const targetExists = nodeIds.has(edge.target);
     
     if (!sourceExists || !targetExists) {
-      console.warn('Removing orphaned edge:', {
-        edgeId: edge.id,
-        source: edge.source,
-        target: edge.target,
-        sourceExists,
-        targetExists
-      });
       return false;
     }
     
@@ -34,8 +27,6 @@ export const cleanOrphanedEdges = (workflow) => {
   });
 
   if (cleanedEdges.length !== workflow.edges.length) {
-    console.log(`Cleaned ${workflow.edges.length - cleanedEdges.length} orphaned edge(s) from workflow: ${workflow.name}`);
-    
     return {
       ...workflow,
       edges: cleanedEdges,
@@ -141,17 +132,11 @@ export const addSchedulerNodeToWorkflow = (workflow, scheduleData) => {
 export const updateSchedulerNodeInWorkflow = (workflow, originalSchedule, updatedSchedule) => {
   if (!workflow || !workflow.nodes) return workflow;
 
-  console.log('updateSchedulerNodeInWorkflow called');
-  console.log('Original schedule:', originalSchedule);
-  console.log('Updated schedule:', updatedSchedule);
-  console.log('Workflow nodes:', workflow.nodes.filter(n => n.type === 'scheduler'));
-
   // Find the scheduler node by nodeId or by matching label
   let schedulerNode = null;
   
   if (originalSchedule.nodeId) {
     schedulerNode = workflow.nodes.find(n => n.id === originalSchedule.nodeId);
-    console.log('Found by nodeId:', schedulerNode?.id);
   }
   
   if (!schedulerNode) {
@@ -159,16 +144,11 @@ export const updateSchedulerNodeInWorkflow = (workflow, originalSchedule, update
       n.type === 'scheduler' && 
       n.data?.label === originalSchedule.title
     );
-    console.log('Found by label match:', schedulerNode?.id);
   }
 
   if (!schedulerNode) {
-    console.warn('Scheduler node not found in workflow');
-    console.warn('Looking for nodeId:', originalSchedule.nodeId, 'or title:', originalSchedule.title);
     return workflow;
   }
-
-  console.log('Updating scheduler node:', schedulerNode.id);
 
   // Update the node data
   const updatedNodes = workflow.nodes.map(n => {
@@ -241,7 +221,6 @@ export const removeSchedulerNodeFromWorkflow = (workflow, schedule) => {
   }
 
   if (!schedulerNode) {
-    console.warn('Scheduler node not found in workflow');
     return workflow;
   }
 
@@ -298,8 +277,6 @@ export const syncWorkflowToSchedules = async (workflow, electronAPI) => {
     } else {
       localStorage.setItem('oncall-schedules', JSON.stringify(allSchedules));
     }
-    
-    console.log(`✓ Synced ${workflowSchedules.length} scheduler(s) for workflow: ${workflow.name}`);
   } catch (error) {
     console.error('Error syncing workflow to schedules:', error);
   }
@@ -315,35 +292,24 @@ export const syncWorkflowToSchedules = async (workflow, electronAPI) => {
 export const updateWorkflowFromSchedule = async (schedule, updateFn, electronAPI) => {
   try {
     if (!electronAPI || !electronAPI.loadWorkflows) {
-      console.warn('Electron API not available');
       return;
     }
-
-    console.log('updateWorkflowFromSchedule called with schedule:', schedule);
 
     const workflows = await electronAPI.loadWorkflows();
     const workflow = workflows.find(w => w.name === schedule.workflow || w.id === schedule.workflowId);
     
     if (!workflow) {
-      console.warn(`Workflow not found: ${schedule.workflow}, workflowId: ${schedule.workflowId}`);
-      console.log('Available workflows:', workflows.map(w => ({ name: w.name, id: w.id })));
       return;
     }
 
-    console.log(`Found workflow "${workflow.name}", updating...`);
-
     // Apply the update function
     const updatedWorkflow = updateFn(workflow, schedule);
-
-    console.log('Updated workflow nodes:', updatedWorkflow.nodes?.filter(n => n.type === 'scheduler'));
 
     // Update workflows array
     const updatedWorkflows = workflows.map(w => w.id === workflow.id ? updatedWorkflow : w);
     
     // Save workflows
     await electronAPI.saveWorkflows(updatedWorkflows);
-    
-    console.log(`✓ Updated workflow "${workflow.name}" from schedule change`);
   } catch (error) {
     console.error('Error updating workflow from schedule:', error);
   }

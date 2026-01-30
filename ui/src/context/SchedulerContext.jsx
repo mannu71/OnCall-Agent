@@ -102,26 +102,21 @@ export const SchedulerProvider = ({ children }) => {
   useEffect(() => {
     const loadSchedules = async () => {
       try {
-        console.log('Loading schedules, isElectron:', isElectron);
         setIsLoading(true);
         let savedSchedules = [];
         
         if (isElectron) {
           // Use Electron file operations
           try {
-            console.log('Using Electron API to load schedules');
             savedSchedules = await window.electronAPI.loadSchedules();
-            console.log('Loaded schedules from Electron:', savedSchedules);
           } catch (error) {
             console.error('Electron load failed:', error);
             savedSchedules = [];
           }
         } else {
           // Use localStorage for web
-          console.log('Using localStorage to load schedules');
           const data = localStorage.getItem('oncall-schedules');
           savedSchedules = data ? JSON.parse(data) : [];
-          console.log('Loaded schedules from localStorage:', savedSchedules);
         }
         
         const validSchedules = Array.isArray(savedSchedules) ? savedSchedules : [];
@@ -133,7 +128,6 @@ export const SchedulerProvider = ({ children }) => {
             // Already internal shape
           return obj;
         });
-        console.log('Setting schedules (normalized):', normalized);
         setSchedules(normalized);
         initialLoadDone.current = true;
       } catch (error) {
@@ -169,19 +163,16 @@ export const SchedulerProvider = ({ children }) => {
     // Debounce saves by 500ms
     saveTimeoutRef.current = setTimeout(async () => {
       try {
-        console.log('saveSchedules called, isElectron:', isElectron, 'schedules count:', schedules.length);
         const workflowPayload = schedules.map(toWorkflow);
         if (isElectron) {
           // Use Electron file operations only; pass workflow format
           const result = await window.electronAPI.saveSchedules(workflowPayload);
-          console.log('Save result:', result);
           if (!result.success) {
             console.error('Failed to save schedules to file:', result.error);
           }
         } else {
           // Use localStorage for web in workflow format for consistency
           localStorage.setItem('oncall-schedules', JSON.stringify(workflowPayload));
-          console.log('Saved to localStorage');
         }
       } catch (error) {
         console.error('Error saving schedules:', error);
@@ -221,17 +212,11 @@ export const SchedulerProvider = ({ children }) => {
   }, [schedules]);
 
   const deleteSchedule = useCallback(async (id) => {
-    console.log('deleteSchedule called with id:', id);
-    
     // Find the schedule being deleted
     const scheduleToDelete = schedules.find(s => s.id === id);
     
     // Remove from schedules state
-    setSchedules(prev => {
-      const filtered = prev.filter(schedule => schedule.id !== id);
-      console.log('Schedules after delete:', filtered);
-      return filtered;
-    });
+    setSchedules(prev => prev.filter(schedule => schedule.id !== id));
 
     // Also remove scheduler node from workflow file using common utility
     if (scheduleToDelete) {

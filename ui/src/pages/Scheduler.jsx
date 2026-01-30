@@ -28,8 +28,6 @@ const SchedulerContent = () => {
         
         // Save workflows
         await window.electronAPI.saveWorkflows(updatedWorkflows);
-        
-        console.log(`✓ Added scheduler node "${scheduleData.title}" to workflow "${workflow.name}"`);
       }
     } catch (error) {
       console.error('Error adding scheduler to workflow:', error);
