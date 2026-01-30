@@ -251,7 +251,19 @@ export function createOrchestratorExecutor(executionGraph, opts = {}) {
     if (!Array.isArray(response.content)) return response;
 
     if (response.content.length === 1 && response.content[0].type === 'text') {
-      return response.content[0].text;
+      const text = response.content[0].text;
+      
+      // Try to parse JSON strings to objects/arrays for better UI rendering
+      if (typeof text === 'string' && text.trim().startsWith('[') || text.trim().startsWith('{')) {
+        try {
+          return JSON.parse(text);
+        } catch (e) {
+          // If parsing fails, return the original text
+          return text;
+        }
+      }
+      
+      return text;
     }
 
     return response.content;
@@ -317,7 +329,7 @@ export function createOrchestratorExecutor(executionGraph, opts = {}) {
       logger.debug('Resolved params:', resolvedParams);
     }
 
-    const client = mcpManager.getClient(server);
+    const client = mcpManager.getNodeClient(server);
     if (!client) throw new Error(`MCP client not found for server: ${server}`);
 
     const rawResponse = await _callToolWithOptionalTimeout(client, tool, resolvedParams);
@@ -337,6 +349,8 @@ export function createOrchestratorExecutor(executionGraph, opts = {}) {
           step: step.name,
           success: true,
           result,
+          label: step.metadata?.label || step.name,
+          database: step.metadata?.database || step.metadata?.db,
           metadata: step.metadata,
           originalSql: step.originalSql
         });

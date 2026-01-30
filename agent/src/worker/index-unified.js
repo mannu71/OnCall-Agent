@@ -241,9 +241,18 @@ class UnifiedWorkerService {
         success: result.success,
         strategy: result.strategy,
         duration: result.duration,
-        result: result.finalAnswer || result.output || result,
         error: result.error
       };
+
+      // For orchestrator workflows, include structured results array
+      if (result.results && Array.isArray(result.results)) {
+        output.results = result.results;
+      }
+
+      // Include the formatted output/answer
+      if (result.finalAnswer || result.output) {
+        output.result = result.finalAnswer || result.output;
+      }
 
       const outputJson = JSON.stringify(output, null, 2);
       await Promise.all([

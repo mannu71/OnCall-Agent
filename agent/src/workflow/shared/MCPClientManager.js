@@ -7,11 +7,13 @@
 
 import { MultiServerMCPClient } from '../../agents/multiserver-mcp-client.js';
 import { buildMCPConfigFromJSON } from '../../agents/build-mcp-config.js';
+import { createMCPClient } from '../../worker/mcp-client.js';
 import logger from '../../shared/logger.js';
 
 export class MCPClientManager {
   constructor(options = {}) {
     this.clients = new Map(); // workflowId -> client
+    this.nodeClients = new Map(); // nodeId -> individual client (for orchestrator)
     this.defaultTimeout = options.defaultTimeout || 900_000; // 15 minutes
     this.defaultRetries = options.defaultRetries || 2;
   }
@@ -63,19 +65,62 @@ export class MCPClientManager {
   }
 
   /**
+   * Connect to multiple MCP servers (for orchestrator workflows)
+   * This method is used by orchestrator-executor.js
+   * 
+   * @param {Array} toolNodes - Array of tool nodes from workflow
+   * @returns {Promise<Array>} Array of connection results
+   */
+  async connectAll(toolNodes = []) {
+    const promises = toolNodes.map(async (node) => {
+      const client = createMCPClient(node.data);
+      try {
+        await client.connect();
+        this.nodeClients.set(node.id, client);
+        return { id: node.id, success: true };
+      } catch (err) {
+        logger.error(`Failed to connect to ${node.data?.label || node.id}:`, err);
+        return { id: node.id, success: false, error: err };
+      }
+    });
+
+    const results = await Promise.all(promises);
+    const successCount = results.filter(r => r.success).length;
+    logger.info(`Connected to ${successCount}/${toolNodes.length} MCP servers`);
+
+    if (successCount === 0) {
+      throw new Error('Failed to connect to any MCP servers');
+    }
+
+    return results;
+  }
+
+  /**
+   * Get a specific node client (for orchestrator workflows)
+   * 
+   * @param {string} nodeId - The node ID
+   * @returns {Object} MCP client instance
+   */
+  getNodeClient(nodeId) {
+    return this.nodeClients.get(nodeId);
+  }
+
+  /**
    * Disconnect all MCP clients
    */
   async disconnectAll() {
     logger.info('Disconnecting all MCP clients', {
-      count: this.clients.size
+      workflowClients: this.clients.size,
+      nodeClients: this.nodeClients.size
     });
 
-    const disconnectPromises = Array.from(this.clients.entries()).map(
+    // Disconnect workflow clients (MultiServerMCPClient)
+    const workflowDisconnectPromises = Array.from(this.clients.entries()).map(
       async ([workflowId, client]) => {
         try {
           await client.disconnectAll();
         } catch (error) {
-          logger.error('Error disconnecting MCP client', {
+          logger.error('Error disconnecting workflow MCP client', {
             workflowId,
             error: error.message
           });
@@ -83,8 +128,23 @@ export class MCPClientManager {
       }
     );
 
-    await Promise.all(disconnectPromises);
+    // Disconnect node clients (individual MCP clients)
+    const nodeDisconnectPromises = Array.from(this.nodeClients.entries()).map(
+      async ([nodeId, client]) => {
+        try {
+          await client.disconnect();
+        } catch (error) {
+          logger.error('Error disconnecting node MCP client', {
+            nodeId,
+            error: error.message
+          });
+        }
+      }
+    );
+
+    await Promise.all([...workflowDisconnectPromises, ...nodeDisconnectPromises]);
     this.clients.clear();
+    this.nodeClients.clear();
   }
 
   /**
@@ -94,8 +154,10 @@ export class MCPClientManager {
    */
   getStats() {
     return {
-      activeClients: this.clients.size,
-      workflowIds: Array.from(this.clients.keys())
+      activeWorkflowClients: this.clients.size,
+      activeNodeClients: this.nodeClients.size,
+      workflowIds: Array.from(this.clients.keys()),
+      nodeIds: Array.from(this.nodeClients.keys())
     };
   }
 }

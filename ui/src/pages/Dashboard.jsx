@@ -69,6 +69,18 @@ const formatNextRun = (date) => {
   return `${dateStr} at ${timeStr}`;
 };
 
+// Helper function to parse result if it's a JSON string
+const parseResultIfNeeded = (result) => {
+  if (typeof result === 'string') {
+    try {
+      return JSON.parse(result);
+    } catch (e) {
+      return result;
+    }
+  }
+  return result;
+};
+
 export default function Dashboard() {
   const [workflowRuns, setWorkflowRuns] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -109,30 +121,57 @@ export default function Dashboard() {
             
             if (latestResult && latestResult.results) {
               // Extract stats from the latest workflow result
-              const profilesUpdated = latestResult.results.find(r => r.label === "Profiles Updated");
-              const failedSchedules = latestResult.results.find(r => r.label === "Failed Schedules");
-              const profileKycAlerts = latestResult.results.find(r => r.label === "Profile KYC Alerts Count");
-              const emailNotifications = latestResult.results.find(r => r.label === "customer email notifications");
-              const metricsRefresh = latestResult.results.find(r => r.label === "Monitoring Metrics Refreshes (Today)");
-              const schedulesRan = latestResult.results.find(r => r.label === "Schedules Ran Count");
-              const searchResults = latestResult.results.find(r => r.label === "Search Results Count");
-              const profilesLocked = latestResult.results.find(r => r.label === "profiles locked in last 3 days");
+              // Support both old format (metadata.label) and new format (label at top level)
+              const profilesUpdated = latestResult.results.find(r => 
+                r.label === "Profiles Updated" || r.metadata?.label === "Profiles Updated"
+              );
+              const failedSchedules = latestResult.results.find(r => 
+                r.label === "Failed Schedules" || r.metadata?.label === "Failed Schedules"
+              );
+              const profileKycAlerts = latestResult.results.find(r => 
+                r.label === "Profile KYC Alerts Count" || r.metadata?.label === "Profile KYC Alerts Count"
+              );
+              const emailNotifications = latestResult.results.find(r => 
+                r.label === "customer email notifications" || r.metadata?.label === "customer email notifications"
+              );
+              const metricsRefresh = latestResult.results.find(r => 
+                r.label === "Monitoring Metrics Refreshes (Today)" || r.metadata?.label === "Monitoring Metrics Refreshes (Today)"
+              );
+              const schedulesRan = latestResult.results.find(r => 
+                r.label === "Schedules Ran Count" || r.metadata?.label === "Schedules Ran Count"
+              );
+              const searchResults = latestResult.results.find(r => 
+                r.label === "Search Results Count" || r.metadata?.label === "Search Results Count"
+              );
+              const profilesLocked = latestResult.results.find(r => 
+                r.label === "profiles locked in last 3 days" || r.metadata?.label === "profiles locked in last 3 days"
+              );
               
-              profilesUpdatedValue = profilesUpdated?.result?.[0]?.total_count || "0";
-              failedSchedulesValue = failedSchedules?.result?.[0]?.count || "0";
-              kycAlertsValue = profileKycAlerts?.result?.[0]?.value || "0";
-              schedulesRanValue = schedulesRan?.result?.[0]?.count || "0";
-              searchResultsValue = searchResults?.result?.[0]?.searchresultscount || "0";
-              profilesLockedValue = profilesLocked?.result?.[0]?.["profiles locked in last 3 days"] || "0";
+              // Parse results if they're JSON strings
+              const parsedProfilesUpdated = profilesUpdated ? parseResultIfNeeded(profilesUpdated.result) : null;
+              const parsedFailedSchedules = failedSchedules ? parseResultIfNeeded(failedSchedules.result) : null;
+              const parsedKycAlerts = profileKycAlerts ? parseResultIfNeeded(profileKycAlerts.result) : null;
+              const parsedSchedulesRan = schedulesRan ? parseResultIfNeeded(schedulesRan.result) : null;
+              const parsedSearchResults = searchResults ? parseResultIfNeeded(searchResults.result) : null;
+              const parsedProfilesLocked = profilesLocked ? parseResultIfNeeded(profilesLocked.result) : null;
+              const parsedEmailNotifications = emailNotifications ? parseResultIfNeeded(emailNotifications.result) : null;
+              const parsedMetricsRefresh = metricsRefresh ? parseResultIfNeeded(metricsRefresh.result) : null;
               
-              if (emailNotifications?.result?.[0]) {
-                const published = emailNotifications.result[0].published_count || "0";
-                const total = emailNotifications.result[0].total_count || "0";
+              profilesUpdatedValue = parsedProfilesUpdated?.[0]?.total_count || "0";
+              failedSchedulesValue = parsedFailedSchedules?.[0]?.count || "0";
+              kycAlertsValue = parsedKycAlerts?.[0]?.value || "0";
+              schedulesRanValue = parsedSchedulesRan?.[0]?.count || "0";
+              searchResultsValue = parsedSearchResults?.[0]?.searchresultscount || "0";
+              profilesLockedValue = parsedProfilesLocked?.[0]?.["profiles locked in last 3 days"] || "0";
+              
+              if (parsedEmailNotifications?.[0]) {
+                const published = parsedEmailNotifications[0].published_count || "0";
+                const total = parsedEmailNotifications[0].total_count || "0";
                 publishedEmailsValue = `${published} / ${total}`;
               }
 
-              if (metricsRefresh?.result?.[0]) {
-                metricsRefreshValue = metricsRefresh.result[0].is_completed ? "Yes" : "No";
+              if (parsedMetricsRefresh?.[0]) {
+                metricsRefreshValue = parsedMetricsRefresh[0].is_completed ? "Yes" : "No";
               }
 
               console.log('Dashboard: extracted stats -', {
@@ -448,19 +487,35 @@ export default function Dashboard() {
                         </TableRow>
                       </TableHead>
                       <TableBody>
-                        {selectedRun.fullData.results.map((result, index) => (
+                        {selectedRun.fullData.results.map((result, index) => {
+                          // Parse result if it's a JSON string
+                          const parsedResult = parseResultIfNeeded(result.result);
+                          const displayLabel = result.label || result.metadata?.label || result.step;
+                          
+                          return (
                           <TableRow key={index} hover>
                             <TableCell sx={{ verticalAlign: 'top', width: '40%' }}>
-                              {result.label || result.step}
+                              {displayLabel}
                             </TableCell>
                             <TableCell>
                               {result.success ? (
-                                result.result && result.result.length > 0 ? (
+                                parsedResult && Array.isArray(parsedResult) && parsedResult.length > 0 ? (
                                   <Box>
-                                    {result.result.map((row, rowIndex) => (
-                                      <Box key={rowIndex} sx={{ mb: rowIndex < result.result.length - 1 ? 1 : 0 }}>
+                                    {parsedResult.map((row, rowIndex) => {
+                                      const isLastRow = rowIndex >= parsedResult.length - 1;
+                                      const marginBottom = isLastRow ? 0 : 1;
+                                      const rowKey = `row-${rowIndex}-${JSON.stringify(row).substring(0, 20)}`;
+                                      
+                                      return (
+                                      <Box key={rowKey} sx={{ mb: marginBottom }}>
                                         {Object.entries(row).map(([key, value]) => {
-                                          const displayValue = typeof value === 'boolean' ? (value ? 'Yes' : 'No') : String(value);
+                                          let displayValue;
+                                          if (typeof value === 'boolean') {
+                                            displayValue = value ? 'Yes' : 'No';
+                                          } else {
+                                            displayValue = String(value);
+                                          }
+                                          
                                           // If there's only one key-value pair, show just the value
                                           if (Object.keys(row).length === 1) {
                                             return (
@@ -477,7 +532,8 @@ export default function Dashboard() {
                                           );
                                         })}
                                       </Box>
-                                    ))}
+                                      );
+                                    })}
                                   </Box>
                                 ) : (
                                   <Typography variant="body2" color="text.secondary">No data</Typography>
@@ -489,7 +545,8 @@ export default function Dashboard() {
                               )}
                             </TableCell>
                           </TableRow>
-                        ))}
+                          );
+                        })}
                       </TableBody>
                     </Table>
                   </TableContainer>
