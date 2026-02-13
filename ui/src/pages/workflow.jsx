@@ -113,10 +113,9 @@ function Workflow() {
       await agentApiClient.deleteWorkflow(workflowToDelete.name);
       const updatedWorkflows = workflows.filter(w => w.id !== workflowToDelete.id);
       setWorkflows(updatedWorkflows);
-      
-      // Remove associated schedules
+
       await removeWorkflowSchedules(workflowToDelete.id);
-      
+
       showMessage('Workflow deleted', 'success');
     } catch (error) {
       console.error('Error deleting workflow:', error);
@@ -141,14 +140,14 @@ function Workflow() {
 
       // Remove schedules for this workflow
       const updatedSchedules = existingSchedules.filter(s => s.workflowId !== workflowId);
-      
+
       // Save updated schedules
       if (window.electronAPI && window.electronAPI.saveSchedules) {
         await window.electronAPI.saveSchedules(updatedSchedules);
       } else {
         localStorage.setItem('oncall-schedules', JSON.stringify(updatedSchedules));
       }
-      
+
       console.log(`Removed schedules for workflow: ${workflowId}`);
     } catch (error) {
       console.error('Error removing workflow schedules:', error);
@@ -170,7 +169,7 @@ function Workflow() {
     setWorkflowName(workflow.name);
     setWorkflowType(workflow.type || 'workflow');
     setCurrentWorkflowData(workflow);
-    
+
     // Set the workflow editor data to the specific workflow's nodes and edges
     setWorkflowEditorData({
       nodes: workflow.nodes || [],
@@ -200,12 +199,12 @@ function Workflow() {
 
   const handleSaveWorkflowData = async (nodes, edges) => {
     try {
-      
+
       if (!workflowName) {
         showMessage('Please enter workflow name', 'error');
         return;
       }
-      
+
       // Validate that workflow has at least one node
       if (!nodes || nodes.length === 0) {
         showMessage('Cannot save empty workflow. Please add at least one node.', 'error');
@@ -218,7 +217,7 @@ function Workflow() {
         showMessage(validation.error, 'error');
         return;
       }
-      
+
       // Create a new workflow object with the design data
       let newWorkflow = {
         id: currentWorkflowData?.id || Date.now().toString(),
@@ -229,38 +228,38 @@ function Workflow() {
         createdAt: currentWorkflowData?.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
-      
+
       // Extract cron schedule from scheduler nodes (for Scheduler Management)
       const schedulerNode = nodes.find(n => n.type === 'scheduler');
       if (schedulerNode && schedulerNode.data?.cronExpression) {
         newWorkflow.schedule = schedulerNode.data.cronExpression;
         newWorkflow.enabled = schedulerNode.data.enabled !== false;
       }
-      
+
       // Clean up any orphaned edges (edges referencing non-existent nodes)
       newWorkflow = cleanOrphanedEdges(newWorkflow);
-      
+
       // Save or update workflow via API
       const existingWorkflow = workflows.find(w => w.id === newWorkflow.id);
-      
+
       if (existingWorkflow) {
         await agentApiClient.updateWorkflow(existingWorkflow.name, newWorkflow);
       } else {
         await agentApiClient.createWorkflow(newWorkflow);
       }
-      
+
       // Update local state
       let existingWorkflows = [...workflows];
       const existingIndex = existingWorkflows.findIndex(w => w.id === newWorkflow.id);
-      
+
       if (existingIndex >= 0) {
         existingWorkflows[existingIndex] = newWorkflow;
       } else {
         existingWorkflows.push(newWorkflow);
       }
-      
+
       setWorkflows(existingWorkflows);
-      
+
       setShowWorkflowEditor(false);
       setCurrentWorkflowData(null);
       setWorkflowName('');
@@ -306,19 +305,19 @@ function Workflow() {
       {showWorkflowEditor ? (
         <div className="h-screen flex flex-col relative">
           {messages.length > 0 && (
-            <div style={{ 
-              position: 'absolute', 
-              top: '70px', 
-              left: '50%', 
-              transform: 'translateX(-50%)', 
-              zIndex: 1000, 
-              display: 'flex', 
-              flexDirection: 'column', 
+            <div style={{
+              position: 'absolute',
+              top: '70px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 1000,
+              display: 'flex',
+              flexDirection: 'column',
               gap: '8px',
               width: 'fit-content'
             }}>
               {messages.map((m) => (
-                <div 
+                <div
                   key={m.id}
                   className={`connection-message ${m.type}`}
                   style={{ position: 'relative', cursor: 'pointer' }}
@@ -359,10 +358,10 @@ function Workflow() {
               </Button>
             </div>
           </div>
-          
+
           {/* Workflow Editor */}
           <div className="flex-1">
-            <WorkflowEditor 
+            <WorkflowEditor
               ref={workflowEditorRef}
               initialNodes={workflowEditorData?.nodes}
               initialEdges={workflowEditorData?.edges}
@@ -382,7 +381,7 @@ function Workflow() {
                   Manage and organize your automated workflows
                 </p>
               </div>
-              
+
               <Button
                 variant="contained"
                 startIcon={<AddIcon />}
@@ -442,7 +441,7 @@ function Workflow() {
                             </span>
                           </TableCell>
                           <TableCell>
-                            <Chip 
+                            <Chip
                               label={workflow.type === 'agent' ? 'Agent' : 'Workflow'}
                               color={workflow.type === 'agent' ? 'secondary' : 'primary'}
                               size="small"
@@ -515,8 +514,8 @@ function Workflow() {
             </Dialog>
 
             {/* Add Workflow Dialog - Name and Schedule */}
-            <Dialog 
-              open={showDialog} 
+            <Dialog
+              open={showDialog}
               onClose={() => setShowDialog(false)}
               maxWidth="sm"
               fullWidth

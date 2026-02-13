@@ -22,7 +22,8 @@ class DependencyContainer:
             WorkflowRepository instance
         """
         if self._workflow_repo is None:
-            self._workflow_repo = WorkflowRepository()
+            storage_path = Path(settings.storage_path) / "workflows"
+            self._workflow_repo = WorkflowRepository(storage_path=storage_path)
         return self._workflow_repo
     
     def get_execution_repository(self) -> ExecutionRepository:
