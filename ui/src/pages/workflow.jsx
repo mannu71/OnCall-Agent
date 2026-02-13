@@ -35,6 +35,7 @@ import {
 import WorkflowEditor from '../components/workflow/WorkflowEditor.jsx';
 import { validateWorkflow } from '../utils/workflowValidation.js';
 import { syncWorkflowToSchedules, cleanOrphanedEdges } from '../utils/workflowScheduleSync.js';
+import agentApiClient from '../services/agentApiClient.js';
 
 // Debounce hook for search optimization
 const useDebounce = (value, delay) => {
@@ -70,24 +71,16 @@ function Workflow() {
 
   const loadWorkflows = async () => {
     try {
-      if (window.electronAPI && window.electronAPI.loadWorkflows) {
-        const data = await window.electronAPI.loadWorkflows();
-        setWorkflows(Array.isArray(data) ? data : []);
-      } else {
-        // For dev mode, try to load from a workflows collection file
-        const response = await fetch('../../../agent/workflows/workflows.json');
-        if (response.ok) {
-          const data = await response.json();
-          setWorkflows(Array.isArray(data) ? data : []);
-        } else {
-          // If workflows.json doesn't exist yet, start with empty array
-          setWorkflows([]);
-        }
-      }
+      const data = await agentApiClient.listWorkflows();
+      setWorkflows(Array.isArray(data) ? data : []);
     } catch (error) {
       console.error('Error loading workflows:', error);
       setWorkflows([]);
-      showMessage('Failed to load workflows', 'error');
+      if (error.code === 'ERR_NETWORK' || error.message.includes('Network Error')) {
+        showMessage('Cannot connect to Agent API at http://localhost:8000. Please start the API server.', 'error');
+      } else {
+        showMessage('Failed to load workflows: ' + (error.response?.data?.detail || error.message), 'error');
+      }
     }
   };
 
@@ -117,28 +110,14 @@ function Workflow() {
     if (!workflowToDelete) return;
 
     try {
+      await agentApiClient.deleteWorkflow(workflowToDelete.name);
       const updatedWorkflows = workflows.filter(w => w.id !== workflowToDelete.id);
+      setWorkflows(updatedWorkflows);
       
-      if (window.electronAPI && window.electronAPI.saveWorkflows) {
-        const result = await window.electronAPI.saveWorkflows(updatedWorkflows);
-        if (result.success) {
-          setWorkflows(updatedWorkflows);
-          
-          // Remove associated schedules
-          await removeWorkflowSchedules(workflowToDelete.id);
-          
-          showMessage('Workflow deleted', 'success');
-        } else {
-          showMessage('Failed to delete workflow', 'error');
-        }
-      } else {
-        setWorkflows(updatedWorkflows);
-        
-        // Remove associated schedules (dev mode)
-        await removeWorkflowSchedules(workflowToDelete.id);
-        
-        showMessage('Workflow deleted (dev mode)', 'warning');
-      }
+      // Remove associated schedules
+      await removeWorkflowSchedules(workflowToDelete.id);
+      
+      showMessage('Workflow deleted', 'success');
     } catch (error) {
       console.error('Error deleting workflow:', error);
       showMessage('Failed to delete workflow', 'error');
@@ -251,10 +230,26 @@ function Workflow() {
         updatedAt: new Date().toISOString()
       };
       
+      // Extract cron schedule from scheduler nodes (for Scheduler Management)
+      const schedulerNode = nodes.find(n => n.type === 'scheduler');
+      if (schedulerNode && schedulerNode.data?.cronExpression) {
+        newWorkflow.schedule = schedulerNode.data.cronExpression;
+        newWorkflow.enabled = schedulerNode.data.enabled !== false;
+      }
+      
       // Clean up any orphaned edges (edges referencing non-existent nodes)
       newWorkflow = cleanOrphanedEdges(newWorkflow);
       
-      // Load existing workflows and update/add the current one
+      // Save or update workflow via API
+      const existingWorkflow = workflows.find(w => w.id === newWorkflow.id);
+      
+      if (existingWorkflow) {
+        await agentApiClient.updateWorkflow(existingWorkflow.name, newWorkflow);
+      } else {
+        await agentApiClient.createWorkflow(newWorkflow);
+      }
+      
+      // Update local state
       let existingWorkflows = [...workflows];
       const existingIndex = existingWorkflows.findIndex(w => w.id === newWorkflow.id);
       
@@ -264,36 +259,13 @@ function Workflow() {
         existingWorkflows.push(newWorkflow);
       }
       
-      if (window.electronAPI && window.electronAPI.saveWorkflows) {
-        // Save all workflows
-        const workflowResult = await window.electronAPI.saveWorkflows(existingWorkflows);
-        
-        if (workflowResult.success) {
-          setWorkflows(existingWorkflows);
-          
-          // Sync scheduler nodes with Schedule Management using common utility
-          await syncWorkflowToSchedules(newWorkflow, window.electronAPI);
-          
-          setShowWorkflowEditor(false);
-          setCurrentWorkflowData(null);
-          setWorkflowName('');
-          setWorkflowType('workflow');
-          showMessage('Workflow saved successfully', 'success');
-        } else {
-          showMessage('Failed to save workflow', 'error');
-        }
-      } else {
-        setWorkflows(existingWorkflows);
-        
-        // Sync scheduler nodes with Schedule Management (dev mode)
-        await syncWorkflowToSchedules(newWorkflow, window.electronAPI);
-        
-        setShowWorkflowEditor(false);
-        setCurrentWorkflowData(null);
-        setWorkflowName('');
-        setWorkflowType('workflow');
-        showMessage('Workflow saved (dev mode)', 'warning');
-      }
+      setWorkflows(existingWorkflows);
+      
+      setShowWorkflowEditor(false);
+      setCurrentWorkflowData(null);
+      setWorkflowName('');
+      setWorkflowType('workflow');
+      showMessage('Workflow saved successfully', 'success');
     } catch (error) {
       console.error('Error saving workflow:', error);
       showMessage('Failed to save workflow', 'error');

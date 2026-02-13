@@ -1,0 +1,133 @@
+{
+  "execution_id": "f9c0d161-f207-4842-8aa0-b2033c6e5d18",
+  "status": "success",
+  "start_time": "2026-02-13T09:05:19.126959Z",
+  "end_time": "2026-02-13T09:05:19.153146Z",
+  "duration": 0.026187,
+  "nodes_executed": 3,
+  "results": {
+    "execution_id": "f9c0d161-f207-4842-8aa0-b2033c6e5d18",
+    "scheduler-1770972412764-a77pqgbsa": {
+      "status": "success",
+      "output": "Workflow triggered",
+      "trigger_time": "2026-02-13T09:05:19.127114Z"
+    },
+    "tool-1770972424471-bckuzsfiq": {
+      "status": "failed",
+      "error": "Failed to connect to MCP server",
+      "tool_data": {
+        "label": "postgres-production",
+        "toolType": "mcp-server",
+        "mcpConfig": {
+          "command": "npx",
+          "args": [
+            "-y",
+            "@modelcontextprotocol/server-postgres",
+            "postgresql://csinvmmn:a$o%8LpNlRE5vylf@kyc-protect-rds-cluster-production.cluster-ro-cxmlpzcblpc4.eu-west-1.rds.amazonaws.com:5432/kyc_protect_api_production?sslmode=require"
+          ],
+          "type": "stdio",
+          "icon": "🗄️",
+          "description": "PostgreSQL Production Database",
+          "env": {
+            "NODE_EXTRA_CA_CERTS": "C:\\Users\\csinvmmn\\Downloads\\global-bundle 1.pem"
+          }
+        },
+        "status": "Ready"
+      }
+    },
+    "orchestrator-1770972417555-uarzb8ezp": {
+      "status": "failed",
+      "error": "No database tool connected to orchestrator",
+      "data": {
+        "label": "SQL Orchestrator",
+        "status": "Ready",
+        "sqlFile": "sql/OnCall Script.sql",
+        "fileName": "OnCall Script.sql",
+        "fileType": "sql"
+      }
+    }
+  },
+  "workflow_name": "oncall-dev",
+  "workflow_id": "1770972437866",
+  "events": [
+    {
+      "event_type": "workflow_started",
+      "data": {
+        "execution_id": "f9c0d161-f207-4842-8aa0-b2033c6e5d18",
+        "workflow_name": "oncall-dev",
+        "workflow_id": "1770972437866"
+      },
+      "timestamp": "2026-02-13T09:05:19.127035Z"
+    },
+    {
+      "event_type": "node_started",
+      "data": {
+        "node_id": "scheduler-1770972412764-a77pqgbsa",
+        "node_type": "scheduler",
+        "label": "Scheduler"
+      },
+      "timestamp": "2026-02-13T09:05:19.127111Z"
+    },
+    {
+      "event_type": "node_completed",
+      "data": {
+        "node_id": "scheduler-1770972412764-a77pqgbsa",
+        "node_type": "scheduler",
+        "status": "success",
+        "duration": 2e-06,
+        "output": "Workflow triggered"
+      },
+      "timestamp": "2026-02-13T09:05:19.127120Z"
+    },
+    {
+      "event_type": "node_started",
+      "data": {
+        "node_id": "tool-1770972424471-bckuzsfiq",
+        "node_type": "tool",
+        "label": "postgres-production"
+      },
+      "timestamp": "2026-02-13T09:05:19.127137Z"
+    },
+    {
+      "event_type": "node_completed",
+      "data": {
+        "node_id": "tool-1770972424471-bckuzsfiq",
+        "node_type": "tool",
+        "status": "failed",
+        "duration": 0.013753,
+        "output": ""
+      },
+      "timestamp": "2026-02-13T09:05:19.140910Z"
+    },
+    {
+      "event_type": "node_started",
+      "data": {
+        "node_id": "orchestrator-1770972417555-uarzb8ezp",
+        "node_type": "orchestrator",
+        "label": "SQL Orchestrator"
+      },
+      "timestamp": "2026-02-13T09:05:19.140972Z"
+    },
+    {
+      "event_type": "node_completed",
+      "data": {
+        "node_id": "orchestrator-1770972417555-uarzb8ezp",
+        "node_type": "orchestrator",
+        "status": "failed",
+        "duration": 0.012145,
+        "output": ""
+      },
+      "timestamp": "2026-02-13T09:05:19.153130Z"
+    },
+    {
+      "event_type": "workflow_completed",
+      "data": {
+        "execution_id": "f9c0d161-f207-4842-8aa0-b2033c6e5d18",
+        "status": "success",
+        "duration": 0.026187,
+        "nodes_executed": 3
+      },
+      "timestamp": "2026-02-13T09:05:19.153194Z"
+    }
+  ]
+}

@@ -119,47 +119,45 @@ export const syncMCPServerToWorkflows = async (oldServerName, serverConfig, newS
     const actualNewName = newServerName || oldServerName;
     
     try {
-        if (!window.electronAPI?.loadWorkflows || !window.electronAPI?.saveWorkflows) {
-            console.warn('Electron API not available for workflow sync');
-            return false;
-        }
-        
-        const workflows = await window.electronAPI.loadWorkflows();
-        if (!workflows || !Array.isArray(workflows)) {
-            return false;
-        }
-        
-        let updated = false;
-        
-        for (const workflow of workflows) {
-            if (!workflow.nodes) continue;
-            
-            for (const node of workflow.nodes) {
-                // Check if this node is a tool that uses the MCP server
-                if (node.type === 'tool' && 
-                    node.data?.toolType === 'mcp-server' && 
-                    node.data?.label === oldServerName) {
-                    
-                    // Update the node's label and mcpConfig
-                    node.data.label = actualNewName;
-                    node.data.mcpConfig = { ...serverConfig };
-                    updated = true;
-                    console.log(`Synced MCP server "${oldServerName}" -> "${actualNewName}" in workflow "${workflow.name}"`);
-                }
-            }
-        }
-        
-        if (updated) {
-            const result = await window.electronAPI.saveWorkflows(workflows);
-            console.log('Workflows synced with MCP server changes:', result);
-            return result?.success || result === true;
-        }
-        
-        return true;
-    } catch (error) {
-        console.error('Error syncing MCP server to workflows:', error);
-        return false;
+    const { default: agentApiClient } = await import('../services/agentApiClient.js');
+    
+    const workflows = await agentApiClient.listWorkflows();
+    if (!workflows || !Array.isArray(workflows)) {
+      return false;
     }
+    
+    let updated = false;
+    
+    for (const workflow of workflows) {
+      if (!workflow.nodes) continue;
+      
+      let workflowUpdated = false;
+      for (const node of workflow.nodes) {
+        // Check if this node is a tool that uses the MCP server
+        if (node.type === 'tool' && 
+            node.data?.toolType === 'mcp-server' && 
+            node.data?.label === oldServerName) {
+          
+          // Update the node's label and mcpConfig
+          node.data.label = actualNewName;
+          node.data.mcpConfig = { ...serverConfig };
+          workflowUpdated = true;
+          updated = true;
+          console.log(`Synced MCP server "${oldServerName}" -> "${actualNewName}" in workflow "${workflow.name}"`);
+        }
+      }
+      
+      if (workflowUpdated) {
+        await agentApiClient.updateWorkflow(workflow.name, workflow);
+      }
+    }
+    
+    console.log('Workflows synced with MCP server changes');
+    return true;
+  } catch (error) {
+    console.error('Error syncing MCP server to workflows:', error);
+    return false;
+  }
 };
 
 /**

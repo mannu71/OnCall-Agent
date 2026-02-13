@@ -1,0 +1,97 @@
+id: '1770972437866'
+name: oncall-dev
+description: 'OnCall Development Workflow'
+type: workflow
+schedule: 30 3 * * *
+enabled: true
+nodes:
+- id: scheduler-1770972412764-a77pqgbsa
+  type: scheduler
+  position:
+    x: -66.33333333333348
+    y: -101.70833333333334
+  data:
+    label: Scheduler
+    cronExpression: 30 3 * * *
+    startTime: 09:00
+    recurrence: daily
+    enabled: true
+    status: Ready
+  width: 200
+  height: 155
+  selected: false
+  positionAbsolute:
+    x: -66.33333333333348
+    y: -101.70833333333334
+  dragging: false
+- id: orchestrator-1770972417555-uarzb8ezp
+  type: orchestrator
+  position:
+    x: 216.99999999999977
+    y: 111.62499999999994
+  data:
+    label: SQL Orchestrator
+    status: Ready
+    sqlFile: sql/OnCall Script.sql
+    fileName: OnCall Script.sql
+    fileType: sql
+  width: 240
+  height: 150
+  selected: true
+  positionAbsolute:
+    x: 216.99999999999977
+    y: 111.62499999999994
+  dragging: false
+- id: tool-1770972424471-bckuzsfiq
+  type: tool
+  position:
+    x: 352
+    y: 519.9583333333334
+  data:
+    label: postgres-production
+    toolType: mcp-server
+    mcpConfig:
+      command: npx
+      args:
+      - -y
+      - '@modelcontextprotocol/server-postgres'
+      - postgresql://csinvmmn:a$o%8LpNlRE5vylf@kyc-protect-rds-cluster-production.cluster-ro-cxmlpzcblpc4.eu-west-1.rds.amazonaws.com:5432/kyc_protect_api_production?sslmode=require
+      type: stdio
+      icon: 🗄️
+      description: PostgreSQL Production Database
+      env:
+        NODE_EXTRA_CA_CERTS: C:\Users\csinvmmn\Downloads\global-bundle 1.pem
+    status: Ready
+  width: 180
+  height: 133
+  selected: false
+edges:
+- animated: true
+  style:
+    strokeWidth: 2
+    stroke: '#b1b1b7'
+  type: default
+  source: scheduler-1770972412764-a77pqgbsa
+  sourceHandle: scheduler-output
+  target: orchestrator-1770972417555-uarzb8ezp
+  targetHandle: orchestrator-input
+  id: reactflow__edge-scheduler-1770972412764-a77pqgbsascheduler-output-orchestrator-1770972417555-uarzb8ezporchestrator-input
+  selected: false
+- animated: true
+  style:
+    strokeWidth: 2
+    stroke: '#4caf50'
+  type: default
+  source: tool-1770972424471-bckuzsfiq
+  sourceHandle: tool-connection
+  target: orchestrator-1770972417555-uarzb8ezp
+  targetHandle: tool
+  id: reactflow__edge-tool-1770972424471-bckuzsfiqtool-connection-orchestrator-1770972417555-uarzb8ezptool
+  selected: false
+tasks: null
+max_retries: 0
+timeout: 3600
+createdAt: '2026-02-13T08:47:17.866Z'
+updatedAt: '2026-02-13T08:47:17.866Z'
+created_at: '2026-02-13T08:47:17.866Z'
+updated_at: '2026-02-13T08:47:17.866Z'

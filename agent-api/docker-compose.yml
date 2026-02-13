@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  agent-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - STORAGE_PATH=/app/data/storage
+      - WORKFLOW_DIR=/app/data/workflows
+      - LOGS_DIR=/app/data/logs
+      - SCHEDULER_TIMEZONE=UTC
+      - MAX_CONCURRENT_WORKFLOWS=5
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

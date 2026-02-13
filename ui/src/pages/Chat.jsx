@@ -24,6 +24,7 @@ import {
   Construction as ConstructionIcon
 } from '@mui/icons-material';
 import { isAgentWorkflowValid } from '../utils/workflowValidation.js';
+import agentApiClient from '../services/agentApiClient.js';
 
 // Use Vite's environment check for development mode
 const DEV_MODE = import.meta.env.DEV;
@@ -111,14 +112,16 @@ function Chat() {
 
   const loadAgents = async () => {
     try {
-      if (window.electronAPI?.loadWorkflows) {
-        const workflows = await window.electronAPI.loadWorkflows();
-        // Filter to only show valid agent workflows
-        const agentWorkflows = workflows.filter(wf => isAgentWorkflowValid(wf));
-        setAgents(agentWorkflows);
-      }
+      const workflows = await agentApiClient.listWorkflows();
+      // Filter to only show valid agent workflows
+      const agentWorkflows = workflows.filter(wf => isAgentWorkflowValid(wf));
+      setAgents(agentWorkflows);
     } catch (error) {
       console.error('Error loading agents:', error);
+      setAgents([]);
+      if (error.code === 'ERR_NETWORK' || error.message.includes('Network Error')) {
+        console.warn('Cannot connect to Agent API. Please start the API server at http://localhost:8000');
+      }
     }
   };
 

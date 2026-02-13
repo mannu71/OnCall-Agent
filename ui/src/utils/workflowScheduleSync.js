@@ -243,10 +243,10 @@ export const removeSchedulerNodeFromWorkflow = (workflow, schedule) => {
 /**
  * Sync workflow changes to schedule storage
  * @param {Object} workflow - The workflow object
- * @param {Function} electronAPI - The electron API object
+ * @param {Object} apiClient - The API client object (agentApiClient or electronAPI)
  * @returns {Promise<void>}
  */
-export const syncWorkflowToSchedules = async (workflow, electronAPI) => {
+export const syncWorkflowToSchedules = async (workflow, apiClient) => {
   try {
     // Extract schedules from workflow
     const workflowSchedules = extractSchedulesFromWorkflow(workflow);
@@ -257,8 +257,10 @@ export const syncWorkflowToSchedules = async (workflow, electronAPI) => {
 
     // Load existing schedules
     let existingSchedules = [];
-    if (electronAPI && electronAPI.loadSchedules) {
-      existingSchedules = await electronAPI.loadSchedules();
+    if (apiClient && apiClient.loadSchedules) {
+      existingSchedules = await apiClient.loadSchedules();
+    } else if (window.electronAPI?.loadSchedules) {
+      existingSchedules = await window.electronAPI.loadSchedules();
     } else {
       const data = localStorage.getItem('oncall-schedules');
       existingSchedules = data ? JSON.parse(data) : [];
@@ -272,8 +274,10 @@ export const syncWorkflowToSchedules = async (workflow, electronAPI) => {
     // Combine and save
     const allSchedules = [...otherSchedules, ...workflowSchedules];
     
-    if (electronAPI && electronAPI.saveSchedules) {
-      await electronAPI.saveSchedules(allSchedules);
+    if (apiClient && apiClient.saveSchedules) {
+      await apiClient.saveSchedules(allSchedules);
+    } else if (window.electronAPI?.saveSchedules) {
+      await window.electronAPI.saveSchedules(allSchedules);
     } else {
       localStorage.setItem('oncall-schedules', JSON.stringify(allSchedules));
     }
@@ -286,16 +290,24 @@ export const syncWorkflowToSchedules = async (workflow, electronAPI) => {
  * Update workflow file with schedule changes
  * @param {Object} schedule - The schedule object
  * @param {Function} updateFn - Function to update workflow (add/update/remove)
- * @param {Function} electronAPI - The electron API object
+ * @param {Object} apiClient - The API client object (agentApiClient or electronAPI)
  * @returns {Promise<void>}
  */
-export const updateWorkflowFromSchedule = async (schedule, updateFn, electronAPI) => {
+export const updateWorkflowFromSchedule = async (schedule, updateFn, apiClient) => {
   try {
-    if (!electronAPI || !electronAPI.loadWorkflows) {
+    let workflows;
+    if (apiClient?.listWorkflows) {
+      // Using agentApiClient
+      workflows = await apiClient.listWorkflows();
+    } else if (apiClient?.loadWorkflows) {
+      // Using electronAPI (backward compatibility)
+      workflows = await apiClient.loadWorkflows();
+    } else if (window.electronAPI?.loadWorkflows) {
+      workflows = await window.electronAPI.loadWorkflows();
+    } else {
       return;
     }
 
-    const workflows = await electronAPI.loadWorkflows();
     const workflow = workflows.find(w => w.name === schedule.workflow || w.id === schedule.workflowId);
     
     if (!workflow) {
@@ -305,11 +317,18 @@ export const updateWorkflowFromSchedule = async (schedule, updateFn, electronAPI
     // Apply the update function
     const updatedWorkflow = updateFn(workflow, schedule);
 
-    // Update workflows array
-    const updatedWorkflows = workflows.map(w => w.id === workflow.id ? updatedWorkflow : w);
-    
-    // Save workflows
-    await electronAPI.saveWorkflows(updatedWorkflows);
+    // Save workflow
+    if (apiClient?.updateWorkflow) {
+      // Using agentApiClient
+      await apiClient.updateWorkflow(workflow.name, updatedWorkflow);
+    } else if (apiClient?.saveWorkflows) {
+      // Using electronAPI (backward compatibility)
+      const updatedWorkflows = workflows.map(w => w.id === workflow.id ? updatedWorkflow : w);
+      await apiClient.saveWorkflows(updatedWorkflows);
+    } else if (window.electronAPI?.saveWorkflows) {
+      const updatedWorkflows = workflows.map(w => w.id === workflow.id ? updatedWorkflow : w);
+      await window.electronAPI.saveWorkflows(updatedWorkflows);
+    }
   } catch (error) {
     console.error('Error updating workflow from schedule:', error);
   }

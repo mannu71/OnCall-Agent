@@ -37,10 +37,11 @@ import {
 import { useScheduler } from '../../context/SchedulerContext';
 import { useWorkflowStatus } from '../../context/WorkflowStatusContext';
 import EditScheduleDialog from './EditScheduleDialog';
+import agentApiClient from '../../services/agentApiClient.js';
 
 const ScheduleList = () => {
   const { schedules, deleteSchedule, updateSchedule, isLoading } = useScheduler();
-  const { isWorkflowRunning, markWorkflowPending } = useWorkflowStatus();
+  const { isWorkflowRunning, markWorkflowPending, clearWorkflowPending } = useWorkflowStatus();
   const [searchTerm, setSearchTerm] = useState('');
   // Removed type filtering
   const [editingSchedule, setEditingSchedule] = useState(null);
@@ -107,57 +108,29 @@ const ScheduleList = () => {
   };
 
   const handleRunNow = async (schedule) => {
+    const workflowName = schedule.workflow;
+    
     try {
-      const workflowName = schedule.workflow;
-      
       // Mark as pending immediately for instant UI feedback
       markWorkflowPending(workflowName);
       
-      // Check if workflow exists before triggering
-      if (window?.electronAPI?.loadWorkflows) {
-        const workflows = await window.electronAPI.loadWorkflows();
-        const workflowExists = workflows.some(wf => wf.name === workflowName);
-        
-        if (!workflowExists) {
-          setSnackbar({
-            open: true,
-            message: `Workflow "${workflowName}" not found. Please update the schedule with a valid workflow.`,
-            severity: 'error'
-          });
-          return;
-        }
-      }
+      // Execute workflow in background
+      await agentApiClient.executeWorkflow(workflowName, true); // background=true
       
-      if (window?.electronAPI?.triggerWorkflow) {
-        const result = await window.electronAPI.triggerWorkflow(workflowName);
-        if (result?.success) {
-          console.log('Workflow triggered:', workflowName);
-          setSnackbar({
-            open: true,
-            message: `Workflow "${workflowName}" triggered successfully!`,
-            severity: 'success'
-          });
-        } else {
-          console.error('Failed to trigger workflow:', result?.error);
-          setSnackbar({
-            open: true,
-            message: `Failed to trigger workflow: ${result?.error || 'Unknown error'}`,
-            severity: 'error'
-          });
-        }
-      } else {
-        console.warn('triggerWorkflow API not available');
-        setSnackbar({
-          open: true,
-          message: 'Workflow trigger is only available in the desktop app.',
-          severity: 'warning'
-        });
-      }
-    } catch (e) {
-      console.error('Error triggering workflow:', e);
       setSnackbar({
         open: true,
-        message: `Failed to trigger workflow: ${e.message}`,
+        message: `Workflow "${workflowName}" started successfully`,
+        severity: 'success'
+      });
+    } catch (e) {
+      console.error('Error executing workflow:', e);
+      
+      // Clear pending state on error
+      clearWorkflowPending(workflowName);
+      
+      setSnackbar({
+        open: true,
+        message: `Failed to execute workflow: ${e.message}`,
         severity: 'error'
       });
     }

@@ -45,6 +45,11 @@ export const WorkflowStatusProvider = ({ children }) => {
     setPendingWorkflows(prev => [...prev, workflowName]);
   };
 
+  // Clear a workflow from pending state (e.g., when API call fails)
+  const clearWorkflowPending = (workflowName) => {
+    setPendingWorkflows(prev => prev.filter(w => w !== workflowName));
+  };
+
   // Remove from pending when it appears in running (synced from main process)
   useEffect(() => {
     setPendingWorkflows(prev => prev.filter(w => !runningWorkflows.includes(w)));
@@ -57,6 +62,7 @@ export const WorkflowStatusProvider = ({ children }) => {
     runningWorkflows: allRunningWorkflows,
     isWorkflowRunning,
     markWorkflowPending,
+    clearWorkflowPending,
     isLoading,
     count: allRunningWorkflows.length
   };

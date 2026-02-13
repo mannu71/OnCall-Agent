@@ -123,12 +123,9 @@ export const syncLLMToWorkflows = async (oldName, llmConfig, newName = null) => 
   const actualNewName = newName || oldName;
   
   try {
-    if (!window.electronAPI?.loadWorkflows || !window.electronAPI?.saveWorkflows) {
-      console.warn('Electron API not available for workflow sync');
-      return false;
-    }
+    const { default: agentApiClient } = await import('../services/agentApiClient.js');
     
-    const workflows = await window.electronAPI.loadWorkflows();
+    const workflows = await agentApiClient.listWorkflows();
     if (!workflows || !Array.isArray(workflows)) {
       return false;
     }
@@ -137,6 +134,8 @@ export const syncLLMToWorkflows = async (oldName, llmConfig, newName = null) => 
     
     for (const workflow of workflows) {
       if (!workflow.nodes || !workflow.edges) continue;
+      
+      let workflowUpdated = false;
       
       // First, find and update all LLM nodes that match
       const updatedLLMNodeIds = [];
@@ -152,6 +151,7 @@ export const syncLLMToWorkflows = async (oldName, llmConfig, newName = null) => 
             node.data.temperature = llmConfig.temperature;
           }
           updatedLLMNodeIds.push(node.id);
+          workflowUpdated = true;
           updated = true;
           console.log(`Synced LLM "${oldName}" -> "${actualNewName}" in workflow "${workflow.name}"`);
         }
@@ -165,6 +165,7 @@ export const syncLLMToWorkflows = async (oldName, llmConfig, newName = null) => 
           if (agentNode) {
             agentNode.data.model = llmConfig.model;
             agentNode.data.agent = llmConfig.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq';
+            workflowUpdated = true;
             updated = true;
             console.log(`Synced connected agent "${agentNode.id}" model to "${llmConfig.model}" in workflow "${workflow.name}"`);
           }
@@ -175,18 +176,18 @@ export const syncLLMToWorkflows = async (oldName, llmConfig, newName = null) => 
       for (const node of workflow.nodes) {
         if (node.type === 'agent' && node.data?.model === oldName) {
           node.data.model = actualNewName;
+          workflowUpdated = true;
           updated = true;
           console.log(`Synced agent node model "${oldName}" -> "${actualNewName}" in workflow "${workflow.name}"`);
         }
       }
+      
+      if (workflowUpdated) {
+        await agentApiClient.updateWorkflow(workflow.name, workflow);
+      }
     }
     
-    if (updated) {
-      const result = await window.electronAPI.saveWorkflows(workflows);
-      console.log('Workflows synced with LLM changes:', result);
-      return result?.success || result === true;
-    }
-    
+    console.log('Workflows synced with LLM changes');
     return true;
   } catch (error) {
     console.error('Error syncing LLM to workflows:', error);

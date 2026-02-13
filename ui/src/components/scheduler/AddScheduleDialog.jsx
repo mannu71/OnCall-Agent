@@ -18,6 +18,7 @@ import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
 import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
 import { TimePicker } from '@mui/x-date-pickers/TimePicker';
 import { dateToCron, dateToLocalTimeString } from '../../utils/cronUtils';
+import agentApiClient from '../../services/agentApiClient.js';
 
 const AddScheduleDialog = ({ open, onClose, onAdd }) => {
   const [formData, setFormData] = useState({
@@ -36,7 +37,7 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
   useEffect(() => {
     const loadWorkflows = async () => {
       try {
-        const wf = await window.electronAPI.loadWorkflows();
+        const wf = await agentApiClient.listWorkflows();
         // Filter to only show workflow type (not agent type)
         const workflowTypeOnly = wf.filter(w => w.type !== 'agent');
         setWorkflows(workflowTypeOnly);
@@ -49,6 +50,7 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
         }
       } catch (error) {
         console.error('Error loading workflows:', error);
+        setWorkflows([]);
       }
     };
     

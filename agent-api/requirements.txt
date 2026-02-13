@@ -1,0 +1,37 @@
+# Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# Scheduler
+apscheduler==3.10.4
+
+# Data Validation
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# YAML Processing
+pyyaml==6.0.1
+
+# SSE Support
+sse-starlette==1.8.2
+
+# Utilities
+python-dateutil==2.8.2
+pytz==2023.3
+
+# AI & Workflows
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-anthropic>=0.1.0
+langgraph>=0.0.20
+mcp>=0.1.0
+
+# Development
+pytest==7.4.4
+pytest-asyncio==0.23.3
+black==24.1.1
+flake8==7.0.0
+mypy==1.8.0
+
+aiofiles==23.2.1

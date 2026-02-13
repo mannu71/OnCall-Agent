@@ -16,18 +16,16 @@ const SchedulerContent = () => {
     
     // Also add scheduler node to the workflow file using common utility
     try {
-      const wf = await window.electronAPI.loadWorkflows();
+      const { default: agentApiClient } = await import('../services/agentApiClient.js');
+      const wf = await agentApiClient.listWorkflows();
       const workflow = wf.find(w => w.name === scheduleData.workflow);
       
       if (workflow) {
         // Use common utility to add scheduler node
         const updatedWorkflow = addSchedulerNodeToWorkflow(workflow, scheduleData);
         
-        // Update workflows array
-        const updatedWorkflows = wf.map(w => w.id === workflow.id ? updatedWorkflow : w);
-        
-        // Save workflows
-        await window.electronAPI.saveWorkflows(updatedWorkflows);
+        // Save workflow
+        await agentApiClient.updateWorkflow(workflow.name, updatedWorkflow);
       }
     } catch (error) {
       console.error('Error adding scheduler to workflow:', error);
