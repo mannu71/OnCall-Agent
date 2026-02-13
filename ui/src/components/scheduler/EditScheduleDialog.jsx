@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, memo } from 'react';
 import {
   Dialog,
   DialogTitle,
@@ -20,7 +20,7 @@ import { TimePicker } from '@mui/x-date-pickers/TimePicker';
 import { dateToCron, dateToLocalTimeString } from '../../utils/cronUtils';
 import agentApiClient from '../../services/agentApiClient.js';
 
-const EditScheduleDialog = ({ open, schedule, onClose, onUpdate }) => {
+const EditScheduleDialog = memo(({ open, schedule, onClose, onUpdate }) => {
   const [formData, setFormData] = useState({
     title: '',
     startTime: new Date(),
@@ -43,7 +43,7 @@ const EditScheduleDialog = ({ open, schedule, onClose, onUpdate }) => {
         setWorkflows([]);
       }
     };
-    
+
     if (open) {
       loadWorkflows();
     }
@@ -73,7 +73,7 @@ const EditScheduleDialog = ({ open, schedule, onClose, onUpdate }) => {
       ...prev,
       [field]: value
     }));
-    
+
     // Clear error when user starts typing
     if (errors[field]) {
       setErrors(prev => ({
@@ -104,7 +104,7 @@ const EditScheduleDialog = ({ open, schedule, onClose, onUpdate }) => {
     }
 
     const timeObj = new Date(formData.startTime);
-    
+
     // Use utility functions for conversion
     const localTimeStr = dateToLocalTimeString(timeObj);
     const cronSchedule = dateToCron(timeObj, formData.recurrence);
@@ -127,10 +127,10 @@ const EditScheduleDialog = ({ open, schedule, onClose, onUpdate }) => {
   };
 
   return (
-    <Dialog 
-      open={open} 
-      onClose={handleClose} 
-      maxWidth="md" 
+    <Dialog
+      open={open}
+      onClose={handleClose}
+      maxWidth="md"
       fullWidth
       disablePortal
       keepMounted={false}
@@ -142,7 +142,7 @@ const EditScheduleDialog = ({ open, schedule, onClose, onUpdate }) => {
           Edit Schedule
         </Typography>
       </DialogTitle>
-      
+
       <DialogContent dividers id="edit-schedule-dialog-description">
         <Grid container spacing={3}>
           <Grid item xs={12}>
@@ -245,6 +245,6 @@ const EditScheduleDialog = ({ open, schedule, onClose, onUpdate }) => {
       </DialogActions>
     </Dialog>
   );
-};
+});
 
 export default EditScheduleDialog;

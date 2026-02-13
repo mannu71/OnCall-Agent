@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useCallback, memo } from 'react';
 import {
   Box,
   Typography,
@@ -39,7 +39,7 @@ import { useWorkflowStatus } from '../../context/WorkflowStatusContext';
 import EditScheduleDialog from './EditScheduleDialog';
 import agentApiClient from '../../services/agentApiClient.js';
 
-const ScheduleList = () => {
+const ScheduleList = memo(() => {
   const { schedules, deleteSchedule, updateSchedule, isLoading } = useScheduler();
   const { isWorkflowRunning, markWorkflowPending, clearWorkflowPending } = useWorkflowStatus();
   const [searchTerm, setSearchTerm] = useState('');
@@ -64,29 +64,31 @@ const ScheduleList = () => {
     return filtered;
   }, [schedules, searchTerm]);
 
-  const handleEdit = (schedule) => {
+  const handleEdit = useCallback((schedule) => {
     setEditingSchedule(schedule);
-    handleMenuClose();
-  };
+    setAnchorEl(null);
+    setSelectedSchedule(null);
+  }, []);
 
-  const handleDelete = (schedule) => {
+  const handleDelete = useCallback((schedule) => {
     console.log('handleDelete called with schedule:', schedule);
     setScheduleToDelete(schedule);
     setDeleteDialogOpen(true);
-    handleMenuClose();
-  };
-
-  const handleMenuOpen = (event, schedule) => {
-    setAnchorEl(event.currentTarget);
-    setSelectedSchedule(schedule);
-  };
-
-  const handleMenuClose = () => {
     setAnchorEl(null);
     setSelectedSchedule(null);
-  };
+  }, []);
 
-  const confirmDelete = () => {
+  const handleMenuOpen = useCallback((event, schedule) => {
+    setAnchorEl(event.currentTarget);
+    setSelectedSchedule(schedule);
+  }, []);
+
+  const handleMenuClose = useCallback(() => {
+    setAnchorEl(null);
+    setSelectedSchedule(null);
+  }, []);
+
+  const confirmDelete = useCallback(() => {
     console.log('confirmDelete called with scheduleToDelete:', scheduleToDelete);
     if (scheduleToDelete && scheduleToDelete.id) {
       console.log('Calling deleteSchedule with id:', scheduleToDelete.id);
@@ -96,27 +98,27 @@ const ScheduleList = () => {
     }
     setDeleteDialogOpen(false);
     setScheduleToDelete(null);
-  };
+  }, [scheduleToDelete, deleteSchedule]);
 
-  const handleCloseEdit = () => {
+  const handleCloseEdit = useCallback(() => {
     setEditingSchedule(null);
-  };
+  }, []);
 
-  const handleUpdateSchedule = (updatedSchedule) => {
+  const handleUpdateSchedule = useCallback((updatedSchedule) => {
     updateSchedule(editingSchedule.id, updatedSchedule);
     setEditingSchedule(null);
-  };
+  }, [editingSchedule, updateSchedule]);
 
-  const handleRunNow = async (schedule) => {
+  const handleRunNow = useCallback(async (schedule) => {
     const workflowName = schedule.workflow;
-    
+
     try {
       // Mark as pending immediately for instant UI feedback
       markWorkflowPending(workflowName);
-      
+
       // Execute workflow in background
       await agentApiClient.executeWorkflow(workflowName, true); // background=true
-      
+
       setSnackbar({
         open: true,
         message: `Workflow "${workflowName}" started successfully`,
@@ -124,21 +126,21 @@ const ScheduleList = () => {
       });
     } catch (e) {
       console.error('Error executing workflow:', e);
-      
+
       // Clear pending state on error
       clearWorkflowPending(workflowName);
-      
+
       setSnackbar({
         open: true,
         message: `Failed to execute workflow: ${e.message}`,
         severity: 'error'
       });
     }
-  };
+  }, [markWorkflowPending, clearWorkflowPending]);
 
   // Removed type color helper
 
-  const formatTime = (timeString) => {
+  const formatTime = useCallback((timeString) => {
     const [hours, minutes] = timeString.split(':');
     const date = new Date();
     date.setHours(parseInt(hours), parseInt(minutes));
@@ -147,7 +149,7 @@ const ScheduleList = () => {
       minute: '2-digit',
       hour12: true
     });
-  };
+  }, []);
 
   return (
     <Box>
@@ -325,6 +327,6 @@ const ScheduleList = () => {
       </Snackbar>
     </Box>
   );
-};
+});
 
 export default ScheduleList;

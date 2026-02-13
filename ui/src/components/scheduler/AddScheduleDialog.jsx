@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, memo } from 'react';
 import {
   Dialog,
   DialogTitle,
@@ -20,7 +20,7 @@ import { TimePicker } from '@mui/x-date-pickers/TimePicker';
 import { dateToCron, dateToLocalTimeString } from '../../utils/cronUtils';
 import agentApiClient from '../../services/agentApiClient.js';
 
-const AddScheduleDialog = ({ open, onClose, onAdd }) => {
+const AddScheduleDialog = memo(({ open, onClose, onAdd }) => {
   const [formData, setFormData] = useState({
     title: '',
     startTime: new Date(),
@@ -53,7 +53,7 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
         setWorkflows([]);
       }
     };
-    
+
     if (open) {
       loadWorkflows();
     }
@@ -66,7 +66,7 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
     }
 
     // Find nodes that can accept scheduler connections (orchestrator, agent)
-    const validTargets = workflow.nodes.filter(node => 
+    const validTargets = workflow.nodes.filter(node =>
       node.type === 'orchestrator' || node.type === 'agent'
     ).map(node => ({
       id: node.id,
@@ -76,7 +76,7 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
     }));
 
     setTargetNodes(validTargets);
-    
+
     // Auto-select first target node
     if (validTargets.length > 0) {
       setFormData(prev => ({ ...prev, targetNode: validTargets[0].id }));
@@ -89,7 +89,7 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
       ...prev,
       [field]: value
     }));
-    
+
     // Clear error when user starts typing
     if (errors[field]) {
       setErrors(prev => ({
@@ -129,7 +129,7 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
 
     try {
       const timeObj = new Date(formData.startTime);
-      
+
       // Use utility functions for conversion
       const localTimeStr = dateToLocalTimeString(timeObj);
       const cronSchedule = dateToCron(timeObj, formData.recurrence);
@@ -164,10 +164,10 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
   };
 
   return (
-    <Dialog 
-      open={open} 
-      onClose={handleClose} 
-      maxWidth="md" 
+    <Dialog
+      open={open}
+      onClose={handleClose}
+      maxWidth="md"
       fullWidth
       disablePortal
       keepMounted={false}
@@ -179,7 +179,7 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
           Add New Schedule
         </Typography>
       </DialogTitle>
-      
+
       <DialogContent dividers id="add-schedule-dialog-description">
         <Grid container spacing={3}>
           <Grid item xs={12}>
@@ -336,6 +336,6 @@ const AddScheduleDialog = ({ open, onClose, onAdd }) => {
       </DialogActions>
     </Dialog>
   );
-};
+});
 
 export default AddScheduleDialog;

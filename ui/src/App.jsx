@@ -1,5 +1,5 @@
-import React from 'react';
-import { ThemeProvider, createTheme, CssBaseline, Box, Typography, Container } from '@mui/material';
+import React, { lazy, Suspense } from 'react';
+import { ThemeProvider, createTheme, CssBaseline, Box, Typography, Container, CircularProgress } from '@mui/material';
 import { BrowserRouter, HashRouter, Routes, Route } from 'react-router-dom';
 import { SidebarProvider, useSidebar } from './context/SidebarContext';
 import { SchedulerProvider } from './context/SchedulerContext';
@@ -7,11 +7,13 @@ import { WorkflowStatusProvider } from './context/WorkflowStatusContext';
 import Sidebar from './components/sidebar/Sidebar';
 import Dashboard from './pages/Dashboard';
 import Scheduler from './pages/Scheduler';
-import Workflow from './pages/workflow';
-import Chat from './pages/Chat';
 import Settings from './pages/Settings';
-import Analytics from './pages/Analytics';
 import './App.css';
+
+// Lazy load heavy components
+const Workflow = lazy(() => import('./pages/workflow'));
+const Analytics = lazy(() => import('./pages/Analytics'));
+const Chat = lazy(() => import('./pages/Chat'));
 
 // Use HashRouter for Electron, BrowserRouter for web
 const Router = window.electronAPI ? HashRouter : BrowserRouter;
@@ -42,6 +44,21 @@ const theme = createTheme({
   },
 });
 
+
+// Loading component for lazy-loaded routes
+const LoadingFallback = () => (
+  <Box
+    sx={{
+      display: 'flex',
+      justifyContent: 'center',
+      alignItems: 'center',
+      minHeight: '100vh',
+      backgroundColor: 'background.default',
+    }}
+  >
+    <CircularProgress />
+  </Box>
+);
 
 const PlaceholderPage = ({ title }) => {
   return (
@@ -83,19 +100,21 @@ const AppRoutes = () => {
           transition: 'margin-left 225ms cubic-bezier(0.4, 0, 0.6, 1)',
         }}
       >
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/dashboard" element={<Dashboard />} />
-          <Route path="/scheduler" element={<Scheduler />} />
-          {isDevelopment && <Route path="/chat" element={<Chat />} />}
-          <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
-          <Route path="/workflow" element={<Workflow />} />
-          <Route path="/alerts" element={<PlaceholderPage title="Alerts" />} />
-          {isDevelopment && <Route path="/analytics" element={<Analytics />} />}
-          <Route path="/emergency" element={<PlaceholderPage title="Emergency Contact" />} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="*" element={<Dashboard />} />
-        </Routes>
+        <Suspense fallback={<LoadingFallback />}>
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/scheduler" element={<Scheduler />} />
+            {isDevelopment && <Route path="/chat" element={<Chat />} />}
+            <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
+            <Route path="/workflow" element={<Workflow />} />
+            <Route path="/alerts" element={<PlaceholderPage title="Alerts" />} />
+            {isDevelopment && <Route path="/analytics" element={<Analytics />} />}
+            <Route path="/emergency" element={<PlaceholderPage title="Emergency Contact" />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="*" element={<Dashboard />} />
+          </Routes>
+        </Suspense>
       </Box>
     </Box>
   );
