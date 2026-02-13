@@ -51,6 +51,9 @@ agent/data/config/triggers/*.flag
 scheduler/triggers/*.flag
 worker/output/
 
+# Ignore top-level data directory
+data/
+
 # Configuration files with sensitive data
 agent/data/config/workflows.json
 agent/data/config/schedules.json
