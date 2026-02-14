@@ -1,5 +1,7 @@
-import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
 import { agentApiClient } from '../services/agentApiClient';
+import { cronToLocalTime } from '../utils/cronUtils';
+import { getSchedulerNode, applyScheduleToWorkflow } from '../utils/workflowUtils';
 
 const SchedulerContext = createContext();
 
@@ -15,109 +17,88 @@ export const SchedulerProvider = ({ children }) => {
   const [schedules, setSchedules] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
-  const initialLoadDone = useRef(false);
 
-  // Helper: parse simple cron (m h * * *) into HH:MM (converts UTC cron to local time for display)
-  const parseCronTime = (cron) => {
-    if (!cron || typeof cron !== 'string') return undefined;
-    const parts = cron.trim().split(/\s+/);
-    if (parts.length < 2) return undefined;
-    const [min, hour] = parts;
-    if (isNaN(parseInt(hour)) || isNaN(parseInt(min))) return undefined;
+  /**
+   * Helper: Format HH:MM string to user-friendly local time
+   */
+  const formatTime = useCallback((timeString) => {
+    if (!timeString) return '-';
+    try {
+      const [hours, minutes] = timeString.split(':');
+      const date = new Date();
+      date.setHours(parseInt(hours), parseInt(minutes));
+      return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    } catch {
+      return timeString;
+    }
+  }, []);
 
-    // Convert UTC time from cron to local time for display
-    const utcDate = new Date();
-    utcDate.setUTCHours(parseInt(hour), parseInt(min), 0, 0);
+  /**
+   * Transform from API workflow model to UI schedule model
+   */
+  const fromApi = useCallback((wf) => {
+    let startTime = undefined;
+    const schedulerNode = getSchedulerNode(wf);
 
-    const pad = (n) => n.toString().padStart(2, '0');
-    // Return local time
-    return `${pad(utcDate.getHours())}:${pad(utcDate.getMinutes())}`;
-  };
-
-  // Transform from agent-api workflow format to UI schedule shape
-  const fromApi = (wf) => {
-    // Extract workflow info from first task if it's a workflow task
-    const workflowTask = wf.tasks?.find(t => t.type === 'workflow');
+    if (schedulerNode?.data) {
+      startTime = schedulerNode.data.startTime || cronToLocalTime(schedulerNode.data.cronExpression);
+    } else if (wf.schedule) {
+      startTime = cronToLocalTime(wf.schedule);
+    }
 
     return {
-      id: wf.name, // Use name as ID
+      id: wf.name || wf.id,
       title: wf.name,
       name: wf.name,
-      description: wf.description,
-      workflow: workflowTask?.workflow_name || 'daily',
+      description: wf.description || '',
+      workflow: wf.name,
       schedule: wf.schedule,
       enabled: wf.enabled ?? true,
-      startTime: parseCronTime(wf.schedule),
+      startTime: startTime,
+      nodes: wf.nodes || [],
+      edges: wf.edges || [],
       tasks: wf.tasks || [],
-      createdAt: wf.createdAt || new Date().toISOString(),
-      updatedAt: wf.updatedAt || new Date().toISOString()
+      createdAt: wf.createdAt || wf.created_at || new Date().toISOString(),
+      updatedAt: wf.updatedAt || wf.updated_at || new Date().toISOString()
     };
-  };
+  }, []);
 
-  // Transform internal schedule back to agent-api workflow format
-  const toApi = (sch) => {
-    // Determine cron schedule
-    const cronSchedule = sch.schedule || (() => {
-      if (sch.startTime) {
-        const [hour, minute] = sch.startTime.split(':');
-        const localDate = new Date();
-        localDate.setHours(parseInt(hour) || 0, parseInt(minute) || 0, 0, 0);
-        const utcH = localDate.getUTCHours().toString();
-        const utcM = localDate.getUTCMinutes().toString();
-        if ((sch.recurrence === 'weekly' || sch.workflow === 'weekly') && sch.date) {
-          const dow = new Date(sch.date).getUTCDay(); // 0-6
-          return `${utcM} ${utcH} * * ${dow}`;
-        }
-        return `${utcM} ${utcH} * * *`;
-      }
-      return '*/5 * * * *'; // Fallback
-    })();
-
-    return {
-      name: sch.title || sch.name,
-      description: sch.description || `Scheduled execution of ${sch.workflow}`,
-      schedule: cronSchedule,
-      enabled: sch.enabled ?? true,
-      tasks: sch.tasks || [{
-        name: `execute-${sch.workflow}`,
-        type: 'workflow',
-        workflow_name: sch.workflow || 'daily',
-        timeout: 3600
-      }]
-    };
-  };
-
-  // Load schedules from API
   const loadSchedules = useCallback(async () => {
     try {
       setIsLoading(true);
       setError(null);
       const apiWorkflows = await agentApiClient.listWorkflows();
-      const normalized = apiWorkflows.map(fromApi);
+      const normalized = Array.isArray(apiWorkflows) ? apiWorkflows.map(fromApi) : [];
       setSchedules(normalized);
-      initialLoadDone.current = true;
     } catch (err) {
-      console.error('Error loading schedules from API:', err);
+      console.error('Failed to load schedules:', err);
       setError('Failed to connect to agent-api');
-      // Falling back to empty or cached
       setSchedules([]);
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [fromApi]);
 
   useEffect(() => {
     loadSchedules();
+    const interval = setInterval(loadSchedules, 5000);
+    const handleVisibilityChange = () => { if (!document.hidden) loadSchedules(); };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, [loadSchedules]);
 
   const addSchedule = useCallback(async (schedule) => {
     try {
       setIsLoading(true);
-      const apiData = toApi(schedule);
-      await agentApiClient.createWorkflow(apiData);
-      await loadSchedules(); // Reload to get fresh data
+      const existingWorkflow = await agentApiClient.getWorkflow(schedule.workflow);
+      const payload = applyScheduleToWorkflow(existingWorkflow, schedule);
+
+      await agentApiClient.updateWorkflow(schedule.workflow, payload);
+      await loadSchedules();
     } catch (err) {
-      console.error('Error adding schedule:', err);
       setError('Failed to create schedule');
       throw err;
     } finally {
@@ -125,14 +106,15 @@ export const SchedulerProvider = ({ children }) => {
     }
   }, [loadSchedules]);
 
-  const updateSchedule = useCallback(async (id, updatedSchedule) => {
+  const updateSchedule = useCallback(async (name, updatedSchedule) => {
     try {
       setIsLoading(true);
-      const apiData = toApi({ ...updatedSchedule, name: id });
-      await agentApiClient.updateWorkflow(id, apiData);
+      const existingWorkflow = await agentApiClient.getWorkflow(name);
+      const payload = applyScheduleToWorkflow(existingWorkflow, updatedSchedule);
+
+      await agentApiClient.updateWorkflow(name, payload);
       await loadSchedules();
     } catch (err) {
-      console.error('Error updating schedule:', err);
       setError('Failed to update schedule');
       throw err;
     } finally {
@@ -140,13 +122,12 @@ export const SchedulerProvider = ({ children }) => {
     }
   }, [loadSchedules]);
 
-  const deleteSchedule = useCallback(async (id) => {
+  const deleteSchedule = useCallback(async (name) => {
     try {
       setIsLoading(true);
-      await agentApiClient.deleteWorkflow(id);
+      await agentApiClient.deleteWorkflow(name);
       await loadSchedules();
     } catch (err) {
-      console.error('Error deleting schedule:', err);
       setError('Failed to delete schedule');
       throw err;
     } finally {
@@ -154,18 +135,18 @@ export const SchedulerProvider = ({ children }) => {
     }
   }, [loadSchedules]);
 
-  const triggerWorkflow = useCallback(async (id) => {
-    try {
-      return await agentApiClient.executeWorkflow(id);
-    } catch (err) {
-      console.error('Error triggering workflow:', err);
-      throw err;
-    }
+  const triggerWorkflow = useCallback(async (name) => {
+    return await agentApiClient.executeWorkflow(name);
   }, []);
 
-  const getSchedule = useCallback((id) => {
-    return schedules.find(schedule => schedule.id === id);
+  const getSchedule = useCallback((name) => {
+    return schedules.find(s => s.name === name || s.id === name);
   }, [schedules]);
+
+  const getFreshSchedule = useCallback(async (name) => {
+    const raw = await agentApiClient.getWorkflow(name);
+    return fromApi(raw);
+  }, [fromApi]);
 
   const value = useMemo(() => ({
     schedules,
@@ -175,9 +156,11 @@ export const SchedulerProvider = ({ children }) => {
     updateSchedule,
     deleteSchedule,
     getSchedule,
+    getFreshSchedule,
     triggerWorkflow,
-    loadSchedules
-  }), [schedules, isLoading, error, addSchedule, updateSchedule, deleteSchedule, getSchedule, triggerWorkflow, loadSchedules]);
+    loadSchedules,
+    formatTime
+  }), [schedules, isLoading, error, addSchedule, updateSchedule, deleteSchedule, getSchedule, getFreshSchedule, triggerWorkflow, loadSchedules, formatTime]);
 
   return (
     <SchedulerContext.Provider value={value}>

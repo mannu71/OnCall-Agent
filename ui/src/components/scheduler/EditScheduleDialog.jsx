@@ -25,7 +25,9 @@ const EditScheduleDialog = memo(({ open, schedule, onClose, onUpdate }) => {
     title: '',
     startTime: new Date(),
     workflow: '',
-    recurrence: 'daily'
+    recurrence: 'daily',
+    enabled: true,
+    description: ''
   });
 
   const [workflows, setWorkflows] = useState([]);
@@ -51,18 +53,21 @@ const EditScheduleDialog = memo(({ open, schedule, onClose, onUpdate }) => {
 
   useEffect(() => {
     if (schedule) {
-      // Parse time from existing schedule
+      // Extract startTime - should be provided by parent after extraction from scheduler node
       const timeString = schedule.startTime || '09:00';
+      
+      // Parse time string to Date object
       const [hours, minutes] = timeString.split(':');
       const timeObj = new Date();
-      timeObj.setHours(parseInt(hours, 10));
-      timeObj.setMinutes(parseInt(minutes, 10));
+      timeObj.setHours(parseInt(hours, 10) || 9, parseInt(minutes, 10) || 0, 0, 0); // Clear seconds/ms, default to 9:00
 
       setFormData({
-        title: schedule.title || '',
+        title: schedule.title || schedule.name || '',
         startTime: timeObj,
-        workflow: (schedule.workflow || ''),
-        recurrence: (schedule.recurrence || 'daily')
+        workflow: schedule.name || '',
+        recurrence: schedule.recurrence || 'daily',
+        enabled: schedule.enabled ?? true,
+        description: schedule.description || ''
       });
     }
   }, [schedule]);
@@ -114,7 +119,9 @@ const EditScheduleDialog = memo(({ open, schedule, onClose, onUpdate }) => {
       workflow: formData.workflow,
       recurrence: formData.recurrence,
       startTime: localTimeStr, // Local time for display
-      schedule: cronSchedule // UTC cron for backend
+      schedule: cronSchedule, // UTC cron for backend
+      enabled: formData.enabled,
+      description: formData.description
     };
 
     onUpdate(updatedData);

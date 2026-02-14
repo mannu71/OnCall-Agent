@@ -2,7 +2,7 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union, Literal
 from enum import Enum
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class TaskType(str, Enum):
@@ -38,18 +38,14 @@ class Task(BaseModel):
     retry_count: int = Field(0, description="Number of retries on failure")
     retry_delay: int = Field(5, description="Delay between retries in seconds")
 
-    @validator('script')
-    def validate_task_content(cls, v, values):
+    @model_validator(mode='after')
+    def validate_task_content(self) -> 'Task':
         """Ensure either command or script is provided based on task type."""
-        task_type = values.get('type')
-        command = values.get('command')
-        
-        # Validate after all fields are set
-        if task_type == TaskType.SHELL and not command:
+        if self.type == TaskType.SHELL and not self.command:
             raise ValueError("Shell tasks require a 'command' field")
-        if task_type == TaskType.PYTHON and not v:
+        if self.type == TaskType.PYTHON and not self.script:
             raise ValueError("Python tasks require a 'script' field")
-        return v
+        return self
 
     class Config:
         use_enum_values = True
@@ -68,23 +64,29 @@ class Workflow(BaseModel):
     nodes: Optional[List[Dict[str, Any]]] = Field(None, description="Workflow nodes")
     edges: Optional[List[Dict[str, Any]]] = Field(None, description="Workflow edges")
     
-    # Legacy fields (for compatibility)
-    tasks: Optional[List[Task]] = Field(None, description="Legacy tasks field")
+    # Legacy fields (for compatibility) - accept any task structure
+    tasks: Optional[List[Dict[str, Any]]] = Field(None, description="Legacy tasks field")
     max_retries: int = Field(0, description="Max workflow retries on failure")
     timeout: int = Field(3600, description="Workflow timeout in seconds")
     
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    
+    # UI Compatibility fields
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
 
-    @validator('name')
-    def validate_name(cls, v):
+    @field_validator('name')
+    @classmethod
+    def validate_name(cls, v: str) -> str:
         """Ensure workflow name is valid."""
         if not v or not v.strip():
             raise ValueError("Workflow name cannot be empty")
         return v.strip()
 
-    @validator('schedule')
-    def validate_schedule(cls, v):
+    @field_validator('schedule')
+    @classmethod
+    def validate_schedule(cls, v: Optional[str]) -> Optional[str]:
         """Basic cron expression validation."""
         if v is None:
             return v
@@ -93,24 +95,12 @@ class Workflow(BaseModel):
             raise ValueError("Cron expression must have exactly 5 fields")
         return v
 
-    @validator('tasks')
-    def validate_tasks(cls, v, values):
-        """Ensure at least one task exists for script workflows."""
-        workflow_type = values.get('type')
-        if workflow_type == 'script':
-            if not v:
-                raise ValueError("Script workflows must have at least one task")
-            task_names = [task.name for task in v]
-            if len(task_names) != len(set(task_names)):
-                raise ValueError("Task names must be unique within a workflow")
-        return v
-    
-    @validator('nodes')
-    def validate_nodes(cls, v, values):
-        """Ensure at least one node exists for workflows."""
-        if not v:
-            raise ValueError("Workflows must have at least one node")
-        return v
+    @model_validator(mode='after')
+    def validate_structure(self) -> 'Workflow':
+        """Ensure the workflow has at least one node or legacy task."""
+        if not (self.nodes or self.tasks):
+            raise ValueError("Workflows must have at least one node or task")
+        return self
 
     class Config:
         use_enum_values = True
@@ -172,7 +162,7 @@ class WorkflowCreate(BaseModel):
     edges: Optional[List[Dict[str, Any]]] = None
     
     # Legacy fields
-    tasks: Optional[List[Task]] = None
+    tasks: Optional[List[Any]] = None
     max_retries: int = 0
     timeout: int = 3600
     
@@ -185,15 +175,19 @@ class WorkflowCreate(BaseModel):
 
 class WorkflowUpdate(BaseModel):
     """Request model for updating a workflow."""
+    id: Optional[str] = None
+    name: Optional[str] = None
     description: Optional[str] = None
     type: Optional[Literal["workflow"]] = None
     schedule: Optional[str] = None
     enabled: Optional[bool] = None
-    tasks: Optional[List[Task]] = None
+    tasks: Optional[List[Dict[str, Any]]] = None
     nodes: Optional[List[Dict[str, Any]]] = None
     edges: Optional[List[Dict[str, Any]]] = None
     max_retries: Optional[int] = None
     timeout: Optional[int] = None
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
     
     class Config:
         extra = "allow"
@@ -213,7 +207,7 @@ class WorkflowResponse(BaseModel):
     edges: Optional[List[Dict[str, Any]]] = None
     
     # Legacy fields
-    tasks: Optional[List[Task]] = None
+    tasks: Optional[List[Dict[str, Any]]] = None
     max_retries: Optional[int] = None
     timeout: Optional[int] = None
     

@@ -17,7 +17,14 @@ import {
   IconButton,
   Menu,
   MenuItem,
-  Alert
+  Alert,
+  Box,
+  Typography,
+  FormControl,
+  InputLabel,
+  Select,
+  AppBar,
+  Toolbar
 } from '@mui/material';
 import {
   Add as AddIcon,
@@ -25,138 +32,149 @@ import {
   Delete as DeleteIcon,
   MoreVert as MoreVertIcon,
   Close as CloseIcon,
-  Save as SaveIcon
+  Save as SaveIcon,
+  PlayArrow as PlayIcon
 } from '@mui/icons-material';
-import {
-  FormControl,
-  InputLabel,
-  Select
-} from '@mui/material';
 import WorkflowEditor from '../components/workflow/WorkflowEditor.jsx';
 import { validateWorkflow } from '../utils/workflowValidation.js';
-import { syncWorkflowToSchedules, cleanOrphanedEdges } from '../utils/workflowScheduleSync.js';
 import agentApiClient from '../services/agentApiClient.js';
-
-// Debounce hook for search optimization
-const useDebounce = (value, delay) => {
-  const [debouncedValue, setDebouncedValue] = useState(value);
-  useEffect(() => {
-    const handler = setTimeout(() => setDebouncedValue(value), delay);
-    return () => clearTimeout(handler);
-  }, [value, delay]);
-  return debouncedValue;
-};
+import { useScheduler } from '../context/SchedulerContext';
 
 function Workflow() {
-  const [workflows, setWorkflows] = useState([]);
+  const {
+    schedules: workflows,
+    loadSchedules,
+    deleteSchedule,
+    triggerWorkflow,
+    formatTime
+  } = useScheduler();
+
   const [showDialog, setShowDialog] = useState(false);
   const [showWorkflowEditor, setShowWorkflowEditor] = useState(false);
-  const [editingWorkflow, setEditingWorkflow] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
-  const debouncedSearchTerm = useDebounce(searchTerm, 300);
   const [anchorEl, setAnchorEl] = useState(null);
   const [selectedWorkflow, setSelectedWorkflow] = useState(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
-  const [workflowToDelete, setWorkflowToDelete] = useState(null);
+
   const [workflowName, setWorkflowName] = useState('');
   const [workflowType, setWorkflowType] = useState('workflow');
   const [currentWorkflowData, setCurrentWorkflowData] = useState(null);
-  const [workflowEditorData, setWorkflowEditorData] = useState({ nodes: [], edges: [] });
+  const [editorKey, setEditorKey] = useState(0);
   const [messages, setMessages] = useState([]);
+
   const workflowEditorRef = useRef(null);
 
+  // Sync with API on mount
   useEffect(() => {
-    loadWorkflows();
-  }, []);
+    loadSchedules();
+  }, [loadSchedules]);
 
-  const loadWorkflows = async () => {
-    try {
-      const data = await agentApiClient.listWorkflows();
-      setWorkflows(Array.isArray(data) ? data : []);
-    } catch (error) {
-      console.error('Error loading workflows:', error);
-      setWorkflows([]);
-      if (error.code === 'ERR_NETWORK' || error.message.includes('Network Error')) {
-        showMessage('Cannot connect to Agent API at http://localhost:8000. Please start the API server.', 'error');
-      } else {
-        showMessage('Failed to load workflows: ' + (error.response?.data?.detail || error.message), 'error');
-      }
-    }
-  };
-
-  const showMessage = (msg, type = 'info') => {
-    const id = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const showMessage = useCallback((msg, type = 'info') => {
+    const id = Math.random().toString(36).substr(2, 9);
     setMessages(prev => [...prev, { id, msg, type }]);
     setTimeout(() => {
       setMessages(prev => prev.filter(m => m.id !== id));
-    }, 3000);
-  };
+    }, 4000);
+  }, []);
 
-  const removeMessage = (id) => {
-    setMessages(prev => prev.filter(m => m.id !== id));
-  };
-
-
-
-
-
-  const handleDeleteWorkflow = async (workflow) => {
-    setWorkflowToDelete(workflow);
-    setDeleteDialogOpen(true);
-    handleMenuClose();
+  const handleExecute = async (workflow) => {
+    try {
+      await triggerWorkflow(workflow.name);
+      showMessage(`Workflow '${workflow.name}' started`, 'success');
+      handleMenuClose();
+    } catch (error) {
+      showMessage(`Failed to start workflow: ${error.message}`, 'error');
+    }
   };
 
   const confirmDelete = async () => {
-    if (!workflowToDelete) return;
-
+    if (!selectedWorkflow) return;
     try {
-      await agentApiClient.deleteWorkflow(workflowToDelete.name);
-      const updatedWorkflows = workflows.filter(w => w.id !== workflowToDelete.id);
-      setWorkflows(updatedWorkflows);
-
-      await removeWorkflowSchedules(workflowToDelete.id);
-
-      showMessage('Workflow deleted', 'success');
+      await deleteSchedule(selectedWorkflow.name);
+      showMessage('Workflow deleted successfully', 'success');
     } catch (error) {
-      console.error('Error deleting workflow:', error);
       showMessage('Failed to delete workflow', 'error');
     } finally {
       setDeleteDialogOpen(false);
-      setWorkflowToDelete(null);
+      setSelectedWorkflow(null);
     }
   };
 
-  // Remove schedules associated with a workflow
-  const removeWorkflowSchedules = async (workflowId) => {
+  const openEditDialog = async (workflow) => {
     try {
-      // Load existing schedules
-      let existingSchedules = [];
-      if (window.electronAPI && window.electronAPI.loadSchedules) {
-        existingSchedules = await window.electronAPI.loadSchedules();
-      } else {
-        const data = localStorage.getItem('oncall-schedules');
-        existingSchedules = data ? JSON.parse(data) : [];
-      }
-
-      // Remove schedules for this workflow
-      const updatedSchedules = existingSchedules.filter(s => s.workflowId !== workflowId);
-
-      // Save updated schedules
-      if (window.electronAPI && window.electronAPI.saveSchedules) {
-        await window.electronAPI.saveSchedules(updatedSchedules);
-      } else {
-        localStorage.setItem('oncall-schedules', JSON.stringify(updatedSchedules));
-      }
-
-      console.log(`Removed schedules for workflow: ${workflowId}`);
+      // Fetch fresh data for editor
+      const fresh = await agentApiClient.getWorkflow(workflow.name);
+      setWorkflowName(fresh.name);
+      setWorkflowType(fresh.type || 'workflow');
+      setCurrentWorkflowData(fresh);
+      setEditorKey(prev => prev + 1);
+      setShowWorkflowEditor(true);
+      handleMenuClose();
     } catch (error) {
-      console.error('Error removing workflow schedules:', error);
+      showMessage('Failed to load workflow details', 'error');
     }
   };
 
-  const handleMenuOpen = (event, workflow) => {
-    setAnchorEl(event.currentTarget);
-    setSelectedWorkflow(workflow);
+  const handleProceedToEditor = () => {
+    if (!workflowName.trim()) {
+      showMessage('Please enter workflow name', 'error');
+      return;
+    }
+    setCurrentWorkflowData(null);
+    setEditorKey(prev => prev + 1);
+    setShowDialog(false);
+    setShowWorkflowEditor(true);
+  };
+
+  const handleSaveWorkflowData = async () => {
+    if (!workflowEditorRef.current) return;
+
+    const { nodes, edges } = workflowEditorRef.current.getWorkflowData();
+
+    if (!nodes || nodes.length === 0) {
+      showMessage('Workflow must have at least one node', 'error');
+      return;
+    }
+
+    const validation = validateWorkflow(workflowType, nodes, edges);
+    if (!validation.isValid) {
+      showMessage(validation.error, 'error');
+      return;
+    }
+
+    try {
+      const payload = {
+        ...currentWorkflowData,
+        name: workflowName,
+        type: workflowType,
+        nodes,
+        edges,
+        updatedAt: new Date().toISOString()
+      };
+
+      if (currentWorkflowData) {
+        await agentApiClient.updateWorkflow(currentWorkflowData.name, payload);
+      } else {
+        await agentApiClient.createWorkflow(payload);
+      }
+
+      // Force immediate refresh to sync schedule changes
+      await loadSchedules();
+      setShowWorkflowEditor(false);
+      showMessage('Workflow saved successfully', 'success');
+    } catch (error) {
+      showMessage(`Save failed: ${error.message}`, 'error');
+    }
+  };
+
+  const filteredWorkflows = useMemo(() => {
+    const term = searchTerm.toLowerCase();
+    return workflows.filter(w => w.name.toLowerCase().includes(term));
+  }, [workflows, searchTerm]);
+
+  const handleMenuOpen = (e, w) => {
+    setAnchorEl(e.currentTarget);
+    setSelectedWorkflow(w);
   };
 
   const handleMenuClose = () => {
@@ -164,402 +182,154 @@ function Workflow() {
     setSelectedWorkflow(null);
   };
 
-  const openEditDialog = (workflow) => {
-    setEditingWorkflow(workflow);
-    setWorkflowName(workflow.name);
-    setWorkflowType(workflow.type || 'workflow');
-    setCurrentWorkflowData(workflow);
+  if (showWorkflowEditor) {
+    return (
+      <Box sx={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
+        <AppBar position="static" color="default" elevation={1}>
+          <Toolbar>
+            <Typography variant="h6" sx={{ flexGrow: 1 }}>{workflowName}</Typography>
+            <Button startIcon={<CloseIcon />} onClick={() => setShowWorkflowEditor(false)} sx={{ mr: 1 }}>Cancel</Button>
+            <Button variant="contained" startIcon={<SaveIcon />} onClick={handleSaveWorkflowData}>Save</Button>
+          </Toolbar>
+        </AppBar>
 
-    // Set the workflow editor data to the specific workflow's nodes and edges
-    setWorkflowEditorData({
-      nodes: workflow.nodes || [],
-      edges: workflow.edges || []
-    });
-    setShowWorkflowEditor(true);
-    handleMenuClose();
-  };
+        {messages.map(m => (
+          <Alert key={m.id} severity={m.type} sx={{ position: 'absolute', top: 70, left: '50%', transform: 'translateX(-50%)', zIndex: 2000 }}>
+            {m.msg}
+          </Alert>
+        ))}
 
-  const openAddDialog = () => {
-    setWorkflowName('');
-    setWorkflowType('workflow');
-    setCurrentWorkflowData(null);
-    setShowDialog(true);
-  };
-
-  const handleProceedToEditor = () => {
-    if (!workflowName) {
-      showMessage('Please enter workflow name', 'error');
-      return;
-    }
-    // For new workflows, start with empty editor data
-    setWorkflowEditorData({ nodes: [], edges: [] });
-    setShowDialog(false);
-    setShowWorkflowEditor(true);
-  };
-
-  const handleSaveWorkflowData = async (nodes, edges) => {
-    try {
-
-      if (!workflowName) {
-        showMessage('Please enter workflow name', 'error');
-        return;
-      }
-
-      // Validate that workflow has at least one node
-      if (!nodes || nodes.length === 0) {
-        showMessage('Cannot save empty workflow. Please add at least one node.', 'error');
-        return;
-      }
-
-      // Validate workflow based on type
-      const validation = validateWorkflow(workflowType, nodes, edges);
-      if (!validation.isValid) {
-        showMessage(validation.error, 'error');
-        return;
-      }
-
-      // Create a new workflow object with the design data
-      let newWorkflow = {
-        id: currentWorkflowData?.id || Date.now().toString(),
-        name: workflowName,
-        type: workflowType,
-        nodes: nodes,
-        edges: edges,
-        createdAt: currentWorkflowData?.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
-
-      // Extract cron schedule from scheduler nodes (for Scheduler Management)
-      const schedulerNode = nodes.find(n => n.type === 'scheduler');
-      if (schedulerNode && schedulerNode.data?.cronExpression) {
-        newWorkflow.schedule = schedulerNode.data.cronExpression;
-        newWorkflow.enabled = schedulerNode.data.enabled !== false;
-      }
-
-      // Clean up any orphaned edges (edges referencing non-existent nodes)
-      newWorkflow = cleanOrphanedEdges(newWorkflow);
-
-      // Save or update workflow via API
-      const existingWorkflow = workflows.find(w => w.id === newWorkflow.id);
-
-      if (existingWorkflow) {
-        await agentApiClient.updateWorkflow(existingWorkflow.name, newWorkflow);
-      } else {
-        await agentApiClient.createWorkflow(newWorkflow);
-      }
-
-      // Update local state
-      let existingWorkflows = [...workflows];
-      const existingIndex = existingWorkflows.findIndex(w => w.id === newWorkflow.id);
-
-      if (existingIndex >= 0) {
-        existingWorkflows[existingIndex] = newWorkflow;
-      } else {
-        existingWorkflows.push(newWorkflow);
-      }
-
-      setWorkflows(existingWorkflows);
-
-      setShowWorkflowEditor(false);
-      setCurrentWorkflowData(null);
-      setWorkflowName('');
-      setWorkflowType('workflow');
-      showMessage('Workflow saved successfully', 'success');
-    } catch (error) {
-      console.error('Error saving workflow:', error);
-      showMessage('Failed to save workflow', 'error');
-    }
-  };
-
-  const handleCancelEditor = () => {
-    setShowWorkflowEditor(false);
-    setCurrentWorkflowData(null);
-    setWorkflowName('');
-    setWorkflowType('workflow');
-  };
-
-
-
-  // Memoize filtered workflows to prevent unnecessary re-renders
-  const filteredWorkflows = useMemo(() => {
-    const searchLower = debouncedSearchTerm.toLowerCase();
-    return workflows.filter(workflow => {
-      const name = (workflow.name || '').toLowerCase();
-      return name.includes(searchLower);
-    });
-  }, [workflows, debouncedSearchTerm]);
-
-  // Memoize date formatter to avoid recreation on each render
-  const formatDate = useCallback((dateString) => {
-    const date = new Date(dateString);
-    return date.toLocaleDateString('en-US', {
-      weekday: 'short',
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric'
-    });
-  }, []);
+        <Box sx={{ flexGrow: 1, position: 'relative' }}>
+          <WorkflowEditor
+            key={editorKey}
+            ref={workflowEditorRef}
+            initialNodes={currentWorkflowData?.nodes || []}
+            initialEdges={currentWorkflowData?.edges || []}
+          />
+        </Box>
+      </Box>
+    );
+  }
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      {showWorkflowEditor ? (
-        <div className="h-screen flex flex-col relative">
-          {messages.length > 0 && (
-            <div style={{
-              position: 'absolute',
-              top: '70px',
-              left: '50%',
-              transform: 'translateX(-50%)',
-              zIndex: 1000,
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '8px',
-              width: 'fit-content'
-            }}>
-              {messages.map((m) => (
-                <div
-                  key={m.id}
-                  className={`connection-message ${m.type}`}
-                  style={{ position: 'relative', cursor: 'pointer' }}
-                  onClick={() => removeMessage(m.id)}
-                >
-                  {m.type === 'success' ? '✅' : m.type === 'error' ? '❌' : 'ℹ️'} {m.msg}
-                </div>
-              ))}
-            </div>
-          )}
-          {/* Editor Header */}
-          <div className="bg-white border-b border-gray-200 px-6 py-4 flex justify-between items-center">
-            <div className="flex-1">
-              <h2 className="text-xl font-semibold text-gray-900">{workflowName || 'New Workflow'}</h2>
-            </div>
-            <div className="flex">
-              <Button
-                variant="outlined"
-                startIcon={<CloseIcon />}
-                onClick={handleCancelEditor}
-                sx={{ marginRight: '0.5rem' }}
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="contained"
-                startIcon={<SaveIcon />}
-                onClick={() => {
-                  if (workflowEditorRef.current) {
-                    const { nodes, edges } = workflowEditorRef.current.getWorkflowData();
-                    handleSaveWorkflowData(nodes, edges);
-                  } else {
-                    showMessage('Workflow editor not ready', 'error');
-                  }
-                }}
-              >
-                Save Workflow
-              </Button>
-            </div>
-          </div>
+    <Box sx={{ p: 4 }}>
+      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 4 }}>
+        <Box>
+          <Typography variant="h4" sx={{ fontWeight: 700 }}>Workflows</Typography>
+          <Typography color="text.secondary">Design and manage agentic processes</Typography>
+        </Box>
+        <Button variant="contained" startIcon={<AddIcon />} onClick={() => { setWorkflowName(''); setShowDialog(true); }}>
+          New Workflow
+        </Button>
+      </Box>
 
-          {/* Workflow Editor */}
-          <div className="flex-1">
-            <WorkflowEditor
-              ref={workflowEditorRef}
-              initialNodes={workflowEditorData?.nodes}
-              initialEdges={workflowEditorData?.edges}
-            />
-          </div>
-        </div>
-      ) : (
-        <div className="p-8">
-          <div className="max-w-7xl mx-auto">
-            {/* Header */}
-            <div className="mb-6 flex justify-between items-center">
-              <div>
-                <h1 className="text-3xl font-semibold text-gray-900 mb-2">
-                  Workflow Management
-                </h1>
-                <p className="text-gray-600">
-                  Manage and organize your automated workflows
-                </p>
-              </div>
+      <TextField
+        fullWidth
+        size="small"
+        placeholder="Search workflows..."
+        value={searchTerm}
+        onChange={(e) => setSearchTerm(e.target.value)}
+        sx={{ mb: 3, maxWidth: 400 }}
+      />
 
-              <Button
-                variant="contained"
-                startIcon={<AddIcon />}
-                onClick={openAddDialog}
-              >
-                Add Workflow
-              </Button>
-            </div>
-
-            {/* Search */}
-            <div className="mb-6">
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                <div className="col-span-1">
-                  <TextField
-                    fullWidth
-                    label="Search workflows"
-                    variant="outlined"
-                    value={searchTerm}
-                    onChange={(e) => setSearchTerm(e.target.value)}
+      <TableContainer component={Paper} elevation={0} variant="outlined" sx={{ borderRadius: 2 }}>
+        <Table>
+          <TableHead sx={{ bgcolor: 'action.hover' }}>
+            <TableRow>
+              <TableCell sx={{ fontWeight: 600 }}>Name</TableCell>
+              <TableCell sx={{ fontWeight: 600 }}>Type</TableCell>
+              <TableCell sx={{ fontWeight: 600 }}>Schedule</TableCell>
+              <TableCell sx={{ fontWeight: 600 }}>Status</TableCell>
+              <TableCell align="right" sx={{ fontWeight: 600 }}>Actions</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {filteredWorkflows.map((w) => (
+              <TableRow key={w.name} hover>
+                <TableCell sx={{ fontWeight: 500 }}>{w.name}</TableCell>
+                <TableCell><Chip label={w.type || 'workflow'} size="small" variant="outlined" /></TableCell>
+                <TableCell>
+                  {w.startTime ? (
+                    <Typography variant="body2">
+                      {formatTime(w.startTime)}
+                      <Typography component="span" variant="caption" sx={{ ml: 1, color: 'text.secondary' }}>
+                        ({w.schedule ? w.schedule.split(' ').slice(0, 2).join(':') + ' UTC' : 'Manual'})
+                      </Typography>
+                    </Typography>
+                  ) : (
+                    <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                      {w.schedule || 'Manual'}
+                    </Typography>
+                  )}
+                </TableCell>
+                <TableCell>
+                  <Chip
+                    label={w.enabled ? 'Active' : 'Disabled'}
                     size="small"
+                    color={w.enabled ? 'success' : 'default'}
                   />
-                </div>
-              </div>
-            </div>
-
-            {/* Workflow Table */}
-            {filteredWorkflows.length === 0 ? (
-              <Alert severity="info">
-                {workflows.length === 0
-                  ? "No workflows created yet. Click 'Add Workflow' to create your first workflow."
-                  : "No workflows match your search."
-                }
-              </Alert>
-            ) : (
-              <div>
-                <p className="text-sm text-gray-600 mb-4">
-                  Showing {filteredWorkflows.length} of {workflows.length} workflows
-                </p>
-
-                <TableContainer component={Paper} className="shadow-md">
-                  <Table>
-                    <TableHead className="bg-gradient-to-r from-purple-600 to-purple-800">
-                      <TableRow>
-                        <TableCell className="text-white font-semibold">Name</TableCell>
-                        <TableCell className="text-white font-semibold">Type</TableCell>
-                        <TableCell className="text-white font-semibold">Created</TableCell>
-                        <TableCell className="text-white font-semibold">Last Updated</TableCell>
-                        <TableCell align="right" className="text-white font-semibold">Actions</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {filteredWorkflows.map((workflow) => (
-                        <TableRow key={workflow.id} hover className="hover:bg-gray-50 transition-colors">
-                          <TableCell>
-                            <span className="font-semibold text-gray-900">
-                              {workflow.name}
-                            </span>
-                          </TableCell>
-                          <TableCell>
-                            <Chip
-                              label={workflow.type === 'agent' ? 'Agent' : 'Workflow'}
-                              color={workflow.type === 'agent' ? 'secondary' : 'primary'}
-                              size="small"
-                            />
-                          </TableCell>
-                          <TableCell>
-                            <span className="text-sm text-gray-600">
-                              {formatDate(workflow.createdAt)}
-                            </span>
-                          </TableCell>
-                          <TableCell>
-                            <span className="text-sm text-gray-600">
-                              {formatDate(workflow.updatedAt)}
-                            </span>
-                          </TableCell>
-                          <TableCell align="right">
-                            <IconButton
-                              size="small"
-                              onClick={(e) => handleMenuOpen(e, workflow)}
-                            >
-                              <MoreVertIcon />
-                            </IconButton>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </TableContainer>
-              </div>
+                </TableCell>
+                <TableCell align="right">
+                  <IconButton size="small" onClick={(e) => handleMenuOpen(e, w)}><MoreVertIcon /></IconButton>
+                </TableCell>
+              </TableRow>
+            ))}
+            {filteredWorkflows.length === 0 && (
+              <TableRow><TableCell colSpan={5} align="center" sx={{ py: 3 }}>No workflows found</TableCell></TableRow>
             )}
+          </TableBody>
+        </Table>
+      </TableContainer>
 
-            {/* Action Menu */}
-            <Menu
-              anchorEl={anchorEl}
-              open={Boolean(anchorEl)}
-              onClose={handleMenuClose}
-            >
-              <MenuItem onClick={() => openEditDialog(selectedWorkflow)}>
-                <div className="flex items-center gap-2">
-                  <EditIcon fontSize="small" />
-                  <span>Edit</span>
-                </div>
-              </MenuItem>
-              <MenuItem onClick={() => handleDeleteWorkflow(selectedWorkflow)} className="text-red-600">
-                <div className="flex items-center gap-2">
-                  <DeleteIcon fontSize="small" />
-                  <span>Delete</span>
-                </div>
-              </MenuItem>
-            </Menu>
+      <Menu anchorEl={anchorEl} open={Boolean(anchorEl)} onClose={handleMenuClose}>
+        <MenuItem onClick={() => openEditDialog(selectedWorkflow)}><EditIcon fontSize="small" sx={{ mr: 1 }} /> Edit</MenuItem>
+        <MenuItem onClick={() => handleExecute(selectedWorkflow)}><PlayIcon fontSize="small" sx={{ mr: 1 }} /> Run Now</MenuItem>
+        <MenuItem onClick={() => setDeleteDialogOpen(true)} sx={{ color: 'error.main' }}><DeleteIcon fontSize="small" sx={{ mr: 1 }} /> Delete</MenuItem>
+      </Menu>
 
-            {/* Delete Confirmation Dialog */}
-            <Dialog
-              open={deleteDialogOpen}
-              onClose={() => setDeleteDialogOpen(false)}
-            >
-              <DialogTitle>Confirm Delete</DialogTitle>
-              <DialogContent>
-                <p className="text-gray-700">
-                  Are you sure you want to delete the workflow "{workflowToDelete?.name}"?
-                  This action cannot be undone.
-                </p>
-              </DialogContent>
-              <DialogActions>
-                <Button onClick={() => setDeleteDialogOpen(false)}>Cancel</Button>
-                <Button onClick={confirmDelete} color="error" variant="contained">
-                  Delete
-                </Button>
-              </DialogActions>
-            </Dialog>
+      <Dialog open={deleteDialogOpen} onClose={() => setDeleteDialogOpen(false)}>
+        <DialogTitle>Confirm Delete</DialogTitle>
+        <DialogContent>Are you sure you want to delete "{selectedWorkflow?.name}"?</DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDeleteDialogOpen(false)}>Cancel</Button>
+          <Button onClick={confirmDelete} color="error" variant="contained">Delete</Button>
+        </DialogActions>
+      </Dialog>
 
-            {/* Add Workflow Dialog - Name and Schedule */}
-            <Dialog
-              open={showDialog}
-              onClose={() => setShowDialog(false)}
-              maxWidth="sm"
-              fullWidth
-            >
-              <DialogTitle className="text-xl font-semibold">
-                Create New Workflow
-              </DialogTitle>
-              <DialogContent sx={{ pt: 3 }}>
-                <TextField
-                  fullWidth
-                  label="Workflow Name"
-                  value={workflowName}
-                  onChange={(e) => setWorkflowName(e.target.value)}
-                  placeholder="e.g., daily-report"
-                  required
-                  autoFocus
-                  sx={{ mt: 1 }}
-                />
-                <FormControl fullWidth sx={{ mt: 2 }}>
-                  <InputLabel id="workflow-type-label">Type</InputLabel>
-                  <Select
-                    labelId="workflow-type-label"
-                    value={workflowType}
-                    label="Type"
-                    onChange={(e) => setWorkflowType(e.target.value)}
-                    native
-                  >
-                    <option value="workflow">Workflow</option>
-                    <option value="agent">Agent</option>
-                  </Select>
-                </FormControl>
-              </DialogContent>
-              <DialogActions>
-                <Button onClick={() => setShowDialog(false)}>Cancel</Button>
-                <Button onClick={handleProceedToEditor} variant="contained">
-                  Continue to Editor
-                </Button>
-              </DialogActions>
-            </Dialog>
-          </div>
-        </div>
-      )}
-    </div>
+      <Dialog open={showDialog} onClose={() => setShowDialog(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>Create Workflow</DialogTitle>
+        <DialogContent>
+          <TextField
+            fullWidth
+            label="Name"
+            value={workflowName}
+            onChange={(e) => setWorkflowName(e.target.value)}
+            sx={{ mt: 1 }}
+            autoFocus
+          />
+          <FormControl fullWidth sx={{ mt: 2 }}>
+            <InputLabel>Type</InputLabel>
+            <Select value={workflowType} label="Type" onChange={(e) => setWorkflowType(e.target.value)}>
+              <MenuItem value="workflow">Standard Workflow</MenuItem>
+              <MenuItem value="agent">Agentic Process</MenuItem>
+            </Select>
+          </FormControl>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setShowDialog(false)}>Cancel</Button>
+          <Button variant="contained" onClick={handleProceedToEditor}>Create</Button>
+        </DialogActions>
+      </Dialog>
+
+      {messages.map(m => (
+        <Alert key={m.id} severity={m.type} sx={{ position: 'fixed', bottom: 20, right: 20, minWidth: 250 }}>
+          {m.msg}
+        </Alert>
+      ))}
+    </Box>
   );
 }
+
+// End of Workflow components
 
 export default Workflow;

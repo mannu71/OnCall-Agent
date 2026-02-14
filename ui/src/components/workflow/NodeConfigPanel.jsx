@@ -9,26 +9,29 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
   const fileInputRef = useRef(null);
   const [timeInput, setTimeInput] = useState(() => {
     // Initialize time from startTime first (most reliable), then cronExpression, or default to current time
-    if (config.startTime) {
-      return config.startTime;
+    if (node?.data?.startTime) {
+      return node.data.startTime;
     }
-    if (config.cronExpression) {
-      return cronToLocalTime(config.cronExpression);
+    if (node?.data?.cronExpression) {
+      return cronToLocalTime(node.data.cronExpression);
     }
     const now = new Date();
     return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
   });
 
-  // Sync timeInput when node config changes
+  // CRITICAL: Sync entire config state when node data changes - no caching!
   useEffect(() => {
     if (node?.data) {
+      setConfig(node.data);
+      
+      // Also update timeInput to reflect the latest schedule
       if (node.data.startTime) {
         setTimeInput(node.data.startTime);
       } else if (node.data.cronExpression) {
         setTimeInput(cronToLocalTime(node.data.cronExpression));
       }
     }
-  }, [node?.id, node?.data?.startTime, node?.data?.cronExpression]);
+  }, [node?.id, node?.data]);
 
   // Load configured LLMs from settings
   useEffect(() => {

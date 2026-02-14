@@ -15,9 +15,19 @@ const client = axios.create({
     },
 });
 
+// Add response interceptor for global error logging
+client.interceptors.response.use(
+    response => response,
+    error => {
+        const message = error.response?.data?.detail || error.message;
+        console.error(`[API Error] ${error.config.method.toUpperCase()} ${error.config.url}:`, message);
+        return Promise.reject(error);
+    }
+);
+
 export const agentApiClient = {
     /**
-     * List all workflows (both visual and script workflows)
+     * List all workflows
      */
     async listWorkflows() {
         const response = await client.get('/api/v1/workflows');
@@ -28,7 +38,7 @@ export const agentApiClient = {
      * Get a specific workflow by name
      */
     async getWorkflow(workflowName) {
-        const response = await client.get(`/api/v1/workflows/${workflowName}`);
+        const response = await client.get(`/api/v1/workflows/${encodeURIComponent(workflowName)}`);
         return response.data;
     },
 
@@ -36,12 +46,10 @@ export const agentApiClient = {
      * Create a new workflow
      */
     async createWorkflow(workflow) {
-        // All workflows from UI are type: "workflow"
-        const workflowData = {
+        const response = await client.post('/api/v1/workflows', {
             ...workflow,
             type: workflow.type || 'workflow'
-        };
-        const response = await client.post('/api/v1/workflows', workflowData);
+        });
         return response.data;
     },
 
@@ -49,7 +57,7 @@ export const agentApiClient = {
      * Update an existing workflow
      */
     async updateWorkflow(workflowName, updates) {
-        const response = await client.put(`/api/v1/workflows/${workflowName}`, updates);
+        const response = await client.put(`/api/v1/workflows/${encodeURIComponent(workflowName)}`, updates);
         return response.data;
     },
 
@@ -57,14 +65,14 @@ export const agentApiClient = {
      * Delete a workflow
      */
     async deleteWorkflow(workflowName) {
-        await client.delete(`/api/v1/workflows/${workflowName}`);
+        await client.delete(`/api/v1/workflows/${encodeURIComponent(workflowName)}`);
     },
 
     /**
      * Execute a workflow manually
      */
     async executeWorkflow(workflowName, background = false) {
-        const response = await client.post(`/api/v1/workflows/${workflowName}/execute`, null, {
+        const response = await client.post(`/api/v1/workflows/${encodeURIComponent(workflowName)}/execute`, null, {
             params: { background },
         });
         return response.data;
@@ -80,26 +88,21 @@ export const agentApiClient = {
     /**
      * Get execution history for a workflow
      */
-    async getWorkflowHistory(workflowName, limit = 10) {
-        const response = await client.get(`/api/v1/workflows/${workflowName}/history`, {
+    async getWorkflowExecutions(workflowName, limit = 50) {
+        const response = await client.get(`/api/v1/workflows/${encodeURIComponent(workflowName)}/executions`, {
             params: { limit },
         });
         return response.data;
     },
 
     /**
-     * Get details of a specific execution
+     * Get all execution history
      */
-    async getExecutionDetails(workflowName, executionId) {
-        const response = await client.get(`/api/v1/workflows/${workflowName}/history/${executionId}`);
+    async listAllExecutions(limit = 100) {
+        const response = await client.get('/api/v1/workflows/executions/all', {
+            params: { limit },
+        });
         return response.data;
-    },
-
-    /**
-     * Stream workflow execution events (SSE)
-     */
-    streamWorkflowExecution(workflowName) {
-        return new EventSource(`${AGENT_API_URL}/api/v1/workflows/${workflowName}/stream`);
     },
 
     /**
@@ -111,15 +114,7 @@ export const agentApiClient = {
     },
 
     /**
-     * Get system status
-     */
-    async getStatus() {
-        const response = await client.get('/api/v1/status');
-        return response.data;
-    },
-
-    /**
-     * Clear in-memory data (active executions, event queues)
+     * Clear in-memory data
      */
     async clearData(clearJobs = false) {
         const response = await client.post('/api/v1/clear', null, {

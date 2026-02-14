@@ -7,8 +7,8 @@ python-multipart==0.0.6
 apscheduler==3.10.4
 
 # Data Validation
-pydantic==2.5.3
-pydantic-settings==2.1.0
+pydantic==2.7.4
+pydantic-settings==2.3.4
 
 # YAML Processing
 pyyaml==6.0.1
@@ -21,11 +21,11 @@ python-dateutil==2.8.2
 pytz==2023.3
 
 # AI & Workflows
-langchain>=0.1.0
-langchain-openai>=0.0.5
-langchain-anthropic>=0.1.0
-langgraph>=0.0.20
-mcp>=0.1.0
+langchain==0.2.16
+langchain-openai==0.1.25
+langchain-anthropic==0.1.23
+langgraph==0.2.45
+mcp==1.1.2
 
 # Development
 pytest==7.4.4

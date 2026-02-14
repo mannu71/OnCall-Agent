@@ -96,9 +96,12 @@ export const cronToLocalTime = (cronExpression) => {
   const utcMinute = parseInt(parts[0]);
   const utcHour = parseInt(parts[1]);
   
-  // Convert UTC to local
-  const utcDate = new Date();
-  utcDate.setUTCHours(utcHour, utcMinute, 0, 0);
+  // Validate parsed values
+  if (isNaN(utcMinute) || isNaN(utcHour)) return '09:00';
+  
+  // Create a date with a fixed date (to avoid date boundary issues)
+  // Use a date in the middle of a month to avoid edge cases
+  const utcDate = new Date(Date.UTC(2024, 0, 15, utcHour, utcMinute, 0, 0));
   
   const localHour = utcDate.getHours().toString().padStart(2, '0');
   const localMinute = utcDate.getMinutes().toString().padStart(2, '0');

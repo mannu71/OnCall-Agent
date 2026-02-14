@@ -136,6 +136,20 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
   const [connectionMessage, setConnectionMessage] = useState('');
   const [messageType, setMessageType] = useState('info'); // 'info', 'success', 'error'
 
+  // CRITICAL: Update nodes and edges when initialNodes/initialEdges change - no caching!
+  // This ensures scheduler times and other workflow data stay in sync when reloaded from API
+  useEffect(() => {
+    if (initialNodes && initialNodes.length > 0) {
+      setNodes(initialNodes);
+    }
+  }, [initialNodes, setNodes]);
+
+  useEffect(() => {
+    if (initialEdges) {
+      setEdges(initialEdges);
+    }
+  }, [initialEdges, setEdges]);
+
   // Helper function to show message with type - wrapped in useCallback to avoid dependency issues
   const showMessage = useCallback((message, type = 'info', duration = 3000) => {
     setConnectionMessage(message);
