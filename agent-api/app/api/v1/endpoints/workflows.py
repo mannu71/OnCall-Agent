@@ -241,16 +241,6 @@ async def stream_workflow_execution(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-@router.get("/executions/all", response_model=List[dict])
-async def get_all_executions(
-    limit: int = Query(50, ge=1, le=500, description="Maximum number of executions to return"),
-    execution_repo: ExecutionRepository = Depends(get_execution_repo)
-):
-    """Get execution history across all workflows."""
-    executions = await execution_repo.list_all()
-    return executions[:limit]
-
-
 @router.get("/{workflow_name}/executions", response_model=List[dict])
 async def get_workflow_executions(
     limit: int = Query(50, ge=1, le=500, description="Maximum number of executions to return"),
@@ -259,15 +249,3 @@ async def get_workflow_executions(
 ):
     """Get execution history for a workflow."""
     return await execution_repo.list_by_workflow(workflow_name, limit=limit)
-
-
-@router.get("/executions/active", response_model=List[str])
-async def get_active_workflows():
-    """Get list of currently running workflow names."""
-    active = [
-        exec_data.get('workflow_name') 
-        for exec_data in visual_executor.active_executions.values() 
-        if exec_data.get('status') == 'running'
-    ]
-    # Filter out duplicates (if any) and None values
-    return list(set(filter(None, active)))

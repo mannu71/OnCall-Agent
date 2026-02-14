@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
 import { agentApiClient } from '../services/agentApiClient';
 
 const WorkflowStatusContext = createContext();
@@ -81,8 +81,5 @@ export const WorkflowStatusProvider = ({ children }) => {
     </WorkflowStatusContext.Provider>
   );
 };
-
-// Add useMemo to imports since it's used
-import { useMemo } from 'react';
 
 export default WorkflowStatusContext;

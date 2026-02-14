@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Box, Typography, Grid, Card, CardContent, Alert, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper, Chip, IconButton, Dialog, DialogTitle, DialogContent, DialogActions, Button, TablePagination } from '@mui/material';
 import VisibilityIcon from '@mui/icons-material/Visibility';
+import DeleteSweepIcon from '@mui/icons-material/DeleteSweep';
 import { useWorkflowStatus } from '../context/WorkflowStatusContext';
 import { useScheduler } from '../context/SchedulerContext';
 import ExecutionMonitor from '../components/monitoring/ExecutionMonitor';
@@ -15,6 +16,8 @@ export default function Dashboard() {
   const [selectedRun, setSelectedRun] = useState(null);
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(10);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [clearing, setClearing] = useState(false);
 
   const loadExecutions = useCallback(async () => {
     try {
@@ -24,6 +27,21 @@ export default function Dashboard() {
       console.error('Error loading executions:', error);
     } finally {
       setLoading(false);
+    }
+  }, []);
+
+  const handleClearAll = useCallback(async () => {
+    setClearing(true);
+    try {
+      await agentApiClient.deleteAllExecutions();
+      setExecutions([]);
+      setPage(0);
+      setConfirmClear(false);
+    } catch (error) {
+      console.error('Error clearing executions:', error);
+      alert('Failed to clear executions. Please try again.');
+    } finally {
+      setClearing(false);
     }
   }, []);
 
@@ -108,7 +126,19 @@ export default function Dashboard() {
 
       <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
         <Typography variant="h6" sx={{ fontWeight: 600 }}>Recent Activity</Typography>
-        <Button size="small" onClick={loadExecutions}>Refresh</Button>
+        <Box sx={{ display: 'flex', gap: 1 }}>
+          <Button size="small" onClick={loadExecutions}>Refresh</Button>
+          <Button 
+            size="small" 
+            color="error" 
+            variant="outlined"
+            startIcon={<DeleteSweepIcon />}
+            onClick={() => setConfirmClear(true)}
+            disabled={executions.length === 0}
+          >
+            Clear All
+          </Button>
+        </Box>
       </Box>
 
       <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2 }}>
@@ -183,6 +213,21 @@ export default function Dashboard() {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setSelectedRun(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={confirmClear} onClose={() => setConfirmClear(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>Clear All Executions?</DialogTitle>
+        <DialogContent>
+          <Typography>
+            This will permanently delete all {executions.length} execution{executions.length !== 1 ? 's' : ''} from the history. This action cannot be undone.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setConfirmClear(false)} disabled={clearing}>Cancel</Button>
+          <Button onClick={handleClearAll} color="error" variant="contained" disabled={clearing}>
+            {clearing ? 'Clearing...' : 'Clear All'}
+          </Button>
         </DialogActions>
       </Dialog>
     </Box>

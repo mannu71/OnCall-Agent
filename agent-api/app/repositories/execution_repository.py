@@ -275,3 +275,27 @@ class ExecutionRepository(BaseRepository[Dict[str, Any]]):
         
         logger.info(f"Deleted {deleted_count} old executions for workflow: {workflow_name}")
         return deleted_count
+    
+    async def delete_all(self) -> int:
+        """Delete all executions across all workflows.
+        
+        Returns:
+            Number of executions deleted
+        """
+        deleted_count = 0
+        
+        # Scan all workflow directories
+        for workflow_dir in self.storage_path.iterdir():
+            if not workflow_dir.is_dir():
+                continue
+            
+            # Delete all .json files in the directory
+            for file_path in workflow_dir.glob("*.json"):
+                try:
+                    file_path.unlink()
+                    deleted_count += 1
+                except Exception as e:
+                    logger.error(f"Error deleting execution file {file_path}: {e}")
+        
+        logger.info(f"Deleted {deleted_count} total executions")
+        return deleted_count

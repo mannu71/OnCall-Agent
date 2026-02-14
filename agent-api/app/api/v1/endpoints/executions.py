@@ -26,6 +26,20 @@ async def list_executions(
     return executions
 
 
+@router.get("/active", response_model=List[str])
+async def get_active_workflows():
+    """Get list of currently running workflow names."""
+    from app.services.visual_workflow_executor import visual_executor
+    
+    active = [
+        exec_data.get('workflow_name') 
+        for exec_data in visual_executor.active_executions.values() 
+        if exec_data.get('status') == 'running'
+    ]
+    # Filter out duplicates (if any) and None values
+    return list(set(filter(None, active)))
+
+
 @router.get("/{execution_id}", response_model=dict)
 async def get_execution(
     execution_id: str,
@@ -58,3 +72,12 @@ async def delete_execution(
         )
     
     return None
+
+
+@router.delete("", status_code=status.HTTP_200_OK)
+async def delete_all_executions(
+    execution_repo: ExecutionRepository = Depends(get_execution_repo)
+):
+    """Delete all execution history."""
+    deleted_count = await execution_repo.delete_all()
+    return {"message": f"Deleted {deleted_count} executions", "deleted_count": deleted_count}

@@ -99,14 +99,22 @@ export const agentApiClient = {
      * Get all execution history
      */
     async listAllExecutions(limit = 100) {
-        const response = await client.get('/api/v1/workflows/executions/all', {
+        const response = await client.get('/api/v1/executions', {
             params: { limit },
         });
         return response.data;
     },
 
     async listActiveWorkflows() {
-        const response = await client.get('/api/v1/workflows/executions/active');
+        const response = await client.get('/api/v1/executions/active');
+        return response.data;
+    },
+
+    /**
+     * Delete all execution history
+     */
+    async deleteAllExecutions() {
+        const response = await client.delete('/api/v1/executions');
         return response.data;
     },
 

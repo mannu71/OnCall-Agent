@@ -47,17 +47,12 @@ coverage/
 output/
 agent/output/
 agent/logs/
-agent/data/config/triggers/*.flag
 scheduler/triggers/*.flag
 worker/output/
 
-# Ignore top-level data directory
-data/
-
-# Configuration files with sensitive data
-agent/data/config/workflows.json
-agent/data/config/schedules.json
-agent/data/config/sql/
+# Ignore entire data directories
+agent/data/
+agent-api/data/
 
 # Temporary files
 tmp/
