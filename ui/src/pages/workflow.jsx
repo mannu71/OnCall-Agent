@@ -132,7 +132,7 @@ function Workflow() {
 
     const { nodes, edges } = workflowEditorRef.current.getWorkflowData();
 
-    if (!nodes || nodes.length === 0) {
+    if (!nodes?.length) {
       showMessage('Workflow must have at least one node', 'error');
       return;
     }
@@ -144,8 +144,13 @@ function Workflow() {
     }
 
     try {
+
+      const {
+        schedule, enabled, startTime, recurrence, createdAt, updatedAt, ...baseData
+      } = currentWorkflowData || {};
+
       const payload = {
-        ...currentWorkflowData,
+        ...baseData,
         name: workflowName,
         type: workflowType,
         nodes,
@@ -159,7 +164,6 @@ function Workflow() {
         await agentApiClient.createWorkflow(payload);
       }
 
-      // Force immediate refresh to sync schedule changes
       await loadSchedules();
       setShowWorkflowEditor(false);
       showMessage('Workflow saved successfully', 'success');

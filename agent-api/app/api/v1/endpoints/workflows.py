@@ -32,26 +32,28 @@ def _sync_scheduler_node(workflow_dict: Dict[str, Any], update_data: Optional[Di
     """
     Ensure the workflow level schedule/enabled fields and the scheduler node stay in sync.
     
-    If update_data is provided, it first updates the scheduler node from update_data,
-    then updates the workflow_dict from the scheduler node.
+    Always syncs FROM the scheduler node TO workflow level fields.
+    If update_data contains top-level schedule fields, those are synced TO the scheduler node first.
     """
-    if 'nodes' not in workflow_dict or not workflow_dict['nodes']:
+    nodes = workflow_dict.get('nodes', [])
+    if not nodes:
         if update_data and 'nodes' in update_data:
-            workflow_dict['schedule'] = None
-            logger.info("[SYNC] No scheduler node found in new nodes, cleared schedule")
+            workflow_dict.update({'schedule': None, 'enabled': False})
+            logger.info("[SYNC] No nodes found, clearing schedule")
         return
 
-    scheduler_node = next((n for n in workflow_dict['nodes'] if n.get('type') == 'scheduler'), None)
+    scheduler_node = next((n for n in nodes if n.get('type') == 'scheduler'), None)
     if not scheduler_node:
         if update_data and 'nodes' in update_data:
-            workflow_dict['schedule'] = None
-            logger.info("[SYNC] No scheduler node found, cleared schedule")
+            workflow_dict.update({'schedule': None, 'enabled': False})
+            logger.info("[SYNC] No scheduler node found, clearing schedule")
         return
 
     if 'data' not in scheduler_node:
         scheduler_node['data'] = {}
 
-    # If this is an update, sync from update_data to scheduler node first
+    # If update_data has top-level schedule fields, sync them TO the scheduler node first
+    # (This handles updates from Schedule Management page)
     if update_data:
         if 'schedule' in update_data and update_data['schedule']:
             scheduler_node['data']['cronExpression'] = update_data['schedule']
@@ -62,11 +64,23 @@ def _sync_scheduler_node(workflow_dict: Dict[str, Any], update_data: Optional[Di
         if 'recurrence' in update_data and update_data['recurrence']:
             scheduler_node['data']['recurrence'] = update_data['recurrence']
 
-    # Sync workflow level fields from scheduler node
-    cron_expression = scheduler_node.get('data', {}).get('cronExpression')
+    # Always sync FROM scheduler node TO workflow level fields
+    # This ensures changes made in the Configure Scheduler Node dialog are preserved
+    node_data = scheduler_node.get('data', {})
+    cron_expression = node_data.get('cronExpression')
+    enabled = node_data.get('enabled', True)
+    
     if cron_expression:
         workflow_dict['schedule'] = cron_expression
-        workflow_dict['enabled'] = scheduler_node.get('data', {}).get('enabled', True)
+        workflow_dict['enabled'] = enabled
+        
+        # Also preserve startTime and recurrence at workflow level for frontend convenience
+        if start_time := node_data.get('startTime'):
+            workflow_dict['startTime'] = start_time
+        if recurrence := node_data.get('recurrence'):
+            workflow_dict['recurrence'] = recurrence
+            
+        logger.info(f"[SYNC] Synced from scheduler node: {cron_expression=}, {enabled=}")
 
 
 @router.get("", response_model=List[WorkflowResponse])
@@ -137,10 +151,19 @@ async def update_workflow(
     update_data = workflow_update.dict(exclude_unset=True)
     workflow_dict = {**existing_workflow, **update_data}
     
-    logger.info(f"Updating workflow '{workflow_name}'")
+    logger.info(f"[UPDATE] Updating workflow '{workflow_name}'")
+    
+    # Log scheduler node data if present
+    if 'nodes' in workflow_dict:
+        scheduler_node = next((n for n in workflow_dict['nodes'] if n.get('type') == 'scheduler'), None)
+        if scheduler_node:
+            logger.info(f"[UPDATE] Scheduler node data BEFORE sync: {scheduler_node.get('data', {})}")
     
     # Sync scheduler node and fields
     _sync_scheduler_node(workflow_dict, update_data)
+    
+    # Log what was synced
+    logger.info(f"[UPDATE] Workflow fields AFTER sync: schedule={workflow_dict.get('schedule')}, enabled={workflow_dict.get('enabled')}, startTime={workflow_dict.get('startTime')}, recurrence={workflow_dict.get('recurrence')}")
     
     # Update timestamps
     now = _get_now_timestamp()
