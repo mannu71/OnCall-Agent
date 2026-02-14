@@ -94,7 +94,7 @@ const AppRoutes = () => {
           minHeight: '100vh',
           width: '100%',
           ml: {
-            md: isOpen ? '250px' : '64px',
+            md: isOpen ? '270px' : '64px',
             xs: 0
           },
           transition: 'margin-left 225ms cubic-bezier(0.4, 0, 0.6, 1)',

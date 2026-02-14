@@ -33,7 +33,8 @@ import {
   MoreVert as MoreVertIcon,
   Close as CloseIcon,
   Save as SaveIcon,
-  PlayArrow as PlayIcon
+  PlayArrow as PlayIcon,
+  Search as SearchIcon
 } from '@mui/icons-material';
 import WorkflowEditor from '../components/workflow/WorkflowEditor.jsx';
 import { validateWorkflow } from '../utils/workflowValidation.js';
@@ -223,14 +224,35 @@ function Workflow() {
         </Button>
       </Box>
 
-      <TextField
-        fullWidth
-        size="small"
-        placeholder="Search workflows..."
-        value={searchTerm}
-        onChange={(e) => setSearchTerm(e.target.value)}
-        sx={{ mb: 3, maxWidth: 400 }}
-      />
+      <Box sx={{ mb: 3, display: 'flex' }}>
+        <TextField
+          size="small"
+          placeholder="Search workflows..."
+          value={searchTerm}
+          onChange={(e) => setSearchTerm(e.target.value)}
+          InputProps={{
+            startAdornment: (
+              <SearchIcon sx={{ color: 'text.secondary', mr: 1, fontSize: 20 }} />
+            ),
+          }}
+          sx={{
+            width: '100%',
+            maxWidth: 400,
+            '& .MuiOutlinedInput-root': {
+              borderRadius: 2,
+              bgcolor: 'background.paper',
+              transition: 'all 0.2s ease-in-out',
+              '&:hover': {
+                boxShadow: '0 2px 8px rgba(0,0,0,0.05)',
+                borderColor: 'primary.main',
+              },
+              '&.Mui-focused': {
+                boxShadow: '0 4px 12px rgba(25, 118, 210, 0.1)',
+              }
+            }
+          }}
+        />
+      </Box>
 
       <TableContainer component={Paper} elevation={0} variant="outlined" sx={{ borderRadius: 2 }}>
         <Table>

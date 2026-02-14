@@ -29,7 +29,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadExecutions();
-    const interval = setInterval(loadExecutions, 10000);
+    const interval = setInterval(loadExecutions, 30000);
     return () => clearInterval(interval);
   }, [loadExecutions]);
 
@@ -65,7 +65,7 @@ export default function Dashboard() {
     [executions, page, rowsPerPage]);
 
   return (
-    <Box sx={{ p: 3 }}>
+    <Box sx={{ p: 4 }}>
       <Box sx={{ mb: 4 }}>
         <Typography variant="h4" sx={{ fontWeight: 700, mb: 1 }}>Dashboard</Typography>
         <Typography variant="body1" color="text.secondary">System monitoring and activity tracking</Typography>

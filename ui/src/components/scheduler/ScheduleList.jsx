@@ -29,7 +29,8 @@ import {
   MoreVert as MoreVertIcon,
   PlayArrow as PlayArrowIcon,
   Edit as EditIcon,
-  Delete as DeleteIcon
+  Delete as DeleteIcon,
+  Search as SearchIcon
 } from '@mui/icons-material';
 import { useScheduler } from '../../context/SchedulerContext';
 import { useWorkflowStatus } from '../../context/WorkflowStatusContext';
@@ -106,15 +107,33 @@ const ScheduleList = memo(() => {
 
   return (
     <Box>
-      <Box mb={3}>
+      <Box sx={{ mb: 3 }}>
         <TextField
           size="small"
-          label="Search schedules"
-          variant="outlined"
+          placeholder="Search schedules..."
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
-          sx={{ maxWidth: 400 }}
-          fullWidth
+          InputProps={{
+            startAdornment: (
+              <SearchIcon sx={{ color: 'text.secondary', mr: 1, fontSize: 20 }} />
+            ),
+          }}
+          sx={{
+            width: '100%',
+            maxWidth: 400,
+            '& .MuiOutlinedInput-root': {
+              borderRadius: 2,
+              bgcolor: 'background.paper',
+              transition: 'all 0.2s ease-in-out',
+              '&:hover': {
+                boxShadow: '0 2px 8px rgba(0,0,0,0.05)',
+                borderColor: 'primary.main',
+              },
+              '&.Mui-focused': {
+                boxShadow: '0 4px 12px rgba(25, 118, 210, 0.1)',
+              }
+            }
+          }}
         />
       </Box>
 

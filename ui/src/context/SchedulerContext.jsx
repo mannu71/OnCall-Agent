@@ -18,9 +18,6 @@ export const SchedulerProvider = ({ children }) => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  /**
-   * Helper: Format HH:MM string to user-friendly local time
-   */
   const formatTime = useCallback((timeString) => {
     if (!timeString) return '-';
     try {
@@ -33,9 +30,6 @@ export const SchedulerProvider = ({ children }) => {
     }
   }, []);
 
-  /**
-   * Transform from API workflow model to UI schedule model
-   */
   const fromApi = useCallback((wf) => {
     let startTime = undefined;
     const schedulerNode = getSchedulerNode(wf);
@@ -63,26 +57,32 @@ export const SchedulerProvider = ({ children }) => {
     };
   }, []);
 
-  const loadSchedules = useCallback(async () => {
+  const loadSchedules = useCallback(async (silent = false) => {
     try {
-      setIsLoading(true);
+      if (!silent) setIsLoading(true);
       setError(null);
       const apiWorkflows = await agentApiClient.listWorkflows();
       const normalized = Array.isArray(apiWorkflows) ? apiWorkflows.map(fromApi) : [];
       setSchedules(normalized);
     } catch (err) {
       console.error('Failed to load schedules:', err);
-      setError('Failed to connect to agent-api');
-      setSchedules([]);
+      if (!silent) setError('Failed to connect to agent-api');
     } finally {
-      setIsLoading(false);
+      if (!silent) setIsLoading(false);
     }
   }, [fromApi]);
 
   useEffect(() => {
-    loadSchedules();
-    const interval = setInterval(loadSchedules, 5000);
-    const handleVisibilityChange = () => { if (!document.hidden) loadSchedules(); };
+    // Initial Load
+    loadSchedules(false);
+
+    // Background polling every 15 seconds (reduced from 5s)
+    const interval = setInterval(() => loadSchedules(true), 15000);
+
+    const handleVisibilityChange = () => {
+      if (!document.hidden) loadSchedules(true);
+    };
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       clearInterval(interval);
@@ -95,9 +95,8 @@ export const SchedulerProvider = ({ children }) => {
       setIsLoading(true);
       const existingWorkflow = await agentApiClient.getWorkflow(schedule.workflow);
       const payload = applyScheduleToWorkflow(existingWorkflow, schedule);
-
       await agentApiClient.updateWorkflow(schedule.workflow, payload);
-      await loadSchedules();
+      await loadSchedules(true);
     } catch (err) {
       setError('Failed to create schedule');
       throw err;
@@ -111,9 +110,8 @@ export const SchedulerProvider = ({ children }) => {
       setIsLoading(true);
       const existingWorkflow = await agentApiClient.getWorkflow(name);
       const payload = applyScheduleToWorkflow(existingWorkflow, updatedSchedule);
-
       await agentApiClient.updateWorkflow(name, payload);
-      await loadSchedules();
+      await loadSchedules(true);
     } catch (err) {
       setError('Failed to update schedule');
       throw err;
@@ -126,7 +124,7 @@ export const SchedulerProvider = ({ children }) => {
     try {
       setIsLoading(true);
       await agentApiClient.deleteWorkflow(name);
-      await loadSchedules();
+      await loadSchedules(true);
     } catch (err) {
       setError('Failed to delete schedule');
       throw err;

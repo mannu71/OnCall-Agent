@@ -105,6 +105,11 @@ export const agentApiClient = {
         return response.data;
     },
 
+    async listActiveWorkflows() {
+        const response = await client.get('/api/v1/workflows/executions/active');
+        return response.data;
+    },
+
     /**
      * Check agent-api health
      */

@@ -259,3 +259,15 @@ async def get_workflow_executions(
 ):
     """Get execution history for a workflow."""
     return await execution_repo.list_by_workflow(workflow_name, limit=limit)
+
+
+@router.get("/executions/active", response_model=List[str])
+async def get_active_workflows():
+    """Get list of currently running workflow names."""
+    active = [
+        exec_data.get('workflow_name') 
+        for exec_data in visual_executor.active_executions.values() 
+        if exec_data.get('status') == 'running'
+    ]
+    # Filter out duplicates (if any) and None values
+    return list(set(filter(None, active)))

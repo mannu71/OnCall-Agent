@@ -40,12 +40,12 @@ function Chat() {
   // Show under development message if not in dev mode
   if (!DEV_MODE) {
     return (
-      <Box 
-        sx={{ 
-          display: 'flex', 
-          flexDirection: 'column', 
-          alignItems: 'center', 
-          justifyContent: 'center', 
+      <Box
+        sx={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
           height: '100%',
           p: 4,
           textAlign: 'center'
@@ -58,13 +58,13 @@ function Chat() {
         <Typography variant="h6" color="text.secondary" gutterBottom>
           🚧 Under Development 🚧
         </Typography>
-        <Paper 
-          elevation={0} 
-          sx={{ 
-            p: 3, 
-            mt: 2, 
-            maxWidth: 500, 
-            bgcolor: 'warning.light', 
+        <Paper
+          elevation={0}
+          sx={{
+            p: 3,
+            mt: 2,
+            maxWidth: 500,
+            bgcolor: 'warning.light',
             borderRadius: 2,
             border: '1px solid',
             borderColor: 'warning.main'
@@ -138,7 +138,7 @@ function Chat() {
   };
 
   const updateMessage = (messageId, updates) => {
-    setMessages(prev => prev.map(msg => 
+    setMessages(prev => prev.map(msg =>
       msg.id === messageId ? { ...msg, ...updates } : msg
     ));
   };
@@ -152,37 +152,37 @@ function Chat() {
   // Trigger the selected agent
   const triggerAgent = async (agent) => {
     if (!agent) return;
-    
+
     addMessage(MESSAGE_TYPES.USER, `Triggering agent: ${agent.name}`);
-    
+
     const thinkingId = addMessage(MESSAGE_TYPES.ASSISTANT, `Running "${agent.name}"...`, { isLoading: true });
     setIsLoading(true);
-    
+
     try {
       if (window.electronAPI?.triggerWorkflow) {
         const result = await window.electronAPI.triggerWorkflow(agent.name);
-        
+
         if (result?.success) {
-          updateMessage(thinkingId, { 
+          updateMessage(thinkingId, {
             content: `Agent "${agent.name}" triggered successfully!`,
-            isLoading: false 
+            isLoading: false
           });
         } else {
-          updateMessage(thinkingId, { 
+          updateMessage(thinkingId, {
             content: `Failed to trigger agent: ${result?.error || 'Unknown error'}`,
             isLoading: false,
             isError: true
           });
         }
       } else {
-        updateMessage(thinkingId, { 
+        updateMessage(thinkingId, {
           content: 'Agent execution is only available in the desktop app.',
           isLoading: false,
           isError: true
         });
       }
     } catch (error) {
-      updateMessage(thinkingId, { 
+      updateMessage(thinkingId, {
         content: `Error: ${error.message}`,
         isLoading: false,
         isError: true
@@ -194,12 +194,12 @@ function Chat() {
 
   const handleSendMessage = async () => {
     if (!inputValue.trim() || isLoading) return;
-    
+
     const userMessage = inputValue.trim();
     setInputValue('');
-    
+
     addMessage(MESSAGE_TYPES.USER, userMessage);
-    
+
     // If no agent selected, prompt user to select one
     if (!selectedAgent) {
       if (agents.length === 0) {
@@ -213,7 +213,7 @@ function Chat() {
       await askAgent(firstAgent, userMessage);
       return;
     }
-    
+
     // Send the question to the selected agent
     await askAgent(selectedAgent, userMessage);
   };
@@ -222,7 +222,7 @@ function Chat() {
   const askAgent = async (agent, question) => {
     const thinkingId = addMessage(MESSAGE_TYPES.ASSISTANT, `Starting agent...`, { isLoading: true, statusHistory: [] });
     setIsLoading(true);
-    
+
     // Subscribe to progress events
     let unsubscribe = null;
     if (window.electronAPI?.onAgentProgress) {
@@ -233,15 +233,15 @@ function Chat() {
             const statusHistory = [...(msg.statusHistory || [])];
             // Add new status to history (keep last 5)
             if (progress.message) {
-              statusHistory.push({ 
-                type: progress.type, 
-                message: progress.message, 
-                time: new Date().toLocaleTimeString() 
+              statusHistory.push({
+                type: progress.type,
+                message: progress.message,
+                time: new Date().toLocaleTimeString()
               });
               if (statusHistory.length > 8) statusHistory.shift();
             }
-            return { 
-              ...msg, 
+            return {
+              ...msg,
               content: progress.message || msg.content,
               currentStatus: progress,
               statusHistory
@@ -251,19 +251,19 @@ function Chat() {
         }));
       });
     }
-    
+
     try {
       if (window.electronAPI?.runAgent) {
         const result = await window.electronAPI.runAgent(agent.name, question);
-        
+
         if (result?.success) {
-          updateMessage(thinkingId, { 
+          updateMessage(thinkingId, {
             content: result.answer || 'Agent completed successfully.',
             isLoading: false,
             currentStatus: null
           });
         } else {
-          updateMessage(thinkingId, { 
+          updateMessage(thinkingId, {
             content: `Error: ${result?.error || 'Unknown error'}`,
             isLoading: false,
             isError: true,
@@ -271,14 +271,14 @@ function Chat() {
           });
         }
       } else {
-        updateMessage(thinkingId, { 
+        updateMessage(thinkingId, {
           content: 'Agent execution is only available in the desktop app.',
           isLoading: false,
           isError: true
         });
       }
     } catch (error) {
-      updateMessage(thinkingId, { 
+      updateMessage(thinkingId, {
         content: `Error: ${error.message}`,
         isLoading: false,
         isError: true
@@ -300,7 +300,7 @@ function Chat() {
   const renderMessage = (message) => {
     const isUser = message.type === MESSAGE_TYPES.USER;
     const isSystem = message.type === MESSAGE_TYPES.SYSTEM;
-    
+
     return (
       <Box
         key={message.id}
@@ -335,7 +335,7 @@ function Chat() {
           >
             {isUser ? <PersonIcon fontSize="small" /> : <AgentIcon fontSize="small" />}
           </Box>
-          
+
           <Paper
             elevation={1}
             sx={{
@@ -348,32 +348,32 @@ function Chat() {
               borderTopRightRadius: isUser ? 4 : 16
             }}
           >
-            <Typography 
-              variant="body1" 
+            <Typography
+              variant="body1"
               sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
             >
               {message.content}
             </Typography>
-            
+
             {message.isLoading && (
               <Box sx={{ mt: 1 }}>
                 {/* Show status history */}
                 {message.statusHistory && message.statusHistory.length > 0 && (
                   <Box sx={{ mb: 1, maxHeight: 150, overflowY: 'auto' }}>
                     {message.statusHistory.map((status, idx) => (
-                      <Typography 
-                        key={idx} 
-                        variant="caption" 
-                        sx={{ 
-                          display: 'block', 
+                      <Typography
+                        key={idx}
+                        variant="caption"
+                        sx={{
+                          display: 'block',
                           color: status.type === 'error' ? 'error.main' : 'text.secondary',
                           fontSize: '0.7rem',
                           opacity: 0.8,
                           pl: 1,
                           borderLeft: '2px solid',
-                          borderColor: status.type === 'tool' ? 'info.main' : 
-                                      status.type === 'thinking' ? 'warning.main' :
-                                      status.type === 'error' ? 'error.main' : 'grey.400',
+                          borderColor: status.type === 'tool' ? 'info.main' :
+                            status.type === 'thinking' ? 'warning.main' :
+                              status.type === 'error' ? 'error.main' : 'grey.400',
                           mb: 0.5
                         }}
                       >
@@ -391,11 +391,11 @@ function Chat() {
                 </Box>
               </Box>
             )}
-            
+
             {message.isError && (
               <Chip icon={<ErrorIcon />} label="Error" color="error" size="small" sx={{ mt: 1 }} />
             )}
-            
+
             <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
               {new Date(message.timestamp).toLocaleTimeString()}
             </Typography>
@@ -408,28 +408,28 @@ function Chat() {
   return (
     <Box sx={{ display: 'flex', height: '100vh', bgcolor: 'grey.50' }}>
       {/* Sidebar - Agent List */}
-      <Paper 
-        elevation={0} 
-        sx={{ 
-          width: 280, 
-          borderRight: 1, 
+      <Paper
+        elevation={0}
+        sx={{
+          width: 280,
+          borderRight: 1,
           borderColor: 'divider',
           display: 'flex',
           flexDirection: 'column'
         }}
       >
-        <Box sx={{ p: 2, borderBottom: 1, borderColor: 'divider' }}>
+        <Box sx={{ p: 2, height: 80, borderBottom: 1, borderColor: 'divider', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
           <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <Typography variant="h6" fontWeight="bold">Agents</Typography>
+            <Typography variant="h6" sx={{ fontWeight: 700, fontSize: '1rem' }}>Agents</Typography>
             <IconButton size="small" onClick={loadAgents} title="Refresh">
               <RefreshIcon fontSize="small" />
             </IconButton>
           </Box>
-          <Typography variant="body2" color="text.secondary">
+          <Typography variant="caption" color="text.secondary">
             Click to trigger an agent
           </Typography>
         </Box>
-        
+
         <List sx={{ flexGrow: 1, overflow: 'auto' }}>
           {agents.length === 0 ? (
             <Box sx={{ p: 2 }}>
@@ -440,8 +440,8 @@ function Chat() {
           ) : (
             agents.map((agent) => (
               <ListItem key={agent.id} disablePadding secondaryAction={
-                <IconButton 
-                  edge="end" 
+                <IconButton
+                  edge="end"
                   onClick={(e) => { e.stopPropagation(); triggerAgent(agent); }}
                   disabled={isLoading}
                   title="Run agent"
@@ -449,7 +449,7 @@ function Chat() {
                   <PlayIcon color="primary" fontSize="small" />
                 </IconButton>
               }>
-                <ListItemButton 
+                <ListItemButton
                   onClick={() => handleSelectAgent(agent)}
                   disabled={isLoading}
                   selected={selectedAgent?.id === agent.id}
@@ -457,7 +457,7 @@ function Chat() {
                   <ListItemIcon>
                     <AgentIcon color={selectedAgent?.id === agent.id ? 'primary' : 'action'} />
                   </ListItemIcon>
-                  <ListItemText 
+                  <ListItemText
                     primary={agent.name}
                     secondary={selectedAgent?.id === agent.id ? 'Selected' : 'Click to select'}
                   />
@@ -467,24 +467,24 @@ function Chat() {
           )}
         </List>
       </Paper>
-      
+
       {/* Main Chat Area */}
       <Box sx={{ flexGrow: 1, display: 'flex', flexDirection: 'column' }}>
-        <Paper 
-          elevation={0} 
-          sx={{ p: 2, borderBottom: 1, borderColor: 'divider', bgcolor: 'background.paper' }}
+        <Paper
+          elevation={0}
+          sx={{ height: 80, px: 3, borderBottom: 1, borderColor: 'divider', bgcolor: 'background.paper', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}
         >
-          <Typography variant="h5" fontWeight="bold">Agent Chat</Typography>
+          <Typography variant="h5" sx={{ fontWeight: 700 }}>Agent Chat</Typography>
           <Typography variant="body2" color="text.secondary">
-            Select an agent from the sidebar, then run it with the play button or type "run"
+            Interact with your agent workflows in real-time
           </Typography>
         </Paper>
-        
+
         <Box sx={{ flexGrow: 1, overflow: 'auto', p: 2, bgcolor: 'grey.50' }}>
           {messages.map(renderMessage)}
           <div ref={messagesEndRef} />
         </Box>
-        
+
         <Paper elevation={2} sx={{ p: 2, borderTop: 1, borderColor: 'divider' }}>
           <Box sx={{ display: 'flex', gap: 1 }}>
             <TextField
@@ -499,12 +499,12 @@ function Chat() {
               size="small"
               sx={{ '& .MuiOutlinedInput-root': { borderRadius: 3 } }}
             />
-            <IconButton 
-              color="primary" 
+            <IconButton
+              color="primary"
               onClick={handleSendMessage}
               disabled={!inputValue.trim() || isLoading}
-              sx={{ 
-                bgcolor: 'primary.main', 
+              sx={{
+                bgcolor: 'primary.main',
                 color: 'white',
                 '&:hover': { bgcolor: 'primary.dark' },
                 '&:disabled': { bgcolor: 'grey.300' }

@@ -1,4 +1,5 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { agentApiClient } from '../services/agentApiClient';
 
 const WorkflowStatusContext = createContext();
 
@@ -13,58 +14,65 @@ export const useWorkflowStatus = () => {
 export const WorkflowStatusProvider = ({ children }) => {
   const [runningWorkflows, setRunningWorkflows] = useState([]);
   const [pendingWorkflows, setPendingWorkflows] = useState([]);
-  const [isLoading, setIsLoading] = useState(true);
+  const [lastCheck, setLastCheck] = useState(0);
 
-  // Poll for running workflows globally
-  useEffect(() => {
-    const checkRunningWorkflows = async () => {
-      try {
-        if (window.electronAPI?.getSchedulesInProgress) {
-          const inProgress = await window.electronAPI.getSchedulesInProgress();
-          setRunningWorkflows(inProgress.schedules || []);
-        }
-      } catch (error) {
-        console.error('Error checking running workflows:', error);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-    
-    checkRunningWorkflows();
-    const interval = setInterval(checkRunningWorkflows, 2000); // Check every 2 seconds
-    
-    return () => clearInterval(interval);
+  const checkRunningWorkflows = useCallback(async () => {
+    try {
+      const active = await agentApiClient.listActiveWorkflows();
+      setRunningWorkflows(active || []);
+      setLastCheck(Date.now());
+    } catch (error) {
+      console.error('Error checking running workflows:', error);
+    }
   }, []);
 
-  const isWorkflowRunning = (workflowName) => {
-    return runningWorkflows.includes(workflowName) || pendingWorkflows.includes(workflowName);
-  };
-
-  // Mark a workflow as pending immediately (before API call completes)
-  const markWorkflowPending = (workflowName) => {
-    setPendingWorkflows(prev => [...prev, workflowName]);
-  };
-
-  // Clear a workflow from pending state (e.g., when API call fails)
-  const clearWorkflowPending = (workflowName) => {
-    setPendingWorkflows(prev => prev.filter(w => w !== workflowName));
-  };
-
-  // Remove from pending when it appears in running (synced from main process)
   useEffect(() => {
-    setPendingWorkflows(prev => prev.filter(w => !runningWorkflows.includes(w)));
+    checkRunningWorkflows();
+
+    // Check every 10 seconds (less aggressive than 2s)
+    const interval = setInterval(checkRunningWorkflows, 10000);
+
+    // If window returns to focus, check immediately
+    const handleFocus = () => checkRunningWorkflows();
+    window.addEventListener('focus', handleFocus);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', handleFocus);
+    };
+  }, [checkRunningWorkflows]);
+
+  const isWorkflowRunning = useCallback((workflowName) => {
+    return runningWorkflows.includes(workflowName) || pendingWorkflows.includes(workflowName);
+  }, [runningWorkflows, pendingWorkflows]);
+
+  const markWorkflowPending = useCallback((workflowName) => {
+    setPendingWorkflows(prev => [...new Set([...prev, workflowName])]);
+  }, []);
+
+  const clearWorkflowPending = useCallback((workflowName) => {
+    setPendingWorkflows(prev => prev.filter(w => w !== workflowName));
+  }, []);
+
+  // Synchronize pending and running
+  useEffect(() => {
+    if (runningWorkflows.length > 0) {
+      setPendingWorkflows(prev => prev.filter(w => !runningWorkflows.includes(w)));
+    }
   }, [runningWorkflows]);
 
-  // Combined list for display
-  const allRunningWorkflows = [...new Set([...runningWorkflows, ...pendingWorkflows])];
+  const allRunningWorkflows = useMemo(() =>
+    [...new Set([...runningWorkflows, ...pendingWorkflows])],
+    [runningWorkflows, pendingWorkflows]
+  );
 
   const value = {
     runningWorkflows: allRunningWorkflows,
     isWorkflowRunning,
     markWorkflowPending,
     clearWorkflowPending,
-    isLoading,
-    count: allRunningWorkflows.length
+    count: allRunningWorkflows.length,
+    lastCheck
   };
 
   return (
@@ -73,5 +81,8 @@ export const WorkflowStatusProvider = ({ children }) => {
     </WorkflowStatusContext.Provider>
   );
 };
+
+// Add useMemo to imports since it's used
+import { useMemo } from 'react';
 
 export default WorkflowStatusContext;

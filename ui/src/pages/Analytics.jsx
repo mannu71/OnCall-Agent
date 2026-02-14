@@ -1,6 +1,6 @@
 import React from 'react';
 import { Box, Paper, Typography, Grid, Card, CardContent } from '@mui/material';
-import { 
+import {
   Construction as ConstructionIcon,
   TrendingUp as TrendingUpIcon,
   Schedule as ScheduleIcon,
@@ -15,12 +15,12 @@ function Analytics() {
   // Show under development message if not in dev mode
   if (!DEV_MODE) {
     return (
-      <Box 
-        sx={{ 
-          display: 'flex', 
-          flexDirection: 'column', 
-          alignItems: 'center', 
-          justifyContent: 'center', 
+      <Box
+        sx={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
           height: '100%',
           p: 4,
           textAlign: 'center'
@@ -33,13 +33,13 @@ function Analytics() {
         <Typography variant="h6" color="text.secondary" gutterBottom>
           🚧 Under Development 🚧
         </Typography>
-        <Paper 
-          elevation={0} 
-          sx={{ 
-            p: 3, 
-            mt: 2, 
-            maxWidth: 500, 
-            bgcolor: 'warning.light', 
+        <Paper
+          elevation={0}
+          sx={{
+            p: 3,
+            mt: 2,
+            maxWidth: 500,
+            bgcolor: 'warning.light',
             borderRadius: 2,
             border: '1px solid',
             borderColor: 'warning.main'
@@ -59,12 +59,10 @@ function Analytics() {
   // Development mode - show analytics placeholder
   return (
     <Box sx={{ p: 3 }}>
-      <Typography variant="h4" gutterBottom fontWeight="bold">
-        Analytics
-      </Typography>
-      <Typography variant="body1" color="text.secondary" sx={{ mb: 3 }}>
-        Workflow and agent performance metrics (Development Preview)
-      </Typography>
+      <Box sx={{ mb: 4 }}>
+        <Typography variant="h4" sx={{ fontWeight: 700, mb: 1 }}>Analytics</Typography>
+        <Typography variant="body1" color="text.secondary">Workflow and agent performance metrics (Development Preview)</Typography>
+      </Box>
 
       <Grid container spacing={3}>
         {/* Summary Cards */}

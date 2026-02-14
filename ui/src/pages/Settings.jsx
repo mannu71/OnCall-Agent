@@ -27,9 +27,9 @@ import {
     InputAdornment,
     Autocomplete
 } from '@mui/material';
-import { 
-    Add as AddIcon, 
-    Edit as EditIcon, 
+import {
+    Add as AddIcon,
+    Edit as EditIcon,
     Delete as DeleteIcon,
     PlayArrow as StartIcon,
     Stop as StopIcon,
@@ -67,10 +67,10 @@ const Settings = () => {
     const [detectedInputVars, setDetectedInputVars] = useState([]);
     const [inputVarValues, setInputVarValues] = useState({});
     const [saveMessage, setSaveMessage] = useState('');
-    
+
     // Connection status state for MCP servers
     const [connectionStatus, setConnectionStatus] = useState({}); // { serverName: { status: 'untested' | 'testing' | 'connected' | 'error', message: '' } }
-    
+
     // LLM state
     const [llms, setLLMs] = useState({});
     const [openLLMDialog, setOpenLLMDialog] = useState(false);
@@ -97,7 +97,7 @@ const Settings = () => {
     const [showApiKey, setShowApiKey] = useState(false);
     const [existingApiKey, setExistingApiKey] = useState(null); // To show if key exists
     const [llmConnectionStatus, setLLMConnectionStatus] = useState({}); // { llmName: { status: 'untested' | 'testing' | 'connected' | 'error', message: '' } }
-    
+
     // Docker state
     const [dockerAvailable, setDockerAvailable] = useState(false);
     const [dockerLoading, setDockerLoading] = useState(false);
@@ -138,7 +138,7 @@ const Settings = () => {
 
         try {
             const result = await window.electronAPI.testMCPServer(serverName, serverConfig);
-            
+
             if (result.success) {
                 setConnectionStatus(prev => ({
                     ...prev,
@@ -185,7 +185,7 @@ const Settings = () => {
 
         try {
             const result = await window.electronAPI.testLLM(llmName, llmConfig);
-            
+
             if (result.success) {
                 setLLMConnectionStatus(prev => ({
                     ...prev,
@@ -215,7 +215,7 @@ const Settings = () => {
             const checkResult = await window.electronAPI.checkDocker();
             setDockerAvailable(checkResult.available);
             setDockerError(checkResult.error);
-            
+
             if (checkResult.available) {
                 const statusResult = await window.electronAPI.dockerStatus();
                 if (statusResult.success) {
@@ -271,13 +271,13 @@ const Settings = () => {
     const handleOpenDialog = async (serverName = null) => {
         // Load current input values
         const currentInputValues = await getMCPInputValues();
-        
+
         if (serverName) {
             // Edit mode
             const server = servers[serverName];
             const argsString = Array.isArray(server.args) ? server.args.join('\n') : '';
             const vars = extractInputVariables(argsString);
-            
+
             setEditingServer(serverName);
             setFormData({
                 name: serverName,
@@ -329,7 +329,7 @@ const Settings = () => {
                     await updateMCPInputValue(varName, inputVarValues[varName]);
                 }
             }
-            
+
             // Parse args - support both newline-separated and comma-separated formats
             // But be careful: connection strings contain commas, so only split on ", " (comma+space)
             // at the beginning of args (like "-y, @package, url")
@@ -337,7 +337,7 @@ const Settings = () => {
                 .split('\n')
                 .map(arg => arg.trim())
                 .filter(arg => arg.length > 0);
-            
+
             // If we have a single arg that looks like comma-separated npx args, split it
             // Pattern: starts with -y, followed by package name, followed by connection string
             if (args.length === 1 && args[0].includes(', ')) {
@@ -348,28 +348,28 @@ const Settings = () => {
                     // because the URL might contain commas
                     const parts = [];
                     let remaining = singleArg;
-                    
+
                     // Extract -y
                     const firstComma = remaining.indexOf(',');
                     if (firstComma !== -1) {
                         parts.push(remaining.substring(0, firstComma).trim());
                         remaining = remaining.substring(firstComma + 1).trim();
-                        
+
                         // Extract package name (up to next comma-space, but before any ://)
                         const urlStart = remaining.indexOf('://');
                         const secondComma = remaining.indexOf(', ');
-                        
+
                         if (secondComma !== -1 && (urlStart === -1 || secondComma < urlStart)) {
                             parts.push(remaining.substring(0, secondComma).trim());
                             remaining = remaining.substring(secondComma + 1).trim();
                         }
-                        
+
                         // Rest is the connection string
                         if (remaining) {
                             parts.push(remaining);
                         }
                     }
-                    
+
                     if (parts.length >= 2) {
                         args = parts;
                     }
@@ -396,7 +396,7 @@ const Settings = () => {
             };
 
             const serverNameToTest = formData.name;
-            
+
             if (editingServer) {
                 // Update existing server (handles rename and syncs to workflows)
                 await updateMCPServer(editingServer, serverConfig, formData.name !== editingServer ? formData.name : null);
@@ -444,7 +444,7 @@ const Settings = () => {
     const handleOpenLLMDialog = async (llmName = null) => {
         setShowApiKey(false);
         setExistingApiKey(null);
-        
+
         if (llmName) {
             const llm = llms[llmName];
             setEditingLLM(llmName);
@@ -458,7 +458,7 @@ const Settings = () => {
                 baseUrl: llm.baseUrl || '',
                 temperature: llm.temperature ?? 0
             });
-            
+
             // Check if API key exists for this LLM
             if (window.electronAPI?.getApiKeyMasked) {
                 const result = await window.electronAPI.getApiKeyMasked(llmName);
@@ -570,10 +570,9 @@ const Settings = () => {
     return (
         <Box sx={{ p: 2, minHeight: '100vh', backgroundColor: 'background.default' }}>
             <Container maxWidth="lg" sx={{ px: 0 }}>
-                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 3 }}>
-                    <Typography variant="h4" gutterBottom sx={{ fontWeight: 600, mb: 0 }}>
-                        Settings
-                    </Typography>
+                <Box sx={{ mb: 4 }}>
+                    <Typography variant="h4" sx={{ fontWeight: 700, mb: 1 }}>Settings</Typography>
+                    <Typography variant="body1" color="text.secondary">Configure system services, MCP servers, and language models</Typography>
                 </Box>
 
                 {saveMessage && (
@@ -659,16 +658,16 @@ const Settings = () => {
                                                         </TableCell>
                                                         <TableCell>
                                                             <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
-                                                                <Chip 
-                                                                    label="Scheduler" 
-                                                                    size="small" 
+                                                                <Chip
+                                                                    label="Scheduler"
+                                                                    size="small"
                                                                     color="primary"
                                                                     variant="outlined"
                                                                     sx={{ fontSize: '0.75em' }}
                                                                 />
-                                                                <Chip 
-                                                                    label="Worker" 
-                                                                    size="small" 
+                                                                <Chip
+                                                                    label="Worker"
+                                                                    size="small"
                                                                     color="secondary"
                                                                     variant="outlined"
                                                                     sx={{ fontSize: '0.75em' }}
@@ -676,12 +675,12 @@ const Settings = () => {
                                                             </Box>
                                                         </TableCell>
                                                         <TableCell>
-                                                            <Chip 
-                                                                label={container.State || container.state || 'unknown'} 
+                                                            <Chip
+                                                                label={container.State || container.state || 'unknown'}
                                                                 size="small"
                                                                 color={
-                                                                    (container.State || container.state) === 'running' 
-                                                                        ? 'success' 
+                                                                    (container.State || container.state) === 'running'
+                                                                        ? 'success'
                                                                         : 'default'
                                                                 }
                                                             />
@@ -723,95 +722,95 @@ const Settings = () => {
 
                     <TableContainer>
                         <Table>
-                            <TableHead>
+                            <TableHead sx={{ bgcolor: 'action.hover' }}>
                                 <TableRow>
-                                    <TableCell>Icon</TableCell>
-                                    <TableCell>Name</TableCell>
-                                    <TableCell>Description</TableCell>
-                                    <TableCell>Command</TableCell>
-                                    <TableCell>Status</TableCell>
-                                    <TableCell align="right">Actions</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>Icon</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>Name</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>Description</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>Command</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>Status</TableCell>
+                                    <TableCell align="right" sx={{ fontWeight: 600 }}>Actions</TableCell>
                                 </TableRow>
                             </TableHead>
                             <TableBody>
                                 {Object.entries(servers).map(([name, config]) => {
                                     const status = connectionStatus[name];
                                     return (
-                                    <TableRow key={name}>
-                                        <TableCell>{config.icon || '🔧'}</TableCell>
-                                        <TableCell>
-                                            <Typography variant="body2" sx={{ fontWeight: 500 }}>
-                                                {name}
-                                            </Typography>
-                                        </TableCell>
-                                        <TableCell>{config.description || '-'}</TableCell>
-                                        <TableCell>
-                                            <code style={{ fontSize: '0.85em' }}>{config.command}</code>
-                                        </TableCell>
-                                        <TableCell>
-                                            {status?.status === 'testing' && (
-                                                <Chip
-                                                    icon={<HourglassEmptyIcon fontSize="small" />}
-                                                    label="Testing..."
-                                                    size="small"
-                                                    color="info"
-                                                />
-                                            )}
-                                            {status?.status === 'connected' && (
-                                                <Chip
-                                                    icon={<CheckCircleIcon fontSize="small" />}
-                                                    label="Connected"
-                                                    size="small"
-                                                    color="success"
-                                                />
-                                            )}
-                                            {status?.status === 'error' && (
-                                                <Chip
-                                                    icon={<ErrorIcon fontSize="small" />}
-                                                    label={status.message?.substring(0, 20) || 'Error'}
-                                                    size="small"
-                                                    color="error"
-                                                    title={status.message}
-                                                />
-                                            )}
-                                            {!status && (
-                                                <Chip
-                                                    label="Not tested"
-                                                    size="small"
-                                                    variant="outlined"
-                                                />
-                                            )}
-                                        </TableCell>
-                                        <TableCell align="right">
-                                            <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 0.5 }}>
-                                                <IconButton
-                                                    size="small"
-                                                    onClick={() => testServerConnection(name, config)}
-                                                    color="info"
-                                                    title="Test Connection"
-                                                    disabled={status?.status === 'testing'}
-                                                >
-                                                    <RefreshIcon fontSize="small" />
-                                                </IconButton>
-                                                <IconButton
-                                                    size="small"
-                                                    onClick={() => handleOpenDialog(name)}
-                                                    color="primary"
-                                                    title="Edit"
-                                                >
-                                                    <EditIcon fontSize="small" />
-                                                </IconButton>
-                                                <IconButton
-                                                    size="small"
-                                                    onClick={() => handleDelete(name)}
-                                                    color="error"
-                                                    title="Delete"
-                                                >
-                                                    <DeleteIcon fontSize="small" />
-                                                </IconButton>
-                                            </Box>
-                                        </TableCell>
-                                    </TableRow>
+                                        <TableRow key={name}>
+                                            <TableCell>{config.icon || '🔧'}</TableCell>
+                                            <TableCell>
+                                                <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                                                    {name}
+                                                </Typography>
+                                            </TableCell>
+                                            <TableCell>{config.description || '-'}</TableCell>
+                                            <TableCell>
+                                                <code style={{ fontSize: '0.85em' }}>{config.command}</code>
+                                            </TableCell>
+                                            <TableCell>
+                                                {status?.status === 'testing' && (
+                                                    <Chip
+                                                        icon={<HourglassEmptyIcon fontSize="small" />}
+                                                        label="Testing..."
+                                                        size="small"
+                                                        color="info"
+                                                    />
+                                                )}
+                                                {status?.status === 'connected' && (
+                                                    <Chip
+                                                        icon={<CheckCircleIcon fontSize="small" />}
+                                                        label="Connected"
+                                                        size="small"
+                                                        color="success"
+                                                    />
+                                                )}
+                                                {status?.status === 'error' && (
+                                                    <Chip
+                                                        icon={<ErrorIcon fontSize="small" />}
+                                                        label={status.message?.substring(0, 20) || 'Error'}
+                                                        size="small"
+                                                        color="error"
+                                                        title={status.message}
+                                                    />
+                                                )}
+                                                {!status && (
+                                                    <Chip
+                                                        label="Not tested"
+                                                        size="small"
+                                                        variant="outlined"
+                                                    />
+                                                )}
+                                            </TableCell>
+                                            <TableCell align="right">
+                                                <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 0.5 }}>
+                                                    <IconButton
+                                                        size="small"
+                                                        onClick={() => testServerConnection(name, config)}
+                                                        color="info"
+                                                        title="Test Connection"
+                                                        disabled={status?.status === 'testing'}
+                                                    >
+                                                        <RefreshIcon fontSize="small" />
+                                                    </IconButton>
+                                                    <IconButton
+                                                        size="small"
+                                                        onClick={() => handleOpenDialog(name)}
+                                                        color="primary"
+                                                        title="Edit"
+                                                    >
+                                                        <EditIcon fontSize="small" />
+                                                    </IconButton>
+                                                    <IconButton
+                                                        size="small"
+                                                        onClick={() => handleDelete(name)}
+                                                        color="error"
+                                                        title="Delete"
+                                                    >
+                                                        <DeleteIcon fontSize="small" />
+                                                    </IconButton>
+                                                </Box>
+                                            </TableCell>
+                                        </TableRow>
                                     );
                                 })}
                                 {Object.keys(servers).length === 0 && (
@@ -845,72 +844,72 @@ const Settings = () => {
 
                     <TableContainer>
                         <Table>
-                            <TableHead>
+                            <TableHead sx={{ bgcolor: 'action.hover' }}>
                                 <TableRow>
-                                    <TableCell>Icon</TableCell>
-                                    <TableCell>Name</TableCell>
-                                    <TableCell>Provider</TableCell>
-                                    <TableCell>Model</TableCell>
-                                    <TableCell>Status</TableCell>
-                                    <TableCell align="right">Actions</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>Icon</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>Name</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>Provider</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>Model</TableCell>
+                                    <TableCell sx={{ fontWeight: 600 }}>Status</TableCell>
+                                    <TableCell align="right" sx={{ fontWeight: 600 }}>Actions</TableCell>
                                 </TableRow>
                             </TableHead>
                             <TableBody>
                                 {Object.entries(llms).map(([name, config]) => {
                                     const status = llmConnectionStatus[name];
                                     return (
-                                    <TableRow key={name}>
-                                        <TableCell>{config.icon || '🧠'}</TableCell>
-                                        <TableCell>
-                                            <Typography variant="body2" sx={{ fontWeight: 500 }}>
-                                                {name}
-                                            </Typography>
-                                        </TableCell>
-                                        <TableCell>
-                                            <Chip label={config.provider} size="small" color="primary" variant="outlined" />
-                                        </TableCell>
-                                        <TableCell>
-                                            <code style={{ fontSize: '0.85em' }}>{config.model}</code>
-                                        </TableCell>
-                                        <TableCell>
-                                            {status?.status === 'testing' && (
-                                                <Chip icon={<HourglassEmptyIcon />} label="Testing..." size="small" color="default" />
-                                            )}
-                                            {status?.status === 'connected' && (
-                                                <Chip icon={<CheckCircleIcon />} label={status.message} size="small" color="success" />
-                                            )}
-                                            {status?.status === 'error' && (
-                                                <Chip icon={<ErrorIcon />} label={status.message} size="small" color="error" title={status.message} />
-                                            )}
-                                            {!status && (
-                                                <Chip label="Not tested" size="small" color="default" variant="outlined" />
-                                            )}
-                                        </TableCell>
-                                        <TableCell align="right">
-                                            <IconButton
-                                                size="small"
-                                                onClick={() => testLLMConnection(name, config)}
-                                                color="default"
-                                                title="Test Connection"
-                                            >
-                                                <RefreshIcon fontSize="small" />
-                                            </IconButton>
-                                            <IconButton
-                                                size="small"
-                                                onClick={() => handleOpenLLMDialog(name)}
-                                                color="primary"
-                                            >
-                                                <EditIcon fontSize="small" />
-                                            </IconButton>
-                                            <IconButton
-                                                size="small"
-                                                onClick={() => handleDeleteLLM(name)}
-                                                color="error"
-                                            >
-                                                <DeleteIcon fontSize="small" />
-                                            </IconButton>
-                                        </TableCell>
-                                    </TableRow>
+                                        <TableRow key={name}>
+                                            <TableCell>{config.icon || '🧠'}</TableCell>
+                                            <TableCell>
+                                                <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                                                    {name}
+                                                </Typography>
+                                            </TableCell>
+                                            <TableCell>
+                                                <Chip label={config.provider} size="small" color="primary" variant="outlined" />
+                                            </TableCell>
+                                            <TableCell>
+                                                <code style={{ fontSize: '0.85em' }}>{config.model}</code>
+                                            </TableCell>
+                                            <TableCell>
+                                                {status?.status === 'testing' && (
+                                                    <Chip icon={<HourglassEmptyIcon />} label="Testing..." size="small" color="default" />
+                                                )}
+                                                {status?.status === 'connected' && (
+                                                    <Chip icon={<CheckCircleIcon />} label={status.message} size="small" color="success" />
+                                                )}
+                                                {status?.status === 'error' && (
+                                                    <Chip icon={<ErrorIcon />} label={status.message} size="small" color="error" title={status.message} />
+                                                )}
+                                                {!status && (
+                                                    <Chip label="Not tested" size="small" color="default" variant="outlined" />
+                                                )}
+                                            </TableCell>
+                                            <TableCell align="right">
+                                                <IconButton
+                                                    size="small"
+                                                    onClick={() => testLLMConnection(name, config)}
+                                                    color="default"
+                                                    title="Test Connection"
+                                                >
+                                                    <RefreshIcon fontSize="small" />
+                                                </IconButton>
+                                                <IconButton
+                                                    size="small"
+                                                    onClick={() => handleOpenLLMDialog(name)}
+                                                    color="primary"
+                                                >
+                                                    <EditIcon fontSize="small" />
+                                                </IconButton>
+                                                <IconButton
+                                                    size="small"
+                                                    onClick={() => handleDeleteLLM(name)}
+                                                    color="error"
+                                                >
+                                                    <DeleteIcon fontSize="small" />
+                                                </IconButton>
+                                            </TableCell>
+                                        </TableRow>
                                     );
                                 })}
                                 {Object.keys(llms).length === 0 && (
@@ -996,9 +995,9 @@ const Settings = () => {
 
                             {/* Dynamic input variable fields */}
                             {detectedInputVars.length > 0 && (
-                                <Box sx={{ 
-                                    p: 2, 
-                                    bgcolor: 'action.hover', 
+                                <Box sx={{
+                                    p: 2,
+                                    bgcolor: 'action.hover',
                                     borderRadius: 1,
                                     display: 'flex',
                                     flexDirection: 'column',
@@ -1012,9 +1011,9 @@ const Settings = () => {
                                             key={varName}
                                             label={varName}
                                             value={inputVarValues[varName] || ''}
-                                            onChange={(e) => setInputVarValues({ 
-                                                ...inputVarValues, 
-                                                [varName]: e.target.value 
+                                            onChange={(e) => setInputVarValues({
+                                                ...inputVarValues,
+                                                [varName]: e.target.value
                                             })}
                                             fullWidth
                                             size="small"
@@ -1071,8 +1070,8 @@ const Settings = () => {
                                 <Select
                                     value={llmFormData.provider}
                                     label="Provider"
-                                    onChange={(e) => setLLMFormData({ 
-                                        ...llmFormData, 
+                                    onChange={(e) => setLLMFormData({
+                                        ...llmFormData,
                                         provider: e.target.value,
                                         model: '' // Reset model when provider changes
                                     })}
@@ -1150,9 +1149,9 @@ const Settings = () => {
 
                             {/* API Key Section */}
                             {llmFormData.provider !== 'Ollama' && (
-                                <Box sx={{ 
-                                    p: 2, 
-                                    bgcolor: 'action.hover', 
+                                <Box sx={{
+                                    p: 2,
+                                    bgcolor: 'action.hover',
                                     borderRadius: 1,
                                     display: 'flex',
                                     flexDirection: 'column',
@@ -1164,18 +1163,18 @@ const Settings = () => {
                                             API Key
                                         </Typography>
                                     </Box>
-                                    
+
                                     {existingApiKey ? (
                                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                                            <Chip 
+                                            <Chip
                                                 icon={<CheckIcon />}
                                                 label={`Key configured: ${existingApiKey}`}
-                                                size="small" 
-                                                color="success" 
-                                                variant="outlined" 
+                                                size="small"
+                                                color="success"
+                                                variant="outlined"
                                             />
-                                            <Button 
-                                                size="small" 
+                                            <Button
+                                                size="small"
                                                 onClick={() => setExistingApiKey(null)}
                                             >
                                                 Update Key
@@ -1212,9 +1211,9 @@ const Settings = () => {
                     </DialogContent>
                     <DialogActions>
                         <Button onClick={handleCloseLLMDialog}>Cancel</Button>
-                        <Button 
-                            onClick={handleSaveLLM} 
-                            variant="contained" 
+                        <Button
+                            onClick={handleSaveLLM}
+                            variant="contained"
                             disabled={!llmFormData.model}
                         >
                             {editingLLM ? 'Update' : 'Add'}
