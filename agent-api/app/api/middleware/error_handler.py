@@ -18,7 +18,7 @@ from app.core.exceptions import (
 logger = logging.getLogger(__name__)
 
 
-async def app_exception_handler(request: Request, exc: AppException) -> JSONResponse:
+def app_exception_handler(request: Request, exc: AppException) -> JSONResponse:
     """Handle application exceptions.
     
     Args:
@@ -55,7 +55,7 @@ async def app_exception_handler(request: Request, exc: AppException) -> JSONResp
     )
 
 
-async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     """Handle validation errors.
     
     Args:
@@ -80,7 +80,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
-async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
     """Handle HTTP exceptions.
     
     Args:
@@ -103,7 +103,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
     )
 
 
-async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Handle unexpected exceptions.
     
     Args:

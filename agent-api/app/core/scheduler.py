@@ -2,7 +2,7 @@
 import asyncio
 import uuid
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Set, List
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -160,7 +160,7 @@ class WorkflowScheduler:
             workflow_name=workflow_name,
             execution_id=execution_id,
             status=WorkflowStatus.RUNNING,
-            start_time=datetime.utcnow(),
+            start_time=datetime.now(timezone.utc),
             task_results=[]
         )
         
@@ -170,7 +170,7 @@ class WorkflowScheduler:
             event_type="workflow_start",
             workflow_name=workflow_name,
             execution_id=execution_id,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             data={"manual": manual}
         ))
         
@@ -187,7 +187,7 @@ class WorkflowScheduler:
                     event_type="task_start",
                     workflow_name=workflow_name,
                     execution_id=execution_id,
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(timezone.utc),
                     data={"task_name": task.name}
                 ))
                 
@@ -198,7 +198,7 @@ class WorkflowScheduler:
                     event_type="task_complete",
                     workflow_name=workflow_name,
                     execution_id=execution_id,
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(timezone.utc),
                     data={
                         "task_name": task.name,
                         "status": result.status,
@@ -226,7 +226,7 @@ class WorkflowScheduler:
             execution.error = str(e)
         
         finally:
-            execution.end_time = datetime.utcnow()
+            execution.end_time = datetime.now(timezone.utc)
             execution.duration_seconds = (execution.end_time - execution.start_time).total_seconds()
             
             # Save legacy execution (visual executor has its own storage logic)
@@ -240,7 +240,7 @@ class WorkflowScheduler:
                 event_type="workflow_complete",
                 workflow_name=workflow_name,
                 execution_id=execution_id,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 data={
                     "status": execution.status,
                     "duration_seconds": execution.duration_seconds,

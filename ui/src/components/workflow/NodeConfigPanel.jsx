@@ -1,11 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { getLLMs } from '../../services/llmService';
+import PropTypes from 'prop-types';
 import { localTimeToCron, cronToLocalTime } from '../../utils/cronUtils';
 
 const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
   const [config, setConfig] = useState(node?.data || {});
-  const [availableLLMs, setAvailableLLMs] = useState({});
-  const [isLoadingLLMs, setIsLoadingLLMs] = useState(true);
   const fileInputRef = useRef(null);
   const [timeInput, setTimeInput] = useState(() => {
     // Initialize time from startTime first (most reliable), then cronExpression, or default to current time
@@ -33,21 +31,6 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
     }
   }, [node?.id, node?.data]);
 
-  // Load configured LLMs from settings
-  useEffect(() => {
-    const loadConfiguredLLMs = async () => {
-      try {
-        const llms = await getLLMs();
-        setAvailableLLMs(llms);
-      } catch (error) {
-        console.error('Error loading LLMs:', error);
-      } finally {
-        setIsLoadingLLMs(false);
-      }
-    };
-    loadConfiguredLLMs();
-  }, []);
-
   if (!node) return null;
 
   const handleConfigChange = (key, value) => {
@@ -70,8 +53,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
         return (
           <>
             <div className="config-field">
-              <label>Agent Name</label>
+              <label htmlFor="agent-name">Agent Name</label>
               <input
+                id="agent-name"
                 type="text"
                 value={config.label || ''}
                 onChange={(e) => handleConfigChange('label', e.target.value)}
@@ -79,8 +63,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
               />
             </div>
             <div className="config-field">
-              <label>Description</label>
+              <label htmlFor="agent-description">Description</label>
               <textarea
+                id="agent-description"
                 value={config.description || ''}
                 onChange={(e) => handleConfigChange('description', e.target.value)}
                 placeholder="Describe the agent's purpose"
@@ -88,8 +73,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
               />
             </div>
             <div className="config-field">
-              <label>Instructions</label>
+              <label htmlFor="agent-instructions">Instructions</label>
               <textarea
+                id="agent-instructions"
                 value={config.instructions || ''}
                 onChange={(e) => handleConfigChange('instructions', e.target.value)}
                 placeholder="Agent instructions and behavior"
@@ -106,8 +92,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
         return (
           <>
             <div className="config-field">
-              <label>Database Type</label>
+              <label htmlFor="db-type">Database Type</label>
               <select
+                id="db-type"
                 value={config.type || 'PostgreSQL'}
                 onChange={(e) => handleConfigChange('type', e.target.value)}
               >
@@ -118,8 +105,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
               </select>
             </div>
             <div className="config-field">
-              <label>Connection String</label>
+              <label htmlFor="db-connection">Connection String</label>
               <input
+                id="db-connection"
                 type="password"
                 value={config.connectionString || ''}
                 onChange={(e) => handleConfigChange('connectionString', e.target.value)}
@@ -127,8 +115,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
               />
             </div>
             <div className="config-field">
-              <label>Database Name</label>
+              <label htmlFor="db-name">Database Name</label>
               <input
+                id="db-name"
                 type="text"
                 value={config.database || ''}
                 onChange={(e) => handleConfigChange('database', e.target.value)}
@@ -142,8 +131,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
         return (
           <>
             <div className="config-field">
-              <label>Team Name</label>
+              <label htmlFor="team-name">Team Name</label>
               <input
+                id="team-name"
                 type="text"
                 value={config.team || ''}
                 onChange={(e) => handleConfigChange('team', e.target.value)}
@@ -151,8 +141,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
               />
             </div>
             <div className="config-field">
-              <label>Channel</label>
+              <label htmlFor="team-channel">Channel</label>
               <input
+                id="team-channel"
                 type="text"
                 value={config.channel || ''}
                 onChange={(e) => handleConfigChange('channel', e.target.value)}
@@ -160,8 +151,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
               />
             </div>
             <div className="config-field">
-              <label>Webhook URL</label>
+              <label htmlFor="team-webhook">Webhook URL</label>
               <input
+                id="team-webhook"
                 type="url"
                 value={config.webhookUrl || ''}
                 onChange={(e) => handleConfigChange('webhookUrl', e.target.value)}
@@ -175,8 +167,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
         return (
           <>
             <div className="config-field">
-              <label>Chat Interface Name</label>
+              <label htmlFor="chat-name">Chat Interface Name</label>
               <input
+                id="chat-name"
                 type="text"
                 value={config.label || ''}
                 onChange={(e) => handleConfigChange('label', e.target.value)}
@@ -184,8 +177,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
               />
             </div>
             <div className="config-field">
-              <label>Welcome Message</label>
+              <label htmlFor="chat-welcome">Welcome Message</label>
               <textarea
+                id="chat-welcome"
                 value={config.welcomeMessage || ''}
                 onChange={(e) => handleConfigChange('welcomeMessage', e.target.value)}
                 placeholder="Custom welcome message for users"
@@ -193,24 +187,26 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
               />
             </div>
             <div className="config-field">
-              <label>Auto-Response</label>
+              <label htmlFor="chat-auto-response">Auto-Response</label>
               <div className="checkbox-group">
-                <label>
+                <label htmlFor="chat-auto-response-checkbox">
                   <input
+                    id="chat-auto-response-checkbox"
                     type="checkbox"
                     checked={config.autoResponse || false}
                     onChange={(e) => handleConfigChange('autoResponse', e.target.checked)}
                   />
-                  Enable automatic responses
+                  {' '}Enable automatic responses
                 </label>
               </div>
             </div>
             <div className="config-field">
-              <label>Message History Limit</label>
+              <label htmlFor="chat-history-limit">Message History Limit</label>
               <input
+                id="chat-history-limit"
                 type="number"
                 value={config.historyLimit || 50}
-                onChange={(e) => handleConfigChange('historyLimit', parseInt(e.target.value))}
+                onChange={(e) => handleConfigChange('historyLimit', Number.parseInt(e.target.value, 10))}
                 placeholder="Max messages to store"
                 min="10"
                 max="1000"
@@ -221,114 +217,114 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
       
       case 'orchestrator':
         return (
-          <>
-            <div className="config-field">
-              <label>SQL File / Workflow</label>
-              <input 
-                ref={fileInputRef}
-                type="file" 
-                accept=".sql,.json" 
-                onChange={async (e) => {
-                  const file = e.target.files[0];
-                  if (file) {
-                    const reader = new FileReader();
-                    reader.onload = async (event) => {
-                      const content = event.target.result;
-                      const fileName = file.name;
-                      const fileType = fileName.endsWith('.sql') ? 'sql' : 'json';
-                      
-                      // If Electron, save file to config/sql/ directory
-                      if (window.electronAPI && window.electronAPI.saveSqlFile) {
-                        try {
-                          const result = await window.electronAPI.saveSqlFile(fileName, content);
-                          if (result.success) {
-                            // Store reference to file - update all at once
-                            const newConfig = {
-                              ...config,
-                              sqlFile: result.relativePath,
-                              fileName: fileName,
-                              fileType: fileType
-                            };
-                            setConfig(newConfig);
-                            onUpdate(node.id, newConfig);
-                          } else {
-                            alert('Failed to save SQL file: ' + result.error);
-                          }
-                        } catch (error) {
-                          alert('Error saving SQL file: ' + error.message);
+          <div className="config-field">
+            <label htmlFor="orchestrator-file">SQL File / Workflow</label>
+            <input 
+              id="orchestrator-file"
+              ref={fileInputRef}
+              type="file" 
+              accept=".sql,.json" 
+              onChange={async (e) => {
+                const file = e.target.files[0];
+                if (file) {
+                  try {
+                    const content = await file.text();
+                    const fileName = file.name;
+                    const fileType = fileName.endsWith('.sql') ? 'sql' : 'json';
+                    
+                    // If Electron, save file to config/sql/ directory
+                    if (globalThis.electronAPI?.saveSqlFile) {
+                      try {
+                        const result = await globalThis.electronAPI.saveSqlFile(fileName, content);
+                        if (result.success) {
+                          // Store reference to file - update all at once
+                          const newConfig = {
+                            ...config,
+                            sqlFile: result.relativePath,
+                            fileName: fileName,
+                            fileType: fileType
+                          };
+                          setConfig(newConfig);
+                          onUpdate(node.id, newConfig);
+                        } else {
+                          alert('Failed to save SQL file: ' + result.error);
                         }
-                      } else {
-                        // Fallback for non-Electron environment (store inline)
-                        const newConfig = {
-                          ...config,
-                          fileContent: content,
-                          fileName: fileName,
-                          fileType: fileType
-                        };
-                        setConfig(newConfig);
-                        onUpdate(node.id, newConfig);
+                      } catch (error) {
+                        alert('Error saving SQL file: ' + error.message);
                       }
-                    };
-                    reader.readAsText(file);
-                  }
-                }}
-              />
-              {config.fileName && (
-                <div style={{ 
-                  marginTop: '8px', 
-                  padding: '8px', 
-                  background: '#f0f0f0', 
-                  borderRadius: '4px',
-                  fontSize: '12px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '8px'
-                }}>
-                  <span>📄 {config.fileName}</span>
-                  <button 
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      e.preventDefault();
-                      // Reset file input
-                      if (fileInputRef.current) {
-                        fileInputRef.current.value = '';
-                      }
+                    } else {
+                      // Fallback for non-Electron environment (store inline)
                       const newConfig = {
                         ...config,
-                        fileContent: '',
-                        sqlFile: '',
-                        fileName: '',
-                        fileType: '',
-                        stepCount: null
+                        fileContent: content,
+                        fileName: fileName,
+                        fileType: fileType
                       };
                       setConfig(newConfig);
                       onUpdate(node.id, newConfig);
-                    }}
-                    style={{
-                      background: 'none',
-                      border: 'none',
-                      color: '#ff4444',
-                      cursor: 'pointer',
-                      fontSize: '18px',
-                      padding: '0 4px',
-                      lineHeight: 1
-                    }}
-                    title="Remove file"
-                  >
-                    ×
-                  </button>
-                </div>
-              )}
-            </div>
-          </>
+                    }
+                  } catch (error) {
+                    alert('Error reading file: ' + error.message);
+                  }
+                }
+              }}
+            />
+            {config.fileName && (
+              <div style={{ 
+                marginTop: '8px', 
+                padding: '8px', 
+                background: '#f0f0f0', 
+                borderRadius: '4px',
+                fontSize: '12px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px'
+              }}>
+                <span>📄 {config.fileName}</span>
+                <button 
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    // Reset file input
+                    if (fileInputRef.current) {
+                      fileInputRef.current.value = '';
+                    }
+                    const newConfig = {
+                      ...config,
+                      fileContent: '',
+                      sqlFile: '',
+                      fileName: '',
+                      fileType: '',
+                      stepCount: null
+                    };
+                    setConfig(newConfig);
+                    onUpdate(node.id, newConfig);
+                  }}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    color: '#ff4444',
+                    cursor: 'pointer',
+                    fontSize: '18px',
+                    padding: '0 4px',
+                    lineHeight: 1
+                  }}
+                  title="Remove file"
+                >
+                  ×
+                </button>
+              </div>
+            )}
+          </div>
         );
       
       case 'scheduler':
         return (
           <>
             <div className="config-field">
-              <label>Schedule Name</label>
+              <label htmlFor="scheduler-name">Schedule Name</label>
               <input
+                id="scheduler-name"
                 type="text"
                 value={config.label || ''}
                 onChange={(e) => handleConfigChange('label', e.target.value)}
@@ -337,8 +333,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
             </div>
             
             <div className="config-field">
-              <label>Recurrence</label>
+              <label htmlFor="scheduler-recurrence">Recurrence</label>
               <select
+                id="scheduler-recurrence"
                 value={config.recurrence || 'daily'}
                 onChange={(e) => {
                   const recurrence = e.target.value;
@@ -364,8 +361,9 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
             </div>
             
             <div className="config-field">
-              <label>Time</label>
+              <label htmlFor="scheduler-time">Time</label>
               <input
+                id="scheduler-time"
                 type="time"
                 value={timeInput}
                 onChange={(e) => {
@@ -396,11 +394,24 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
   };
 
   return (
-    <div className="config-panel-overlay" onClick={onClose}>
-      <div className="config-panel" onClick={(e) => e.stopPropagation()} onKeyDown={handleKeyDown}>
+    <div 
+      className="config-panel-overlay" 
+      onClick={onClose} 
+      onKeyDown={(e) => e.key === 'Escape' && onClose()}
+      role="button"
+      tabIndex={0}
+      aria-label="Close configuration panel"
+    >
+      <div 
+        className="config-panel" 
+        onClick={(e) => e.stopPropagation()} 
+        onKeyDown={handleKeyDown}
+        role="dialog"
+        aria-labelledby="config-panel-title"
+      >
         <div className="config-header">
-          <h3>Configure {node.type.charAt(0).toUpperCase() + node.type.slice(1)} Node</h3>
-          <button className="close-btn" onClick={onClose}>×</button>
+          <h3 id="config-panel-title">Configure {node.type.charAt(0).toUpperCase() + node.type.slice(1)} Node</h3>
+          <button className="close-btn" onClick={onClose} aria-label="Close">×</button>
         </div>
         <div className="config-content">
           {renderConfigFields()}
@@ -412,6 +423,16 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
       </div>
     </div>
   );
+};
+
+NodeConfigPanel.propTypes = {
+  node: PropTypes.shape({
+    id: PropTypes.string,
+    type: PropTypes.string,
+    data: PropTypes.object,
+  }),
+  onUpdate: PropTypes.func.isRequired,
+  onClose: PropTypes.func.isRequired,
 };
 
 export default NodeConfigPanel;

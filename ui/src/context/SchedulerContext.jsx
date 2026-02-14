@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
+import PropTypes from 'prop-types';
 import { agentApiClient } from '../services/agentApiClient';
 import { cronToLocalTime } from '../utils/cronUtils';
 import { getSchedulerNode, applyScheduleToWorkflow } from '../utils/workflowUtils';
@@ -13,49 +14,53 @@ export const useScheduler = () => {
   return context;
 };
 
+const formatTime = (timeString) => {
+  if (!timeString) return '-';
+  try {
+    const [hours, minutes] = timeString.split(':');
+    const date = new Date(2024, 0, 15); // Fixed date to avoid DST issues
+    date.setHours(Number.parseInt(hours, 10), Number.parseInt(minutes, 10), 0, 0);
+    return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  } catch {
+    return timeString;
+  }
+};
+
+const fromApi = (wf) => {
+  let startTime;
+  let recurrence;
+  const schedulerNode = getSchedulerNode(wf);
+
+  if (schedulerNode?.data) {
+    startTime = schedulerNode.data.startTime || cronToLocalTime(schedulerNode.data.cronExpression);
+    recurrence = schedulerNode.data.recurrence;
+  } else if (wf.schedule) {
+    startTime = cronToLocalTime(wf.schedule);
+  }
+
+  return {
+    id: wf.name || wf.id,
+    title: wf.name,
+    name: wf.name,
+    description: wf.description || '',
+    workflow: wf.name,
+    schedule: wf.schedule,
+    enabled: wf.enabled ?? true,
+    startTime: startTime,
+    recurrence: recurrence || wf.recurrence || 'daily',
+    nodes: wf.nodes || [],
+    edges: wf.edges || [],
+    tasks: wf.tasks || [],
+    type: wf.type,
+    createdAt: wf.createdAt || wf.created_at || new Date().toISOString(),
+    updatedAt: wf.updatedAt || wf.updated_at || new Date().toISOString()
+  };
+};
+
 export const SchedulerProvider = ({ children }) => {
   const [schedules, setSchedules] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
-
-  const formatTime = useCallback((timeString) => {
-    if (!timeString) return '-';
-    try {
-      const [hours, minutes] = timeString.split(':');
-      const date = new Date();
-      date.setHours(parseInt(hours), parseInt(minutes));
-      return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-    } catch {
-      return timeString;
-    }
-  }, []);
-
-  const fromApi = useCallback((wf) => {
-    let startTime = undefined;
-    const schedulerNode = getSchedulerNode(wf);
-
-    if (schedulerNode?.data) {
-      startTime = schedulerNode.data.startTime || cronToLocalTime(schedulerNode.data.cronExpression);
-    } else if (wf.schedule) {
-      startTime = cronToLocalTime(wf.schedule);
-    }
-
-    return {
-      id: wf.name || wf.id,
-      title: wf.name,
-      name: wf.name,
-      description: wf.description || '',
-      workflow: wf.name,
-      schedule: wf.schedule,
-      enabled: wf.enabled ?? true,
-      startTime: startTime,
-      nodes: wf.nodes || [],
-      edges: wf.edges || [],
-      tasks: wf.tasks || [],
-      createdAt: wf.createdAt || wf.created_at || new Date().toISOString(),
-      updatedAt: wf.updatedAt || wf.updated_at || new Date().toISOString()
-    };
-  }, []);
 
   const loadSchedules = useCallback(async (silent = false) => {
     try {
@@ -70,14 +75,14 @@ export const SchedulerProvider = ({ children }) => {
     } finally {
       if (!silent) setIsLoading(false);
     }
-  }, [fromApi]);
+  }, []);
 
   useEffect(() => {
     // Initial Load
     loadSchedules(false);
 
-    // Background polling every 15 seconds (reduced from 5s)
-    const interval = setInterval(() => loadSchedules(true), 15000);
+    // Background polling every 30 seconds (increased from 15s to reduce load)
+    const interval = setInterval(() => loadSchedules(true), 30000);
 
     const handleVisibilityChange = () => {
       if (!document.hidden) loadSchedules(true);
@@ -137,14 +142,14 @@ export const SchedulerProvider = ({ children }) => {
     return await agentApiClient.executeWorkflow(name);
   }, []);
 
-  const getSchedule = useCallback((name) => {
-    return schedules.find(s => s.name === name || s.id === name);
+  const getSchedule = useCallback((idOrName) => {
+    return schedules.find(s => s.name === idOrName || s.id === idOrName);
   }, [schedules]);
 
   const getFreshSchedule = useCallback(async (name) => {
     const raw = await agentApiClient.getWorkflow(name);
     return fromApi(raw);
-  }, [fromApi]);
+  }, []);
 
   const value = useMemo(() => ({
     schedules,
@@ -158,11 +163,26 @@ export const SchedulerProvider = ({ children }) => {
     triggerWorkflow,
     loadSchedules,
     formatTime
-  }), [schedules, isLoading, error, addSchedule, updateSchedule, deleteSchedule, getSchedule, getFreshSchedule, triggerWorkflow, loadSchedules, formatTime]);
+  }), [
+    schedules,
+    isLoading,
+    error,
+    addSchedule,
+    updateSchedule,
+    deleteSchedule,
+    getSchedule,
+    getFreshSchedule,
+    triggerWorkflow,
+    loadSchedules
+  ]);
 
   return (
     <SchedulerContext.Provider value={value}>
       {children}
     </SchedulerContext.Provider>
   );
+};
+
+SchedulerProvider.propTypes = {
+  children: PropTypes.node.isRequired,
 };

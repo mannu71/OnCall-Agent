@@ -11,7 +11,7 @@
 export const localTimeToUTC = (timeString) => {
   const [hour, minute] = timeString.split(':');
   const localDate = new Date();
-  localDate.setHours(parseInt(hour || '0'), parseInt(minute || '0'), 0, 0);
+  localDate.setHours(Number.parseInt(hour || '0', 10), Number.parseInt(minute || '0', 10), 0, 0);
   
   return {
     utcHour: localDate.getUTCHours().toString(),
@@ -93,11 +93,11 @@ export const cronToLocalTime = (cronExpression) => {
   if (parts.length < 2) return '09:00';
   
   // Parse UTC time from cron
-  const utcMinute = parseInt(parts[0]);
-  const utcHour = parseInt(parts[1]);
+  const utcMinute = Number.parseInt(parts[0], 10);
+  const utcHour = Number.parseInt(parts[1], 10);
   
   // Validate parsed values
-  if (isNaN(utcMinute) || isNaN(utcHour)) return '09:00';
+  if (Number.isNaN(utcMinute) || Number.isNaN(utcHour)) return '09:00';
   
   // Create a date with a fixed date (to avoid date boundary issues)
   // Use a date in the middle of a month to avoid edge cases

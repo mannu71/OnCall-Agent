@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback, memo } from 'react';
+import React, { useState, useEffect, memo, useCallback, useMemo } from 'react';
+import PropTypes from 'prop-types';
 import {
   Dialog,
   DialogTitle,
@@ -18,48 +19,37 @@ import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
 import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
 import { TimePicker } from '@mui/x-date-pickers/TimePicker';
 import { dateToCron, dateToLocalTimeString } from '../../utils/cronUtils';
-import agentApiClient from '../../services/agentApiClient.js';
+import { useScheduler } from '../../context/SchedulerContext';
 
 const EditScheduleDialog = memo(({ open, schedule, onClose, onUpdate }) => {
+  const { schedules } = useScheduler();
   const [formData, setFormData] = useState({
     title: '',
-    startTime: new Date(),
+    startTime: new Date(2024, 0, 15, 9, 0),
     workflow: '',
     recurrence: 'daily',
     enabled: true,
     description: ''
   });
 
-  const [workflows, setWorkflows] = useState([]);
   const [errors, setErrors] = useState({});
 
-  useEffect(() => {
-    const loadWorkflows = async () => {
-      try {
-        const wf = await agentApiClient.listWorkflows();
-        // Filter to only show workflow type (not agent type)
-        const workflowTypeOnly = wf.filter(w => w.type !== 'agent');
-        setWorkflows(workflowTypeOnly);
-      } catch (error) {
-        console.error('Error loading workflows:', error);
-        setWorkflows([]);
-      }
-    };
+  // Filter workflows from schedules context - only non-agent workflows
+  const filteredWorkflows = useMemo(() =>
+    schedules.filter(s => s.type !== 'agent'),
+    [schedules]
+  );
 
-    if (open) {
-      loadWorkflows();
-    }
-  }, [open]);
-
+  // Sync form data when schedule prop changes
   useEffect(() => {
-    if (schedule) {
-      // Extract startTime - should be provided by parent after extraction from scheduler node
+    if (schedule && open) {
       const timeString = schedule.startTime || '09:00';
-      
-      // Parse time string to Date object
-      const [hours, minutes] = timeString.split(':');
-      const timeObj = new Date();
-      timeObj.setHours(parseInt(hours, 10) || 9, parseInt(minutes, 10) || 0, 0, 0); // Clear seconds/ms, default to 9:00
+      const [hoursStr, minutesStr] = timeString.split(':');
+      const hours = Number.parseInt(hoursStr, 10) || 9;
+      const minutes = Number.parseInt(minutesStr, 10) || 0;
+
+      const timeObj = new Date(2024, 0, 15);
+      timeObj.setHours(hours, minutes, 0, 0);
 
       setFormData({
         title: schedule.title || schedule.name || '',
@@ -69,89 +59,78 @@ const EditScheduleDialog = memo(({ open, schedule, onClose, onUpdate }) => {
         enabled: schedule.enabled ?? true,
         description: schedule.description || ''
       });
+      setErrors({});
     }
-  }, [schedule]);
+  }, [schedule, open]);
 
-  const handleChange = (field) => (event) => {
-    const value = event.target ? event.target.value : event;
-    setFormData(prev => ({
-      ...prev,
-      [field]: value
-    }));
+  const handleChange = useCallback((field) => (event) => {
+    let value;
+    if (event?.target) {
+      value = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
+    } else {
+      value = event;
+    }
 
-    // Clear error when user starts typing
+    setFormData(prev => ({ ...prev, [field]: value }));
+
     if (errors[field]) {
-      setErrors(prev => ({
-        ...prev,
-        [field]: ''
-      }));
+      setErrors(prev => {
+        const newErrors = { ...prev };
+        delete newErrors[field];
+        return newErrors;
+      });
     }
-  };
+  }, [errors]);
 
-  const validateForm = () => {
+  const validateForm = useCallback(() => {
     const newErrors = {};
-
-    if (!formData.title.trim()) {
-      newErrors.title = 'Title is required';
-    }
-
-    if (!formData.startTime || isNaN(new Date(formData.startTime).getTime())) {
+    if (!formData.title.trim()) newErrors.title = 'Title is required';
+    if (!formData.workflow) newErrors.workflow = 'Workflow is required';
+    if (!formData.startTime || Number.isNaN(formData.startTime.getTime())) {
       newErrors.startTime = 'Valid time is required';
     }
 
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
-  };
+  }, [formData]);
 
-  const handleSubmit = () => {
-    if (!validateForm()) {
-      return;
-    }
+  const handleSubmit = useCallback(() => {
+    if (!validateForm()) return;
 
-    const timeObj = new Date(formData.startTime);
+    const localTimeStr = dateToLocalTimeString(formData.startTime);
+    const cronSchedule = dateToCron(formData.startTime, formData.recurrence);
 
-    // Use utility functions for conversion
-    const localTimeStr = dateToLocalTimeString(timeObj);
-    const cronSchedule = dateToCron(timeObj, formData.recurrence);
-
-    const updatedData = {
+    onUpdate({
       title: formData.title,
       workflow: formData.workflow,
       recurrence: formData.recurrence,
-      startTime: localTimeStr, // Local time for display
-      schedule: cronSchedule, // UTC cron for backend
+      startTime: localTimeStr,
+      schedule: cronSchedule,
       enabled: formData.enabled,
       description: formData.description
-    };
+    });
+    onClose();
+  }, [validateForm, formData, onUpdate, onClose]);
 
-    onUpdate(updatedData);
-    handleClose();
-  };
-
-  const handleClose = () => {
+  const handleClose = useCallback(() => {
     setErrors({});
     onClose();
-  };
+  }, [onClose]);
 
   return (
     <Dialog
       open={open}
       onClose={handleClose}
-      maxWidth="md"
+      maxWidth="sm"
       fullWidth
-      disablePortal
-      keepMounted={false}
       aria-labelledby="edit-schedule-dialog-title"
-      aria-describedby="edit-schedule-dialog-description"
     >
       <DialogTitle id="edit-schedule-dialog-title">
-        <Typography variant="h6" component="h2">
-          Edit Schedule
-        </Typography>
+        Edit Schedule
       </DialogTitle>
 
-      <DialogContent dividers id="edit-schedule-dialog-description">
-        <Grid container spacing={3}>
+      <DialogContent dividers>
+        <Grid container spacing={2} sx={{ mt: 0.5 }}>
           <Grid item xs={12}>
             <TextField
               fullWidth
@@ -161,24 +140,23 @@ const EditScheduleDialog = memo(({ open, schedule, onClose, onUpdate }) => {
               error={!!errors.title}
               helperText={errors.title}
               required
+              variant="outlined"
             />
           </Grid>
 
-          <Grid item xs={12} sm={3}>
-            <FormControl fullWidth>
-              <InputLabel>Workflow</InputLabel>
+          <Grid item xs={12}>
+            <FormControl fullWidth error={!!errors.workflow}>
+              <InputLabel id="workflow-select-label">Workflow</InputLabel>
               <Select
+                labelId="workflow-select-label"
                 value={formData.workflow}
                 onChange={handleChange('workflow')}
                 label="Workflow"
-                error={!!errors.workflow}
               >
-                {workflows.length === 0 ? (
-                  <MenuItem value="" disabled>
-                    No workflows available
-                  </MenuItem>
+                {filteredWorkflows.length === 0 ? (
+                  <MenuItem value="" disabled>No workflows available</MenuItem>
                 ) : (
-                  workflows.map((wf) => (
+                  filteredWorkflows.map((wf) => (
                     <MenuItem key={wf.id} value={wf.name}>
                       {wf.name}
                     </MenuItem>
@@ -195,32 +173,24 @@ const EditScheduleDialog = memo(({ open, schedule, onClose, onUpdate }) => {
 
           <Grid item xs={12} sm={6}>
             <FormControl fullWidth>
-              <InputLabel id="recurrence-label">
-                Recurrence
-              </InputLabel>
+              <InputLabel id="recurrence-label">Recurrence</InputLabel>
               <Select
                 labelId="recurrence-label"
                 value={formData.recurrence}
                 onChange={handleChange('recurrence')}
                 label="Recurrence"
-                error={!!errors.recurrence}
               >
                 <MenuItem value="daily">Daily</MenuItem>
                 <MenuItem value="weekly">Weekly</MenuItem>
                 <MenuItem value="monthly">Monthly</MenuItem>
               </Select>
-              {errors.recurrence && (
-                <Typography variant="caption" color="error" sx={{ mt: 0.5, ml: 1.5 }}>
-                  {errors.recurrence}
-                </Typography>
-              )}
             </FormControl>
           </Grid>
 
-          <Grid item xs={12} sm={3}>
+          <Grid item xs={12} sm={6}>
             <LocalizationProvider dateAdapter={AdapterDateFns}>
               <TimePicker
-                label="Time"
+                label="Execution Time"
                 value={formData.startTime}
                 onChange={handleChange('startTime')}
                 slotProps={{
@@ -233,25 +203,50 @@ const EditScheduleDialog = memo(({ open, schedule, onClose, onUpdate }) => {
               />
             </LocalizationProvider>
           </Grid>
+
+          <Grid item xs={12}>
+            <TextField
+              fullWidth
+              label="Description (Optional)"
+              value={formData.description}
+              onChange={handleChange('description')}
+              multiline
+              rows={2}
+            />
+          </Grid>
         </Grid>
 
-        {Object.keys(errors).length > 0 && (
+        {Object.keys(errors).length > 0 && !errors.title && !errors.workflow && !errors.startTime && (
           <Alert severity="error" sx={{ mt: 2 }}>
-            {errors.general || 'Please fix the errors above before submitting.'}
+            Please fix the errors above before submitting.
           </Alert>
         )}
       </DialogContent>
 
-      <DialogActions>
-        <Button onClick={handleClose}>
+      <DialogActions sx={{ px: 3, py: 2 }}>
+        <Button onClick={handleClose} color="inherit">
           Cancel
         </Button>
-        <Button onClick={handleSubmit} variant="contained">
-          Update Schedule
+        <Button onClick={handleSubmit} variant="contained" disableElevation>
+          Save Changes
         </Button>
       </DialogActions>
     </Dialog>
   );
 });
+
+EditScheduleDialog.propTypes = {
+  open: PropTypes.bool.isRequired,
+  schedule: PropTypes.shape({
+    name: PropTypes.string,
+    title: PropTypes.string,
+    startTime: PropTypes.string,
+    recurrence: PropTypes.string,
+    enabled: PropTypes.bool,
+    description: PropTypes.string,
+  }),
+  onClose: PropTypes.func.isRequired,
+  onUpdate: PropTypes.func.isRequired,
+};
 
 export default EditScheduleDialog;

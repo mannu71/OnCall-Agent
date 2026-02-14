@@ -71,7 +71,7 @@ function Workflow() {
   }, [loadSchedules]);
 
   const showMessage = useCallback((msg, type = 'info') => {
-    const id = Math.random().toString(36).substr(2, 9);
+    const id = Math.random().toString(36).substring(2, 11);
     setMessages(prev => [...prev, { id, msg, type }]);
     setTimeout(() => {
       setMessages(prev => prev.filter(m => m.id !== id));
@@ -94,6 +94,7 @@ function Workflow() {
       await deleteSchedule(selectedWorkflow.name);
       showMessage('Workflow deleted successfully', 'success');
     } catch (error) {
+      console.error('Error deleting workflow:', error);
       showMessage('Failed to delete workflow', 'error');
     } finally {
       setDeleteDialogOpen(false);
@@ -112,6 +113,7 @@ function Workflow() {
       setShowWorkflowEditor(true);
       handleMenuClose();
     } catch (error) {
+      console.error('Error loading workflow:', error);
       showMessage('Failed to load workflow details', 'error');
     }
   };
@@ -234,10 +236,12 @@ function Workflow() {
           placeholder="Search workflows..."
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
-          InputProps={{
-            startAdornment: (
-              <SearchIcon sx={{ color: 'text.secondary', mr: 1, fontSize: 20 }} />
-            ),
+          slotProps={{
+            input: {
+              startAdornment: (
+                <SearchIcon sx={{ color: 'text.secondary', mr: 1, fontSize: 20 }} />
+              ),
+            },
           }}
           sx={{
             width: '100%',

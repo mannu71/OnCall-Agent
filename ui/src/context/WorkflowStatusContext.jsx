@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
+import PropTypes from 'prop-types';
 import { agentApiClient } from '../services/agentApiClient';
 
 const WorkflowStatusContext = createContext();
@@ -66,20 +67,24 @@ export const WorkflowStatusProvider = ({ children }) => {
     [runningWorkflows, pendingWorkflows]
   );
 
-  const value = {
+  const value = useMemo(() => ({
     runningWorkflows: allRunningWorkflows,
     isWorkflowRunning,
     markWorkflowPending,
     clearWorkflowPending,
     count: allRunningWorkflows.length,
     lastCheck
-  };
+  }), [allRunningWorkflows, isWorkflowRunning, markWorkflowPending, clearWorkflowPending, lastCheck]);
 
   return (
     <WorkflowStatusContext.Provider value={value}>
       {children}
     </WorkflowStatusContext.Provider>
   );
+};
+
+WorkflowStatusProvider.propTypes = {
+  children: PropTypes.node.isRequired,
 };
 
 export default WorkflowStatusContext;

@@ -1,9 +1,8 @@
-import React, { useState, useMemo, useCallback, memo } from 'react';
+import React, { useState, useMemo, memo } from 'react';
 import {
   Box,
   Typography,
   TextField,
-  Grid,
   Alert,
   Table,
   TableBody,
@@ -79,6 +78,7 @@ const ScheduleList = memo(() => {
       const fresh = await getFreshSchedule(schedule.name);
       setEditingSchedule(fresh);
     } catch (error) {
+      console.error('Error loading schedule:', error);
       setSnackbar({ open: true, message: 'Failed to load schedule', severity: 'error' });
     }
     handleMenuClose();
@@ -113,10 +113,12 @@ const ScheduleList = memo(() => {
           placeholder="Search schedules..."
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
-          InputProps={{
-            startAdornment: (
-              <SearchIcon sx={{ color: 'text.secondary', mr: 1, fontSize: 20 }} />
-            ),
+          slotProps={{
+            input: {
+              startAdornment: (
+                <SearchIcon sx={{ color: 'text.secondary', mr: 1, fontSize: 20 }} />
+              ),
+            },
           }}
           sx={{
             width: '100%',
@@ -137,18 +139,25 @@ const ScheduleList = memo(() => {
         />
       </Box>
 
-      {isLoading ? (
-        <Box display="flex" justifyContent="center" sx={{ py: 4 }}>
-          <CircularProgress size={30} />
-        </Box>
-      ) : filteredSchedules.length === 0 ? (
-        <Alert severity="info">
-          {schedules.length === 0 ? "No schedules found." : "No schedules match your search."}
-        </Alert>
-      ) : (
-        <TableContainer component={Paper} elevation={0} variant="outlined" sx={{ borderRadius: 2 }}>
-          <Table>
-            <TableHead sx={{ bgcolor: 'action.hover' }}>
+      {(() => {
+        if (isLoading) {
+          return (
+            <Box display="flex" justifyContent="center" sx={{ py: 4 }}>
+              <CircularProgress size={30} />
+            </Box>
+          );
+        }
+        if (filteredSchedules.length === 0) {
+          return (
+            <Alert severity="info">
+              {schedules.length === 0 ? "No schedules found." : "No schedules match your search."}
+            </Alert>
+          );
+        }
+        return (
+          <TableContainer component={Paper} elevation={0} variant="outlined" sx={{ borderRadius: 2 }}>
+            <Table>
+              <TableHead sx={{ bgcolor: 'action.hover' }}>
               <TableRow>
                 <TableCell sx={{ fontWeight: 600 }}>Title</TableCell>
                 <TableCell sx={{ fontWeight: 600 }}>Workflow</TableCell>
@@ -190,7 +199,8 @@ const ScheduleList = memo(() => {
             </TableBody>
           </Table>
         </TableContainer>
-      )}
+        );
+      })()}
 
       <Menu anchorEl={anchorEl} open={Boolean(anchorEl)} onClose={handleMenuClose}>
         <MenuItem onClick={() => handleEditSchedule(selectedSchedule)}>

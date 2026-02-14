@@ -10,6 +10,9 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Constants
+JSON_GLOB_PATTERN = "*.json"
+
 
 class ExecutionRepository(BaseRepository[Dict[str, Any]]):
     """Repository for execution history data access."""
@@ -113,7 +116,7 @@ class ExecutionRepository(BaseRepository[Dict[str, Any]]):
             if not workflow_dir.is_dir():
                 continue
             
-            for file_path in workflow_dir.glob("*.json"):
+            for file_path in workflow_dir.glob(JSON_GLOB_PATTERN):
                 try:
                     async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
                         content = await f.read()
@@ -290,7 +293,7 @@ class ExecutionRepository(BaseRepository[Dict[str, Any]]):
                 continue
             
             # Delete all .json files in the directory
-            for file_path in workflow_dir.glob("*.json"):
+            for file_path in workflow_dir.glob(JSON_GLOB_PATTERN):
                 try:
                     file_path.unlink()
                     deleted_count += 1

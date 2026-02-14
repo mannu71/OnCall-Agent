@@ -56,7 +56,7 @@ export default function Dashboard() {
     const enabledSchedules = schedules.filter(s => s.enabled).length;
     const failedLast24h = executions.filter(e =>
       e.status === 'failed' &&
-      (new Date() - new Date(e.start_time)) < 24 * 60 * 60 * 1000
+      (Date.now() - new Date(e.start_time).getTime()) < 24 * 60 * 60 * 1000
     ).length;
 
     return [
@@ -100,8 +100,8 @@ export default function Dashboard() {
       )}
 
       <Grid container spacing={3} sx={{ mb: 4 }}>
-        {stats.map((stat, i) => (
-          <Grid item xs={12} sm={6} md={3} key={i}>
+        {stats.map((stat) => (
+          <Grid item xs={12} sm={6} md={3} key={stat.title}>
             <Card variant="outlined" sx={{ borderRadius: 2 }}>
               <CardContent sx={{ textAlign: 'center' }}>
                 <Typography variant="body2" color="text.secondary" sx={{ fontWeight: 600 }}>{stat.title}</Typography>
@@ -153,32 +153,42 @@ export default function Dashboard() {
             </TableRow>
           </TableHead>
           <TableBody>
-            {loading && executions.length === 0 ? (
-              <TableRow><TableCell colSpan={5} align="center">Loading history...</TableCell></TableRow>
-            ) : executions.length === 0 ? (
-              <TableRow><TableCell colSpan={5} align="center">No recent activity</TableCell></TableRow>
-            ) : (
-              paginatedRuns.map((run) => (
-                <TableRow key={run.execution_id} hover>
-                  <TableCell sx={{ textTransform: 'capitalize', fontWeight: 500 }}>{run.workflow_name.replace(/-/g, ' ')}</TableCell>
-                  <TableCell>{new Date(run.start_time).toLocaleString()}</TableCell>
-                  <TableCell>{run.duration_seconds ? `${run.duration_seconds.toFixed(1)}s` : '-'}</TableCell>
-                  <TableCell>
-                    <Chip
-                      label={run.status}
-                      size="small"
-                      color={run.status === 'success' ? 'success' : run.status === 'failed' ? 'error' : 'warning'}
-                      sx={{ fontWeight: 600, textTransform: 'capitalize' }}
-                    />
-                  </TableCell>
-                  <TableCell align="right">
-                    <IconButton size="small" color="primary" onClick={() => setSelectedRun(run)}>
-                      <VisibilityIcon />
-                    </IconButton>
-                  </TableCell>
-                </TableRow>
-              ))
-            )}
+            {(() => {
+              if (loading && executions.length === 0) {
+                return <TableRow><TableCell colSpan={5} align="center">Loading history...</TableCell></TableRow>;
+              }
+              if (executions.length === 0) {
+                return <TableRow><TableCell colSpan={5} align="center">No recent activity</TableCell></TableRow>;
+              }
+              return paginatedRuns.map((run) => {
+                const getStatusColor = () => {
+                  if (run.status === 'success') return 'success';
+                  if (run.status === 'failed') return 'error';
+                  return 'warning';
+                };
+
+                return (
+                  <TableRow key={run.execution_id} hover>
+                    <TableCell sx={{ textTransform: 'capitalize', fontWeight: 500 }}>{run.workflow_name.replaceAll('-', ' ')}</TableCell>
+                    <TableCell>{new Date(run.start_time).toLocaleString()}</TableCell>
+                    <TableCell>{run.duration_seconds ? `${run.duration_seconds.toFixed(1)}s` : '-'}</TableCell>
+                    <TableCell>
+                      <Chip
+                        label={run.status}
+                        size="small"
+                        color={getStatusColor()}
+                        sx={{ fontWeight: 600, textTransform: 'capitalize' }}
+                      />
+                    </TableCell>
+                    <TableCell align="right">
+                      <IconButton size="small" color="primary" onClick={() => setSelectedRun(run)}>
+                        <VisibilityIcon />
+                      </IconButton>
+                    </TableCell>
+                  </TableRow>
+                );
+              });
+            })()}
           </TableBody>
         </Table>
         <TablePagination
@@ -187,7 +197,7 @@ export default function Dashboard() {
           rowsPerPage={rowsPerPage}
           page={page}
           onPageChange={(e, p) => setPage(p)}
-          onRowsPerPageChange={(e) => { setRowsPerPage(parseInt(e.target.value, 10)); setPage(0); }}
+          onRowsPerPageChange={(e) => { setRowsPerPage(Number.parseInt(e.target.value, 10)); setPage(0); }}
         />
       </TableContainer>
 
@@ -198,8 +208,8 @@ export default function Dashboard() {
             <Box>
               <Typography variant="body2" color="text.secondary" gutterBottom>Execution ID: {selectedRun.execution_id}</Typography>
               <Box sx={{ mt: 2 }}>
-                {selectedRun.task_results?.map((task, i) => (
-                  <Box key={i} sx={{ mb: 2, p: 2, bgcolor: 'action.hover', borderRadius: 1 }}>
+                {selectedRun.task_results?.map((task) => (
+                  <Box key={task.task_name + '-' + task.status} sx={{ mb: 2, p: 2, bgcolor: 'action.hover', borderRadius: 1 }}>
                     <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>{task.task_name}</Typography>
                     <Typography variant="body2" color={task.status === 'success' ? 'success.main' : 'error.main'}>
                       Status: {task.status} | Duration: {task.duration_seconds?.toFixed(1)}s
@@ -220,7 +230,7 @@ export default function Dashboard() {
         <DialogTitle>Clear All Executions?</DialogTitle>
         <DialogContent>
           <Typography>
-            This will permanently delete all {executions.length} execution{executions.length !== 1 ? 's' : ''} from the history. This action cannot be undone.
+            This will permanently delete all {executions.length} execution{executions.length === 1 ? '' : 's'} from the history. This action cannot be undone.
           </Typography>
         </DialogContent>
         <DialogActions>

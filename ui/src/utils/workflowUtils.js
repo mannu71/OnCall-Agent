@@ -6,7 +6,7 @@
  * Clean up orphaned edges in workflow (edges that reference non-existent nodes)
  */
 export const cleanOrphanedEdges = (workflow) => {
-    if (!workflow || !workflow.edges || !workflow.nodes) return workflow;
+    if (!workflow?.edges || !workflow?.nodes) return workflow;
 
     const nodeIds = new Set(workflow.nodes.map(n => n.id));
 
