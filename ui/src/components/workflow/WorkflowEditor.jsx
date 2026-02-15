@@ -482,16 +482,13 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
   }, [setEdges]);
 
   const onConfigUpdate = useCallback((nodeId, newData) => {
-    console.log('[WorkflowEditor] onConfigUpdate called for node:', nodeId, 'with data:', newData);
-    setNodes((nds) => {
-      const updatedNodes = nds.map((node) =>
+    setNodes((nds) => 
+      nds.map((node) =>
         node.id === nodeId
           ? { ...node, data: { ...node.data, ...newData } }
           : node
-      );
-      console.log('[WorkflowEditor] Updated nodes:', updatedNodes.find(n => n.id === nodeId)?.data);
-      return updatedNodes;
-    });
+      )
+    );
   }, [setNodes]);
 
   const sendMessageToConnectedAgents = useCallback(async (sourceId, message) => {
@@ -514,15 +511,8 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
   // Expose trigger function globally for dev console access
   useEffect(() => {
     // Function to list all Teams nodes
-    const connectedNodeIds = new Set(edges.flatMap(edge => [edge.source, edge.target]));
     const listTeamsNodes = () => {
       const teamsNodes = nodes.filter(node => node.type === 'teams');
-      console.log("\uD83D\uDCCB Available Teams nodes:", teamsNodes.map(node => ({
-        id: node.id,
-        label: node.data?.label || 'Teams Channel',
-        channel: node.data?.channel || 'General Channel',
-        connected: connectedNodeIds.has(node.id)
-      })));
       return teamsNodes;
     };
 

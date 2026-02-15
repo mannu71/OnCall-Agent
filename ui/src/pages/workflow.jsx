@@ -72,13 +72,15 @@ function Workflow() {
     loadSchedules();
   }, [loadSchedules]);
 
+  const removeMessage = useCallback((id) => {
+    setMessages(prev => prev.filter(m => m.id !== id));
+  }, []);
+
   const showMessage = useCallback((msg, type = 'info') => {
     const id = Math.random().toString(36).substring(2, 11);
     setMessages(prev => [...prev, { id, msg, type }]);
-    setTimeout(() => {
-      setMessages(prev => prev.filter(m => m.id !== id));
-    }, 4000);
-  }, []);
+    setTimeout(() => removeMessage(id), 4000);
+  }, [removeMessage]);
 
   const handleExecute = async (workflow) => {
     // Prevent duplicate execution if already running

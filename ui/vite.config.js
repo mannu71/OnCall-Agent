@@ -6,6 +6,12 @@ export default defineConfig({
   plugins: [react()],
   base: './', // Use relative paths for Electron
 
+  // Dev server configuration
+  server: {
+    port: 5175,
+    strictPort: true, // Exit if port is already in use
+  },
+
   // Build optimizations
   build: {
     target: 'esnext',

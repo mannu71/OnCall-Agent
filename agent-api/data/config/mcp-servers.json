@@ -1,99 +1,18 @@
 {
   "servers": {
-    "ado": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@azure-devops/mcp",
-        "creditsafe"
-      ],
-      "type": "stdio",
-      "icon": "🔧",
-      "description": "Azure DevOps integration",
-      "env": {}
-    },
     "postgres-production": {
-      "command": "uvx",
-      "args": [
-        "postgres-mcp",
-        "--access-mode=restricted"
-      ],
-      "type": "stdio",
-      "icon": "🗄️",
-      "description": "PostgreSQL Production Database",
-      "env": {
-        "DATABASE_URI": "postgresql://csinvmmn:a$o%8LpNlRE5vylf@kyc-protect-rds-cluster-production.cluster-ro-cxmlpzcblpc4.eu-west-1.rds.amazonaws.com:5432/kyc_protect_api_production?sslmode=require"
-      }
-    },
-    "postgres-dev": {
-      "type": "stdio",
-      "command": "npx",
-      "env": {
-        "NODE_EXTRA_CA_CERTS": "/app/data/certs/global-bundle.pem"
-      },
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-postgres@0.6.2",
-        "postgresql://csinvmmn:N0wAMoK%23WKhldvP%5E@kyc-protect-rds-cluster-test.cluster-c75tta7e5wmw.eu-west-1.rds.amazonaws.com/kyc_protect_api_test?sslmode=require"
-      ],
-      "icon": "🗄️",
-      "description": "PostgreSQL Development Database"
-    },
-    "awslabs.cloudwatch-mcp-server": {
-      "disabled": false,
-      "timeout": 60,
-      "type": "stdio",
-      "command": "uv",
-      "args": [
-        "--native-tls",
-        "tool",
-        "run",
-        "--from",
-        "awslabs.cloudwatch-mcp-server@latest",
-        "awslabs.cloudwatch-mcp-server.exe"
-      ],
-      "icon": "📊",
-      "description": "AWS CloudWatch monitoring",
-      "env": {
-        "FASTMCP_LOG_LEVEL": "ERROR",
-        "AWS_PROFILE": "cs-production",
-        "AWS_REGION": "eu-west-1"
-      }
-    },
-    "postgres-acuris-production": {
       "command": "npx",
       "args": [
         "-y",
-        "@modelcontextprotocol/server-postgres@0.6.2",
-        "postgresql://csinvmmn:odntD^mQ$@D67!*G@compliance-acuris-api-rds-cluster-production.cluster-ro-cxmlpzcblpc4.eu-west-1.rds.amazonaws.com:5432/compliance_acuris_api_production?sslmode=require"
+        "@modelcontextprotocol/server-postgres",
+        "postgresql://csinvmmn:a$o%8LpNlRE5vylf@kyc-protect-rds-cluster-production.cluster-ro-cxmlpzcblpc4.eu-west-1.rds.amazonaws.com:5432/kyc_protect_api_production?sslmode=require"
       ],
-      "type": "stdio",
-      "icon": "🗄️",
-      "description": "PostgreSQL Acuris Production Database",
-      "env": {
-        "NODE_EXTRA_CA_CERTS": "/app/data/certs/global-bundle.pem"
-      }
-    },
-    "postgres": {
-      "command": "uvx",
-      "args": [
-        "postgres-mcp,",
-        "--access-mode=unrestricted"
-      ],
-      "type": "stdio",
-      "icon": "🔧",
+      "env": {},
       "description": "",
-      "env": {}
+      "icon": "\ud83d\uddc4\ufe0f",
+      "disabled": false
     }
   },
-  "inputs": [
-    {
-      "id": "ado_org",
-      "type": "promptString",
-      "description": "Azure DevOps organization name (e.g. 'contoso')"
-    }
-  ],
-  "inputValues": {
-    "ado_org": "creditsafe"
-  }
+  "inputs": [],
+  "inputValues": {}
 }

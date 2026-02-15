@@ -1,9 +1,9 @@
 import { app, BrowserWindow, ipcMain } from "electron";
-import path from "path";
-import fs from "fs";
-import { fileURLToPath } from "url";
-import { exec, spawn } from "child_process";
-import { promisify } from "util";
+import path from "node:path";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import { exec, spawn } from "node:child_process";
+import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
 
@@ -42,77 +42,74 @@ const getOutputDir = () => {
   return outputDir;
 };
 
+// Monitor workflow completion by polling for new output files
+function monitorWorkflowCompletion(workflowName) {
+  const outputDirPath = getOutputDir();
+  let lastOutputTime = Date.now();
+
+  if (fs.existsSync(outputDirPath)) {
+    const files = fs.readdirSync(outputDirPath);
+    const latestFile = files
+      .filter(f => f.endsWith('.json'))
+      .map(f => fs.statSync(path.join(outputDirPath, f)).mtimeMs)
+      .sort((a, b) => b - a)[0];
+    if (latestFile) lastOutputTime = latestFile;
+  }
+
+  const checkCompletion = setInterval(() => {
+    try {
+      if (fs.existsSync(outputDirPath)) {
+        const files = fs.readdirSync(outputDirPath);
+        const newestFile = files
+          .filter(f => f.endsWith('.json') && !f.includes('_latest'))
+          .map(f => ({ name: f, time: fs.statSync(path.join(outputDirPath, f)).mtimeMs }))
+          .sort((a, b) => b.time - a.time)[0];
+
+        if (newestFile && newestFile.time > lastOutputTime) {
+          console.log(`Workflow completed (new output): ${workflowName}, file: ${newestFile.name}`);
+          runningWorkflows.delete(workflowName);
+          clearInterval(checkCompletion);
+        }
+      }
+    } catch (err) {
+      console.error('Error checking workflow completion:', err);
+    }
+  }, 2000);
+
+  // Safety timeout
+  setTimeout(() => {
+    console.log(`Workflow timeout: ${workflowName}`);
+    runningWorkflows.delete(workflowName);
+    clearInterval(checkCompletion);
+  }, 5 * 60 * 1000);
+}
+
 // Setup trigger folder watcher for automatic scheduled workflows
 function setupTriggerWatcher() {
   const triggersDirPath = getTriggersDir();
-  const outputDirPath = getOutputDir();
   
-  console.log('Setting up trigger watcher:', { triggersDir: triggersDirPath, outputDir: outputDirPath });
+  console.log('Setting up trigger watcher:', { triggersDir: triggersDirPath, outputDir: getOutputDir() });
   
   if (!fs.existsSync(triggersDirPath)) {
     fs.mkdirSync(triggersDirPath, { recursive: true });
   }
   
   fs.watch(triggersDirPath, (eventType, filename) => {
-    if (eventType === 'rename' && filename && filename.endsWith('.flag')) {
-      const flagPath = path.join(triggersDirPath, filename);
-      const workflowName = filename.replace('.flag', '').replace(/_/g, ' ');
-      
-      // Check if file was created (not deleted)
-      if (fs.existsSync(flagPath)) {
-        // New trigger file = workflow starting
-        if (!runningWorkflows.has(workflowName)) {
-          console.log(`Workflow started (trigger watcher): ${workflowName}`);
-          runningWorkflows.add(workflowName);
-          
-          // Get baseline for output detection
-          let lastOutputTime = Date.now();
-          if (fs.existsSync(outputDirPath)) {
-            const files = fs.readdirSync(outputDirPath);
-            const latestFile = files
-              .filter(f => f.endsWith('.json'))
-              .map(f => fs.statSync(path.join(outputDirPath, f)).mtimeMs)
-              .sort((a, b) => b - a)[0];
-            if (latestFile) lastOutputTime = latestFile;
-          }
-          
-          // Poll for completion - only check for new output files
-          // NOTE: We don't check for flag file deletion because the worker deletes it
-          // immediately when it STARTS processing, not when it completes
-          const checkCompletion = setInterval(() => {
-            try {
-              // Check for new output file (the only reliable completion signal)
-              if (fs.existsSync(outputDirPath)) {
-                const files = fs.readdirSync(outputDirPath);
-                const newestFile = files
-                  .filter(f => f.endsWith('.json') && !f.includes('_latest'))
-                  .map(f => ({ name: f, time: fs.statSync(path.join(outputDirPath, f)).mtimeMs }))
-                  .sort((a, b) => b.time - a.time)[0];
-                
-                if (newestFile && newestFile.time > lastOutputTime) {
-                  console.log(`Workflow completed (new output): ${workflowName}, file: ${newestFile.name}`);
-                  runningWorkflows.delete(workflowName);
-                  clearInterval(checkCompletion);
-                }
-              }
-            } catch (err) {
-              console.error('Error checking workflow completion:', err);
-            }
-          }, 2000);
-          
-          // Safety timeout
-          setTimeout(() => {
-            console.log(`Workflow timeout: ${workflowName}`);
-            runningWorkflows.delete(workflowName);
-            clearInterval(checkCompletion);
-          }, 5 * 60 * 1000);
-        }
-      }
+    if (eventType !== 'rename' || !filename?.endsWith('.flag')) {
+      return;
+    }
+
+    const flagPath = path.join(triggersDirPath, filename);
+    const workflowName = filename.replace('.flag', '').replaceAll('_', ' ');
+
+    // Check if file was created (not deleted) and not already running
+    if (fs.existsSync(flagPath) && !runningWorkflows.has(workflowName)) {
+      console.log(`Workflow started (trigger watcher): ${workflowName}`);
+      runningWorkflows.add(workflowName);
+      monitorWorkflowCompletion(workflowName);
     }
   });
 }
-
-// NOTE: setupTriggerWatcher is called in app.whenReady() to ensure app.getPath() is available
 
 // Import file utilities
 import { saveSchedulesToFile, loadSchedulesFromFile, saveWorkflowsToFile, loadWorkflowsFromFile, saveMCPConfigToFile, loadMCPConfigFromFile, saveLLMConfigToFile, loadLLMConfigFromFile, setLLMApiKey, getLLMApiKeyMasked, getLLMApiKey, hasLLMApiKey, deleteLLMApiKey, triggerWorkflow, runAgentWorkflow, saveSqlFile, loadSqlFile, loadWorkflowRuns, loadLatestWorkflowResult, loadWorkflowResult, clearWorkflowOutputs, getPathsInfo } from './fileUtils.js';
@@ -183,54 +180,7 @@ ipcMain.handle('workflows:trigger', async (event, workflowName) => {
     
     // Watch for new output files (workflow completed when new output appears)
     if (result.success) {
-      const outputDirPath = getOutputDir();
-      const triggersDirPath = getTriggersDir();
-      const safeName = workflowName.replace(/\s+/g, '_');
-      const flagPath = path.join(triggersDirPath, `${safeName}.flag`);
-      
-      let lastOutputTime = Date.now();
-      
-      // Check existing files to get baseline
-      if (fs.existsSync(outputDirPath)) {
-        const files = fs.readdirSync(outputDirPath);
-        const latestFile = files
-          .filter(f => f.endsWith('.json'))
-          .map(f => fs.statSync(path.join(outputDirPath, f)).mtimeMs)
-          .sort((a, b) => b - a)[0];
-        if (latestFile) lastOutputTime = latestFile;
-      }
-      
-      // Poll for new output file (the only reliable completion signal)
-      // NOTE: We don't check for flag file deletion because the worker deletes it
-      // immediately when it STARTS processing, not when it completes
-      const checkCompletion = setInterval(() => {
-        try {
-          // Check for new output file
-          if (fs.existsSync(outputDirPath)) {
-            const files = fs.readdirSync(outputDirPath);
-            const newestFile = files
-              .filter(f => f.endsWith('.json') && !f.includes('_latest'))
-              .map(f => ({ name: f, time: fs.statSync(path.join(outputDirPath, f)).mtimeMs }))
-              .sort((a, b) => b.time - a.time)[0];
-            
-            if (newestFile && newestFile.time > lastOutputTime) {
-              // New output file = workflow completed
-              console.log(`Workflow completed (new output): ${workflowName}, file: ${newestFile.name}`);
-              runningWorkflows.delete(workflowName);
-              clearInterval(checkCompletion);
-            }
-          }
-        } catch (err) {
-          console.error('Error checking workflow completion:', err);
-        }
-      }, 2000); // Check every 2 seconds
-      
-      // Safety timeout: remove from tracking after 5 minutes max
-      setTimeout(() => {
-        console.log(`Workflow timeout: ${workflowName}`);
-        runningWorkflows.delete(workflowName);
-        clearInterval(checkCompletion);
-      }, 5 * 60 * 1000);
+      monitorWorkflowCompletion(workflowName);
     }
     
     return result;
@@ -395,7 +345,7 @@ ipcMain.handle('mcp-server:test', async (event, serverName, serverConfig) => {
               // Get the last meaningful line from stderr
               const lines = stderr.trim().split('\n').filter(l => l.trim());
               if (lines.length > 0) {
-                errorMsg = lines[lines.length - 1].substring(0, 50);
+                errorMsg = lines.at(-1).substring(0, 50);
               }
             }
             resolve({ 
@@ -484,6 +434,60 @@ ipcMain.handle('llm-config:delete-api-key', async (event, llmName) => {
   }
 });
 
+// Build provider-specific request config for LLM connection test
+function buildLlmTestRequest(provider, model, endpoint, baseUrl, apiKey) {
+  const headers = { 'Content-Type': 'application/json' };
+
+  switch (provider) {
+    case 'OpenAI':
+      return { url: 'https://api.openai.com/v1/models', headers: { ...headers, Authorization: `Bearer ${apiKey}` } };
+
+    case 'Anthropic':
+      return {
+        url: 'https://api.anthropic.com/v1/messages',
+        headers: { ...headers, 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: model || 'claude-3-5-sonnet-20241022', max_tokens: 1, messages: [] })
+      };
+
+    case 'Groq':
+      return { url: 'https://api.groq.com/openai/v1/models', headers: { ...headers, Authorization: `Bearer ${apiKey}` } };
+
+    case 'Google':
+      return { url: `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`, headers };
+
+    case 'Azure OpenAI':
+      if (!endpoint) return { error: 'Azure endpoint URL is required' };
+      return { url: `${endpoint}/openai/models?api-version=2024-02-01`, headers: { ...headers, 'api-key': apiKey } };
+
+    case 'Ollama': {
+      const ollamaUrl = baseUrl || 'http://localhost:11434';
+      return { url: `${ollamaUrl}/api/tags`, headers };
+    }
+
+    default:
+      return { error: `Unknown provider: ${provider}` };
+  }
+}
+
+// Parse LLM test error response into a result object
+function parseLlmErrorResponse(response, errorText, provider) {
+  let errorMsg = `HTTP ${response.status}`;
+  try {
+    const errorJson = JSON.parse(errorText);
+    errorMsg = errorJson.error?.message || errorJson.message || errorMsg;
+  } catch {
+    errorMsg = errorText.substring(0, 100) || errorMsg;
+  }
+
+  // For Anthropic, a 400 error with valid API key means connection works
+  // (we send empty messages intentionally to avoid burning tokens)
+  if (provider === 'Anthropic' && response.status === 400) {
+    return { success: true, message: `Connected to ${provider}` };
+  }
+
+  return { success: false, error: errorMsg };
+}
+
 // IPC handler for testing LLM connection
 ipcMain.handle('llm:test', async (event, llmName, llmConfig) => {
   try {
@@ -497,109 +501,45 @@ ipcMain.handle('llm:test', async (event, llmName, llmConfig) => {
       return { success: false, error: 'No API key configured' };
     }
     
-    let testUrl;
-    let headers = { 'Content-Type': 'application/json' };
-    let body;
-    
-    switch (provider) {
-      case 'OpenAI':
-        testUrl = 'https://api.openai.com/v1/models';
-        headers['Authorization'] = `Bearer ${apiKey}`;
-        break;
-        
-      case 'Anthropic':
-        // Use a HEAD-like request that validates API key without burning tokens
-        // We make a request with invalid content to trigger auth check before usage
-        testUrl = 'https://api.anthropic.com/v1/messages';
-        headers['x-api-key'] = apiKey;
-        headers['anthropic-version'] = '2023-06-01';
-        // Send empty messages to validate API key - will return 400 if key valid, 401 if invalid
-        body = JSON.stringify({
-          model: model || 'claude-3-5-sonnet-20241022',
-          max_tokens: 1,
-          messages: []
-        });
-        break;
-        
-      case 'Groq':
-        testUrl = 'https://api.groq.com/openai/v1/models';
-        headers['Authorization'] = `Bearer ${apiKey}`;
-        break;
-        
-      case 'Google':
-        testUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
-        break;
-        
-      case 'Azure OpenAI':
-        if (!endpoint) {
-          return { success: false, error: 'Azure endpoint URL is required' };
-        }
-        testUrl = `${endpoint}/openai/models?api-version=2024-02-01`;
-        headers['api-key'] = apiKey;
-        break;
-        
-      case 'Ollama':
-        const ollamaUrl = baseUrl || 'http://localhost:11434';
-        testUrl = `${ollamaUrl}/api/tags`;
-        break;
-        
-      default:
-        return { success: false, error: `Unknown provider: ${provider}` };
+    const reqConfig = buildLlmTestRequest(provider, model, endpoint, baseUrl, apiKey);
+    if (reqConfig.error) {
+      return { success: false, error: reqConfig.error };
     }
     
-    // Use built-in fetch (Node.js 18+)
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000);
     
     const fetchOptions = {
-      method: body ? 'POST' : 'GET',
-      headers,
+      method: reqConfig.body ? 'POST' : 'GET',
+      headers: reqConfig.headers,
       signal: controller.signal
     };
     
-    if (body) {
-      fetchOptions.body = body;
+    if (reqConfig.body) {
+      fetchOptions.body = reqConfig.body;
     }
     
     try {
-      const response = await fetch(testUrl, fetchOptions);
+      const response = await fetch(reqConfig.url, fetchOptions);
       clearTimeout(timeoutId);
       
       if (response.ok) {
         return { success: true, message: `Connected to ${provider}` };
-      } else {
-        const errorText = await response.text();
-        let errorMsg = `HTTP ${response.status}`;
-        try {
-          const errorJson = JSON.parse(errorText);
-          errorMsg = errorJson.error?.message || errorJson.message || errorMsg;
-        } catch {
-          errorMsg = errorText.substring(0, 100) || errorMsg;
-        }
-        
-        // For Anthropic, a 400 error with valid API key means connection works
-        // (we send empty messages intentionally to avoid burning tokens)
-        if (provider === 'Anthropic' && response.status === 400) {
-          return { success: true, message: `Connected to ${provider}` };
-        }
-        
-        return { success: false, error: errorMsg };
       }
+
+      const errorText = await response.text();
+      return parseLlmErrorResponse(response, errorText, provider);
     } finally {
       clearTimeout(timeoutId);
     }
   } catch (error) {
     console.error('Error testing LLM:', error);
-    if (error.name === 'AbortError') {
-      return { success: false, error: 'Connection timeout' };
-    }
-    if (error.code === 'ECONNREFUSED') {
-      return { success: false, error: 'Connection refused - check if service is running' };
-    }
-    if (error.code === 'ENOTFOUND') {
-      return { success: false, error: 'Host not found - check endpoint URL' };
-    }
-    return { success: false, error: error.message };
+    const errorMap = {
+      AbortError: 'Connection timeout',
+      ECONNREFUSED: 'Connection refused - check if service is running',
+      ENOTFOUND: 'Host not found - check endpoint URL'
+    };
+    return { success: false, error: errorMap[error.name] || errorMap[error.code] || error.message };
   }
 });
 
@@ -705,10 +645,13 @@ function createDockerComposeForPackaged() {
   const writableAgentDir = getWritableAgentPath();
   const bundledAgentDir = path.join(process.resourcesPath, 'agent');
   
+  const bundledPath = bundledAgentDir.replaceAll('\\', '/');
+  const writablePath = writableAgentDir.replaceAll('\\', '/');
+  
   // Create a modified docker-compose.yml in the writable directory
   const composeContent = `services:
   agent:
-    build: "${bundledAgentDir.replace(/\\/g, '/')}"
+    build: "${bundledPath}"
     container_name: oncall-agent
     restart: unless-stopped
     environment:
@@ -720,13 +663,13 @@ function createDockerComposeForPackaged() {
       - SCHEDULER_FILE=/app/data/config/schedules.json
     volumes:
       # Mount writable data directory for config (schedules, workflows, triggers, sql)
-      - "${writableAgentDir.replace(/\\/g, '/')}/data:/app/data"
+      - "${writablePath}/data:/app/data"
       
       # Mount writable output directory
-      - "${writableAgentDir.replace(/\\/g, '/')}/output:/app/output"
+      - "${writablePath}/output:/app/output"
       
       # Mount writable logs directory
-      - "${writableAgentDir.replace(/\\/g, '/')}/logs:/app/logs"
+      - "${writablePath}/logs:/app/logs"
     networks:
       - oncall-network
 
@@ -759,6 +702,7 @@ ipcMain.handle('docker:check', async () => {
     await execAsync('docker-compose --version');
     return { available: true, error: null };
   } catch (error) {
+    console.error('Docker check failed:', error);
     return { available: false, error: 'Docker Desktop is not installed or not running' };
   }
 });
@@ -769,7 +713,7 @@ ipcMain.handle('docker:start', async () => {
     const composePath = getDockerComposePath();
     const agentDir = path.dirname(composePath);
     
-    const { stdout, stderr } = await execAsync(
+    const { stdout } = await execAsync(
       `docker-compose -f "${composePath}" up -d --build`,
       { cwd: agentDir }
     );
@@ -787,7 +731,7 @@ ipcMain.handle('docker:stop', async () => {
     const composePath = getDockerComposePath();
     const agentDir = path.dirname(composePath);
     
-    const { stdout, stderr } = await execAsync(
+    const { stdout } = await execAsync(
       `docker-compose -f "${composePath}" down`,
       { cwd: agentDir }
     );
@@ -817,6 +761,7 @@ ipcMain.handle('docker:status', async () => {
         try {
           return JSON.parse(line);
         } catch (e) {
+          console.error('Failed to parse docker status line:', e);
           return null;
         }
       })
@@ -847,18 +792,43 @@ function createWindow() {
     // In packaged app, load from asar
     win.loadFile(path.join(__dirname, "..", "dist", "index.html"));
   } else {
-    win.loadURL("http://localhost:5173");
+    const devUrl = "http://localhost:5175";
+    console.log(`Loading dev URL: ${devUrl}`);
+    win.loadURL(devUrl).catch(err => {
+      console.error('Failed to load URL:', err);
+      console.error('Make sure Vite dev server is running on port 5175');
+    });
   }
+
+  // Open DevTools in development
+  if (!app.isPackaged) {
+    win.webContents.openDevTools();
+  }
+
+  // Log when window is ready
+  win.webContents.on('did-finish-load', () => {
+    console.log('Window loaded successfully');
+  });
+
+  win.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
+    console.error('Failed to load window:', errorCode, errorDescription);
+  });
 }
 
 app.whenReady().then(() => {
+  console.log('Electron app is ready');
+  
   // Initialize trigger watcher after app is ready (so app.getPath works)
   setupTriggerWatcher();
   
   createWindow();
+  
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+}).catch(err => {
+  console.error('Error during app initialization:', err);
+  process.exit(1);
 });
 
 app.on("window-all-closed", () => {

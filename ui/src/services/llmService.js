@@ -34,8 +34,8 @@ export const loadLLMConfig = async () => {
   }
 
   try {
-    if (window.electronAPI?.loadLLMConfig) {
-      const config = await window.electronAPI.loadLLMConfig();
+    if (globalThis.electronAPI?.loadLLMConfig) {
+      const config = await globalThis.electronAPI.loadLLMConfig();
       configCache = config || { llms: DEFAULT_LLMS };
       cacheTimestamp = now;
       return configCache;
@@ -53,8 +53,8 @@ export const loadLLMConfig = async () => {
  */
 export const saveLLMConfig = async (config) => {
   try {
-    if (window.electronAPI?.saveLLMConfig) {
-      const result = await window.electronAPI.saveLLMConfig(config);
+    if (globalThis.electronAPI?.saveLLMConfig) {
+      const result = await globalThis.electronAPI.saveLLMConfig(config);
       if (result.success) {
         // Update cache on successful save
         configCache = config;
@@ -102,7 +102,7 @@ export const updateLLM = async (name, llmConfig, newName = null) => {
   if (newName && newName !== name) {
     delete config.llms[name];
     config.llms[newName] = llmConfig;
-  } else if (config.llms && config.llms[name]) {
+  } else if (config.llms?.[name]) {
     config.llms[name] = { ...config.llms[name], ...llmConfig };
   }
   
@@ -114,6 +114,58 @@ export const updateLLM = async (name, llmConfig, newName = null) => {
   }
   
   return config;
+};
+
+/**
+ * Update LLM nodes in a workflow
+ */
+const updateLLMNodes = (nodes, oldName, actualNewName, llmConfig) => {
+  const updatedNodeIds = [];
+  for (const node of nodes) {
+    if (node.type === 'llm' && (node.data?.label === oldName || node.data?.model === oldName)) {
+      node.data.label = actualNewName;
+      node.data.model = llmConfig.model;
+      node.data.provider = llmConfig.provider;
+      node.data.agent = llmConfig.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq';
+      if (llmConfig.temperature !== undefined) {
+        node.data.temperature = llmConfig.temperature;
+      }
+      updatedNodeIds.push(node.id);
+    }
+  }
+  return updatedNodeIds;
+};
+
+/**
+ * Update agent nodes connected to LLM nodes via edges
+ */
+const updateConnectedAgentNodes = (nodes, edges, updatedLLMNodeIds, llmConfig) => {
+  let updated = false;
+  for (const edge of edges) {
+    if (updatedLLMNodeIds.includes(edge.source) && edge.targetHandle === 'model') {
+      const agentNode = nodes.find(n => n.id === edge.target && n.type === 'agent');
+      if (agentNode) {
+        agentNode.data.model = llmConfig.model;
+        agentNode.data.agent = llmConfig.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq';
+        updated = true;
+      }
+    }
+  }
+  return updated;
+};
+
+/**
+ * Update agent nodes that directly reference the LLM model
+ */
+const updateDirectAgentReferences = (nodes, oldName, actualNewName) => {
+  let updated = false;
+  for (const node of nodes) {
+    if (node.type === 'agent' && node.data?.model === oldName) {
+      node.data.model = actualNewName;
+      updated = true;
+    }
+  }
+  return updated;
 };
 
 /**
@@ -130,64 +182,20 @@ export const syncLLMToWorkflows = async (oldName, llmConfig, newName = null) => 
       return false;
     }
     
-    let updated = false;
-    
     for (const workflow of workflows) {
       if (!workflow.nodes || !workflow.edges) continue;
       
-      let workflowUpdated = false;
+      const updatedLLMNodeIds = updateLLMNodes(workflow.nodes, oldName, actualNewName, llmConfig);
+      const connectedUpdated = updateConnectedAgentNodes(workflow.nodes, workflow.edges, updatedLLMNodeIds, llmConfig);
+      const directUpdated = updateDirectAgentReferences(workflow.nodes, oldName, actualNewName);
       
-      // First, find and update all LLM nodes that match
-      const updatedLLMNodeIds = [];
-      for (const node of workflow.nodes) {
-        // Check if this node is an LLM that uses this configuration
-        if (node.type === 'llm' && (node.data?.label === oldName || node.data?.model === oldName)) {
-          // Update the node's label and LLM config
-          node.data.label = actualNewName;
-          node.data.model = llmConfig.model;
-          node.data.provider = llmConfig.provider;
-          node.data.agent = llmConfig.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq';
-          if (llmConfig.temperature !== undefined) {
-            node.data.temperature = llmConfig.temperature;
-          }
-          updatedLLMNodeIds.push(node.id);
-          workflowUpdated = true;
-          updated = true;
-          console.log(`Synced LLM "${oldName}" -> "${actualNewName}" in workflow "${workflow.name}"`);
-        }
-      }
-      
-      // Now find all agents connected to the updated LLM nodes via edges
-      for (const edge of workflow.edges) {
-        if (updatedLLMNodeIds.includes(edge.source) && edge.targetHandle === 'model') {
-          // Find the target agent node
-          const agentNode = workflow.nodes.find(n => n.id === edge.target && n.type === 'agent');
-          if (agentNode) {
-            agentNode.data.model = llmConfig.model;
-            agentNode.data.agent = llmConfig.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq';
-            workflowUpdated = true;
-            updated = true;
-            console.log(`Synced connected agent "${agentNode.id}" model to "${llmConfig.model}" in workflow "${workflow.name}"`);
-          }
-        }
-      }
-      
-      // Also update agent nodes that directly reference this LLM model by name
-      for (const node of workflow.nodes) {
-        if (node.type === 'agent' && node.data?.model === oldName) {
-          node.data.model = actualNewName;
-          workflowUpdated = true;
-          updated = true;
-          console.log(`Synced agent node model "${oldName}" -> "${actualNewName}" in workflow "${workflow.name}"`);
-        }
-      }
+      const workflowUpdated = updatedLLMNodeIds.length > 0 || connectedUpdated || directUpdated;
       
       if (workflowUpdated) {
         await agentApiClient.updateWorkflow(workflow.name, workflow);
       }
     }
     
-    console.log('Workflows synced with LLM changes');
     return true;
   } catch (error) {
     console.error('Error syncing LLM to workflows:', error);

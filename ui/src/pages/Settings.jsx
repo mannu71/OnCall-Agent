@@ -44,11 +44,62 @@ import {
 } from '@mui/icons-material';
 import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer, getMCPInputValues, updateMCPInputValue, invalidateCache } from '../services/mcpService';
 import { getLLMs, addLLM, updateLLM, deleteLLM } from '../services/llmService';
+import agentApiClient from '../services/agentApiClient';
 
 // Helper to extract ${input:...} variables from args string
 const extractInputVariables = (argsString) => {
     const matches = argsString.match(/\$\{input:([^}]+)\}/g) || [];
     return matches.map(m => m.match(/\$\{input:([^}]+)\}/)[1]);
+};
+
+// Parse args string into array, handling comma-separated npx args
+const parseArgsString = (argsString) => {
+    let args = argsString
+        .split('\n')
+        .map(arg => arg.trim())
+        .filter(arg => arg.length > 0);
+
+    if (args.length !== 1 || !args[0].includes(', ')) {
+        return args;
+    }
+
+    const singleArg = args[0];
+    if (!singleArg.startsWith('-y, ') && !singleArg.startsWith('-y,')) {
+        return args;
+    }
+
+    const parts = [];
+    let remaining = singleArg;
+    const firstComma = remaining.indexOf(',');
+
+    if (firstComma === -1) {
+        return args;
+    }
+
+    parts.push(remaining.substring(0, firstComma).trim());
+    remaining = remaining.substring(firstComma + 1).trim();
+
+    const urlStart = remaining.indexOf('://');
+    const secondComma = remaining.indexOf(', ');
+
+    if (secondComma !== -1 && (urlStart === -1 || secondComma < urlStart)) {
+        parts.push(remaining.substring(0, secondComma).trim());
+        remaining = remaining.substring(secondComma + 1).trim();
+    }
+
+    if (remaining) {
+        parts.push(remaining);
+    }
+
+    return parts.length >= 2 ? parts : args;
+};
+
+// Parse environment variables JSON string
+const parseEnvVars = (envString) => {
+    if (!envString.trim()) {
+        return {};
+    }
+    return JSON.parse(envString);
 };
 
 const Settings = () => {
@@ -72,7 +123,7 @@ const Settings = () => {
     const [connectionStatus, setConnectionStatus] = useState({}); // { serverName: { status: 'untested' | 'testing' | 'connected' | 'error', message: '' } }
 
     // LLM state
-    const [llms, setLLMs] = useState({});
+    const [llms, setLlms] = useState({});
     const [openLLMDialog, setOpenLLMDialog] = useState(false);
     const [editingLLM, setEditingLLM] = useState(null);
     const [llmFormData, setLLMFormData] = useState({
@@ -98,21 +149,21 @@ const Settings = () => {
     const [existingApiKey, setExistingApiKey] = useState(null); // To show if key exists
     const [llmConnectionStatus, setLLMConnectionStatus] = useState({}); // { llmName: { status: 'untested' | 'testing' | 'connected' | 'error', message: '' } }
 
+    // Certificates state
+    const [certificates, setCertificates] = useState([]);
+    const [certUploadLoading, setCertUploadLoading] = useState(false);
     // Docker state
     const [dockerAvailable, setDockerAvailable] = useState(false);
     const [dockerLoading, setDockerLoading] = useState(false);
     const [dockerContainers, setDockerContainers] = useState([]);
     const [dockerError, setDockerError] = useState(null);
 
-    // MCP Input values state (for server variable configuration)
-    const [mcpInputValues, setMCPInputValues] = useState({});
-
     // Load MCP servers and LLMs on mount
     useEffect(() => {
         loadServers();
         loadLLMConfigs();
-        loadMCPInputValuesData();
-        if (window.electronAPI) {
+        loadCertificates();
+        if (globalThis.electronAPI) {
             checkDockerStatus();
         }
     }, []);
@@ -125,7 +176,7 @@ const Settings = () => {
 
     // Test MCP server connection
     const testServerConnection = async (serverName, serverConfig) => {
-        if (!window.electronAPI?.testMCPServer) {
+        if (!globalThis.electronAPI?.testMCPServer) {
             setSaveMessage('Connection test is only available in the desktop app');
             setTimeout(() => setSaveMessage(''), 3000);
             return;
@@ -137,7 +188,7 @@ const Settings = () => {
         }));
 
         try {
-            const result = await window.electronAPI.testMCPServer(serverName, serverConfig);
+            const result = await globalThis.electronAPI.testMCPServer(serverName, serverConfig);
 
             if (result.success) {
                 setConnectionStatus(prev => ({
@@ -167,12 +218,54 @@ const Settings = () => {
 
     const loadLLMConfigs = async () => {
         const llmConfigs = await getLLMs();
-        setLLMs(llmConfigs);
+        setLlms(llmConfigs);
+    };
+
+    // Certificate management functions
+    const loadCertificates = async () => {
+        try {
+            const certs = await agentApiClient.listCertificates();
+            setCertificates(certs);
+        } catch (error) {
+            console.error('Failed to load certificates:', error);
+            setCertificates([]);
+        }
+    };
+
+    const handleCertificateUpload = async (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        setCertUploadLoading(true);
+        try {
+            const result = await agentApiClient.uploadCertificate(file);
+            setSaveMessage(result.message);
+            await loadCertificates();
+        } catch (error) {
+            setSaveMessage(`Failed to upload certificate: ${error.message}`);
+        } finally {
+            setCertUploadLoading(false);
+            event.target.value = ''; // Reset file input
+        }
+        setTimeout(() => setSaveMessage(''), 3000);
+    };
+
+    const handleDeleteCertificate = async (filename) => {
+        if (!globalThis.confirm(`Delete certificate "${filename}"?`)) return;
+
+        try {
+            await agentApiClient.deleteCertificate(filename);
+            setSaveMessage(`Deleted certificate: ${filename}`);
+            await loadCertificates();
+        } catch (error) {
+            setSaveMessage(`Failed to delete certificate: ${error.message}`);
+        }
+        setTimeout(() => setSaveMessage(''), 3000);
     };
 
     // Test LLM connection
     const testLLMConnection = async (llmName, llmConfig) => {
-        if (!window.electronAPI?.testLLM) {
+        if (!globalThis.electronAPI?.testLLM) {
             setSaveMessage('LLM connection test is only available in the desktop app');
             setTimeout(() => setSaveMessage(''), 3000);
             return;
@@ -184,7 +277,7 @@ const Settings = () => {
         }));
 
         try {
-            const result = await window.electronAPI.testLLM(llmName, llmConfig);
+            const result = await globalThis.electronAPI.testLLM(llmName, llmConfig);
 
             if (result.success) {
                 setLLMConnectionStatus(prev => ({
@@ -205,19 +298,14 @@ const Settings = () => {
         }
     };
 
-    const loadMCPInputValuesData = async () => {
-        const values = await getMCPInputValues();
-        setMCPInputValues(values);
-    };
-
     const checkDockerStatus = async () => {
         try {
-            const checkResult = await window.electronAPI.checkDocker();
+            const checkResult = await globalThis.electronAPI.checkDocker();
             setDockerAvailable(checkResult.available);
             setDockerError(checkResult.error);
 
             if (checkResult.available) {
-                const statusResult = await window.electronAPI.dockerStatus();
+                const statusResult = await globalThis.electronAPI.dockerStatus();
                 if (statusResult.success) {
                     setDockerContainers(statusResult.containers);
                 }
@@ -232,7 +320,7 @@ const Settings = () => {
         setDockerLoading(true);
         setDockerError(null);
         try {
-            const result = await window.electronAPI.dockerStart();
+            const result = await globalThis.electronAPI.dockerStart();
             if (result.success) {
                 setSaveMessage('Docker services started successfully');
                 setTimeout(() => setSaveMessage(''), 3000);
@@ -252,7 +340,7 @@ const Settings = () => {
         setDockerLoading(true);
         setDockerError(null);
         try {
-            const result = await window.electronAPI.dockerStop();
+            const result = await globalThis.electronAPI.dockerStop();
             if (result.success) {
                 setSaveMessage('Docker services stopped successfully');
                 setTimeout(() => setSaveMessage(''), 3000);
@@ -308,13 +396,6 @@ const Settings = () => {
         setOpenDialog(true);
     };
 
-    // Update detected variables when args change
-    const handleArgsChange = (value) => {
-        setFormData({ ...formData, args: value });
-        const vars = extractInputVariables(value);
-        setDetectedInputVars(vars);
-    };
-
     const handleCloseDialog = () => {
         setOpenDialog(false);
         setEditingServer(null);
@@ -330,57 +411,14 @@ const Settings = () => {
                 }
             }
 
-            // Parse args - support both newline-separated and comma-separated formats
-            // But be careful: connection strings contain commas, so only split on ", " (comma+space)
-            // at the beginning of args (like "-y, @package, url")
-            let args = formData.args
-                .split('\n')
-                .map(arg => arg.trim())
-                .filter(arg => arg.length > 0);
-
-            // If we have a single arg that looks like comma-separated npx args, split it
-            // Pattern: starts with -y, followed by package name, followed by connection string
-            if (args.length === 1 && args[0].includes(', ')) {
-                const singleArg = args[0];
-                // Check if it looks like: "-y, @package, url" format
-                if (singleArg.startsWith('-y, ') || singleArg.startsWith('-y,')) {
-                    // Split carefully - only split the first two comma-space occurrences
-                    // because the URL might contain commas
-                    const parts = [];
-                    let remaining = singleArg;
-
-                    // Extract -y
-                    const firstComma = remaining.indexOf(',');
-                    if (firstComma !== -1) {
-                        parts.push(remaining.substring(0, firstComma).trim());
-                        remaining = remaining.substring(firstComma + 1).trim();
-
-                        // Extract package name (up to next comma-space, but before any ://)
-                        const urlStart = remaining.indexOf('://');
-                        const secondComma = remaining.indexOf(', ');
-
-                        if (secondComma !== -1 && (urlStart === -1 || secondComma < urlStart)) {
-                            parts.push(remaining.substring(0, secondComma).trim());
-                            remaining = remaining.substring(secondComma + 1).trim();
-                        }
-
-                        // Rest is the connection string
-                        if (remaining) {
-                            parts.push(remaining);
-                        }
-                    }
-
-                    if (parts.length >= 2) {
-                        args = parts;
-                    }
-                }
-            }
+            const args = parseArgsString(formData.args);
 
             let env = {};
             if (formData.env.trim()) {
                 try {
-                    env = JSON.parse(formData.env);
+                    env = parseEnvVars(formData.env);
                 } catch (e) {
+                    console.error('Invalid JSON in environment variables:', e);
                     alert('Invalid JSON in environment variables');
                     return;
                 }
@@ -392,33 +430,29 @@ const Settings = () => {
                 type: formData.type,
                 icon: formData.icon,
                 description: formData.description,
-                env: env  // Always include env (even if empty, to clear old values)
+                env
             };
 
             const serverNameToTest = formData.name;
 
             if (editingServer) {
-                // Update existing server (handles rename and syncs to workflows)
-                await updateMCPServer(editingServer, serverConfig, formData.name !== editingServer ? formData.name : null);
-                if (editingServer !== formData.name) {
-                    setSaveMessage(`Renamed server: ${editingServer} → ${formData.name}`);
-                } else {
+                const newName = editingServer === formData.name ? null : formData.name;
+                await updateMCPServer(editingServer, serverConfig, newName);
+                if (editingServer === formData.name) {
                     setSaveMessage(`Updated server: ${formData.name}`);
+                } else {
+                    setSaveMessage(`Renamed server: ${editingServer} → ${formData.name}`);
                 }
             } else {
-                // Add new server
                 await addMCPServer(formData.name, serverConfig);
                 setSaveMessage(`Added new server: ${formData.name}`);
             }
 
             await loadServers();
-            await loadMCPInputValuesData(); // Refresh input values
             handleCloseDialog();
 
-            // Auto-test connection for the saved server
             testServerConnection(serverNameToTest, serverConfig);
 
-            // Clear message after 3 seconds
             setTimeout(() => setSaveMessage(''), 3000);
         } catch (error) {
             console.error('Error saving server:', error);
@@ -427,7 +461,7 @@ const Settings = () => {
     };
 
     const handleDelete = async (serverName) => {
-        if (window.confirm(`Are you sure you want to delete "${serverName}"?`)) {
+        if (globalThis.confirm(`Are you sure you want to delete "${serverName}"?`)) {
             try {
                 await deleteMCPServer(serverName);
                 setSaveMessage(`Deleted server: ${serverName}`);
@@ -460,8 +494,8 @@ const Settings = () => {
             });
 
             // Check if API key exists for this LLM
-            if (window.electronAPI?.getApiKeyMasked) {
-                const result = await window.electronAPI.getApiKeyMasked(llmName);
+            if (globalThis.electronAPI?.getApiKeyMasked) {
+                const result = await globalThis.electronAPI.getApiKeyMasked(llmName);
                 if (result.success && result.masked) {
                     setExistingApiKey(result.masked);
                 }
@@ -512,8 +546,8 @@ const Settings = () => {
             }
 
             // Then save API key if provided (LLM must exist first)
-            if (llmFormData.apiKey && window.electronAPI?.setApiKey) {
-                const keyResult = await window.electronAPI.setApiKey(llmName, llmFormData.apiKey);
+            if (llmFormData.apiKey && globalThis.electronAPI?.setApiKey) {
+                const keyResult = await globalThis.electronAPI.setApiKey(llmName, llmFormData.apiKey);
                 if (!keyResult.success) {
                     console.error('Failed to save API key:', keyResult.error);
                 }
@@ -531,7 +565,7 @@ const Settings = () => {
     };
 
     const handleDeleteLLM = async (llmName) => {
-        if (window.confirm(`Are you sure you want to delete "${llmName}"?`)) {
+        if (globalThis.confirm(`Are you sure you want to delete "${llmName}"?`)) {
             try {
                 await deleteLLM(llmName);
                 setSaveMessage(`Deleted LLM: ${llmName}`);
@@ -582,7 +616,7 @@ const Settings = () => {
                 )}
 
                 {/* Docker Management Section */}
-                {window.electronAPI && (
+                {globalThis.electronAPI && (
                     <Paper sx={{ p: 3, mb: 3 }}>
                         <Typography variant="h6" sx={{ fontWeight: 500, mb: 2 }}>
                             Agent Service (Docker)
@@ -649,8 +683,8 @@ const Settings = () => {
                                                 </TableRow>
                                             </TableHead>
                                             <TableBody>
-                                                {dockerContainers.map((container, index) => (
-                                                    <TableRow key={index}>
+                                                {dockerContainers.map((container) => (
+                                                    <TableRow key={container.Name || container.name || container.Id || container.id}>
                                                         <TableCell>
                                                             <code style={{ fontSize: '0.85em' }}>
                                                                 {container.Name || container.name || 'N/A'}
@@ -825,6 +859,75 @@ const Settings = () => {
                             </TableBody>
                         </Table>
                     </TableContainer>
+                </Paper>
+
+                {/* Certificates Section */}
+                <Paper sx={{ p: 3, mb: 3 }}>
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                        <Typography variant="h6" sx={{ fontWeight: 500 }}>
+                            SSL Certificates
+                        </Typography>
+                        <Button
+                            variant="contained"
+                            component="label"
+                            startIcon={certUploadLoading ? <CircularProgress size={20} color="inherit" /> : <AddIcon />}
+                            disabled={certUploadLoading}
+                        >
+                            Upload Certificate{' '}
+                            <input
+                                type="file"
+                                hidden
+                                accept=".pem,.crt,.cer,.cert"
+                                onChange={handleCertificateUpload}
+                            />
+                        </Button>
+                    </Box>
+                    <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                        Upload SSL certificates for secure database connections. Certificates are automatically used when configuring MCP servers with SSL.
+                    </Typography>
+                    {certificates.length > 0 ? (
+                        <TableContainer>
+                            <Table size="small">
+                                <TableHead sx={{ bgcolor: 'action.hover' }}>
+                                    <TableRow>
+                                        <TableCell sx={{ fontWeight: 600 }}>Filename</TableCell>
+                                        <TableCell sx={{ fontWeight: 600 }}>Container Path</TableCell>
+                                        <TableCell align="right" sx={{ fontWeight: 600 }}>Actions</TableCell>
+                                    </TableRow>
+                                </TableHead>
+                                <TableBody>
+                                    {certificates.map((filename) => (
+                                        <TableRow key={filename}>
+                                            <TableCell>
+                                                <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>
+                                                    {filename}
+                                                </Typography>
+                                            </TableCell>
+                                            <TableCell>
+                                                <Typography variant="body2" sx={{ fontFamily: 'monospace', color: 'text.secondary' }}>
+                                                    /app/data/certs/{filename}
+                                                </Typography>
+                                            </TableCell>
+                                            <TableCell align="right">
+                                                <IconButton
+                                                    size="small"
+                                                    onClick={() => handleDeleteCertificate(filename)}
+                                                    color="error"
+                                                    title="Delete Certificate"
+                                                >
+                                                    <DeleteIcon fontSize="small" />
+                                                </IconButton>
+                                            </TableCell>
+                                        </TableRow>
+                                    ))}
+                                </TableBody>
+                            </Table>
+                        </TableContainer>
+                    ) : (
+                        <Typography variant="body2" color="text.secondary">
+                            No certificates uploaded. Click "Upload Certificate" to add one.
+                        </Typography>
+                    )}
                 </Paper>
 
                 {/* LLM Configuration Section */}
@@ -1131,20 +1234,20 @@ const Settings = () => {
                             )}
 
                             {/* Temperature Setting */}
-                            {!isReasoningModel(llmFormData.model) ? (
+                            {isReasoningModel(llmFormData.model) ? (
+                                <Alert severity="info" sx={{ mt: 1 }}>
+                                    Reasoning models (o1, o3, o4-mini, etc.) do not support temperature settings.
+                                </Alert>
+                            ) : (
                                 <TextField
                                     label="Temperature"
                                     type="number"
                                     value={llmFormData.temperature}
-                                    onChange={(e) => setLLMFormData({ ...llmFormData, temperature: Math.max(0, Math.min(1, parseFloat(e.target.value) || 0)) })}
+                                    onChange={(e) => setLLMFormData({ ...llmFormData, temperature: Math.max(0, Math.min(1, Number.parseFloat(e.target.value) || 0)) })}
                                     fullWidth
-                                    inputProps={{ min: 0, max: 1, step: 0.1 }}
+                                    slotProps={{ htmlInput: { min: 0, max: 1, step: 0.1 } }}
                                     helperText="Controls randomness (0 = deterministic, 1 = creative)"
                                 />
-                            ) : (
-                                <Alert severity="info" sx={{ mt: 1 }}>
-                                    Reasoning models (o1, o3, o4-mini, etc.) do not support temperature settings.
-                                </Alert>
                             )}
 
                             {/* API Key Section */}
@@ -1190,18 +1293,20 @@ const Settings = () => {
                                             type={showApiKey ? 'text' : 'password'}
                                             placeholder="sk-..."
                                             helperText="Your API key will be securely stored locally"
-                                            InputProps={{
-                                                endAdornment: (
-                                                    <InputAdornment position="end">
-                                                        <IconButton
-                                                            onClick={() => setShowApiKey(!showApiKey)}
-                                                            edge="end"
-                                                            size="small"
-                                                        >
-                                                            {showApiKey ? <VisibilityOffIcon /> : <VisibilityIcon />}
-                                                        </IconButton>
-                                                    </InputAdornment>
-                                                ),
+                                            slotProps={{
+                                                input: {
+                                                    endAdornment: (
+                                                        <InputAdornment position="end">
+                                                            <IconButton
+                                                                onClick={() => setShowApiKey(!showApiKey)}
+                                                                edge="end"
+                                                                size="small"
+                                                            >
+                                                                {showApiKey ? <VisibilityOffIcon /> : <VisibilityIcon />}
+                                                            </IconButton>
+                                                        </InputAdornment>
+                                                    ),
+                                                }
                                             }}
                                         />
                                     )}

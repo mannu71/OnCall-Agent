@@ -26,14 +26,11 @@ export function useWorkflowStream(workflowName, enabled = true) {
             return;
         }
 
-        console.log(`[SSE] Connecting to workflow stream: ${workflowName}`);
-
         try {
             const eventSource = agentApiClient.streamWorkflowExecution(workflowName);
             eventSourceRef.current = eventSource;
 
             eventSource.onopen = () => {
-                console.log(`[SSE] Connected to ${workflowName}`);
                 setIsConnected(true);
                 setError(null);
             };
@@ -41,7 +38,6 @@ export function useWorkflowStream(workflowName, enabled = true) {
             eventSource.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
-                    console.log(`[SSE] Event received:`, data);
 
                     setEvents(prev => [...prev, {
                         ...data,
@@ -83,7 +79,6 @@ export function useWorkflowStream(workflowName, enabled = true) {
         // Cleanup on unmount or when dependencies change
         return () => {
             if (eventSourceRef.current) {
-                console.log(`[SSE] Closing connection to ${workflowName}`);
                 eventSourceRef.current.close();
                 eventSourceRef.current = null;
             }
