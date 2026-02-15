@@ -2,9 +2,9 @@
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, HTTPException, status, Query, Depends
+from fastapi import APIRouter, HTTPException, status, Query, Depends, Body
 from fastapi.responses import StreamingResponse
 
 from app.models.workflow import (
@@ -18,6 +18,7 @@ from app.api.deps import get_workflow_repo, get_execution_repo, verify_workflow_
 from app.core.scheduler import workflow_scheduler
 from app.services.visual_workflow_executor import visual_executor
 from app.core.exceptions import NotFoundException
+from app.config import settings
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 logger = logging.getLogger(__name__)
@@ -25,7 +26,56 @@ logger = logging.getLogger(__name__)
 
 def _get_now_timestamp() -> str:
     """Get current UTC timestamp in ISO format with Z suffix."""
-    return datetime.utcnow().isoformat() + 'Z'
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def _find_scheduler_node(nodes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Find the scheduler node in the nodes list."""
+    return next((n for n in nodes if n.get('type') == 'scheduler'), None)
+
+
+def _clear_schedule_fields(workflow_dict: Dict[str, Any]) -> None:
+    """Clear schedule-related fields from workflow."""
+    workflow_dict.update({'schedule': None, 'enabled': False})
+    logger.info("[SYNC] No scheduler node found, clearing schedule")
+
+
+def _sync_update_to_scheduler_node(scheduler_node: Dict[str, Any], update_data: Dict[str, Any]) -> None:
+    """Sync top-level schedule fields from update_data to scheduler node."""
+    if not update_data:
+        return
+    
+    node_data = scheduler_node.get('data', {})
+    
+    if schedule := update_data.get('schedule'):
+        node_data['cronExpression'] = schedule
+    if 'enabled' in update_data:
+        node_data['enabled'] = update_data['enabled']
+    if start_time := update_data.get('startTime'):
+        node_data['startTime'] = start_time
+    if recurrence := update_data.get('recurrence'):
+        node_data['recurrence'] = recurrence
+
+
+def _sync_scheduler_to_workflow(scheduler_node: Dict[str, Any], workflow_dict: Dict[str, Any]) -> None:
+    """Sync scheduler node data to workflow-level fields."""
+    node_data = scheduler_node.get('data', {})
+    cron_expression = node_data.get('cronExpression')
+    enabled = node_data.get('enabled', True)
+    
+    if not cron_expression:
+        return
+    
+    workflow_dict['schedule'] = cron_expression
+    workflow_dict['enabled'] = enabled
+    
+    # Also preserve startTime and recurrence at workflow level for frontend convenience
+    if start_time := node_data.get('startTime'):
+        workflow_dict['startTime'] = start_time
+    if recurrence := node_data.get('recurrence'):
+        workflow_dict['recurrence'] = recurrence
+    
+    logger.info(f"[SYNC] Synced from scheduler node: {cron_expression=}, {enabled=}")
 
 
 def _sync_scheduler_node(workflow_dict: Dict[str, Any], update_data: Optional[Dict[str, Any]] = None) -> None:
@@ -38,15 +88,13 @@ def _sync_scheduler_node(workflow_dict: Dict[str, Any], update_data: Optional[Di
     nodes = workflow_dict.get('nodes', [])
     if not nodes:
         if update_data and 'nodes' in update_data:
-            workflow_dict.update({'schedule': None, 'enabled': False})
-            logger.info("[SYNC] No nodes found, clearing schedule")
+            _clear_schedule_fields(workflow_dict)
         return
 
-    scheduler_node = next((n for n in nodes if n.get('type') == 'scheduler'), None)
+    scheduler_node = _find_scheduler_node(nodes)
     if not scheduler_node:
         if update_data and 'nodes' in update_data:
-            workflow_dict.update({'schedule': None, 'enabled': False})
-            logger.info("[SYNC] No scheduler node found, clearing schedule")
+            _clear_schedule_fields(workflow_dict)
         return
 
     if 'data' not in scheduler_node:
@@ -54,33 +102,11 @@ def _sync_scheduler_node(workflow_dict: Dict[str, Any], update_data: Optional[Di
 
     # If update_data has top-level schedule fields, sync them TO the scheduler node first
     # (This handles updates from Schedule Management page)
-    if update_data:
-        if 'schedule' in update_data and update_data['schedule']:
-            scheduler_node['data']['cronExpression'] = update_data['schedule']
-        if 'enabled' in update_data:
-            scheduler_node['data']['enabled'] = update_data['enabled']
-        if 'startTime' in update_data and update_data['startTime']:
-            scheduler_node['data']['startTime'] = update_data['startTime']
-        if 'recurrence' in update_data and update_data['recurrence']:
-            scheduler_node['data']['recurrence'] = update_data['recurrence']
+    _sync_update_to_scheduler_node(scheduler_node, update_data)
 
     # Always sync FROM scheduler node TO workflow level fields
     # This ensures changes made in the Configure Scheduler Node dialog are preserved
-    node_data = scheduler_node.get('data', {})
-    cron_expression = node_data.get('cronExpression')
-    enabled = node_data.get('enabled', True)
-    
-    if cron_expression:
-        workflow_dict['schedule'] = cron_expression
-        workflow_dict['enabled'] = enabled
-        
-        # Also preserve startTime and recurrence at workflow level for frontend convenience
-        if start_time := node_data.get('startTime'):
-            workflow_dict['startTime'] = start_time
-        if recurrence := node_data.get('recurrence'):
-            workflow_dict['recurrence'] = recurrence
-            
-        logger.info(f"[SYNC] Synced from scheduler node: {cron_expression=}, {enabled=}")
+    _sync_scheduler_to_workflow(scheduler_node, workflow_dict)
 
 
 @router.get("", response_model=List[WorkflowResponse])
@@ -119,7 +145,7 @@ async def create_workflow(
         )
     
     now = _get_now_timestamp()
-    workflow_dict = workflow_data.dict()
+    workflow_dict = workflow_data.model_dump()
     
     # Sync scheduler node and fields
     _sync_scheduler_node(workflow_dict)
@@ -148,7 +174,7 @@ async def update_workflow(
             details={"workflow_name": workflow_name}
         )
     
-    update_data = workflow_update.dict(exclude_unset=True)
+    update_data = workflow_update.model_dump(exclude_unset=True)
     workflow_dict = {**existing_workflow, **update_data}
     
     logger.info(f"[UPDATE] Updating workflow '{workflow_name}'")
@@ -185,14 +211,66 @@ async def update_workflow(
 @router.delete("/{workflow_name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_workflow(
     workflow_name: str,
-    workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
+    delete_scripts: bool = Query(False, description="Also delete SQL scripts if not used by other workflows"),
+    workflow_repo: WorkflowRepository = Depends(get_workflow_repo),
+    execution_repo: ExecutionRepository = Depends(get_execution_repo)
 ):
-    """Delete a workflow."""
+    """Delete a workflow and all associated execution history.
+    
+    Args:
+        workflow_name: Name of workflow to delete
+        delete_scripts: If True, also delete SQL scripts that aren't used by other workflows
+    """
+    # Get SQL files before deleting the workflow
+    sql_files = await workflow_repo.get_sql_files_for_workflow(workflow_name) if delete_scripts else []
+    
     if not await workflow_repo.delete(workflow_name):
         raise NotFoundException(
             message=f"Workflow '{workflow_name}' not found",
             details={"workflow_name": workflow_name}
         )
+    
+    # Cancel and cleanup any active executions
+    execution_ids_to_clear = [
+        eid for eid, data in list(visual_executor.active_executions.items())
+        if data.get('workflow_name') == workflow_name
+    ]
+    
+    for execution_id in execution_ids_to_clear:
+        visual_executor.cleanup_execution(execution_id)
+    
+    # Delete all execution history for this workflow
+    deleted_count = await execution_repo.delete_by_workflow(workflow_name)
+    
+    # Delete SQL scripts if requested and not used by other workflows
+    deleted_scripts = []
+    if delete_scripts and sql_files:
+        from pathlib import Path
+        # SQL scripts are in data/config/sql/ directory
+        sql_base_path = Path(\"data\") / \"config\" / \"sql\"
+        
+        for sql_file in sql_files:
+            # Check if file is used by other workflows
+            is_used = await workflow_repo.is_sql_file_used_by_other_workflows(sql_file, workflow_name)
+            
+            if not is_used:
+                sql_path = sql_base_path / sql_file
+                if sql_path.exists():
+                    try:
+                        sql_path.unlink()
+                        deleted_scripts.append(sql_file)
+                        logger.info(f"Deleted SQL script: {sql_file}")
+                    except Exception as e:
+                        logger.error(f"Error deleting SQL script {sql_file}: {e}")
+                else:
+                    logger.warning(f"SQL script not found: {sql_file}")
+            else:
+                logger.info(f"Kept SQL script '{sql_file}' (used by other workflows)")
+    
+    log_msg = f"Deleted workflow '{workflow_name}' and {deleted_count} execution records"
+    if deleted_scripts:
+        log_msg += f" and {len(deleted_scripts)} SQL scripts: {', '.join(deleted_scripts)}"
+    logger.info(log_msg)
     
     await workflow_scheduler.reload_workflows()
     return None
@@ -202,9 +280,10 @@ async def delete_workflow(
 async def execute_workflow(
     workflow_name: str,
     background: bool = False,
+    inputs: Optional[Dict[str, Any]] = Body(None),
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
 ):
-    """Manually execute a workflow."""
+    """Manually execute a workflow with optional input parameters."""
     workflow = await workflow_repo.get_by_name(workflow_name)
     if not workflow:
         raise NotFoundException(
@@ -212,37 +291,43 @@ async def execute_workflow(
             details={"workflow_name": workflow_name}
         )
     
+    # Check if already running (prevents duplicate executions)
+    if visual_executor._is_workflow_running(workflow_name):
+        return {
+            "status": "already_running",
+            "workflow_name": workflow_name,
+            "message": f"Workflow '{workflow_name}' is already running"
+        }
+    
     if background:
-        asyncio.create_task(visual_executor.execute_workflow(workflow))
+        task = asyncio.create_task(visual_executor.execute_workflow(workflow, inputs=inputs))
+        visual_executor.background_tasks.add(task)
+        task.add_done_callback(visual_executor.background_tasks.discard)
+        # Keep a local reference to prevent premature garbage collection
+        _ = task  # noqa: F841
         return {
             "status": "started",
             "workflow_name": workflow_name,
             "message": f"Workflow '{workflow_name}' execution started in background"
         }
     
-    return await visual_executor.execute_workflow(workflow)
+    return await visual_executor.execute_workflow(workflow, inputs=inputs)
 
 
 @router.get("/{workflow_name}/stream")
 async def stream_workflow_execution(
     workflow_name: str = Depends(verify_workflow_exists),
-    workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
 ):
-    """Stream workflow execution events via SSE."""
+    """Stream events for an already-running workflow execution via SSE.
+    
+    Monitors an existing execution. Does NOT start a new one.
+    """
     
     async def event_generator():
-        workflow = await workflow_repo.get_by_name(workflow_name)
-        
-        # Start execution and wait slightly for it to register
-        asyncio.create_task(visual_executor.execute_workflow(workflow))
-        await asyncio.sleep(0.1)
-        
-        # Find the execution ID
-        exec_id = next((eid for eid, data in visual_executor.active_executions.items() 
-                       if data.get('workflow_name') == workflow_name), None)
+        exec_id = visual_executor._is_workflow_running(workflow_name)
         
         if not exec_id:
-            yield f"data: {json.dumps({'error': 'Could not find execution'})}\n\n"
+            yield f"data: {json.dumps({'event': 'no_execution', 'message': 'No active execution found'})}\n\n"
             return
         
         queue = visual_executor.subscribe_to_events(exec_id)
@@ -254,10 +339,13 @@ async def stream_workflow_execution(
                     event = await asyncio.wait_for(queue.get(), timeout=60.0)
                     yield f"data: {json.dumps(event.dict())}\n\n"
                     
-                    if event.event_type in ["workflow_completed", "workflow_failed"]:
+                    if event.event_type in ("workflow_completed", "workflow_failed"):
                         break
                 except asyncio.TimeoutError:
-                    yield f"data: {json.dumps({'event': 'keepalive', 'timestamp': _get_now_timestamp()})}\n\n"
+                    # Check if execution is still active
+                    if exec_id not in visual_executor.active_executions:
+                        break
+                    yield f"data: {json.dumps({'event': 'keepalive'})}\n\n"
         finally:
             visual_executor.unsubscribe_from_events(exec_id, queue)
     

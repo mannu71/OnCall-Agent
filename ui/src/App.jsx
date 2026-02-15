@@ -85,19 +85,18 @@ const PlaceholderPage = ({ title }) => {
 const AppRoutes = () => {
   const { isOpen } = useSidebar();
   return (
-    <Box sx={{ display: 'flex', minHeight: '100vh', width: '100%' }}>
+    <Box sx={{ minHeight: '100vh' }}>
       <Sidebar />
       <Box
         component="main"
         sx={{
-          flexGrow: 1,
           minHeight: '100vh',
-          width: '100%',
           ml: {
             md: isOpen ? '270px' : '64px',
             xs: 0
           },
           transition: 'margin-left 225ms cubic-bezier(0.4, 0, 0.6, 1)',
+          overflowX: 'hidden',
         }}
       >
         <Suspense fallback={<LoadingFallback />}>

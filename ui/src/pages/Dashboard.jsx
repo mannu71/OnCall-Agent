@@ -110,16 +110,16 @@ export default function Dashboard() {
 
   const tableContent = useMemo(() => {
     if (loading && executions.length === 0) {
-      return <TableRow><TableCell colSpan={6} align="center">Loading history...</TableCell></TableRow>;
+      return <TableRow><TableCell colSpan={6} align="center">Loading...</TableCell></TableRow>;
     }
     if (executions.length === 0) {
       return <TableRow><TableCell colSpan={6} align="center">No recent activity</TableCell></TableRow>;
     }
     return paginatedRuns.map((run) => (
       <TableRow key={run.execution_id} hover>
-        <TableCell sx={{ textTransform: 'capitalize', fontWeight: 500 }}>{run.workflow_name.replaceAll('-', ' ')}</TableCell>
-        <TableCell>{new Date(run.start_time).toLocaleString()}</TableCell>
-        <TableCell>{run.duration ? `${run.duration.toFixed(1)}s` : '-'}</TableCell>
+        <TableCell sx={{ textTransform: 'capitalize', fontWeight: 500, maxWidth: { xs: 120, sm: 200 }, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{run.workflow_name.replaceAll('-', ' ')}</TableCell>
+        <TableCell sx={{ whiteSpace: 'nowrap', display: { xs: 'none', sm: 'table-cell' } }}>{new Date(run.start_time).toLocaleString()}</TableCell>
+        <TableCell sx={{ display: { xs: 'none', md: 'table-cell' } }}>{run.duration ? `${run.duration.toFixed(1)}s` : '-'}</TableCell>
         <TableCell>
           {run.output ? (
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
@@ -143,7 +143,7 @@ export default function Dashboard() {
   }, [loading, executions.length, paginatedRuns]);
 
   return (
-    <Box sx={{ p: { xs: 2, sm: 3, md: 4 } }}>
+    <Box sx={{ p: { xs: 2, sm: 3, md: 4 }, maxWidth: '100%', boxSizing: 'border-box' }}>
       <Box sx={{ mb: { xs: 2, md: 4 } }}>
         <Typography variant="h4" sx={{ fontWeight: 700, mb: 1, fontSize: { xs: '1.5rem', sm: '2rem', md: '2.125rem' } }}>Dashboard</Typography>
         <Typography variant="body1" color="text.secondary">System monitoring and activity tracking</Typography>
@@ -161,11 +161,11 @@ export default function Dashboard() {
 
       <Grid container spacing={{ xs: 1.5, sm: 2, md: 3 }} sx={{ mb: { xs: 2, md: 4 } }}>
         {stats.map((stat) => (
-          <Grid item xs={6} sm={6} md={3} key={stat.title}>
+          <Grid size={{ xs: 6, sm: 6, md: 3 }} key={stat.title}>
             <Card variant="outlined" sx={{ borderRadius: 2 }}>
-              <CardContent sx={{ textAlign: 'center' }}>
-                <Typography variant="body2" color="text.secondary" sx={{ fontWeight: 600 }}>{stat.title}</Typography>
-                <Typography variant="h4" sx={{ color: stat.color, fontWeight: 700, mt: 1 }}>{stat.value}</Typography>
+              <CardContent sx={{ textAlign: 'center', py: { xs: 1.5, sm: 2 }, px: { xs: 1, sm: 2 } }}>
+                <Typography variant="body2" color="text.secondary" sx={{ fontWeight: 600, fontSize: { xs: '0.75rem', sm: '0.875rem' } }}>{stat.title}</Typography>
+                <Typography variant="h4" sx={{ color: stat.color, fontWeight: 700, mt: 1, fontSize: { xs: '1.5rem', sm: '2rem', md: '2.125rem' } }}>{stat.value}</Typography>
               </CardContent>
             </Card>
           </Grid>
@@ -201,13 +201,13 @@ export default function Dashboard() {
         </Box>
       </Box>
 
-      <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, overflowX: 'auto' }}>
-        <Table sx={{ minWidth: 600 }}>
+      <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, overflowX: 'auto', width: '100%' }}>
+        <Table sx={{ minWidth: { xs: 500, sm: 600 } }} size="small">
           <TableHead sx={{ bgcolor: 'action.hover' }}>
             <TableRow>
               <TableCell sx={{ fontWeight: 600 }}>Workflow</TableCell>
-              <TableCell sx={{ fontWeight: 600 }}>Started</TableCell>
-              <TableCell sx={{ fontWeight: 600 }}>Duration</TableCell>
+              <TableCell sx={{ fontWeight: 600, display: { xs: 'none', sm: 'table-cell' } }}>Started</TableCell>
+              <TableCell sx={{ fontWeight: 600, display: { xs: 'none', md: 'table-cell' } }}>Duration</TableCell>
               <TableCell sx={{ fontWeight: 600 }}>Queries</TableCell>
               <TableCell sx={{ fontWeight: 600 }}>Status</TableCell>
               <TableCell align="right" sx={{ fontWeight: 600 }}>Details</TableCell>
@@ -227,52 +227,52 @@ export default function Dashboard() {
         />
       </TableContainer>
 
-      <Dialog open={Boolean(selectedRun)} onClose={() => setSelectedRun(null)} maxWidth="lg" fullWidth
-        slotProps={{ paper: { sx: { m: { xs: 1, sm: 2 }, width: { xs: 'calc(100% - 16px)', sm: 'calc(100% - 32px)' } } } }}
-      >
+      <Dialog open={Boolean(selectedRun)} onClose={() => setSelectedRun(null)} maxWidth="lg" fullWidth>
         <DialogTitle>Execution Details: {selectedRun?.workflow_name}</DialogTitle>
         <DialogContent dividers>
           {selectedRun && (
             <Box>
               <Box sx={{ mb: 3, p: 2, bgcolor: 'action.hover', borderRadius: 1 }}>
-                <Grid container spacing={2}>
-                  <Grid item xs={12} md={6}>
+                <Grid container spacing={2} columns={6}>
+                  <Grid size={2}>
                     <Typography variant="caption" color="text.secondary">Execution ID</Typography>
                     <Typography variant="body2" sx={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>
                       {selectedRun.execution_id}
                     </Typography>
                   </Grid>
-                  <Grid item xs={6} md={3}>
+                  <Grid size={1}>
                     <Typography variant="caption" color="text.secondary">Duration</Typography>
                     <Typography variant="body2">{selectedRun.duration?.toFixed(2)}s</Typography>
                   </Grid>
-                  <Grid item xs={6} md={3}>
+                  <Grid size={1}>
                     <Typography variant="caption" color="text.secondary">Nodes Executed</Typography>
                     <Typography variant="body2">{selectedRun.nodes_executed || 0}</Typography>
                   </Grid>
                   {selectedRun.output && (
                     <>
-                      <Grid item xs={6} md={4}>
-                        <Typography variant="caption" color="text.secondary">Queries Executed</Typography>
+                      <Grid size={1}>
+                        <Typography variant="caption" color="text.secondary">Queries</Typography>
                         <Typography variant="body2" sx={{ fontWeight: 600, color: 'primary.main' }}>
                           {selectedRun.output.queries_executed || 0}
                         </Typography>
                       </Grid>
-                      <Grid item xs={6} md={4}>
+                      <Grid size={1}>
                         <Typography variant="caption" color="text.secondary">Failures</Typography>
                         <Typography variant="body2" sx={{ fontWeight: 600, color: selectedRun.output.failures > 0 ? 'error.main' : 'success.main' }}>
                           {selectedRun.output.failures || 0}
                         </Typography>
                       </Grid>
-                      <Grid item xs={12} md={4}>
-                        <Typography variant="caption" color="text.secondary">Success Rate</Typography>
-                        <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                          {selectedRun.output.queries_executed > 0 
-                            ? `${(((selectedRun.output.queries_executed - selectedRun.output.failures) / selectedRun.output.queries_executed) * 100).toFixed(1)}%`
-                            : 'N/A'}
-                        </Typography>
-                      </Grid>
                     </>
+                  )}
+                  {selectedRun.output && (
+                    <Grid size={6}>
+                      <Typography variant="caption" color="text.secondary">Success Rate</Typography>
+                      <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                        {selectedRun.output.queries_executed > 0 
+                          ? `${(((selectedRun.output.queries_executed - selectedRun.output.failures) / selectedRun.output.queries_executed) * 100).toFixed(1)}%`
+                          : 'N/A'}
+                      </Typography>
+                    </Grid>
                   )}
                 </Grid>
               </Box>
