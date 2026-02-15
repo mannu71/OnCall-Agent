@@ -4,7 +4,7 @@ import yaml
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.repositories.base import BaseRepository
 from app.config import settings
 
@@ -57,7 +57,7 @@ class WorkflowRepository(BaseRepository[Dict[str, Any]]):
         if not timestamp:
             return False
         
-        return datetime.utcnow() - timestamp < self._cache_ttl
+        return datetime.now(timezone.utc) - timestamp < self._cache_ttl
     
     def _update_cache(self, workflow_name: str, workflow: Dict[str, Any]) -> None:
         """Update cache for a workflow.
@@ -67,7 +67,7 @@ class WorkflowRepository(BaseRepository[Dict[str, Any]]):
             workflow: Workflow data
         """
         self._cache[workflow_name] = workflow
-        self._cache_timestamps[workflow_name] = datetime.utcnow()
+        self._cache_timestamps[workflow_name] = datetime.now(timezone.utc)
     
     def _invalidate_cache(self, workflow_name: str) -> None:
         """Invalidate cache for a workflow.

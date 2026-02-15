@@ -3,12 +3,15 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies including Node.js for MCP servers
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     gcc \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    nodejs \
+    npm \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm config set strict-ssl false
 
 # Copy requirements first for better caching
 COPY requirements.txt .

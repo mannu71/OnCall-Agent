@@ -33,7 +33,7 @@ const debounce = (func, wait) => {
 
 // More comprehensive ResizeObserver error handling
 // Suppress ResizeObserver errors
-if (typeof window !== 'undefined') {
+if (globalThis.window !== undefined) {
   const originalError = console.error;
   console.error = (...args) => {
     if (typeof args[0] === 'string' && args[0].includes('ResizeObserver')) return;
@@ -95,6 +95,16 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
     }
   }, [initialEdges, setEdges]);
 
+  // Helper: update a single node's data by id
+  const updateNodeData = useCallback((nodeId, dataUpdate) => {
+    setNodes(nds => nds.map(n => n.id === nodeId ? { ...n, data: { ...n.data, ...dataUpdate } } : n));
+  }, [setNodes]);
+
+  // Helper: reset LLM-agent connection data
+  const resetAgentLlmData = useCallback((targetNodeId) => {
+    updateNodeData(targetNodeId, { model: '', initialized: false, initializing: false, processing: false });
+  }, [updateNodeData]);
+
   // Helper function to show message with type - wrapped in useCallback to avoid dependency issues
   const showMessage = useCallback((message, type = 'info', duration = 3000) => {
     setConnectionMessage(message);
@@ -108,31 +118,11 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
       if (change.type === 'remove') {
         const edge = edges.find(e => e.id === change.id);
         if (edge) {
-          // Check if this was an LLM -> Agent connection
           const sourceNode = nodes.find(n => n.id === edge.source);
           const targetNode = nodes.find(n => n.id === edge.target);
 
           if (sourceNode?.type === 'llm' && targetNode?.type === 'agent' && edge.targetHandle === 'model') {
-            console.log("🔌 Disconnecting LLM from agent:", targetNode.id);
-
-            // Clean up agent data - reset status
-            setNodes((nds) =>
-              nds.map((node) =>
-                node.id === targetNode.id
-                  ? {
-                    ...node,
-                    data: {
-                      ...node.data,
-                      model: '',
-                      initialized: false,
-                      initializing: false,
-                      processing: false
-                    }
-                  }
-                  : node
-              )
-            );
-
+            resetAgentLlmData(targetNode.id);
             showMessage('LLM disconnected from agent', 'info', 2000);
           }
         }
@@ -141,7 +131,7 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
 
     // Apply the default edge changes
     defaultOnEdgesChange(changes);
-  }, [edges, nodes, setNodes, defaultOnEdgesChange, showMessage]);
+  }, [edges, nodes, defaultOnEdgesChange, showMessage, resetAgentLlmData]);
 
   // Auto-zoom after ReactFlow is initialized
   useEffect(() => {
@@ -172,44 +162,51 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
     };
   }, [reactFlowInstance]);
 
+  // Helper: update multiple nodes' data based on a map of nodeId -> dataUpdate
+  const updateMultipleNodes = useCallback((updateMap) => {
+    setNodes(nds => nds.map(n => {
+      const update = updateMap[n.id];
+      return update ? { ...n, data: { ...n.data, ...update } } : n;
+    }));
+  }, [setNodes]);
+
+  // Helper: set output data on nodes targeted by edges
+  const setOutputOnTargets = useCallback((outputEdgeTargets, dataUpdate) => {
+    setNodes(nds => nds.map(n =>
+      outputEdgeTargets.has(n.id) ? { ...n, data: { ...n.data, ...dataUpdate } } : n
+    ));
+  }, [setNodes]);
+
   // Shared logic to process a single agent with a message
   const processSingleAgent = useCallback(async (agentNode, message) => {
     const agentId = agentNode.id;
     const llmEdge = edgesRef.current.find(e => e.target === agentId && e.targetHandle === 'model');
     const llmNode = llmEdge ? nodesRef.current.find(n => n.id === llmEdge.source) : null;
 
-    setNodes(nds => nds.map(n => {
-      if (n.id === agentId) return { ...n, data: { ...n.data, processing: true, lastMessage: message } };
-      if (n.id === llmNode?.id) return { ...n, data: { ...n.data, processing: true } };
-      return n;
-    }));
+    const startUpdates = { [agentId]: { processing: true, lastMessage: message } };
+    if (llmNode?.id) startUpdates[llmNode.id] = { processing: true };
+    updateMultipleNodes(startUpdates);
 
     try {
       await new Promise(resolve => setTimeout(resolve, 1500));
       const response = `Processed by ${agentNode.data?.label || 'Agent'}: ${message}`;
       const outputEdges = edgesRef.current.filter(e => e.source === agentId && e.sourceHandle === 'agent-output');
+      const targetIds = new Set(outputEdges.map(e => e.target));
 
-      setNodes(nds => nds.map(n => {
-        if (outputEdges.some(e => e.target === n.id)) {
-          return { ...n, data: { ...n.data, input: response, lastUpdated: new Date().toISOString() } };
-        }
-        return n;
-      }));
+      setOutputOnTargets(targetIds, { input: response, lastUpdated: new Date().toISOString() });
       return true;
     } finally {
-      setNodes(nds => nds.map(n => {
-        if (n.id === agentId) return { ...n, data: { ...n.data, processing: false } };
-        if (n.id === llmNode?.id) return { ...n, data: { ...n.data, processing: false } };
-        return n;
-      }));
+      const endUpdates = { [agentId]: { processing: false } };
+      if (llmNode?.id) endUpdates[llmNode.id] = { processing: false };
+      updateMultipleNodes(endUpdates);
     }
-  }, [setNodes]);
+  }, [updateMultipleNodes, setOutputOnTargets]);
 
   const triggerTeamsNode = useCallback(async (nodeId, message = "Test message") => {
     const teamsNode = nodesRef.current.find(n => n.id === nodeId);
     if (!teamsNode) return;
 
-    setNodes(nds => nds.map(n => n.id === nodeId ? { ...n, data: { ...n.data, processing: true, status: 'Processing...' } } : n));
+    updateNodeData(nodeId, { processing: true, status: 'Processing...' });
 
     try {
       await new Promise(resolve => setTimeout(resolve, 800));
@@ -224,9 +221,9 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
       }
       showMessage(`Teams triggered ${triggered} agent(s)`, triggered > 0 ? 'success' : 'info');
     } finally {
-      setNodes(nds => nds.map(n => n.id === nodeId ? { ...n, data: { ...n.data, processing: false, status: 'Connected' } } : n));
+      updateNodeData(nodeId, { processing: false, status: 'Connected' });
     }
-  }, [setNodes, showMessage, processSingleAgent]);
+  }, [showMessage, processSingleAgent, updateNodeData]);
 
   // Helper function to get edge color based on source node type
   const getEdgeColor = useCallback((sourceId) => {
@@ -252,71 +249,81 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
     getWorkflowData: () => ({ nodes: nodesRef.current, edges: edgesRef.current })
   }), []);
 
+  // Helper: check if user is typing in an input field
+  const isUserTyping = useCallback(() => {
+    const el = document.activeElement;
+    return el && (
+      el.tagName === 'INPUT' ||
+      el.tagName === 'TEXTAREA' ||
+      el.contentEditable === 'true' ||
+      el.isContentEditable ||
+      el.closest('.config-panel') ||
+      el.closest('.chat-input-container-mini') ||
+      el.closest('input') ||
+      el.closest('textarea')
+    );
+  }, []);
+
+  // Handle Delete/Backspace for selected edge
+  const handleDeleteEdge = useCallback(() => {
+    const sourceNode = nodes.find(n => n.id === selectedEdge.source);
+    const targetNode = nodes.find(n => n.id === selectedEdge.target);
+
+    if (sourceNode?.type === 'llm' && targetNode?.type === 'agent' && selectedEdge.targetHandle === 'model') {
+      resetAgentLlmData(targetNode.id);
+      showMessage('LLM disconnected from agent', 'info', 2000);
+    }
+
+    setEdges((eds) => eds.filter((edge) => edge.id !== selectedEdge.id));
+    setSelectedEdge(null);
+    showMessage('Connection deleted successfully', 'success', 2000);
+  }, [selectedEdge, nodes, setEdges, showMessage, resetAgentLlmData]);
+
+  // Handle Delete/Backspace for selected node
+  const handleDeleteNode = useCallback(() => {
+    setNodes((nds) => nds.filter((node) => node.id !== selectedNode.id));
+    setEdges((eds) => eds.filter((edge) =>
+      edge.source !== selectedNode.id && edge.target !== selectedNode.id
+    ));
+    setSelectedNode(null);
+    setShowConfigPanel(false);
+    showMessage('Node and its connections deleted successfully', 'success', 2000);
+  }, [selectedNode, setNodes, setEdges, showMessage]);
+
+  // Handle P key to trigger Teams nodes
+  const handleTriggerTeams = useCallback(() => {
+    const teamsNodes = nodes.filter(node => node.type === 'teams');
+
+    if (teamsNodes.length === 0) {
+      showMessage('No Teams nodes found in the flow', 'info', 2000);
+      return;
+    }
+
+    if (teamsNodes.length === 1) {
+      const teamsNode = teamsNodes[0];
+      triggerTeamsNode(teamsNode.id, "Analyse recent logs and suggest fix");
+      showMessage(`Triggered Teams node: ${teamsNode.data?.label || 'Teams Channel'}`, 'success', 2000);
+    } else {
+      teamsNodes.forEach((teamsNode, index) => {
+        setTimeout(() => {
+          triggerTeamsNode(teamsNode.id, `Analyse recent logs and suggest fix - Node ${index + 1}`);
+        }, index * 200);
+      });
+      showMessage(`Triggered ${teamsNodes.length} Teams nodes`, 'success', 2000);
+    }
+  }, [nodes, triggerTeamsNode, showMessage]);
+
   // Keyboard shortcut handler for deleting nodes and edges
   useEffect(() => {
     const handleKeyDown = (event) => {
       if (event.key === 'Delete' || event.key === 'Backspace') {
-        // Don't delete nodes when user is typing in an input field
-        const activeElement = document.activeElement;
-        const isTyping = activeElement && (
-          activeElement.tagName === 'INPUT' ||
-          activeElement.tagName === 'TEXTAREA' ||
-          activeElement.contentEditable === 'true' ||
-          activeElement.isContentEditable ||
-          activeElement.closest('.config-panel') ||
-          activeElement.closest('.chat-input-container-mini') ||
-          activeElement.closest('input') ||
-          activeElement.closest('textarea')
-        );
-
-        if (isTyping) {
-          return; // Let the input field handle the backspace/delete
-        }
-
+        if (isUserTyping()) return;
         event.preventDefault();
 
         if (selectedEdge) {
-          // Check if this was an LLM -> Agent connection and clean up
-          const sourceNode = nodes.find(n => n.id === selectedEdge.source);
-          const targetNode = nodes.find(n => n.id === selectedEdge.target);
-
-          if (sourceNode?.type === 'llm' && targetNode?.type === 'agent' && selectedEdge.targetHandle === 'model') {
-            console.log("🔌 Disconnecting LLM from agent via keyboard:", targetNode.id);
-
-            // Clean up agent data - reset status
-            setNodes((nds) =>
-              nds.map((node) =>
-                node.id === targetNode.id
-                  ? {
-                    ...node,
-                    data: {
-                      ...node.data,
-                      model: '',
-                      initialized: false,
-                      initializing: false,
-                      processing: false
-                    }
-                  }
-                  : node
-              )
-            );
-
-            showMessage('LLM disconnected from agent', 'info', 2000);
-          }
-
-          // Delete selected edge
-          setEdges((eds) => eds.filter((edge) => edge.id !== selectedEdge.id));
-          setSelectedEdge(null);
-          showMessage('Connection deleted successfully', 'success', 2000);
+          handleDeleteEdge();
         } else if (selectedNode) {
-          // Delete selected node and its connections
-          setNodes((nds) => nds.filter((node) => node.id !== selectedNode.id));
-          setEdges((eds) => eds.filter((edge) =>
-            edge.source !== selectedNode.id && edge.target !== selectedNode.id
-          ));
-          setSelectedNode(null);
-          setShowConfigPanel(false);
-          showMessage('Node and its connections deleted successfully', 'success', 2000);
+          handleDeleteNode();
         }
       }
 
@@ -327,56 +334,15 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
       }
 
       if (event.key === 'p' || event.key === 'P') {
-        // Don't trigger when user is typing in an input field
-        const activeElement = document.activeElement;
-        const isTyping = activeElement && (
-          activeElement.tagName === 'INPUT' ||
-          activeElement.tagName === 'TEXTAREA' ||
-          activeElement.contentEditable === 'true' ||
-          activeElement.isContentEditable ||
-          activeElement.closest('.config-panel') ||
-          activeElement.closest('.chat-input-container-mini') ||
-          activeElement.closest('input') ||
-          activeElement.closest('textarea')
-        );
-
-        if (isTyping) {
-          return; // Let the input field handle the key press
-        }
-
+        if (isUserTyping()) return;
         event.preventDefault();
-
-        // Find all Teams nodes
-        const teamsNodes = nodes.filter(node => node.type === 'teams');
-
-        if (teamsNodes.length === 0) {
-          showMessage('No Teams nodes found in the flow', 'info', 2000);
-          return;
-        }
-
-        if (teamsNodes.length === 1) {
-          // If only one Teams node, trigger it directly
-          const teamsNode = teamsNodes[0];
-          console.log(`🎯 Triggering Teams node via 'P' key: ${teamsNode.id}`);
-          triggerTeamsNode(teamsNode.id, "Analyse recent logs and suggest fix");
-          showMessage(`Triggered Teams node: ${teamsNode.data?.label || 'Teams Channel'}`, 'success', 2000);
-        } else {
-          // If multiple Teams nodes, trigger all of them
-          console.log(`🎯 Triggering ${teamsNodes.length} Teams nodes via 'P' key`);
-          teamsNodes.forEach((teamsNode, index) => {
-            // Stagger the triggers slightly to avoid overwhelming
-            setTimeout(() => {
-              triggerTeamsNode(teamsNode.id, `Analyse recent logs and suggest fix - Node ${index + 1}`);
-            }, index * 200);
-          });
-          showMessage(`Triggered ${teamsNodes.length} Teams nodes`, 'success', 2000);
-        }
+        handleTriggerTeams();
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedNode, selectedEdge, setNodes, setEdges, showMessage, nodes, triggerTeamsNode]); const onConnect = useCallback(
+    globalThis.addEventListener('keydown', handleKeyDown);
+    return () => globalThis.removeEventListener('keydown', handleKeyDown);
+  }, [selectedNode, selectedEdge, setNodes, setEdges, showMessage, nodes, triggerTeamsNode, isUserTyping, handleDeleteEdge, handleDeleteNode, handleTriggerTeams]); const onConnect = useCallback(
     async (params) => {
       // Validate connection before adding
       if (isValidConnection(params.source, params.target, params.sourceHandle, params.targetHandle, nodes, edges)) {
@@ -548,25 +514,26 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
   // Expose trigger function globally for dev console access
   useEffect(() => {
     // Function to list all Teams nodes
+    const connectedNodeIds = new Set(edges.flatMap(edge => [edge.source, edge.target]));
     const listTeamsNodes = () => {
       const teamsNodes = nodes.filter(node => node.type === 'teams');
-      console.log("📋 Available Teams nodes:", teamsNodes.map(node => ({
+      console.log("\uD83D\uDCCB Available Teams nodes:", teamsNodes.map(node => ({
         id: node.id,
         label: node.data?.label || 'Teams Channel',
         channel: node.data?.channel || 'General Channel',
-        connected: edges.some(edge => edge.source === node.id || edge.target === node.id)
+        connected: connectedNodeIds.has(node.id)
       })));
       return teamsNodes;
     };
 
     // Expose functions to global window object
-    window.triggerTeamsNode = triggerTeamsNode;
-    window.listTeamsNodes = listTeamsNodes;
+    globalThis.triggerTeamsNode = triggerTeamsNode;
+    globalThis.listTeamsNodes = listTeamsNodes;
 
     // Cleanup on unmount
     return () => {
-      delete window.triggerTeamsNode;
-      delete window.listTeamsNodes;
+      delete globalThis.triggerTeamsNode;
+      delete globalThis.listTeamsNodes;
     };
   }, [triggerTeamsNode, nodes, edges]);
 
@@ -589,7 +556,7 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
       const nodeData = JSON.parse(event.dataTransfer.getData('application/reactflow'));
 
       // Check if the dropped element is valid
-      if (typeof nodeData === 'undefined' || !nodeData) {
+      if (nodeData === undefined || !nodeData) {
         return;
       }
 
@@ -599,7 +566,7 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
       });
 
       const newNode = {
-        id: `${nodeData.type}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        id: `${nodeData.type}-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
         type: nodeData.type,
         position,
         data: nodeData.data,
@@ -610,13 +577,15 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
     [reactFlowInstance, setNodes],
   );
 
+  const messageIcon = { success: '\u2705', error: '\u274c' };
+
   return (
-    <div class="flex h-[calc(100vh-90px)] w-full relative">
+    <div className="flex h-[calc(100vh-90px)] w-full relative">
       <NodeSidebar />
-      <div class="flex-1 h-full" ref={reactFlowWrapper}>
+      <div className="flex-1 h-full" ref={reactFlowWrapper}>
         {connectionMessage && (
           <div className={`connection-message ${messageType}`}>
-            {messageType === 'success' ? '✅' : messageType === 'error' ? '❌' : 'ℹ️'} {connectionMessage}
+            {messageIcon[messageType] || '\u2139\ufe0f'} {connectionMessage}
           </div>
         )}
         <ErrorBoundary>

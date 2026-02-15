@@ -29,7 +29,7 @@
       "type": "stdio",
       "command": "npx",
       "env": {
-        "NODE_EXTRA_CA_CERTS": "C:\\Users\\csinvmmn\\Downloads\\global-bundle 1.pem"
+        "NODE_EXTRA_CA_CERTS": "/app/data/certs/global-bundle.pem"
       },
       "args": [
         "-y",
@@ -70,7 +70,9 @@
       "type": "stdio",
       "icon": "🗄️",
       "description": "PostgreSQL Acuris Production Database",
-      "env": {}
+      "env": {
+        "NODE_EXTRA_CA_CERTS": "/app/data/certs/global-bundle.pem"
+      }
     },
     "postgres": {
       "command": "uvx",

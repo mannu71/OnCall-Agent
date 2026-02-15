@@ -1,14 +1,15 @@
 """SQL Orchestrator for executing SQL-based workflows with dependency resolution."""
 import re
+import json
 import asyncio
 import logging
-from typing import Dict, List, Any, Optional, Set, Tuple
-from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Set
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
-# Pattern to match template variables like {variable_name} or {step.column}
 TEMPLATE_VAR_PATTERN = re.compile(r'\{([^}]+)\}')
+BUILT_IN_VARS = frozenset({'current_date', 'next_date', 'current_date_time'})
 
 
 class SQLQuery:
@@ -26,7 +27,6 @@ class SQLQuery:
         self.label = label or query_id
         self.database = database
         self.dependencies: Set[str] = set()
-        self.output_columns: List[str] = []
         
         # Extract dependencies from SQL
         self._extract_dependencies()
@@ -34,33 +34,49 @@ class SQLQuery:
     def _extract_dependencies(self):
         """Extract variable dependencies from SQL query."""
         for match in TEMPLATE_VAR_PATTERN.finditer(self.sql):
-            var_path = match.group(1).strip()
-            # Extract the step name (before the first dot if exists)
-            parts = var_path.split('.')
-            if parts[0] not in ['current_date', 'next_date', 'current_date_time']:
-                self.dependencies.add(parts[0])
-    
-    def can_parallelize_with(self, other: 'SQLQuery') -> bool:
-        """Check if this query can run in parallel with another."""
-        # Can run in parallel if no dependencies on each other
-        return (
-            self.query_id not in other.dependencies and
-            other.query_id not in self.dependencies
-        )
+            var_name = match.group(1).strip().split('.')[0]
+            if var_name not in BUILT_IN_VARS:
+                self.dependencies.add(var_name)
 
 
 class SQLOrchestrator:
     """Orchestrates execution of multi-step SQL workflows."""
     
-    def __init__(self, mcp_manager):
+    def __init__(self, mcp_manager, query_timeout: int = 60):
         self.mcp_manager = mcp_manager
+        self.query_timeout = query_timeout
         self.queries: List[SQLQuery] = []
         self.results: Dict[str, Any] = {}
+        now_utc = datetime.now(timezone.utc)
         self.variables: Dict[str, Any] = {
-            'current_date': datetime.utcnow().strftime('%Y-%m-%d'),
-            'next_date': (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%d'),
-            'current_date_time': datetime.utcnow().isoformat() + 'Z'
+            'current_date': now_utc.strftime('%Y-%m-%d'),
+            'next_date': (now_utc + timedelta(days=1)).strftime('%Y-%m-%d'),
+            'current_date_time': now_utc.isoformat().replace('+00:00', 'Z')
         }
+    
+    @staticmethod
+    def _extract_metadata(stripped_line: str):
+        """Extract label or db metadata from a SQL comment line. Returns (key, value) or None."""
+        for prefix in ('-- label:', '--label:'):
+            if stripped_line.startswith(prefix):
+                return 'label', stripped_line.split(':', 1)[1].strip()
+        for prefix in ('-- db:', '--db:'):
+            if stripped_line.startswith(prefix):
+                return 'db', stripped_line.split(':', 1)[1].strip()
+        return None
+    
+    def _build_query(self, sql_lines, label, database, counter):
+        """Build a SQLQuery from accumulated lines."""
+        sql_text = '\n'.join(sql_lines).strip()
+        if not sql_text:
+            return None
+        query_id = f"query_{counter}"
+        return SQLQuery(
+            query_id=query_id,
+            sql=sql_text,
+            label=label or query_id,
+            database=database
+        )
     
     def parse_sql_file(self, sql_content: str) -> List[SQLQuery]:
         """
@@ -74,151 +90,95 @@ class SQLOrchestrator:
         """
         queries = []
         current_sql = []
-        current_label = None
-        current_db = None
+        metadata = {'label': None, 'db': None}
         query_counter = 1
         
-        lines = sql_content.split('\n')
-        
-        for line in lines:
+        for line in sql_content.split('\n'):
             stripped = line.strip()
             
-            # Extract metadata from comments
-            if stripped.startswith('-- label:') or stripped.startswith('--label:'):
-                current_label = stripped.split(':', 1)[1].strip()
-            elif stripped.startswith('-- db:') or stripped.startswith('--db:'):
-                current_db = stripped.split(':', 1)[1].strip()
-            elif stripped and not stripped.startswith('--'):
-                current_sql.append(line)
-                
-                # Check for query terminator
-                if stripped.endswith(';'):
-                    sql_text = '\n'.join(current_sql).strip()
-                    if sql_text:
-                        query_id = f"query_{query_counter}"
-                        query = SQLQuery(
-                            query_id=query_id,
-                            sql=sql_text,
-                            label=current_label or query_id,
-                            database=current_db
-                        )
-                        queries.append(query)
-                        query_counter += 1
-                    
-                    # Reset for next query
-                    current_sql = []
-                    current_label = None
-                    # Keep current_db for subsequent queries
+            meta = self._extract_metadata(stripped)
+            if meta:
+                metadata[meta[0]] = meta[1]
+                continue
+            
+            if not stripped or stripped.startswith('--'):
+                continue
+            
+            current_sql.append(line)
+            
+            if stripped.endswith(';'):
+                query = self._build_query(current_sql, metadata['label'], metadata['db'], query_counter)
+                if query:
+                    queries.append(query)
+                    query_counter += 1
+                current_sql = []
+                metadata['label'] = None
         
         # Handle last query if no semicolon
-        if current_sql:
-            sql_text = '\n'.join(current_sql).strip()
-            if sql_text:
-                query_id = f"query_{query_counter}"
-                query = SQLQuery(
-                    query_id=query_id,
-                    sql=sql_text,
-                    label=current_label or query_id,
-                    database=current_db
-                )
-                queries.append(query)
+        query = self._build_query(current_sql, metadata['label'], metadata['db'], query_counter)
+        if query:
+            queries.append(query)
         
         logger.info(f"Parsed {len(queries)} SQL queries from file")
         return queries
     
-    def get_execution_order(self, queries: List[SQLQuery]) -> List[List[SQLQuery]]:
-        """
-        Determine execution order with parallel groups.
+    def _get_var_lower_map(self) -> Dict[str, str]:
+        """Build lowercase → original-case key map for case-insensitive lookup."""
+        return {k.lower(): k for k in self.variables}
+    
+    def _has_variable(self, name: str) -> bool:
+        """Case-insensitive check if a variable exists."""
+        return name.lower() in self._get_var_lower_map()
+    
+    def _resolve_path(self, parts: List[str]) -> Any:
+        """Resolve a dotted variable path from variables or step results."""
+        var_lower_map = self._get_var_lower_map()
+        base_key = var_lower_map.get(parts[0].lower())
         
-        Returns:
-            List of query groups where each group can be executed in parallel
-        """
-        remaining = queries.copy()
-        execution_groups = []
-        executed_ids = set()
+        if base_key:
+            value = self._unwrap_array(self.variables[base_key])
+        elif parts[0] in self.results:
+            value = self._unwrap_array(self.results[parts[0]])
+        else:
+            return None  # sentinel: not found
         
-        while remaining:
-            # Find queries that can execute now (dependencies met)
-            ready = []
-            for query in remaining:
-                if query.dependencies.issubset(executed_ids):
-                    ready.append(query)
-            
-            if not ready:
-                # Circular dependency or missing dependency
-                pending_deps = set()
-                for query in remaining:
-                    pending_deps.update(query.dependencies - executed_ids)
-                raise ValueError(
-                    f"Cannot resolve dependencies. Queries waiting: {[q.query_id for q in remaining]}, "
-                    f"Missing dependencies: {pending_deps}"
-                )
-            
-            # Group ready queries by parallelizability
-            parallel_groups = []
-            for query in ready:
-                placed = False
-                for group in parallel_groups:
-                    if all(query.can_parallelize_with(q) for q in group):
-                        group.append(query)
-                        placed = True
-                        break
-                if not placed:
-                    parallel_groups.append([query])
-            
-            # Add groups to execution order
-            for group in parallel_groups:
-                execution_groups.append(group)
-                for query in group:
-                    executed_ids.add(query.query_id)
-                    remaining.remove(query)
+        for part in parts[1:]:
+            value = self._unwrap_array(value)
+            if value is None:
+                return None
+            if not isinstance(value, dict):
+                logger.warning(f"Cannot navigate path {'.' .join(parts)}, expected dict got {type(value)}")
+                return None
+            # Case-insensitive column lookup
+            col_key = next((k for k in value if k.lower() == part.lower()), None)
+            if col_key is None:
+                logger.warning(f"Column '{part}' not found in {parts[0]}")
+                return None
+            value = value[col_key]
         
-        logger.info(f"Execution plan: {len(execution_groups)} groups")
-        for i, group in enumerate(execution_groups):
-            logger.info(f"  Group {i+1}: {[q.label for q in group]}")
-        
-        return execution_groups
+        return self._unwrap_array(value)
     
     def resolve_variables(self, sql: str) -> str:
         """Replace template variables in SQL with actual values."""
         def replacer(match):
             var_path = match.group(1).strip()
             parts = var_path.split('.')
-            
-            # Check for system variables first
-            if parts[0] in self.variables:
-                value = self.variables[parts[0]]
-                return self._format_sql_value(value)
-            
-            # Check step results
-            if parts[0] in self.results:
-                result = self.results[parts[0]]
-                
-                # Navigate nested path
-                for part in parts[1:]:
-                    if isinstance(result, list) and result:
-                        result = result[0]  # Take first row
-                    if isinstance(result, dict):
-                        # Case-insensitive column lookup
-                        matching_key = next(
-                            (k for k in result.keys() if k.lower() == part.lower()),
-                            None
-                        )
-                        if matching_key:
-                            result = result[matching_key]
-                        else:
-                            logger.warning(f"Column '{part}' not found in {parts[0]}")
-                            return 'NULL'
-                    else:
-                        logger.warning(f"Cannot navigate to {var_path}")
-                        return 'NULL'
-                
-                return self._format_sql_value (result)
-            
-            logger.warning(f"Variable '{var_path}' not found")
-            return 'NULL'
+            value = self._resolve_path(parts)
+            if value is None:
+                logger.warning(f"Variable '{var_path}' resolved to NULL")
+                return 'NULL'
+            return self._format_sql_value(value)
         
         return TEMPLATE_VAR_PATTERN.sub(replacer, sql)
+    
+    def _unwrap_array(self, value: Any) -> Any:
+        """Unwrap single-element arrays recursively (Node.js behavior)."""
+        if isinstance(value, list):
+            if len(value) == 0:
+                return None
+            if len(value) == 1:
+                return value[0]
+        return value
     
     def _format_sql_value(self, value: Any) -> str:
         """Format a Python value for SQL interpolation."""
@@ -240,29 +200,27 @@ class SQLOrchestrator:
         self,
         query: SQLQuery,
         server_id: str,
-        timeout: int = 60
     ) -> Dict[str, Any]:
         """Execute a single SQL query on an MCP server."""
         try:
             # Resolve template variables
             resolved_sql = self.resolve_variables(query.sql)
             
-            logger.info(f"Executing query: {query.label}")
+            logger.info(f"Executing query: {query.label} on database: {server_id}")
             logger.debug(f"SQL: {resolved_sql[:200]}...")
             
-            # Execute via MCP
-            result = await self.mcp_manager.execute_tool(
-                server_id=server_id,
-                tool_name='query',  # Standard PostgreSQL MCP tool name
-                arguments={'sql': resolved_sql},
-                timeout=timeout
-            )
+            # Execute via MCP with timeout context manager
+            async with asyncio.timeout(self.query_timeout):
+                result = await self.mcp_manager.execute_tool(
+                    server_id=server_id,
+                    tool_name='query',
+                    arguments={'sql': resolved_sql},
+                )
             
             if result.get('success'):
                 # Parse result content
                 content = result.get('content', [])
                 if content and hasattr(content[0], 'text'):
-                    import json
                     result_data = json.loads(content[0].text)
                 else:
                     result_data = content
@@ -270,12 +228,23 @@ class SQLOrchestrator:
                 # Store result
                 self.results[query.query_id] = result_data
                 
+                # Auto-promote single-row, single-column results to base variables
+                if isinstance(result_data, list) and len(result_data) == 1:
+                    row = result_data[0]
+                    if isinstance(row, dict) and len(row) == 1:
+                        # Extract the single column name and value
+                        col_name = list(row.keys())[0]
+                        col_value = row[col_name]
+                        # Add to variables (preserve original case)
+                        self.variables[col_name] = col_value
+                        logger.info(f"Auto-promoted variable: {col_name} = {col_value}")
+                
                 return {
                     'query_id': query.query_id,
                     'label': query.label,
                     'success': True,
                     'result': result_data,
-                    'database': query.database
+                    'database': server_id  # Actual database used
                 }
             else:
                 return {
@@ -294,57 +263,81 @@ class SQLOrchestrator:
                 'error': str(e)
             }
     
+    def _find_ready_queries(self, remaining, executed_ids):
+        """Find queries whose dependencies are all satisfied."""
+        return [
+            q for q in remaining
+            if all(
+                dep in executed_ids or self._has_variable(dep)
+                for dep in q.dependencies
+            )
+        ]
+    
+    def _resolve_server_id(self, query, default_server_id):
+        """Resolve the server ID for a query based on database mapping."""
+        if query.database and self.db_server_map:
+            mapped_id = self.db_server_map.get(query.database)
+            if mapped_id:
+                return mapped_id
+            logger.warning(f"No server mapping for database '{query.database}', using default")
+        return default_server_id
+    
     async def execute_workflow(
         self,
         sql_content: str,
         server_id: str,
-        timeout: int = 900
+        db_server_map: Dict[str, str] = None
     ) -> Dict[str, Any]:
         """
-        Execute complete SQL workflow.
+        Execute complete SQL workflow with dynamic dependency resolution.
         
         Args:
             sql_content: SQL file content
-            server_id: MCP server ID for database
-            timeout: Per-query timeout in seconds
+            server_id: Default MCP server ID for database
+            db_server_map: Mapping of database labels to MCP server IDs
         
         Returns:
             Execution results
         """
+        self.db_server_map = db_server_map or {}
         try:
-            # Parse SQL file
             self.queries = self.parse_sql_file(sql_content)
             
             if not self.queries:
-                return {
-                    'success': False,
-                    'error': 'No queries found in SQL content'
-                }
+                return {'success': False, 'error': 'No queries found in SQL content'}
             
-            # Determine execution order
-            execution_groups = self.get_execution_order(self.queries)
-            
-            # Execute queries
+            remaining = self.queries.copy()
+            executed_ids = set()
             all_results = []
+            iteration = 0
             
-            for group_idx, group in enumerate(execution_groups):
-                logger.info(f"Executing group {group_idx + 1}/{len(execution_groups)}")
+            while remaining:
+                iteration += 1
+                logger.info(f"Iteration {iteration}: {len(remaining)} queries remaining")
                 
-                if len(group) == 1:
-                    # Sequential execution
-                    result = await self.execute_query(group[0], server_id, timeout)
+                ready = self._find_ready_queries(remaining, executed_ids)
+                
+                if not ready:
+                    pending_deps = {
+                        dep for q in remaining for dep in q.dependencies
+                        if dep not in executed_ids and not self._has_variable(dep)
+                    }
+                    return {
+                        'success': False,
+                        'error': f"Cannot resolve dependencies. Queries waiting: {[q.query_id for q in remaining]}, Missing dependencies: {pending_deps}",
+                        'results': all_results,
+                        'queries_executed': len(all_results),
+                        'failures': sum(1 for r in all_results if not r.get('success'))
+                    }
+                
+                for query in ready:
+                    query_server_id = self._resolve_server_id(query, server_id)
+                    logger.info(f"Executing: {query.label} ({query.query_id}) on {query.database or 'default'}")
+                    result = await self.execute_query(query, query_server_id)
                     all_results.append(result)
-                else:
-                    # Parallel execution
-                    logger.info(f"Executing {len(group)} queries in parallel")
-                    tasks = [
-                        self.execute_query(query, server_id, timeout)
-                        for query in group
-                    ]
-                    group_results = await asyncio.gather(*tasks)
-                    all_results.extend(group_results)
+                    executed_ids.add(query.query_id)
+                    remaining.remove(query)
             
-            # Check for failures
             failed = [r for r in all_results if not r.get('success')]
             
             return {

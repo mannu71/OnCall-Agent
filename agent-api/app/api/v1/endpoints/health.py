@@ -1,5 +1,5 @@
 """Health check and status routes."""
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import APIRouter, Query
 
 from app.models.workflow import HealthResponse
@@ -16,7 +16,7 @@ async def health_check():
     
     return HealthResponse(
         status="healthy",
-        timestamp=datetime.utcnow(),
+        timestamp=datetime.now(timezone.utc),
         scheduler_running=workflow_scheduler.is_running(),
         active_workflows=len(active_executions)
     )
@@ -59,6 +59,6 @@ async def clear_data(clear_jobs: bool = Query(False, description="Also clear sch
     
     return {
         "status": "cleared",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         **result
     }

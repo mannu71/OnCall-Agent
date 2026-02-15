@@ -4,7 +4,7 @@ import subprocess
 import sys
 import io
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.models.workflow import Task, TaskResult, TaskStatus, TaskType
@@ -17,7 +17,7 @@ class TaskExecutor:
 
     async def execute_task(self, task: Task) -> TaskResult:
         """Execute a single task and return the result."""
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         
         try:
             if task.type == TaskType.SHELL:
@@ -29,7 +29,7 @@ class TaskExecutor:
             else:
                 raise ValueError(f"Unknown task type: {task.type}")
             
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             duration = (end_time - start_time).total_seconds()
             
             # Determine status based on error
@@ -46,7 +46,7 @@ class TaskExecutor:
             )
         
         except Exception as e:
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
             duration = (end_time - start_time).total_seconds()
             
             return TaskResult(
@@ -108,10 +108,13 @@ class TaskExecutor:
             
             try:
                 # Execute the script with timeout
-                async def run_script():
+                def run_script():
                     exec(task.script, {'__builtins__': __builtins__})
                 
-                await asyncio.wait_for(run_script(), timeout=task.timeout)
+                await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(None, run_script),
+                    timeout=task.timeout
+                )
                 
                 # Get output
                 stdout_str = stdout_buffer.getvalue()

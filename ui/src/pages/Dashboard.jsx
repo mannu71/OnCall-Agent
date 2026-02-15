@@ -7,6 +7,32 @@ import { useScheduler } from '../context/SchedulerContext';
 import ExecutionMonitor from '../components/monitoring/ExecutionMonitor';
 import agentApiClient from '../services/agentApiClient';
 
+const STATUS_COLOR = { success: 'success', failed: 'error' };
+
+const formatResult = (data) => {
+  if (!data) return 'No data';
+  try {
+    const parsed = Array.isArray(data) ? data : [data];
+    if (parsed.length === 0) return 'Empty result';
+
+    if (parsed.length === 1 && typeof parsed[0] === 'object') {
+      const entries = Object.entries(parsed[0]);
+      if (entries.length === 1) return String(entries[0][1]);
+      return entries.map(([k, v]) => `${k}: ${v}`).join(', ');
+    }
+
+    if (parsed.length > 1) {
+      const keys = Object.keys(parsed[0]);
+      return keys.length === 1
+        ? `${parsed.length} rows (first: ${parsed[0][keys[0]]})`
+        : `${parsed.length} rows`;
+    }
+    return JSON.stringify(data);
+  } catch {
+    return String(data);
+  }
+};
+
 export default function Dashboard() {
   const { schedules, formatTime } = useScheduler();
   const { runningWorkflows, count: inProgressCount } = useWorkflowStatus();
@@ -82,6 +108,40 @@ export default function Dashboard() {
     executions.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage),
     [executions, page, rowsPerPage]);
 
+  const tableContent = useMemo(() => {
+    if (loading && executions.length === 0) {
+      return <TableRow><TableCell colSpan={6} align="center">Loading history...</TableCell></TableRow>;
+    }
+    if (executions.length === 0) {
+      return <TableRow><TableCell colSpan={6} align="center">No recent activity</TableCell></TableRow>;
+    }
+    return paginatedRuns.map((run) => (
+      <TableRow key={run.execution_id} hover>
+        <TableCell sx={{ textTransform: 'capitalize', fontWeight: 500 }}>{run.workflow_name.replaceAll('-', ' ')}</TableCell>
+        <TableCell>{new Date(run.start_time).toLocaleString()}</TableCell>
+        <TableCell>{run.duration ? `${run.duration.toFixed(1)}s` : '-'}</TableCell>
+        <TableCell>
+          {run.output ? (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+              <Typography variant="body2" sx={{ fontWeight: 600, color: 'primary.main' }}>
+                {run.output.queries_executed || 0}
+              </Typography>
+              {run.output.failures > 0 && (
+                <Chip label={`${run.output.failures} failed`} size="small" color="error" sx={{ height: 20, fontSize: '0.7rem' }} />
+              )}
+            </Box>
+          ) : '-'}
+        </TableCell>
+        <TableCell>
+          <Chip label={run.status} size="small" color={STATUS_COLOR[run.status] || 'warning'} sx={{ fontWeight: 600, textTransform: 'capitalize' }} />
+        </TableCell>
+        <TableCell align="right">
+          <IconButton size="small" color="primary" onClick={() => setSelectedRun(run)}><VisibilityIcon /></IconButton>
+        </TableCell>
+      </TableRow>
+    ));
+  }, [loading, executions.length, paginatedRuns]);
+
   return (
     <Box sx={{ p: 4 }}>
       <Box sx={{ mb: 4 }}>
@@ -148,47 +208,13 @@ export default function Dashboard() {
               <TableCell sx={{ fontWeight: 600 }}>Workflow</TableCell>
               <TableCell sx={{ fontWeight: 600 }}>Started</TableCell>
               <TableCell sx={{ fontWeight: 600 }}>Duration</TableCell>
+              <TableCell sx={{ fontWeight: 600 }}>Queries</TableCell>
               <TableCell sx={{ fontWeight: 600 }}>Status</TableCell>
               <TableCell align="right" sx={{ fontWeight: 600 }}>Details</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
-            {(() => {
-              if (loading && executions.length === 0) {
-                return <TableRow><TableCell colSpan={5} align="center">Loading history...</TableCell></TableRow>;
-              }
-              if (executions.length === 0) {
-                return <TableRow><TableCell colSpan={5} align="center">No recent activity</TableCell></TableRow>;
-              }
-              return paginatedRuns.map((run) => {
-                const getStatusColor = () => {
-                  if (run.status === 'success') return 'success';
-                  if (run.status === 'failed') return 'error';
-                  return 'warning';
-                };
-
-                return (
-                  <TableRow key={run.execution_id} hover>
-                    <TableCell sx={{ textTransform: 'capitalize', fontWeight: 500 }}>{run.workflow_name.replaceAll('-', ' ')}</TableCell>
-                    <TableCell>{new Date(run.start_time).toLocaleString()}</TableCell>
-                    <TableCell>{run.duration_seconds ? `${run.duration_seconds.toFixed(1)}s` : '-'}</TableCell>
-                    <TableCell>
-                      <Chip
-                        label={run.status}
-                        size="small"
-                        color={getStatusColor()}
-                        sx={{ fontWeight: 600, textTransform: 'capitalize' }}
-                      />
-                    </TableCell>
-                    <TableCell align="right">
-                      <IconButton size="small" color="primary" onClick={() => setSelectedRun(run)}>
-                        <VisibilityIcon />
-                      </IconButton>
-                    </TableCell>
-                  </TableRow>
-                );
-              });
-            })()}
+            {tableContent}
           </TableBody>
         </Table>
         <TablePagination
@@ -201,23 +227,94 @@ export default function Dashboard() {
         />
       </TableContainer>
 
-      <Dialog open={Boolean(selectedRun)} onClose={() => setSelectedRun(null)} maxWidth="md" fullWidth>
+      <Dialog open={Boolean(selectedRun)} onClose={() => setSelectedRun(null)} maxWidth="lg" fullWidth>
         <DialogTitle>Execution Details: {selectedRun?.workflow_name}</DialogTitle>
         <DialogContent dividers>
           {selectedRun && (
             <Box>
-              <Typography variant="body2" color="text.secondary" gutterBottom>Execution ID: {selectedRun.execution_id}</Typography>
-              <Box sx={{ mt: 2 }}>
-                {selectedRun.task_results?.map((task) => (
-                  <Box key={task.task_name + '-' + task.status} sx={{ mb: 2, p: 2, bgcolor: 'action.hover', borderRadius: 1 }}>
-                    <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>{task.task_name}</Typography>
-                    <Typography variant="body2" color={task.status === 'success' ? 'success.main' : 'error.main'}>
-                      Status: {task.status} | Duration: {task.duration_seconds?.toFixed(1)}s
+              <Box sx={{ mb: 3, p: 2, bgcolor: 'action.hover', borderRadius: 1 }}>
+                <Grid container spacing={2}>
+                  <Grid item xs={12} md={6}>
+                    <Typography variant="caption" color="text.secondary">Execution ID</Typography>
+                    <Typography variant="body2" sx={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>
+                      {selectedRun.execution_id}
                     </Typography>
-                    {task.error && <Typography variant="caption" color="error">{task.error}</Typography>}
-                  </Box>
-                ))}
+                  </Grid>
+                  <Grid item xs={6} md={3}>
+                    <Typography variant="caption" color="text.secondary">Duration</Typography>
+                    <Typography variant="body2">{selectedRun.duration?.toFixed(2)}s</Typography>
+                  </Grid>
+                  <Grid item xs={6} md={3}>
+                    <Typography variant="caption" color="text.secondary">Nodes Executed</Typography>
+                    <Typography variant="body2">{selectedRun.nodes_executed || 0}</Typography>
+                  </Grid>
+                  {selectedRun.output && (
+                    <>
+                      <Grid item xs={6} md={4}>
+                        <Typography variant="caption" color="text.secondary">Queries Executed</Typography>
+                        <Typography variant="body2" sx={{ fontWeight: 600, color: 'primary.main' }}>
+                          {selectedRun.output.queries_executed || 0}
+                        </Typography>
+                      </Grid>
+                      <Grid item xs={6} md={4}>
+                        <Typography variant="caption" color="text.secondary">Failures</Typography>
+                        <Typography variant="body2" sx={{ fontWeight: 600, color: selectedRun.output.failures > 0 ? 'error.main' : 'success.main' }}>
+                          {selectedRun.output.failures || 0}
+                        </Typography>
+                      </Grid>
+                      <Grid item xs={12} md={4}>
+                        <Typography variant="caption" color="text.secondary">Success Rate</Typography>
+                        <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                          {selectedRun.output.queries_executed > 0 
+                            ? `${(((selectedRun.output.queries_executed - selectedRun.output.failures) / selectedRun.output.queries_executed) * 100).toFixed(1)}%`
+                            : 'N/A'}
+                        </Typography>
+                      </Grid>
+                    </>
+                  )}
+                </Grid>
               </Box>
+
+              {selectedRun.output?.error && (
+                <Alert severity="error" sx={{ mb: 2 }}>
+                  <Typography variant="body2" sx={{ fontWeight: 600 }}>Workflow Error</Typography>
+                  <Typography variant="caption">{selectedRun.output.error}</Typography>
+                </Alert>
+              )}
+
+              {selectedRun.output?.results && selectedRun.output.results.length > 0 && (
+                <Box sx={{ mt: 2 }}>
+                  <Typography variant="subtitle2" sx={{ fontWeight: 600, mb: 1 }}>Query Results</Typography>
+                  <TableContainer component={Paper} variant="outlined">
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell sx={{ fontWeight: 600 }}>Label</TableCell>
+                          <TableCell sx={{ fontWeight: 600 }}>Result / Error</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {selectedRun.output.results.map((query, idx) => (
+                          <TableRow key={query.query_id || idx} sx={{ bgcolor: query.success ? 'inherit' : 'error.lighter' }}>
+                            <TableCell sx={{ fontWeight: 500, minWidth: 200 }}>{query.label || query.query_id}</TableCell>
+                            <TableCell>
+                              {query.success ? (
+                                <Typography variant="body2" sx={{ fontFamily: 'monospace', color: 'text.primary' }}>
+                                  {formatResult(query.result || query.data)}
+                                </Typography>
+                              ) : (
+                                <Typography variant="body2" color="error">{query.error}</Typography>
+                              )}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                </Box>
+              )}
+
+
             </Box>
           )}
         </DialogContent>

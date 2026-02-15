@@ -4,6 +4,7 @@ import logging
 from typing import Dict, List, Any, Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +32,25 @@ class MCPClientManager:
             
             command = config.get('command')
             args = config.get('args', [])
-            env = config.get('env', {})
+            
+            # Merge custom env with system env to preserve PATH
+            custom_env = config.get('env', {})
+            if custom_env:
+                env = {**os.environ, **custom_env}
+            else:
+                env = None  # Use default environment
             
             if not command:
                 raise ValueError(f"Server {server_id} missing 'command' in config")
+            
+            # Use full path for npx if command is just 'npx'
+            if command == 'npx':
+                command = '/usr/bin/npx'
+            
+            # Debug logging
+            logger.info(f"MCP Config - Command: {command}")
+            logger.info(f"MCP Config - Args: {args}")
+            logger.info(f"MCP Config - Env keys: {list(env.keys()) if env else 'default'}")
             
             # Create server parameters
             server_params = StdioServerParameters(
@@ -47,12 +63,18 @@ class MCPClientManager:
             stdio_context = stdio_client(server_params)
             read, write = await stdio_context.__aenter__()
             
+            logger.info(f"Stdio streams created for {server_id}")
+            
             # Create session
             session = ClientSession(read, write)
             await session.__aenter__()
             
+            logger.info(f"Session created for {server_id}, initializing...")
+            
             # Initialize connection
             await session.initialize()
+            
+            logger.info(f"Session initialized for {server_id}, listing tools...")
             
             # List available tools
             tools_result = await session.list_tools()
@@ -71,7 +93,8 @@ class MCPClientManager:
             return True
                 
         except Exception as e:
-            logger.error(f"Failed to connect to MCP server {server_id}: {e}")
+            logger.error(f"Failed to connect to MCP server {server_id}: {e}", exc_info=True)
+            logger.error(f"Config was - command: {config.get('command')}, args: {config.get('args')}")
             return False
     
     async def execute_tool(
@@ -79,7 +102,6 @@ class MCPClientManager:
         server_id: str,
         tool_name: str,
         arguments: Dict[str, Any],
-        timeout: Optional[int] = 60
     ) -> Dict[str, Any]:
         """
         Execute a tool on an MCP server.
@@ -88,7 +110,6 @@ class MCPClientManager:
             server_id: Server identifier
             tool_name: Name of the tool to execute
             arguments: Tool arguments
-            timeout: Optional timeout in seconds
         
         Returns:
             Tool execution result
@@ -102,14 +123,7 @@ class MCPClientManager:
             
             session = self.connections[server_id]['session']
             
-            # Execute tool with timeout
-            if timeout:
-                result = await asyncio.wait_for(
-                    session.call_tool(tool_name, arguments),
-                    timeout=timeout
-                )
-            else:
-                result = await session.call_tool(tool_name, arguments)
+            result = await session.call_tool(tool_name, arguments)
             
             logger.info(f"Tool '{tool_name}' executed successfully")
             
@@ -137,8 +151,26 @@ class MCPClientManager:
     
     async def disconnect_all(self):
         """Disconnect from all MCP servers."""
-        for server_id in list(self.connections.keys()):
-            await self.disconnect_server(server_id)
+        # Iterate over items without modifying dict during iteration
+        for server_id, conn in tuple(self.connections.items()):
+            try:
+                # Close session
+                session = conn.get('session')
+                if session:
+                    await session.__aexit__(None, None, None)
+                
+                # Close stdio context
+                stdio_context = conn.get('stdio_context')
+                if stdio_context:
+                    await stdio_context.__aexit__(None, None, None)
+                
+                logger.info(f"Disconnected from MCP server: {server_id}")
+            except Exception as e:
+                logger.error(f"Error disconnecting from {server_id}: {e}")
+        
+        # Clear all connections after disconnecting
+        self.connections.clear()
+        self.tools.clear()
     
     async def disconnect_server(self, server_id: str):
         """Disconnect from a specific MCP server."""

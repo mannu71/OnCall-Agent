@@ -18,7 +18,7 @@ const formatTime = (timeString) => {
   if (!timeString) return '-';
   try {
     const [hours, minutes] = timeString.split(':');
-    const date = new Date(2024, 0, 15); // Fixed date to avoid DST issues
+    const date = new Date(2024, 0, 15); // Fixed date to avoid DST issue
     date.setHours(Number.parseInt(hours, 10), Number.parseInt(minutes, 10), 0, 0);
     return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   } catch {

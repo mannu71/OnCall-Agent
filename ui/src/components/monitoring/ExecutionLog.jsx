@@ -1,4 +1,5 @@
 import React, { useRef, useEffect } from 'react';
+import PropTypes from 'prop-types';
 import {
     Box,
     Paper,
@@ -113,6 +114,11 @@ const ExecutionLog = ({ events, maxHeight = 400 }) => {
             </List>
         </Paper>
     );
+};
+
+ExecutionLog.propTypes = {
+    events: PropTypes.arrayOf(PropTypes.object),
+    maxHeight: PropTypes.number,
 };
 
 export default ExecutionLog;
