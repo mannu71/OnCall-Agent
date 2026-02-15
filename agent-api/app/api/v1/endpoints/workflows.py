@@ -109,6 +109,61 @@ def _sync_scheduler_node(workflow_dict: Dict[str, Any], update_data: Optional[Di
     _sync_scheduler_to_workflow(scheduler_node, workflow_dict)
 
 
+def _validate_orchestrator_nodes(workflow_dict: Dict[str, Any]) -> None:
+    """Validate that all orchestrator nodes have SQL files attached.
+    
+    Args:
+        workflow_dict: Workflow dictionary with nodes
+        
+    Raises:
+        HTTPException: If any orchestrator node is missing SQL file
+    """
+    nodes = workflow_dict.get('nodes', [])
+    orchestrator_nodes = [n for n in nodes if n.get('type') == 'orchestrator']
+    
+    nodes_without_sql = []
+    for node in orchestrator_nodes:
+        node_data = node.get('data', {})
+        file_name = node_data.get('fileName')
+        file_content = node_data.get('fileContent')
+        
+        # Must have either fileContent (new upload) or fileName (existing file)
+        if not file_name and not file_content:
+            node_label = node_data.get('label', f"Orchestrator {node.get('id', 'unknown')}")
+            nodes_without_sql.append(node_label)
+    
+    if nodes_without_sql:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"SQL Orchestrator nodes must have an SQL file attached: {', '.join(nodes_without_sql)}"
+        )
+
+
+async def _extract_and_save_sql_files(workflow_name: str, workflow_dict: Dict[str, Any], workflow_repo: WorkflowRepository) -> None:
+    """Extract SQL files from orchestrator nodes and save them to disk.
+    
+    Args:
+        workflow_name: Name of the workflow
+        workflow_dict: Workflow dictionary with nodes
+        workflow_repo: Workflow repository instance
+    """
+    nodes = workflow_dict.get('nodes', [])
+    for node in nodes:
+        if node.get('type') == 'orchestrator':
+            node_data = node.get('data', {})
+            file_content = node_data.get('fileContent')
+            file_name = node_data.get('fileName')
+            
+            if file_content and file_name:
+                logger.info(f"Saving SQL file '{file_name}' for workflow '{workflow_name}'")
+                await workflow_repo.save_sql_file(workflow_name, file_name, file_content)
+                
+                # Remove fileContent from node data (keep fileName reference)
+                del node_data['fileContent']
+                # Remove pendingUpload flag if present
+                node_data.pop('pendingUpload', None)
+
+
 @router.get("", response_model=List[WorkflowResponse])
 async def list_workflows(
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
@@ -147,6 +202,12 @@ async def create_workflow(
     now = _get_now_timestamp()
     workflow_dict = workflow_data.model_dump()
     
+    # Validate orchestrator nodes have SQL files
+    _validate_orchestrator_nodes(workflow_dict)
+    
+    # Extract and save SQL files from orchestrator nodes
+    await _extract_and_save_sql_files(workflow_data.name, workflow_dict, workflow_repo)
+    
     # Sync scheduler node and fields
     _sync_scheduler_node(workflow_dict)
     
@@ -179,6 +240,12 @@ async def update_workflow(
     
     logger.info(f"[UPDATE] Updating workflow '{workflow_name}'")
     
+    # Validate orchestrator nodes have SQL files
+    _validate_orchestrator_nodes(workflow_dict)
+    
+    # Extract and save SQL files from orchestrator nodes
+    await _extract_and_save_sql_files(workflow_name, workflow_dict, workflow_repo)
+    
     # Log scheduler node data if present
     if 'nodes' in workflow_dict:
         scheduler_node = next((n for n in workflow_dict['nodes'] if n.get('type') == 'scheduler'), None)
@@ -208,22 +275,81 @@ async def update_workflow(
     return WorkflowResponse(**saved_workflow)
 
 
+def _cleanup_active_executions(workflow_name: str) -> None:
+    """Cancel and cleanup any active executions for a workflow.
+    
+    Args:
+        workflow_name: Name of the workflow
+    """
+    execution_ids_to_clear = [
+        eid for eid, data in visual_executor.active_executions.items()
+        if data.get('workflow_name') == workflow_name
+    ]
+    
+    for execution_id in execution_ids_to_clear:
+        visual_executor.cleanup_execution(execution_id)
+
+
+async def _cleanup_legacy_sql_files(
+    sql_files: List[str], 
+    workflow_name: str,
+    workflow_repo: WorkflowRepository
+) -> List[str]:
+    """Cleanup legacy SQL files from global directory if not used by other workflows.
+    
+    Args:
+        sql_files: List of SQL filenames
+        workflow_name: Name of the workflow being deleted
+        workflow_repo: Workflow repository instance
+        
+    Returns:
+        List of deleted SQL filenames
+    """
+    from pathlib import Path
+    
+    deleted_scripts = []
+    sql_base_path = Path("data") / "config" / "sql"
+    
+    for sql_file in sql_files:
+        sql_path = sql_base_path / sql_file
+        if not sql_path.exists():
+            continue
+            
+        # Check if file is used by other workflows
+        is_used = await workflow_repo.is_sql_file_used_by_other_workflows(sql_file, workflow_name)
+        
+        if not is_used:
+            try:
+                sql_path.unlink()
+                deleted_scripts.append(sql_file)
+                logger.info(f"Deleted global SQL script: {sql_file}")
+            except Exception as e:
+                logger.error(f"Error deleting SQL script {sql_file}: {e}")
+        else:
+            logger.info(f"Kept global SQL script '{sql_file}' (used by other workflows)")
+    
+    return deleted_scripts
+
+
 @router.delete("/{workflow_name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_workflow(
     workflow_name: str,
-    delete_scripts: bool = Query(False, description="Also delete SQL scripts if not used by other workflows"),
+    delete_scripts: bool = Query(True, description="Also delete SQL scripts from legacy global directory if not used by other workflows"),
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo),
     execution_repo: ExecutionRepository = Depends(get_execution_repo)
 ):
-    """Delete a workflow and all associated execution history.
+    """Delete a workflow and all associated files.
+    
+    Automatically deletes the entire workflow directory (including workflow.yaml and all SQL files).
     
     Args:
         workflow_name: Name of workflow to delete
-        delete_scripts: If True, also delete SQL scripts that aren't used by other workflows
+        delete_scripts: If True, also delete SQL scripts from legacy global sql/ directory (if not shared)
     """
-    # Get SQL files before deleting the workflow
+    # Get SQL files from global directory (for legacy cleanup)
     sql_files = await workflow_repo.get_sql_files_for_workflow(workflow_name) if delete_scripts else []
     
+    # Delete workflow directory (includes workflow.yaml and all SQL files)
     if not await workflow_repo.delete(workflow_name):
         raise NotFoundException(
             message=f"Workflow '{workflow_name}' not found",
@@ -231,45 +357,20 @@ async def delete_workflow(
         )
     
     # Cancel and cleanup any active executions
-    execution_ids_to_clear = [
-        eid for eid, data in list(visual_executor.active_executions.items())
-        if data.get('workflow_name') == workflow_name
-    ]
-    
-    for execution_id in execution_ids_to_clear:
-        visual_executor.cleanup_execution(execution_id)
+    _cleanup_active_executions(workflow_name)
     
     # Delete all execution history for this workflow
     deleted_count = await execution_repo.delete_by_workflow(workflow_name)
     
-    # Delete SQL scripts if requested and not used by other workflows
+    # Cleanup legacy SQL scripts from global directory if requested
     deleted_scripts = []
     if delete_scripts and sql_files:
-        from pathlib import Path
-        # SQL scripts are in data/config/sql/ directory
-        sql_base_path = Path(\"data\") / \"config\" / \"sql\"
-        
-        for sql_file in sql_files:
-            # Check if file is used by other workflows
-            is_used = await workflow_repo.is_sql_file_used_by_other_workflows(sql_file, workflow_name)
-            
-            if not is_used:
-                sql_path = sql_base_path / sql_file
-                if sql_path.exists():
-                    try:
-                        sql_path.unlink()
-                        deleted_scripts.append(sql_file)
-                        logger.info(f"Deleted SQL script: {sql_file}")
-                    except Exception as e:
-                        logger.error(f"Error deleting SQL script {sql_file}: {e}")
-                else:
-                    logger.warning(f"SQL script not found: {sql_file}")
-            else:
-                logger.info(f"Kept SQL script '{sql_file}' (used by other workflows)")
+        deleted_scripts = await _cleanup_legacy_sql_files(sql_files, workflow_name, workflow_repo)
     
-    log_msg = f"Deleted workflow '{workflow_name}' and {deleted_count} execution records"
+    # Log deletion summary
+    log_msg = f"Deleted workflow directory '{workflow_name}/' (includes workflow.yaml and all SQL files) and {deleted_count} execution records"
     if deleted_scripts:
-        log_msg += f" and {len(deleted_scripts)} SQL scripts: {', '.join(deleted_scripts)}"
+        log_msg += f"; also cleaned up {len(deleted_scripts)} legacy SQL scripts from global directory: {', '.join(deleted_scripts)}"
     logger.info(log_msg)
     
     await workflow_scheduler.reload_workflows()

@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import PropTypes from 'prop-types';
 import { localTimeToCron, cronToLocalTime } from '../../utils/cronUtils';
 
-const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
+const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
   const [config, setConfig] = useState(node?.data || {});
   const fileInputRef = useRef(null);
   const [timeInput, setTimeInput] = useState(() => {
@@ -17,7 +17,8 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
     return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
   });
 
-  // CRITICAL: Sync entire config state when node data changes - no caching!
+  // Sync config ONLY when switching to a different node (by ID change)
+  // Do NOT sync on every node.data change to prevent resetting during editing
   useEffect(() => {
     if (node?.data) {
       setConfig(node.data);
@@ -29,7 +30,7 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
         setTimeInput(cronToLocalTime(node.data.cronExpression));
       }
     }
-  }, [node?.id, node?.data]);
+  }, [node?.id]); // ONLY depend on node ID, not node.data
 
   if (!node) return null;
 
@@ -228,41 +229,22 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
                 const file = e.target.files[0];
                 if (file) {
                   try {
-                    const content = await file.text();
                     const fileName = file.name;
                     const fileType = fileName.endsWith('.sql') ? 'sql' : 'json';
+                    const content = await file.text();
                     
-                    // If Electron, save file to config/sql/ directory
-                    if (globalThis.electronAPI?.saveSqlFile) {
-                      try {
-                        const result = await globalThis.electronAPI.saveSqlFile(fileName, content);
-                        if (result.success) {
-                          // Store reference to file - update all at once
-                          const newConfig = {
-                            ...config,
-                            sqlFile: result.relativePath,
-                            fileName: fileName,
-                            fileType: fileType
-                          };
-                          setConfig(newConfig);
-                          onUpdate(node.id, newConfig);
-                        } else {
-                          alert('Failed to save SQL file: ' + result.error);
-                        }
-                      } catch (error) {
-                        alert('Error saving SQL file: ' + error.message);
-                      }
-                    } else {
-                      // Fallback for non-Electron environment (store inline)
-                      const newConfig = {
-                        ...config,
-                        fileContent: content,
-                        fileName: fileName,
-                        fileType: fileType
-                      };
-                      setConfig(newConfig);
-                      onUpdate(node.id, newConfig);
-                    }
+                    // Store file content inline - will be uploaded when workflow is saved
+                    const newConfig = {
+                      ...config,
+                      sqlFile: fileName,
+                      fileName: fileName,
+                      fileType: fileType,
+                      fileContent: content,
+                      pendingUpload: true  // Flag to indicate this needs to be uploaded
+                    };
+                    setConfig(newConfig);
+                    onUpdate(node.id, newConfig);
+                    console.log('SQL file loaded, will be uploaded when workflow is saved');
                   } catch (error) {
                     alert('Error reading file: ' + error.message);
                   }
@@ -396,18 +378,15 @@ const NodeConfigPanel = ({ node, onUpdate, onClose }) => {
   return (
     <div 
       className="config-panel-overlay" 
-      onClick={onClose} 
+      onClick={onClose}
       onKeyDown={(e) => e.key === 'Escape' && onClose()}
-      role="button"
-      tabIndex={0}
-      aria-label="Close configuration panel"
+      tabIndex={-1}
+      aria-hidden="true"
     >
       <div 
-        className="config-panel" 
-        onClick={(e) => e.stopPropagation()} 
+        className="config-panel"
+        onClick={(e) => e.stopPropagation()}
         onKeyDown={handleKeyDown}
-        role="dialog"
-        aria-labelledby="config-panel-title"
       >
         <div className="config-header">
           <h3 id="config-panel-title">Configure {node.type.charAt(0).toUpperCase() + node.type.slice(1)} Node</h3>
@@ -431,8 +410,14 @@ NodeConfigPanel.propTypes = {
     type: PropTypes.string,
     data: PropTypes.object,
   }),
+  workflowName: PropTypes.string,
   onUpdate: PropTypes.func.isRequired,
   onClose: PropTypes.func.isRequired,
+};
+
+NodeConfigPanel.defaultProps = {
+  node: null,
+  workflowName: '',
 };
 
 export default NodeConfigPanel;

@@ -41,7 +41,7 @@ if (globalThis.window !== undefined) {
   };
 }
 
-const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
+const Flow = forwardRef(({ workflowName, initialNodes, initialEdges }, ref) => {
   const defaultInitialNodes = [
     {
       id: 'agent-initial',
@@ -81,19 +81,22 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
     edgesRef.current = edges;
   }, [edges]);
 
-  // CRITICAL: Update nodes and edges when initialNodes/initialEdges change - no caching!
-  // This ensures scheduler times and other workflow data stay in sync when reloaded from API
+  // Initialize nodes and edges ONLY on mount, not on every prop change
+  // This prevents resetting connections during editing
+  // The component key changes when switching workflows, so mount/unmount handles workflow switching
   useEffect(() => {
     if (initialNodes && initialNodes.length > 0) {
       setNodes(initialNodes);
     }
-  }, [initialNodes, setNodes]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Intentionally empty - only run on mount
 
   useEffect(() => {
     if (initialEdges) {
       setEdges(initialEdges);
     }
-  }, [initialEdges, setEdges]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Intentionally empty - only run on mount
 
   // Helper: update a single node's data by id
   const updateNodeData = useCallback((nodeId, dataUpdate) => {
@@ -657,6 +660,7 @@ const Flow = forwardRef(({ initialNodes, initialEdges }, ref) => {
       {showConfigPanel && (
         <NodeConfigPanel
           node={selectedNode}
+          workflowName={workflowName}
           onUpdate={onConfigUpdate}
           onClose={() => setShowConfigPanel(false)}
         />

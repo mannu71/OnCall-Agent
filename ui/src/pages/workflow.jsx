@@ -157,7 +157,6 @@ function Workflow() {
     }
 
     try {
-
       const {
         schedule, enabled, startTime, recurrence, createdAt, updatedAt, ...baseData
       } = currentWorkflowData || {};
@@ -221,6 +220,7 @@ function Workflow() {
           <WorkflowEditor
             key={editorKey}
             ref={workflowEditorRef}
+            workflowName={workflowName}
             initialNodes={currentWorkflowData?.nodes || []}
             initialEdges={currentWorkflowData?.edges || []}
           />

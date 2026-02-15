@@ -204,7 +204,7 @@ class VisualWorkflowExecutor:
             # Persist before cleanup (cleanup removes events from active_executions)
             if result:
                 await self._persist_execution(result, workflow, execution_id)
-            self.cleanup_execution(execution_id)
+            await self.cleanup_execution(execution_id)
         
         return result
     
@@ -325,6 +325,7 @@ class VisualWorkflowExecutor:
         start_time = datetime.now(timezone.utc)
         context['execution_id'] = execution_id
         context['inputs'] = self.active_executions[execution_id].get('inputs', {})
+        context['workflow_name'] = self.active_executions[execution_id].get('workflow_name')
         
         # Node type → executor mapping
         executors = {
@@ -383,8 +384,16 @@ class VisualWorkflowExecutor:
         }
     
     @staticmethod
-    def _load_sql_content(node_data: Dict[str, Any]) -> Optional[str]:
-        """Load SQL content from node data, either inline or from a file."""
+    def _load_sql_content(node_data: Dict[str, Any], workflow_name: Optional[str] = None) -> Optional[str]:
+        """Load SQL content from node data, either inline or from a file.
+        
+        Args:
+            node_data: The orchestrator node data containing sqlFile/fileName
+            workflow_name: Optional workflow name to look for SQL in workflow's own directory
+            
+        Returns:
+            SQL content string or None if not found
+        """
         sql_content = node_data.get('sqlContent')
         if sql_content:
             return sql_content
@@ -394,8 +403,25 @@ class VisualWorkflowExecutor:
             return None
         
         sql_filename = sql_file.replace('sql/', '').replace('sql\\', '')
-        for base in (Path('data/config/sql'), Path('/app/data/config/sql')):
-            candidate = base / sql_filename
+        
+        # Search paths in priority order:
+        search_paths = []
+        
+        # 1. Workflow's own directory (if workflow_name provided)
+        if workflow_name:
+            safe_name = workflow_name.replace(' ', '_').replace('/', '_').replace('\\', '_')
+            search_paths.extend([
+                Path('data/storage/workflows') / safe_name / sql_filename,
+                Path('/app/data/storage/workflows') / safe_name / sql_filename,
+            ])
+        
+        # 2. Global SQL directories (fallback for backwards compatibility)
+        search_paths.extend([
+            Path('data/config/sql') / sql_filename,
+            Path('/app/data/config/sql') / sql_filename,
+        ])
+        
+        for candidate in search_paths:
             if candidate.exists():
                 logger.info(f"Loaded SQL from: {candidate}")
                 return candidate.read_text(encoding='utf-8')
@@ -406,9 +432,10 @@ class VisualWorkflowExecutor:
         """Execute orchestrator node with real SQL execution."""
         node_data = node.get('data', {})
         execution_id = context.get('execution_id')
+        workflow_name = context.get('workflow_name')
         
         try:
-            sql_content = self._load_sql_content(node_data)
+            sql_content = self._load_sql_content(node_data, workflow_name)
             if not sql_content:
                 sql_file = node_data.get('sqlFile') or node_data.get('fileName')
                 error_msg = f"SQL file not found: {sql_file}" if sql_file else "No SQL content provided"
@@ -532,17 +559,14 @@ class VisualWorkflowExecutor:
         """Get status of an execution."""
         return self.active_executions.get(execution_id)
     
-    def cleanup_execution(self, execution_id: str):
+    async def cleanup_execution(self, execution_id: str):
         """Clean up execution data and disconnect MCP clients."""
         if execution_id in self.mcp_managers:
             mcp_manager = self.mcp_managers.pop(execution_id)
             try:
-                loop = asyncio.get_running_loop()
-                task = loop.create_task(mcp_manager.disconnect_all())
-                self.background_tasks.add(task)
-                task.add_done_callback(self.background_tasks.discard)
-            except RuntimeError:
-                logger.warning(f"No event loop for MCP cleanup of {execution_id}")
+                await mcp_manager.disconnect_all()
+            except Exception as e:
+                logger.warning(f"Error during MCP cleanup of {execution_id}: {e}")
         
         self.active_executions.pop(execution_id, None)
         self.event_queues.pop(execution_id, None)

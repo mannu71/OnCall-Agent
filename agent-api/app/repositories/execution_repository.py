@@ -238,6 +238,33 @@ class ExecutionRepository(BaseRepository[Dict[str, Any]]):
         
         return False
     
+    async def delete_by_workflow(self, workflow_name: str) -> int:
+        """Delete all executions for a specific workflow.
+        
+        Args:
+            workflow_name: Workflow name
+            
+        Returns:
+            Number of executions deleted
+        """
+        workflow_dir = self._get_workflow_dir(workflow_name)
+        
+        if not workflow_dir.exists():
+            return 0
+        
+        deleted_count = 0
+        
+        # Delete all .json files in the workflow directory
+        for file_path in workflow_dir.glob(JSON_GLOB_PATTERN):
+            try:
+                file_path.unlink()
+                deleted_count += 1
+            except Exception as e:
+                logger.error(f"Error deleting execution file {file_path}: {e}")
+        
+        logger.info(f"Deleted {deleted_count} executions for workflow: {workflow_name}")
+        return deleted_count
+    
     async def exists(self, execution_id: str) -> bool:
         """Check if an execution exists by ID.
         

@@ -63,9 +63,13 @@ export const agentApiClient = {
 
     /**
      * Delete a workflow
+     * @param {string} workflowName - Name of the workflow
+     * @param {boolean} deleteScripts - Also delete SQL scripts (default: true)
      */
-    async deleteWorkflow(workflowName) {
-        await client.delete(`/api/v1/workflows/${encodeURIComponent(workflowName)}`);
+    async deleteWorkflow(workflowName, deleteScripts = true) {
+        await client.delete(`/api/v1/workflows/${encodeURIComponent(workflowName)}`, {
+            params: { delete_scripts: deleteScripts }
+        });
     },
 
     /**

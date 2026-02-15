@@ -37,6 +37,23 @@ const validators = {
     };
   },
 
+  orchestratorHasSql: (nodes) => {
+    const orchestratorNodes = nodes?.filter(node => node.type === 'orchestrator') || [];
+    const nodesWithoutSql = orchestratorNodes.filter(node => {
+      const data = node.data || {};
+      return !data.fileName && !data.fileContent;
+    });
+    
+    if (nodesWithoutSql.length > 0) {
+      const labels = nodesWithoutSql.map(n => n.data?.label || 'Orchestrator').join(', ');
+      return {
+        isValid: false,
+        error: `SQL Orchestrator nodes must have an SQL file attached: ${labels}`
+      };
+    }
+    return { isValid: true, error: null };
+  },
+
   hasAgentNode: (nodes) => ({
     isValid: !!findNodeByType(nodes, 'agent'),
     error: 'Agent workflow must have an Agent AI node.'
@@ -61,6 +78,10 @@ export const validateWorkflow = (workflowType, nodes, edges) => {
 
   const allConnectedResult = validators.allConnected(nodes, edges);
   if (!allConnectedResult.isValid) return allConnectedResult;
+
+  // Validate orchestrator nodes have SQL files
+  const orchestratorSqlResult = validators.orchestratorHasSql(nodes);
+  if (!orchestratorSqlResult.isValid) return orchestratorSqlResult;
 
   if (workflowType === 'agent') {
     const hasAgentResult = validators.hasAgentNode(nodes);
