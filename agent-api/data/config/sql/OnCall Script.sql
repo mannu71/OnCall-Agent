@@ -2,15 +2,10 @@
 -- label: Profiles Updated
 SELECT COUNT(DISTINCT p.id) AS total_count
 FROM profiles p
-JOIN profile_kyc_status_history h1 ON p.id = h1.profile_id
-JOIN profile_kyc_status_history h2 ON p.id = h2.profile_id
 WHERE p.deleted_by_id IS NULL
-  AND h1.status = 'approved'
-  AND h2.status = 'approved_review_due'
-  AND h2.status_updated_at > h1.status_updated_at
-  AND h2.status_updated_at >= {current_date}
-  AND h2.status_updated_at < {next_date}
-  AND p.kyc_review_on < h2.status_updated_at;
+  AND p.status = 'approved_review_due'
+  AND p.status_updated_at >= {current_date}
+  AND p.status_updated_at < {next_date};
 
 -- label:Previous Pending Monitoring Notifications Count
 SELECT COUNT(*) AS pending_count 

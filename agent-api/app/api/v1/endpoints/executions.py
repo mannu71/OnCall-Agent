@@ -63,6 +63,55 @@ async def get_active_workflows():
     return list(set(filter(None, active)))
 
 
+@router.delete("/active", status_code=status.HTTP_200_OK)
+async def clear_active_executions():
+    """Clear all stuck/running workflow executions from memory."""
+    from app.services.visual_workflow_executor import visual_executor
+    
+    cleared_count = len(visual_executor.active_executions)
+    cleared_names = [
+        exec_data.get('workflow_name') 
+        for exec_data in visual_executor.active_executions.values()
+    ]
+    
+    # Clean up all executions
+    for execution_id in visual_executor.active_executions.copy():
+        visual_executor.cleanup_execution(execution_id)
+    
+    return {
+        "message": f"Cleared {cleared_count} active executions",
+        "cleared_count": cleared_count,
+        "cleared_workflows": list(filter(None, cleared_names))
+    }
+
+
+@router.delete("/active/{workflow_name}", status_code=status.HTTP_200_OK)
+async def cancel_workflow_by_name(workflow_name: str):
+    """Cancel/clear a specific workflow by name from active executions."""
+    from app.services.visual_workflow_executor import visual_executor
+    
+    # Find execution IDs matching the workflow name
+    execution_ids_to_clear = [
+        exec_id for exec_id, exec_data in visual_executor.active_executions.items()
+        if exec_data.get('workflow_name') == workflow_name
+    ]
+    
+    if not execution_ids_to_clear:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active execution found for workflow '{workflow_name}'"
+        )
+    
+    # Clean up all matching executions
+    for execution_id in execution_ids_to_clear:
+        visual_executor.cleanup_execution(execution_id)
+    
+    return {
+        "message": f"Cancelled {len(execution_ids_to_clear)} execution(s) for workflow '{workflow_name}'",
+        "cancelled_count": len(execution_ids_to_clear)
+    }
+
+
 @router.get("/{execution_id}", response_model=dict)
 async def get_execution(
     execution_id: str,

@@ -139,7 +139,7 @@ export const SchedulerProvider = ({ children }) => {
   }, [loadSchedules]);
 
   const triggerWorkflow = useCallback(async (name) => {
-    return await agentApiClient.executeWorkflow(name);
+    return await agentApiClient.executeWorkflow(name, true);
   }, []);
 
   const getSchedule = useCallback((idOrName) => {

@@ -110,17 +110,36 @@ class VisualWorkflowExecutor:
             except Exception as e:
                 logger.warning(f"Error publishing event: {e}")
     
+    def _is_workflow_running(self, workflow_name: str) -> Optional[str]:
+        """Return execution ID if workflow is already running, None otherwise."""
+        for exec_id, exec_data in self.active_executions.items():
+            if exec_data.get('workflow_name') == workflow_name and exec_data.get('status') == 'running':
+                return exec_id
+        return None
+
     async def execute_workflow(self, workflow: Dict[str, Any], inputs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Execute a visual workflow and return results."""
+        workflow_name = workflow.get('name')
+        
+        # Prevent duplicate concurrent executions of the same workflow
+        existing_id = self._is_workflow_running(workflow_name)
+        if existing_id:
+            logger.warning(f"Workflow '{workflow_name}' is already running (ID: {existing_id}), skipping")
+            return {
+                "status": "skipped",
+                "message": f"Workflow '{workflow_name}' is already running",
+                "existing_execution_id": existing_id
+            }
+        
         execution_id = str(uuid.uuid4())
         start_time = datetime.now(timezone.utc)
         
-        logger.info(f"Starting workflow execution: {workflow.get('name')} (ID: {execution_id})")
+        logger.info(f"Starting workflow execution: {workflow_name} (ID: {execution_id})")
         
         # Initialize execution state
         self.active_executions[execution_id] = {
             "id": execution_id,
-            "workflow_name": workflow.get('name'),
+            "workflow_name": workflow_name,
             "workflow_id": workflow.get('id'),
             "status": "running",
             "start_time": start_time.isoformat() + 'Z',
@@ -129,10 +148,11 @@ class VisualWorkflowExecutor:
             "inputs": inputs or {}
         }
         
+        result = None
         try:
             await self._publish_event(execution_id, "workflow_started", {
                 "execution_id": execution_id,
-                "workflow_name": workflow.get('name'),
+                "workflow_name": workflow_name,
                 "workflow_id": workflow.get('id')
             })
             
@@ -164,27 +184,29 @@ class VisualWorkflowExecutor:
                 "duration": result['duration'],
                 "nodes_executed": len(executed)
             })
-            
-            await self._persist_execution(result, workflow, execution_id)
-            return result
         
         except Exception as e:
             result = self._build_result(execution_id, "failed", start_time, error=str(e))
+            logger.error(f"Workflow execution failed: {execution_id} - {e}")
             
-            logger.error(f"Workflow execution failed: {execution_id} - {str(e)}")
-            
-            self.active_executions[execution_id]['status'] = 'failed'
-            self.active_executions[execution_id]['error'] = str(e)
-            self.active_executions[execution_id]['end_time'] = result['end_time']
+            if execution_id in self.active_executions:
+                self.active_executions[execution_id]['status'] = 'failed'
+                self.active_executions[execution_id]['error'] = str(e)
+                self.active_executions[execution_id]['end_time'] = result['end_time']
             
             await self._publish_event(execution_id, "workflow_failed", {
                 "execution_id": execution_id,
                 "error": str(e),
                 "duration": result['duration']
             })
-            
-            await self._persist_execution(result, workflow, execution_id)
-            return result
+        
+        finally:
+            # Persist before cleanup (cleanup removes events from active_executions)
+            if result:
+                await self._persist_execution(result, workflow, execution_id)
+            self.cleanup_execution(execution_id)
+        
+        return result
     
     @staticmethod
     def _build_execution_graph(nodes, edges):
@@ -220,10 +242,13 @@ class VisualWorkflowExecutor:
     async def _execute_nodes_bfs(self, execution_id, adjacency, start_nodes, parents_of, node_map):
         """Execute nodes in topological order using BFS."""
         executed = set()
-        queue = start_nodes.copy()
+        queue = list(start_nodes)
         execution_results = {}
+        max_iterations = len(node_map) * 2  # Safety limit against infinite loops
+        iterations = 0
         
-        while queue:
+        while queue and iterations < max_iterations:
+            iterations += 1
             node_id = queue.pop(0)
             
             if node_id in executed:
@@ -235,6 +260,7 @@ class VisualWorkflowExecutor:
             
             node = node_map.get(node_id)
             if not node:
+                executed.add(node_id)  # Skip unknown nodes but mark as done
                 continue
             
             logger.info(f"Executing node: {node_id} ({node.get('type')})")
@@ -246,6 +272,9 @@ class VisualWorkflowExecutor:
             for child_id in adjacency.get(node_id, []):
                 if child_id not in executed and child_id not in queue:
                     queue.append(child_id)
+        
+        if iterations >= max_iterations:
+            logger.warning(f"BFS hit iteration limit for execution {execution_id}")
         
         return executed, execution_results
     
@@ -507,14 +536,16 @@ class VisualWorkflowExecutor:
         """Clean up execution data and disconnect MCP clients."""
         if execution_id in self.mcp_managers:
             mcp_manager = self.mcp_managers.pop(execution_id)
-            # Hold reference to prevent GC before completion
-            task = asyncio.create_task(mcp_manager.disconnect_all())
-            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            try:
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(mcp_manager.disconnect_all())
+                self.background_tasks.add(task)
+                task.add_done_callback(self.background_tasks.discard)
+            except RuntimeError:
+                logger.warning(f"No event loop for MCP cleanup of {execution_id}")
         
-        if execution_id in self.active_executions:
-            del self.active_executions[execution_id]
-        if execution_id in self.event_queues:
-            del self.event_queues[execution_id]
+        self.active_executions.pop(execution_id, None)
+        self.event_queues.pop(execution_id, None)
 
 
 # Global executor instance

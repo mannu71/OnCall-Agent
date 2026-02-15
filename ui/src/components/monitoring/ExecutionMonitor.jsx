@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import PropTypes from 'prop-types';
 import {
     Box,
     Paper,
@@ -112,13 +113,19 @@ const ExecutionMonitor = ({ workflowName, autoStart = false, onClose }) => {
 
                     {events.length > 0 && (
                         <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-                            {events.length} event{events.length !== 1 ? 's' : ''} received
+                            {events.length} event{events.length === 1 ? '' : 's'} received
                         </Typography>
                     )}
                 </Box>
             </Collapse>
         </Paper>
     );
+};
+
+ExecutionMonitor.propTypes = {
+    workflowName: PropTypes.string.isRequired,
+    autoStart: PropTypes.bool,
+    onClose: PropTypes.func,
 };
 
 export default ExecutionMonitor;

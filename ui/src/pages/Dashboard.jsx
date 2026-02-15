@@ -143,9 +143,9 @@ export default function Dashboard() {
   }, [loading, executions.length, paginatedRuns]);
 
   return (
-    <Box sx={{ p: 4 }}>
-      <Box sx={{ mb: 4 }}>
-        <Typography variant="h4" sx={{ fontWeight: 700, mb: 1 }}>Dashboard</Typography>
+    <Box sx={{ p: { xs: 2, sm: 3, md: 4 } }}>
+      <Box sx={{ mb: { xs: 2, md: 4 } }}>
+        <Typography variant="h4" sx={{ fontWeight: 700, mb: 1, fontSize: { xs: '1.5rem', sm: '2rem', md: '2.125rem' } }}>Dashboard</Typography>
         <Typography variant="body1" color="text.secondary">System monitoring and activity tracking</Typography>
       </Box>
 
@@ -159,9 +159,9 @@ export default function Dashboard() {
         </Alert>
       )}
 
-      <Grid container spacing={3} sx={{ mb: 4 }}>
+      <Grid container spacing={{ xs: 1.5, sm: 2, md: 3 }} sx={{ mb: { xs: 2, md: 4 } }}>
         {stats.map((stat) => (
-          <Grid item xs={12} sm={6} md={3} key={stat.title}>
+          <Grid item xs={6} sm={6} md={3} key={stat.title}>
             <Card variant="outlined" sx={{ borderRadius: 2 }}>
               <CardContent sx={{ textAlign: 'center' }}>
                 <Typography variant="body2" color="text.secondary" sx={{ fontWeight: 600 }}>{stat.title}</Typography>
@@ -184,7 +184,7 @@ export default function Dashboard() {
         </Box>
       )}
 
-      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2, flexWrap: 'wrap', gap: 1 }}>
         <Typography variant="h6" sx={{ fontWeight: 600 }}>Recent Activity</Typography>
         <Box sx={{ display: 'flex', gap: 1 }}>
           <Button size="small" onClick={loadExecutions}>Refresh</Button>
@@ -201,8 +201,8 @@ export default function Dashboard() {
         </Box>
       </Box>
 
-      <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2 }}>
-        <Table>
+      <TableContainer component={Paper} variant="outlined" sx={{ borderRadius: 2, overflowX: 'auto' }}>
+        <Table sx={{ minWidth: 600 }}>
           <TableHead sx={{ bgcolor: 'action.hover' }}>
             <TableRow>
               <TableCell sx={{ fontWeight: 600 }}>Workflow</TableCell>
@@ -227,7 +227,9 @@ export default function Dashboard() {
         />
       </TableContainer>
 
-      <Dialog open={Boolean(selectedRun)} onClose={() => setSelectedRun(null)} maxWidth="lg" fullWidth>
+      <Dialog open={Boolean(selectedRun)} onClose={() => setSelectedRun(null)} maxWidth="lg" fullWidth
+        PaperProps={{ sx: { m: { xs: 1, sm: 2 }, width: { xs: 'calc(100% - 16px)', sm: 'calc(100% - 32px)' } } }}
+      >
         <DialogTitle>Execution Details: {selectedRun?.workflow_name}</DialogTitle>
         <DialogContent dividers>
           {selectedRun && (

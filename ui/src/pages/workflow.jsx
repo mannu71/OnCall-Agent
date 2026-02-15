@@ -40,6 +40,7 @@ import WorkflowEditor from '../components/workflow/WorkflowEditor.jsx';
 import { validateWorkflow } from '../utils/workflowValidation.js';
 import agentApiClient from '../services/agentApiClient.js';
 import { useScheduler } from '../context/SchedulerContext';
+import { useWorkflowStatus } from '../context/WorkflowStatusContext';
 
 function Workflow() {
   const {
@@ -49,6 +50,7 @@ function Workflow() {
     triggerWorkflow,
     formatTime
   } = useScheduler();
+  const { isWorkflowRunning } = useWorkflowStatus();
 
   const [showDialog, setShowDialog] = useState(false);
   const [showWorkflowEditor, setShowWorkflowEditor] = useState(false);
@@ -79,6 +81,13 @@ function Workflow() {
   }, []);
 
   const handleExecute = async (workflow) => {
+    // Prevent duplicate execution if already running
+    if (isWorkflowRunning(workflow.name)) {
+      showMessage(`Workflow '${workflow.name}' is already running`, 'warning');
+      handleMenuClose();
+      return;
+    }
+    
     try {
       await triggerWorkflow(workflow.name);
       showMessage(`Workflow '${workflow.name}' started`, 'success');

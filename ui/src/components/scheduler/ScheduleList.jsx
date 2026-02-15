@@ -94,6 +94,13 @@ const ScheduleList = memo(() => {
 
   const handleRunNow = async (schedule) => {
     const name = schedule.name;
+    
+    // Prevent duplicate execution if already running/pending
+    if (isWorkflowRunning(name)) {
+      setSnackbar({ open: true, message: `Workflow "${name}" is already running`, severity: 'warning' });
+      return;
+    }
+    
     try {
       markWorkflowPending(name);
       await agentApiClient.executeWorkflow(name, true);
