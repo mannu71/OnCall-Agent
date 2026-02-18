@@ -12,7 +12,8 @@
     "start": "electron .",
     "lint": "eslint .",
     "preview": "vite preview",
-    "package": "npm run build && electron-builder"
+    "package": "npm run build && electron-builder",
+    "postinstall": "cd ../agent-api && pip install -r requirements.txt"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",
@@ -43,6 +44,7 @@
     "globals": "^16.5.0",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.17",
+    "terser": "^5.46.0",
     "vite": "^7.2.2"
   },
   "build": {
@@ -64,6 +66,18 @@
         "to": "agent",
         "filter": [
           "**/*"
+        ]
+      },
+      {
+        "from": "../agent-api",
+        "to": "agent-api",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/.pytest_cache/**",
+          "!**/venv/**",
+          "!**/.venv/**"
         ]
       }
     ],

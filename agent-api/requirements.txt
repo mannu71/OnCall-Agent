@@ -20,6 +20,9 @@ sse-starlette==1.8.2
 python-dateutil==2.8.2
 pytz==2023.3
 
+# HTTP Client (for LLM testing)
+httpx==0.27.0
+
 # AI & Workflows
 langchain==0.2.16
 langchain-openai==0.1.25

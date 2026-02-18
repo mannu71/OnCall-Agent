@@ -2,6 +2,92 @@
  * Workflow Utilities
  */
 
+// ============================================
+// Date Utilities
+// ============================================
+
+/**
+ * Parse date string to Date object, handling multiple formats
+ * Handles malformed formats like "2026-02-17T12:48:21.351271+00:00Z"
+ */
+export const parseDate = (dateStr) => {
+    if (!dateStr) return null;
+
+    // Handle the malformed format: "2026-02-17T12:48:21.351271+00:00Z"
+    // This has both +00:00 and Z which is invalid
+    let normalized = dateStr;
+    if (normalized.includes('+00:00Z')) {
+        normalized = normalized.replace('+00:00Z', 'Z');
+    }
+    if (normalized.includes('+00:00')) {
+        normalized = normalized.replace('+00:00', 'Z');
+    }
+
+    // Try parsing
+    let date = new Date(normalized);
+    if (!isNaN(date.getTime())) {
+        return date;
+    }
+
+    // Try ISO format with Z suffix
+    if (!normalized.endsWith('Z') && !normalized.includes('+')) {
+        date = new Date(normalized + 'Z');
+        if (!isNaN(date.getTime())) {
+            return date;
+        }
+    }
+
+    // Try replacing space with T for ISO format
+    if (normalized.includes(' ')) {
+        date = new Date(normalized.replace(' ', 'T'));
+        if (!isNaN(date.getTime())) {
+            return date;
+        }
+    }
+
+    return null;
+};
+
+/**
+ * Format date for display
+ */
+export const formatDate = (dateStr) => {
+    const date = parseDate(dateStr);
+    if (!date) return 'N/A';
+    return date.toLocaleString();
+};
+
+/**
+ * Format result data for display
+ */
+export const formatResult = (data) => {
+    if (!data) return 'No data';
+    try {
+        const parsed = Array.isArray(data) ? data : [data];
+        if (parsed.length === 0) return 'Empty result';
+
+        if (parsed.length === 1 && typeof parsed[0] === 'object') {
+            const entries = Object.entries(parsed[0]);
+            if (entries.length === 1) return String(entries[0][1]);
+            return entries.map(([k, v]) => `${k}: ${v}`).join(', ');
+        }
+
+        if (parsed.length > 1) {
+            const keys = Object.keys(parsed[0]);
+            return keys.length === 1
+                ? `${parsed.length} rows (first: ${parsed[0][keys[0]]})`
+                : `${parsed.length} rows`;
+        }
+        return JSON.stringify(data);
+    } catch {
+        return String(data);
+    }
+};
+
+// ============================================
+// Workflow Structure Utilities
+// ============================================
+
 /**
  * Clean up orphaned edges in workflow (edges that reference non-existent nodes)
  */

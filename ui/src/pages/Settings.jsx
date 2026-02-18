@@ -31,8 +31,6 @@ import {
     Add as AddIcon,
     Edit as EditIcon,
     Delete as DeleteIcon,
-    PlayArrow as StartIcon,
-    Stop as StopIcon,
     Visibility as VisibilityIcon,
     VisibilityOff as VisibilityOffIcon,
     Key as KeyIcon,
@@ -152,20 +150,12 @@ const Settings = () => {
     // Certificates state
     const [certificates, setCertificates] = useState([]);
     const [certUploadLoading, setCertUploadLoading] = useState(false);
-    // Docker state
-    const [dockerAvailable, setDockerAvailable] = useState(false);
-    const [dockerLoading, setDockerLoading] = useState(false);
-    const [dockerContainers, setDockerContainers] = useState([]);
-    const [dockerError, setDockerError] = useState(null);
 
     // Load MCP servers and LLMs on mount
     useEffect(() => {
         loadServers();
         loadLLMConfigs();
         loadCertificates();
-        if (globalThis.electronAPI) {
-            checkDockerStatus();
-        }
     }, []);
 
     const loadServers = async () => {
@@ -295,64 +285,6 @@ const Settings = () => {
                 ...prev,
                 [llmName]: { status: 'error', message: error.message || 'Connection test failed' }
             }));
-        }
-    };
-
-    const checkDockerStatus = async () => {
-        try {
-            const checkResult = await globalThis.electronAPI.checkDocker();
-            setDockerAvailable(checkResult.available);
-            setDockerError(checkResult.error);
-
-            if (checkResult.available) {
-                const statusResult = await globalThis.electronAPI.dockerStatus();
-                if (statusResult.success) {
-                    setDockerContainers(statusResult.containers);
-                }
-            }
-        } catch (error) {
-            console.error('Error checking Docker status:', error);
-            setDockerError('Failed to check Docker status');
-        }
-    };
-
-    const handleDockerStart = async () => {
-        setDockerLoading(true);
-        setDockerError(null);
-        try {
-            const result = await globalThis.electronAPI.dockerStart();
-            if (result.success) {
-                setSaveMessage('Docker services started successfully');
-                setTimeout(() => setSaveMessage(''), 3000);
-                await checkDockerStatus();
-            } else {
-                setDockerError(result.error);
-            }
-        } catch (error) {
-            console.error('Error starting Docker:', error);
-            setDockerError('Failed to start Docker services');
-        } finally {
-            setDockerLoading(false);
-        }
-    };
-
-    const handleDockerStop = async () => {
-        setDockerLoading(true);
-        setDockerError(null);
-        try {
-            const result = await globalThis.electronAPI.dockerStop();
-            if (result.success) {
-                setSaveMessage('Docker services stopped successfully');
-                setTimeout(() => setSaveMessage(''), 3000);
-                await checkDockerStatus();
-            } else {
-                setDockerError(result.error);
-            }
-        } catch (error) {
-            console.error('Error stopping Docker:', error);
-            setDockerError('Failed to stop Docker services');
-        } finally {
-            setDockerLoading(false);
         }
     };
 
@@ -613,121 +545,6 @@ const Settings = () => {
                     <Alert severity="success" sx={{ mb: 2 }}>
                         {saveMessage}
                     </Alert>
-                )}
-
-                {/* Docker Management Section */}
-                {globalThis.electronAPI && (
-                    <Paper sx={{ p: 3, mb: 3 }}>
-                        <Typography variant="h6" sx={{ fontWeight: 500, mb: 2 }}>
-                            Agent Service (Docker)
-                        </Typography>
-
-                        {dockerError && (
-                            <Alert severity="error" sx={{ mb: 2 }}>
-                                {dockerError}
-                            </Alert>
-                        )}
-
-                        <Box sx={{ mb: 2 }}>
-                            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-                                Start the OnCall Agent service in Docker to run scheduled workflows automatically.
-                                The agent includes the scheduler and worker processes.
-                            </Typography>
-
-                            <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
-                                <Button
-                                    variant="contained"
-                                    color="success"
-                                    startIcon={dockerLoading ? <CircularProgress size={20} color="inherit" /> : <StartIcon />}
-                                    onClick={handleDockerStart}
-                                    disabled={!dockerAvailable || dockerLoading}
-                                >
-                                    Start Services
-                                </Button>
-                                <Button
-                                    variant="contained"
-                                    color="error"
-                                    startIcon={dockerLoading ? <CircularProgress size={20} color="inherit" /> : <StopIcon />}
-                                    onClick={handleDockerStop}
-                                    disabled={!dockerAvailable || dockerLoading}
-                                >
-                                    Stop Services
-                                </Button>
-                                <Button
-                                    variant="outlined"
-                                    onClick={checkDockerStatus}
-                                    disabled={dockerLoading}
-                                >
-                                    Refresh Status
-                                </Button>
-                            </Box>
-
-                            {!dockerAvailable && (
-                                <Alert severity="warning" sx={{ mb: 2 }}>
-                                    Docker Desktop is not running. Please install and start Docker Desktop to manage dependencies.
-                                </Alert>
-                            )}
-
-                            {dockerContainers.length > 0 && (
-                                <Box>
-                                    <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 500 }}>
-                                        Running Containers:
-                                    </Typography>
-                                    <TableContainer>
-                                        <Table size="small">
-                                            <TableHead>
-                                                <TableRow>
-                                                    <TableCell>Name</TableCell>
-                                                    <TableCell>Components</TableCell>
-                                                    <TableCell>Status</TableCell>
-                                                </TableRow>
-                                            </TableHead>
-                                            <TableBody>
-                                                {dockerContainers.map((container) => (
-                                                    <TableRow key={container.Name || container.name || container.Id || container.id}>
-                                                        <TableCell>
-                                                            <code style={{ fontSize: '0.85em' }}>
-                                                                {container.Name || container.name || 'N/A'}
-                                                            </code>
-                                                        </TableCell>
-                                                        <TableCell>
-                                                            <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
-                                                                <Chip
-                                                                    label="Scheduler"
-                                                                    size="small"
-                                                                    color="primary"
-                                                                    variant="outlined"
-                                                                    sx={{ fontSize: '0.75em' }}
-                                                                />
-                                                                <Chip
-                                                                    label="Worker"
-                                                                    size="small"
-                                                                    color="secondary"
-                                                                    variant="outlined"
-                                                                    sx={{ fontSize: '0.75em' }}
-                                                                />
-                                                            </Box>
-                                                        </TableCell>
-                                                        <TableCell>
-                                                            <Chip
-                                                                label={container.State || container.state || 'unknown'}
-                                                                size="small"
-                                                                color={
-                                                                    (container.State || container.state) === 'running'
-                                                                        ? 'success'
-                                                                        : 'default'
-                                                                }
-                                                            />
-                                                        </TableCell>
-                                                    </TableRow>
-                                                ))}
-                                            </TableBody>
-                                        </Table>
-                                    </TableContainer>
-                                </Box>
-                            )}
-                        </Box>
-                    </Paper>
                 )}
 
                 <Paper sx={{ p: 3, mb: 3 }}>

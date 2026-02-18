@@ -142,7 +142,7 @@ class VisualWorkflowExecutor:
             "workflow_name": workflow_name,
             "workflow_id": workflow.get('id'),
             "status": "running",
-            "start_time": start_time.isoformat() + 'Z',
+            "start_time": start_time.isoformat().replace('+00:00', 'Z'),
             "nodes_completed": [],
             "events": [],
             "inputs": inputs or {}
@@ -286,8 +286,8 @@ class VisualWorkflowExecutor:
         result = {
             "execution_id": execution_id,
             "status": status,
-            "start_time": start_time.isoformat() + 'Z',
-            "end_time": end_time.isoformat() + 'Z',
+            "start_time": start_time.isoformat().replace('+00:00', 'Z'),
+            "end_time": end_time.isoformat().replace('+00:00', 'Z'),
             "duration": duration,
         }
         if status == "success":

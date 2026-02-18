@@ -6,32 +6,9 @@ import { useWorkflowStatus } from '../context/WorkflowStatusContext';
 import { useScheduler } from '../context/SchedulerContext';
 import ExecutionMonitor from '../components/monitoring/ExecutionMonitor';
 import agentApiClient from '../services/agentApiClient';
+import { parseDate, formatDate, formatResult } from '../utils/workflowUtils';
 
 const STATUS_COLOR = { success: 'success', failed: 'error' };
-
-const formatResult = (data) => {
-  if (!data) return 'No data';
-  try {
-    const parsed = Array.isArray(data) ? data : [data];
-    if (parsed.length === 0) return 'Empty result';
-
-    if (parsed.length === 1 && typeof parsed[0] === 'object') {
-      const entries = Object.entries(parsed[0]);
-      if (entries.length === 1) return String(entries[0][1]);
-      return entries.map(([k, v]) => `${k}: ${v}`).join(', ');
-    }
-
-    if (parsed.length > 1) {
-      const keys = Object.keys(parsed[0]);
-      return keys.length === 1
-        ? `${parsed.length} rows (first: ${parsed[0][keys[0]]})`
-        : `${parsed.length} rows`;
-    }
-    return JSON.stringify(data);
-  } catch {
-    return String(data);
-  }
-};
 
 export default function Dashboard() {
   const { schedules, formatTime } = useScheduler();
@@ -80,10 +57,12 @@ export default function Dashboard() {
   const stats = useMemo(() => {
     const totalSchedules = schedules.length;
     const enabledSchedules = schedules.filter(s => s.enabled).length;
-    const failedLast24h = executions.filter(e =>
-      e.status === 'failed' &&
-      (Date.now() - new Date(e.start_time).getTime()) < 24 * 60 * 60 * 1000
-    ).length;
+    const failedLast24h = executions.filter(e => {
+      if (e.status !== 'failed') return false;
+      const date = parseDate(e.start_time);
+      if (!date) return false;
+      return (Date.now() - date.getTime()) < 24 * 60 * 60 * 1000;
+    }).length;
 
     return [
       { title: "Active Workflows", value: totalSchedules, color: "primary.main" },
@@ -118,7 +97,7 @@ export default function Dashboard() {
     return paginatedRuns.map((run) => (
       <TableRow key={run.execution_id} hover>
         <TableCell sx={{ textTransform: 'capitalize', fontWeight: 500, maxWidth: { xs: 120, sm: 200 }, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{run.workflow_name.replaceAll('-', ' ')}</TableCell>
-        <TableCell sx={{ whiteSpace: 'nowrap', display: { xs: 'none', sm: 'table-cell' } }}>{new Date(run.start_time).toLocaleString()}</TableCell>
+        <TableCell sx={{ whiteSpace: 'nowrap', display: { xs: 'none', sm: 'table-cell' } }}>{formatDate(run.start_time)}</TableCell>
         <TableCell sx={{ display: { xs: 'none', md: 'table-cell' } }}>{run.duration ? `${run.duration.toFixed(1)}s` : '-'}</TableCell>
         <TableCell>
           {run.output ? (
@@ -188,9 +167,9 @@ export default function Dashboard() {
         <Typography variant="h6" sx={{ fontWeight: 600 }}>Recent Activity</Typography>
         <Box sx={{ display: 'flex', gap: 1 }}>
           <Button size="small" onClick={loadExecutions}>Refresh</Button>
-          <Button 
-            size="small" 
-            color="error" 
+          <Button
+            size="small"
+            color="error"
             variant="outlined"
             startIcon={<DeleteSweepIcon />}
             onClick={() => setConfirmClear(true)}
@@ -268,7 +247,7 @@ export default function Dashboard() {
                     <Grid size={6}>
                       <Typography variant="caption" color="text.secondary">Success Rate</Typography>
                       <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                        {selectedRun.output.queries_executed > 0 
+                        {selectedRun.output.queries_executed > 0
                           ? `${(((selectedRun.output.queries_executed - selectedRun.output.failures) / selectedRun.output.queries_executed) * 100).toFixed(1)}%`
                           : 'N/A'}
                       </Typography>
