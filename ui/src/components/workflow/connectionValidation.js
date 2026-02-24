@@ -1,149 +1,99 @@
 // ----------------------------------------------------
-// 1️⃣ MAPPER DEFINITIONS
+// CONNECTION MAP - Single source of truth for all node connections
 // ----------------------------------------------------
 
 export const CONNECTION_MAP = {
+  // Core nodes
   agent: {
-    sourceHandles: {
-      "agent-output": ["gmail", "teams", "chat", "output", "orchestrator"]
+    outputs: ["gmail", "teams", "chat", "output", "orchestrator"],
+    inputs: {
+      input: ["teams", "chat", "scheduler"],
+      model: ["llm"],
+      memory: ["memory"],
+      tool: ["tool", "database", "cloudwatchAnalyzer"]
     },
-    targetHandles: {
-      "agent-input": ["teams", "chat", "scheduler"],
-      "model": ["llm"],
-      "memory": ["memory"],
-      "tool": ["tool", "database"]
-    },
-    constraints: { model: 1, memory: 1 }
+    maxInputs: { model: 1, memory: 1 }
   },
 
-  llm: {
-    allowedTargets: ["agent"],
-    maxOutputs: 1
-  },
+  // Input nodes (single output)
+  llm: { outputs: ["agent"], maxOutputs: 1 },
+  memory: { outputs: ["agent"], maxOutputs: 1 },
+  tool: { outputs: ["agent", "database", "orchestrator"], maxOutputs: 1 },
+  database: { outputs: ["tool", "agent"], maxOutputs: 1 },
 
-  memory: {
-    allowedTargets: ["agent"],
-    maxOutputs: 1
-  },
+  // Output nodes
+  gmail: { outputs: ["agent"] },
+  teams: { outputs: ["agent"] },
+  chat: { outputs: ["agent"] },
+  output: { inputs: ["agent", "orchestrator"] },
 
-  tool: {
-    allowedTargets: ["agent", "database", "orchestrator"],
-    maxOutputs: 1
-  },
+  // Scheduler
+  scheduler: { outputs: ["agent", "orchestrator"] },
 
-  database: {
-    allowedTargets: ["tool", "agent"],
-    maxOutputs: 1
-  },
-
-  gmail: { allowedTargets: ["agent"] },
-  teams: { allowedTargets: ["agent"] },
-  chat: { allowedTargets: ["agent"] },
-
-  scheduler: {
-    allowedTargets: ["agent", "orchestrator"],
-    sourceHandles: {
-      "scheduler-output": ["agent", "orchestrator"]
+  // Orchestrator
+  orchestrator: {
+    outputs: ["agent", "output", "orchestrator"],
+    inputs: {
+      input: ["scheduler"],
+      tool: ["tool"]
     }
   },
 
-  // ⭐ Updated Orchestrator rules — TOOL and SCHEDULER INPUT
-  orchestrator: {
-    sourceHandles: {
-      "orchestrator-output": ["agent", "output", "orchestrator"]
-    },
-    targetHandles: {
-      "orchestrator-input": ["scheduler"],               // left handle for scheduler
-      "tool": ["tool"]                                   // bottom handle for tool
-    },
-    allowedSources: ["tool", "scheduler"]                // Tool or Scheduler allowed to connect INTO orchestrator
-  },
-
-  output: {
-    allowedSources: ["agent", "orchestrator"]
-  }
+  // CloudWatch Analyzer (behaves like a tool)
+  cloudwatchAnalyzer: { outputs: ["agent"], maxOutputs: 1 }
 };
 
-// Standard error messages
+// Error messages
 export const ERROR_MESSAGES = {
-  "llm-multiple": "LLM nodes can only have one outgoing connection.",
-  "tool-multiple": "Tool nodes can only have one outgoing connection.",
-  "database-multiple": "Database nodes can only have one outgoing connection.",
-  "memory-multiple": "Memory nodes can only have one outgoing connection.",
-  "output-invalid":
-    "Output Display can only accept connections from Agent or Orchestrator output.",
-  "agent-output-invalid":
-    "Agent output can only connect to Gmail, Teams, Chat, Output or Orchestrator.",
-  "orchestrator-input-invalid":
-    "Orchestrator can only accept Tool (bottom) or Scheduler (left) connections.",
-  "orchestrator-scheduler-handle":
-    "Scheduler must connect to the left input handle of the Orchestrator.",
-  "orchestrator-tool-handle":
-    "Tool must connect to the bottom 'Tool' handle of the Orchestrator."
+  maxOutputs: "This node can only have one outgoing connection.",
+  invalidTarget: "This connection is not allowed.",
+  invalidSource: "This node cannot accept connections from this source.",
+  agentOutput: "Agent output can only connect to Gmail, Teams, Chat, Output or Orchestrator.",
+  orchestratorInput: "Orchestrator can only accept Tool or Scheduler connections."
 };
 
 
 // ----------------------------------------------------
-// 2️⃣ VALIDATION – CLEAN LOGIC
+// VALIDATION
 // ----------------------------------------------------
 
-export const isValidConnection = (
-  source,
-  target,
-  sourceHandle,
-  targetHandle,
-  nodes,
-  edges
-) => {
-  const sourceNode = nodes.find((n) => n.id === source);
-  const targetNode = nodes.find((n) => n.id === target);
+export const isValidConnection = (source, target, sourceHandle, targetHandle, nodes, edges) => {
+  const sourceNode = nodes.find(n => n.id === source);
+  const targetNode = nodes.find(n => n.id === target);
 
   if (!sourceNode || !targetNode) return false;
 
-  const src = CONNECTION_MAP[sourceNode.type] || {};
-  const tgt = CONNECTION_MAP[targetNode.type] || {};
+  const srcConfig = CONNECTION_MAP[sourceNode.type];
+  const tgtConfig = CONNECTION_MAP[targetNode.type];
 
-  // 🔹 Orchestrator incoming rule — Tool or Scheduler allowed
-  if (targetNode.type === "orchestrator") {
-    // Scheduler must connect to left input handle
-    if (sourceNode.type === "scheduler") {
-      return targetHandle === "orchestrator-input";
+  if (!srcConfig || !tgtConfig) return false;
+
+  // Check if source can output to target type
+  if (srcConfig.outputs && !srcConfig.outputs.includes(targetNode.type)) {
+    return false;
+  }
+
+  // Check if target can accept from source type
+  if (tgtConfig.inputs) {
+    // Handle-specific input check
+    if (targetHandle && tgtConfig.inputs[targetHandle]) {
+      if (!tgtConfig.inputs[targetHandle].includes(sourceNode.type)) {
+        return false;
+      }
     }
-    // Tool must connect to bottom tool handle
-    if (sourceNode.type === "tool") {
-      return targetHandle === "tool";
+    // General inputs check (flatten all inputs)
+    const allInputs = Object.values(tgtConfig.inputs).flat();
+    if (!allInputs.includes(sourceNode.type)) {
+      return false;
     }
-    return false;
   }
 
-  // 🔹 Orchestrator outgoing rule
-  if (sourceNode.type === "orchestrator") {
-    return CONNECTION_MAP.orchestrator.sourceHandles[sourceHandle]?.includes(targetNode.type) || false;
-  }
-
-  // 🔹 Agent handle-specific rules
-  if (src.sourceHandles?.[sourceHandle]) {
-    return src.sourceHandles[sourceHandle].includes(targetNode.type);
-  }
-
-  if (tgt.targetHandles?.[targetHandle]) {
-    return tgt.targetHandles[targetHandle].includes(sourceNode.type);
-  }
-
-  // 🔹 Basic allowedTargets rule
-  if (src.allowedTargets && !src.allowedTargets.includes(targetNode.type)) {
-    return false;
-  }
-
-  // 🔹 Basic allowedSources rule
-  if (tgt.allowedSources && !tgt.allowedSources.includes(sourceNode.type)) {
-    return false;
-  }
-
-  // 🔹 One-output constraints
-  if (src.maxOutputs !== undefined) {
-    const outCount = edges.filter((e) => e.source === source).length;
-    if (outCount > 0) return false;
+  // Check max outputs constraint
+  if (srcConfig.maxOutputs) {
+    const existingOutputs = edges.filter(e => e.source === source).length;
+    if (existingOutputs >= srcConfig.maxOutputs) {
+      return false;
+    }
   }
 
   return true;
@@ -151,54 +101,31 @@ export const isValidConnection = (
 
 
 // ----------------------------------------------------
-// 3️⃣ EXPLANATION MESSAGES
+// CONNECTION MESSAGE
 // ----------------------------------------------------
 
-export const getConnectionMessage = (
-  source,
-  target,
-  sourceHandle,
-  targetHandle,
-  nodes,
-  edges
-) => {
-  const sourceNode = nodes.find((n) => n.id === source);
-  const targetNode = nodes.find((n) => n.id === target);
+export const getConnectionMessage = (source, target, sourceHandle, targetHandle, nodes, edges) => {
+  const sourceNode = nodes.find(n => n.id === source);
+  const targetNode = nodes.find(n => n.id === target);
+
   if (!sourceNode || !targetNode) return "Invalid connection";
 
-  const srcType = sourceNode.type;
+  const srcConfig = CONNECTION_MAP[sourceNode.type];
 
-  // 🔹 Orchestrator message rule
-  if (targetNode.type === "orchestrator") {
-    if (sourceNode.type !== "tool" && sourceNode.type !== "scheduler") {
-      return ERROR_MESSAGES["orchestrator-input-invalid"];
-    }
-    if (sourceNode.type === "scheduler" && targetHandle !== "orchestrator-input") {
-      return ERROR_MESSAGES["orchestrator-scheduler-handle"];
-    }
-    if (sourceNode.type === "tool" && targetHandle !== "tool") {
-      return ERROR_MESSAGES["orchestrator-tool-handle"];
+  // Check max outputs
+  if (srcConfig?.maxOutputs) {
+    const existingOutputs = edges.filter(e => e.source === source).length;
+    if (existingOutputs >= srcConfig.maxOutputs) {
+      return ERROR_MESSAGES.maxOutputs;
     }
   }
 
-  // 🔹 One-output types
-  if (["llm", "tool", "database", "memory"].includes(srcType)) {
-    const outCount = edges.filter((e) => e.source === source).length;
-    if (outCount > 0) {
-      return ERROR_MESSAGES[`${srcType}-multiple`];
+  // Check valid output
+  if (srcConfig?.outputs && !srcConfig.outputs.includes(targetNode.type)) {
+    if (sourceNode.type === "agent") {
+      return ERROR_MESSAGES.agentOutput;
     }
-  }
-
-  // 🔹 Output node rule
-  if (targetNode.type === "output" && !["agent", "orchestrator"].includes(sourceNode.type)) {
-    return ERROR_MESSAGES["output-invalid"];
-  }
-
-  // 🔹 Agent output rule
-  if (srcType === "agent" && sourceHandle === "agent-output") {
-    if (!["gmail", "teams", "chat", "output", "orchestrator"].includes(targetNode.type)) {
-      return ERROR_MESSAGES["agent-output-invalid"];
-    }
+    return ERROR_MESSAGES.invalidTarget;
   }
 
   return "Connection allowed";
@@ -206,7 +133,7 @@ export const getConnectionMessage = (
 
 
 // ----------------------------------------------------
-// 4️⃣ NODE GROUPS (for sidebar UI)
+// NODE CATEGORIES (for sidebar UI)
 // ----------------------------------------------------
 
 export const nodeCategories = {
@@ -214,7 +141,7 @@ export const nodeCategories = {
   ai: ["llm"],
   data: ["database"],
   communication: ["teams", "chat", "output"],
-  tools: ["tool"],
+  tools: ["tool", "cloudwatchAnalyzer"],
   memory: ["memory"],
   workflow: ["orchestrator"],
   scheduling: ["scheduler"]

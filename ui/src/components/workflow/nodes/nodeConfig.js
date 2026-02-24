@@ -1,249 +1,217 @@
 import { Position } from 'reactflow';
 
+// ----------------------------------------------------
+// BASE CONFIGURATIONS (reusable patterns)
+// ----------------------------------------------------
+
+const baseHandles = {
+  // Source handles (outputs)
+  sourceRight: { type: 'source', position: Position.Right, id: 'output', style: { background: '#666' } },
+  sourceLeft: (id = 'output', color = '#4caf50') => ({
+    type: 'source', position: Position.Left, id, style: { background: color }
+  }),
+  sourceTop: (id = 'output', color = '#ff9800') => ({
+    type: 'source', position: Position.Top, id, style: { background: color }
+  }),
+
+  // Target handles (inputs)
+  targetLeft: (id = 'input', color = '#666') => ({
+    type: 'target', position: Position.Left, id, style: { background: color }
+  }),
+  // Agent bottom handles with positioning
+  targetBottomLeft: (id, color, label) => ({
+    type: 'target', position: Position.Bottom, id, style: { background: color, left: '25%' }, label
+  }),
+  targetBottomCenter: (id, color, label) => ({
+    type: 'target', position: Position.Bottom, id, style: { background: color, left: '50%' }, label
+  }),
+  targetBottomRight: (id, color, label) => ({
+    type: 'target', position: Position.Bottom, id, style: { background: color, left: '75%' }, label
+  })
+};
+
+// Common icon maps
+const iconMaps = {
+  tool: { search: '🔍', analysis: '📊', text: '📝', image: '📷', api: '🔧', file: '📋' },
+  memory: { vector: '🧠', episodic: '📚', working: '💾', knowledge: '🗂️' }
+};
+
+// ----------------------------------------------------
+// NODE CONFIGURATIONS
+// ----------------------------------------------------
+
 export const nodeConfigurations = {
+  // Core Agent
   agent: {
     icon: '🤖',
     title: 'AI Agent',
     className: 'agent-node',
     defaultLabel: 'AI Agent',
-    defaultDescription: 'Tools Agent',
     handles: [
-      { type: 'target', position: Position.Left, id: 'agent-input', style: { background: '#666' } },
-      { type: 'target', position: Position.Bottom, id: 'model', style: { background: '#2196f3', left: '25%' }, label: 'Chat Model' },
-      { type: 'target', position: Position.Bottom, id: 'memory', style: { background: '#ff9800', left: '50%' }, label: 'Memory' },
-      { type: 'target', position: Position.Bottom, id: 'tool', style: { background: '#4caf50', left: '75%' }, label: 'Tool' },
-      { type: 'source', position: Position.Right, id: 'agent-output', style: { background: '#666' } }
+      baseHandles.targetLeft('agent-input'),
+      baseHandles.targetBottomLeft('model', '#2196f3', 'Chat Model'),
+      baseHandles.targetBottomCenter('memory', '#ff9800', 'Memory'),
+      baseHandles.targetBottomRight('tool', '#4caf50', 'Tool'),
+      baseHandles.sourceRight
     ],
-    hasProcessing: true,
-    hasInitialization: true,
-    getIcon: (data) => {
-      if (data?.processing) return { icon: '🤖', spinner: true };
-      if (data?.initializing) return { icon: '⚙️', spinner: true };
-      if (data?.initialized) return { icon: '✅' };
-      return { icon: '🤖' };
+    getStatus: (data) => {
+      const mode = data?.agentMode === 'multi' ? 'Multi-Agent' : 'Single Agent';
+      if (data?.initializing) return { text: `Initializing (${mode})...`, class: 'initializing' };
+      if (data?.initialized) return { text: `${mode} ready`, class: 'ready', model: data?.model };
+      if (data?.processing) return { text: `Processing (${mode})...`, class: 'processing' };
+      return { text: `Connect LLM (${mode})`, class: 'not-initialized' };
     },
-    renderStatus: (data) => {
-      if (data?.initializing) {
-        return {
-          text: 'Initializing agent...',
-          className: 'initializing-status',
-          modelInfo: data?.model
-        };
-      }
-      if (data?.initialized) {
-        return {
-          text: 'Agent ready',
-          className: 'initialized-status',
-          modelInfo: data?.model
-        };
-      }
-      return {
-        text: 'Connect LLM to initialize',
-        className: 'not-initialized-status'
-      };
-    },
-    renderProcessing: (data) => {
-      if (data?.processing && data?.lastMessage) {
-        return {
-          text: 'Processing message...',
-          message: data.lastMessage.length > 30 ? data.lastMessage.substring(0, 30) + '...' : data.lastMessage
-        };
+    getExtra: (data) => {
+      if (data?.agentMode === 'multi') {
+        return { text: '🧩 Orchestrated', class: 'mode' };
       }
       return null;
     }
   },
 
-  chat: {
-    icon: '💬',
-    title: 'Chat',
-    className: 'chat-node',
-    defaultLabel: 'Chat Interface',
-    defaultDescription: 'Interactive Chat',
-    handles: [
-      { type: 'target', position: Position.Left, id: 'chat-input', style: { background: '#666' } },
-      { type: 'source', position: Position.Right, id: 'chat-output', style: { background: '#666' } }
-    ],
-    hasProcessing: true,
-    getIcon: (data) => {
-      if (data?.processing) return { icon: '💬', spinner: true };
-      return { icon: '💬' };
-    }
-  },
-
+  // LLM
   llm: {
     icon: '🧠',
     title: 'LLM',
     className: 'llm-node',
     defaultLabel: 'Language Model',
-    defaultDescription: 'GPT-4',
-    handles: [
-      { type: 'source', position: Position.Right, id: 'llm-output', style: { background: '#4285f4' } }
-    ],
-    hasProcessing: true,
-    getIcon: (data) => {
-      if (data?.processing) return { icon: '🧠', spinner: true };
-      return { icon: '🧠' };
-    },
-    renderStatus: (data) => {
-      if (data?.processing) {
-        return {
-          text: `Processing (${data?.model || 'LLM'})...`,
-          className: 'llm-processing-status',
-          icon: '⚡'
-        };
-      }
-      return { text: data?.status || 'Ready', className: 'node-status' };
-    },
-    renderExtra: (data) => {
-      if (data?.agent) {
-        return {
-          text: data.agent === 'openai' ? 'OpenAI Agent' : 'Groq Agent',
-          className: 'node-provider'
-        };
-      }
-      return null;
+    handles: [baseHandles.sourceLeft('llm-output', '#4285f4')],
+    getStatus: (data) => {
+      if (data?.processing) return { text: `Processing (${data?.model || 'LLM'})...`, class: 'processing' };
+      return { text: data?.status || 'Ready', class: 'ready' };
     }
   },
 
-  tool: {
-    icon: '🛠️',
-    title: 'Tool',
-    className: 'tool-node',
-    defaultLabel: 'Tool',
-    defaultDescription: 'Generic tool',
-    handles: [
-      { type: 'source', position: Position.Left, id: 'tool-connection', style: { background: '#4caf50' } }
-    ],
-    getIcon: (data) => {
-      const iconMap = {
-        search: '🔍',
-        analysis: '📊',
-        text: '📝',
-        image: '📷',
-        api: '🔧',
-        file: '📋'
-      };
-      return { icon: iconMap[data?.toolType] || '🛠️' };
-    }
-  },
-
+  // Memory
   memory: {
     icon: '🧠',
     title: 'Memory',
     className: 'memory-node',
     defaultLabel: 'Memory',
-    defaultDescription: 'Generic memory',
-    handles: [
-      { type: 'source', position: Position.Top, id: 'memory-output', style: { background: '#ff9800' } }
-    ],
-    getIcon: (data) => {
-      const iconMap = {
-        vector: '🧠',
-        episodic: '📚',
-        working: '💾',
-        knowledge: '🗂️'
-      };
-      return { icon: iconMap[data?.memoryType] || '🧠' };
-    }
+    handles: [baseHandles.sourceTop()],
+    getIcon: (data) => iconMaps.memory[data?.memoryType] || '🧠'
   },
 
+  // Tool
+  tool: {
+    icon: '🛠️',
+    title: 'Tool',
+    className: 'tool-node',
+    defaultLabel: 'Tool',
+    handles: [baseHandles.sourceLeft()],
+    getIcon: (data) => iconMaps.tool[data?.toolType] || '🛠️'
+  },
+
+  // Database
   database: {
     icon: '🗄️',
     title: 'Database',
     className: 'database-node',
     defaultLabel: 'Database',
-    defaultDescription: 'PostgreSQL',
-    handles: [
-      { type: 'source', position: Position.Left, id: 'database-connection', style: { background: '#34a853' } }
-    ]
+    handles: [baseHandles.sourceLeft('database-connection', '#34a853')]
   },
 
+  // Chat
+  chat: {
+    icon: '💬',
+    title: 'Chat',
+    className: 'chat-node',
+    defaultLabel: 'Chat Interface',
+    handles: [baseHandles.targetLeft(), baseHandles.sourceRight]
+  },
+
+  // Teams
   teams: {
     icon: '💬',
     title: 'Teams',
     className: 'teams-node',
     defaultLabel: 'Teams Channel',
-    defaultDescription: 'General Channel',
     handles: [
-      { type: 'target', position: Position.Left, id: 'teams-input', style: { background: '#6264a7' } },
+      baseHandles.targetLeft('teams-input', '#6264a7'),
       { type: 'source', position: Position.Right, id: 'teams-output', style: { background: '#6264a7' } }
     ],
-    hasProcessing: true,
-    getIcon: (data) => {
-      if (data?.processing) return { icon: '💬', spinner: true };
-      return { icon: '💬' };
-    },
-    renderStatus: (data) => {
-      return {
-        text: data?.processing ? 'Processing...' : (data?.status || 'Connected'),
-        className: 'node-status'
-      };
-    }
+    getStatus: (data) => ({
+      text: data?.processing ? 'Processing...' : (data?.status || 'Connected'),
+      class: data?.processing ? 'processing' : 'ready'
+    })
   },
 
+  // Output
   output: {
     icon: '📤',
     title: 'Output',
     className: 'output-node',
     defaultLabel: 'Output',
-    defaultDescription: 'Display output',
-    handles: [
-      { type: 'target', position: Position.Left, id: 'input', style: { background: '#666' } }
-    ],
-    isCustom: true // Special handling needed for OutputNode
+    handles: [baseHandles.targetLeft()],
+    isCustom: true
   },
 
+  // Scheduler
   scheduler: {
     icon: '⏰',
     title: 'Scheduler',
     className: 'scheduler-node',
     defaultLabel: 'Scheduler',
-    defaultDescription: '',
-    handles: [
-      { type: 'source', position: Position.Right, id: 'scheduler-output', style: { background: '#9c27b0' } }
-    ],
-    hasProcessing: false,
+    handles: [{ type: 'source', position: Position.Right, id: 'scheduler-output', style: { background: '#9c27b0' } }],
+    getIcon: (data) => data?.enabled !== false ? '⏰' : '⏸️',
+    getStatus: (data) => {
+      const cron = data?.cronExpression || '0 9 * * *';
+      const parts = cron.split(' ');
+      const recurrence = data?.recurrence || 'daily';
+
+      let text = 'Ready';
+      if (parts.length >= 2 && parts[1] !== '*') {
+        const time = `${parts[1]}:${parts[0].padStart(2, '0')}`;
+        text = `${recurrence.charAt(0).toUpperCase() + recurrence.slice(1)} at ${time}`;
+      }
+      return { text, class: 'ready', icon: '✓' };
+    },
+    getExtra: (data) => data?.cronExpression ? { text: data.cronExpression, class: 'cron' } : null
+  },
+
+  // CloudWatch Analyzer
+  cloudwatchAnalyzer: {
+    icon: '📊',
+    title: 'CloudWatch Log Analyzer',
+    className: 'cloudwatch-analyzer-node',
+    defaultLabel: 'Log Analyzer',
+    handles: [baseHandles.sourceLeft()],
     getIcon: (data) => {
-      if (data?.enabled !== false) return { icon: '⏰' };
-      return { icon: '⏸️' };
+      if (data?.processing) return '📊';
+      if (data?.error) return '❌';
+      if (data?.lastAnalysis) return '✅';
+      return '📊';
     },
-    renderStatus: (data) => {
-      const cronExpr = data?.cronExpression || '0 9 * * *';
-      const parts = cronExpr.split(' ');
-      let statusText = 'Ready';
-      
-      // Parse cron to display friendly time
-      if (parts.length >= 2) {
-        const minute = parts[0].padStart(2, '0');
-        const hour = parts[1];
-        
-        // Check recurrence type
-        const recurrence = data?.recurrence || 'daily';
-        if (recurrence === 'daily') {
-          statusText = `Daily at ${hour}:${minute}`;
-        } else if (recurrence === 'weekly') {
-          statusText = `Weekly at ${hour}:${minute}`;
-        } else if (recurrence === 'monthly') {
-          statusText = `Monthly at ${hour}:${minute}`;
-        } else if (hour !== '*') {
-          statusText = `At ${hour}:${minute}`;
-        }
-      }
-      
-      return {
-        text: statusText,
-        className: 'scheduler-enabled-status',
-        icon: '✓'
-      };
+    getStatus: (data) => {
+      if (data?.processing) return { text: 'Analyzing logs...', class: 'processing' };
+      if (data?.error) return { text: `Error: ${data.error.slice(0, 30)}...`, class: 'error' };
+      const count = data?.logGroups?.length || 0;
+      return { text: `${count} log group${count !== 1 ? 's' : ''} configured`, class: 'ready' };
     },
-    renderExtra: (data) => {
-      if (data?.cronExpression) {
-        return {
-          text: data.cronExpression,
-          className: 'node-cron'
-        };
-      }
-      return null;
-    }
+    getExtra: (data) => data?.lastAnalysis ? {
+      text: `Last: ${new Date(data.lastAnalysis).toLocaleTimeString()}`,
+      class: 'timestamp'
+    } : null
   }
+};
+
+// ----------------------------------------------------
+// HELPER FUNCTIONS
+// ----------------------------------------------------
+
+export const getNodeConfig = (type) => nodeConfigurations[type] || null;
+
+export const getNodeHandles = (type) => nodeConfigurations[type]?.handles || [];
+
+export const getNodeIcon = (type, data) => {
+  const config = nodeConfigurations[type];
+  if (!config) return '❓';
+  if (config.getIcon) return config.getIcon(data);
+  return config.icon;
+};
+
+export const getNodeStatus = (type, data) => {
+  const config = nodeConfigurations[type];
+  if (!config?.getStatus) return null;
+  return config.getStatus(data);
 };

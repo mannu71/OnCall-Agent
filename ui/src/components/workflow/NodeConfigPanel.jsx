@@ -22,7 +22,7 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
   useEffect(() => {
     if (node?.data) {
       setConfig(node.data);
-      
+
       // Also update timeInput to reflect the latest schedule
       if (node.data.startTime) {
         setTimeInput(node.data.startTime);
@@ -64,6 +64,49 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
               />
             </div>
             <div className="config-field">
+              <label>Agent Mode</label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '8px' }}>
+                <span style={{ fontSize: '13px', color: config.agentMode === 'multi' ? '#666' : '#1976d2', fontWeight: config.agentMode !== 'multi' ? '600' : 'normal' }}>
+                  Single
+                </span>
+                <div
+                  className="toggle-switch"
+                  onClick={() => handleConfigChange('agentMode', config.agentMode === 'multi' ? 'single' : 'multi')}
+                  style={{
+                    position: 'relative',
+                    width: '48px',
+                    height: '24px',
+                    backgroundColor: config.agentMode === 'multi' ? '#1976d2' : '#ccc',
+                    borderRadius: '12px',
+                    cursor: 'pointer',
+                    transition: 'background-color 0.2s'
+                  }}
+                >
+                  <div
+                    style={{
+                      position: 'absolute',
+                      top: '2px',
+                      left: config.agentMode === 'multi' ? '26px' : '2px',
+                      width: '20px',
+                      height: '20px',
+                      backgroundColor: 'white',
+                      borderRadius: '50%',
+                      transition: 'left 0.2s',
+                      boxShadow: '0 1px 3px rgba(0,0,0,0.3)'
+                    }}
+                  />
+                </div>
+                <span style={{ fontSize: '13px', color: config.agentMode === 'multi' ? '#1976d2' : '#666', fontWeight: config.agentMode === 'multi' ? '600' : 'normal' }}>
+                  Multi
+                </span>
+              </div>
+              <small style={{ color: '#666', marginTop: '8px', display: 'block' }}>
+                {config.agentMode === 'multi'
+                  ? '🧩 Uses orchestrator to coordinate multiple specialized agents'
+                  : '🤖 One agent handles all tasks'}
+              </small>
+            </div>
+            <div className="config-field">
               <label htmlFor="agent-description">Description</label>
               <textarea
                 id="agent-description"
@@ -85,10 +128,10 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
             </div>
           </>
         );
-      
+
       case 'llm':
         return null; // LLM nodes are configured in Settings page only
-      
+
       case 'database':
         return (
           <>
@@ -127,7 +170,7 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
             </div>
           </>
         );
-    
+
       case 'teams':
         return (
           <>
@@ -163,7 +206,7 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
             </div>
           </>
         );
-      
+
       case 'chat':
         return (
           <>
@@ -215,16 +258,16 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
             </div>
           </>
         );
-      
+
       case 'orchestrator':
         return (
           <div className="config-field">
             <label htmlFor="orchestrator-file">SQL File / Workflow</label>
-            <input 
+            <input
               id="orchestrator-file"
               ref={fileInputRef}
-              type="file" 
-              accept=".sql,.json" 
+              type="file"
+              accept=".sql,.json"
               onChange={async (e) => {
                 const file = e.target.files[0];
                 if (file) {
@@ -232,7 +275,7 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                     const fileName = file.name;
                     const fileType = fileName.endsWith('.sql') ? 'sql' : 'json';
                     const content = await file.text();
-                    
+
                     // Store file content inline - will be uploaded when workflow is saved
                     const newConfig = {
                       ...config,
@@ -252,10 +295,10 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
               }}
             />
             {config.fileName && (
-              <div style={{ 
-                marginTop: '8px', 
-                padding: '8px', 
-                background: '#f0f0f0', 
+              <div style={{
+                marginTop: '8px',
+                padding: '8px',
+                background: '#f0f0f0',
                 borderRadius: '4px',
                 fontSize: '12px',
                 display: 'flex',
@@ -263,7 +306,7 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                 gap: '8px'
               }}>
                 <span>📄 {config.fileName}</span>
-                <button 
+                <button
                   onClick={(e) => {
                     e.stopPropagation();
                     e.preventDefault();
@@ -299,7 +342,7 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
             )}
           </div>
         );
-      
+
       case 'scheduler':
         return (
           <>
@@ -313,7 +356,7 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                 placeholder="Enter schedule name"
               />
             </div>
-            
+
             <div className="config-field">
               <label htmlFor="scheduler-recurrence">Recurrence</label>
               <select
@@ -321,10 +364,10 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                 value={config.recurrence || 'daily'}
                 onChange={(e) => {
                   const recurrence = e.target.value;
-                  
+
                   // Use utility function to generate cron from local time
                   const cronExpression = localTimeToCron(timeInput, recurrence);
-                  
+
                   // Update recurrence, cron (UTC), AND preserve startTime (local)
                   const newConfig = {
                     ...config,
@@ -341,7 +384,7 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                 <option value="monthly">Monthly</option>
               </select>
             </div>
-            
+
             <div className="config-field">
               <label htmlFor="scheduler-time">Time</label>
               <input
@@ -351,11 +394,11 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                 onChange={(e) => {
                   const newTime = e.target.value;
                   setTimeInput(newTime);
-                  
+
                   // Use utility function to generate cron from local time
                   const recurrence = config.recurrence || 'daily';
                   const cronExpression = localTimeToCron(newTime, recurrence);
-                  
+
                   // Update both cronExpression (UTC) and startTime (local for display)
                   const newConfig = {
                     ...config,
@@ -369,21 +412,139 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
             </div>
           </>
         );
-      
+
+      case 'cloudwatchAnalyzer':
+        return (
+          <>
+            <div className="config-field">
+              <label htmlFor="analyzer-name">Analyzer Name</label>
+              <input
+                id="analyzer-name"
+                type="text"
+                value={config.label || ''}
+                onChange={(e) => handleConfigChange('label', e.target.value)}
+                placeholder="Enter analyzer name"
+              />
+            </div>
+
+            <div className="config-field">
+              <label>Log Groups</label>
+              <div className="log-groups-list" style={{ maxHeight: '200px', overflowY: 'auto', marginBottom: '10px' }}>
+                {(config.logGroups || []).map((group, index) => (
+                  <div key={index} className="log-group-item" style={{ display: 'flex', gap: '5px', marginBottom: '5px' }}>
+                    <input
+                      type="text"
+                      value={group}
+                      onChange={(e) => {
+                        const newGroups = [...(config.logGroups || [])];
+                        newGroups[index] = e.target.value;
+                        handleConfigChange('logGroups', newGroups);
+                      }}
+                      placeholder="/aws/lambda/my-function"
+                      style={{ flex: 1 }}
+                    />
+                    <button
+                      className="remove-btn"
+                      onClick={() => {
+                        const newGroups = config.logGroups.filter((_, i) => i !== index);
+                        handleConfigChange('logGroups', newGroups);
+                      }}
+                      style={{
+                        background: '#f44336',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: '4px',
+                        cursor: 'pointer',
+                        padding: '4px 8px'
+                      }}
+                    >✕</button>
+                  </div>
+                ))}
+              </div>
+              <button
+                className="add-btn"
+                onClick={() => handleConfigChange('logGroups', [...(config.logGroups || []), ''])}
+                style={{
+                  background: '#4caf50',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  padding: '8px 16px',
+                  width: '100%'
+                }}
+              >+ Add Log Group</button>
+            </div>
+
+            <div className="config-field">
+              <label htmlFor="analysis-type">Analysis Type</label>
+              <select
+                id="analysis-type"
+                value={config.analysisType || 'error-patterns'}
+                onChange={(e) => handleConfigChange('analysisType', e.target.value)}
+              >
+                <option value="error-patterns">Error Patterns</option>
+                <option value="activity-summary">Activity Summary</option>
+                <option value="anomaly-detection">Anomaly Detection</option>
+                <option value="correlation">Cross-Group Correlation</option>
+              </select>
+            </div>
+
+            <div className="config-field">
+              <label htmlFor="time-range">Time Range</label>
+              <select
+                id="time-range"
+                value={config.timeRange || '1h'}
+                onChange={(e) => handleConfigChange('timeRange', e.target.value)}
+              >
+                <option value="15m">Last 15 minutes</option>
+                <option value="1h">Last 1 hour</option>
+                <option value="6h">Last 6 hours</option>
+                <option value="24h">Last 24 hours</option>
+                <option value="7d">Last 7 days</option>
+              </select>
+            </div>
+
+            <div className="config-field">
+              <label htmlFor="error-threshold">Error Threshold</label>
+              <input
+                id="error-threshold"
+                type="number"
+                value={config.errorThreshold || 10}
+                onChange={(e) => handleConfigChange('errorThreshold', parseInt(e.target.value))}
+                placeholder="10"
+                min="1"
+              />
+              <small style={{ color: '#666', fontSize: '11px' }}>Alert if error count exceeds this value</small>
+            </div>
+
+            <div className="config-field">
+              <label className="checkbox-label" style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={config.enableAlerts || false}
+                  onChange={(e) => handleConfigChange('enableAlerts', e.target.checked)}
+                />
+                Enable Alerts
+              </label>
+            </div>
+          </>
+        );
+
       default:
         return <div>No configuration available for this node type.</div>;
     }
   };
 
   return (
-    <div 
-      className="config-panel-overlay" 
+    <div
+      className="config-panel-overlay"
       onClick={onClose}
       onKeyDown={(e) => e.key === 'Escape' && onClose()}
       tabIndex={-1}
       aria-hidden="true"
     >
-      <div 
+      <div
         className="config-panel"
         onClick={(e) => e.stopPropagation()}
         onKeyDown={handleKeyDown}
