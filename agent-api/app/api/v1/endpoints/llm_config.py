@@ -1,6 +1,6 @@
 """LLM Configuration API routes."""
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel, Field
 import json
@@ -13,6 +13,46 @@ logger = logging.getLogger(__name__)
 def get_llm_config_path() -> Path:
     """Get the path to the LLM config file."""
     return Path("data") / "config" / "llm-config.json"
+
+
+# AWS Bedrock available models
+BEDROCK_MODELS = {
+    "claude-3-sonnet": {
+        "provider": "AWS Bedrock",
+        "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+        "icon": "🤖",
+        "description": "Claude 3 Sonnet - Balanced performance",
+        "region": "us-east-1"
+    },
+    "claude-3-haiku": {
+        "provider": "AWS Bedrock",
+        "model": "anthropic.claude-3-haiku-20240307-v1:0",
+        "icon": "⚡",
+        "description": "Claude 3 Haiku - Fast and efficient",
+        "region": "us-east-1"
+    },
+    "claude-3-opus": {
+        "provider": "AWS Bedrock",
+        "model": "anthropic.claude-3-opus-20240229-v1:0",
+        "icon": "🧠",
+        "description": "Claude 3 Opus - Most capable",
+        "region": "us-east-1"
+    },
+    "titan-text": {
+        "provider": "AWS Bedrock",
+        "model": "amazon.titan-text-express-v1",
+        "icon": "📝",
+        "description": "Amazon Titan Text Express",
+        "region": "us-east-1"
+    },
+    "llama-3": {
+        "provider": "AWS Bedrock",
+        "model": "meta.llama3-70b-instruct-v1:0",
+        "icon": "🦙",
+        "description": "Llama 3 70B Instruct",
+        "region": "us-east-1"
+    }
+}
 
 
 class LLMProviderConfig(BaseModel):
@@ -87,6 +127,16 @@ async def save_llm_config(config: Dict[str, Any]) -> Dict[str, Any]:
         json.dump(config, f, indent=2)
     
     return config
+
+
+@router.get("/bedrock-models", response_model=Dict[str, Any])
+async def get_bedrock_models():
+    """Get available AWS Bedrock models.
+    
+    Returns:
+        Dictionary of available Bedrock models
+    """
+    return {"models": BEDROCK_MODELS}
 
 
 def mask_api_key(api_key: str) -> str:

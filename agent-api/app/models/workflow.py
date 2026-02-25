@@ -2,7 +2,7 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union, Literal
 from enum import Enum
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 
 
 class TaskType(str, Enum):
@@ -30,6 +30,8 @@ class WorkflowStatus(str, Enum):
 
 class Task(BaseModel):
     """Individual task within a workflow."""
+    model_config = ConfigDict(use_enum_values=True)
+    
     name: str = Field(..., description="Unique task name")
     type: TaskType = Field(..., description="Task type (shell or python)")
     command: Optional[str] = Field(None, description="Shell command to execute")
@@ -47,16 +49,15 @@ class Task(BaseModel):
             raise ValueError("Python tasks require a 'script' field")
         return self
 
-    class Config:
-        use_enum_values = True
-
 
 class Workflow(BaseModel):
     """Workflow definition - all workflows configured via UI with nodes and edges."""
-    id: Optional[str] = Field(None, description="Unique workflow ID")
+    model_config = ConfigDict(use_enum_values=True, extra="allow")
+    
+    id: Optional[Union[str, int]] = Field(None, description="Unique workflow ID")
     name: str = Field(..., description="Unique workflow name")
     description: str = Field("", description="Workflow description")
-    type: Literal["workflow"] = Field("workflow", description="Workflow type")
+    type: Optional[Literal["workflow"]] = Field("workflow", description="Workflow type")
     schedule: Optional[str] = Field(None, description="Cron expression for scheduling")
     enabled: bool = Field(True, description="Whether the workflow is enabled")
     
@@ -65,7 +66,7 @@ class Workflow(BaseModel):
     edges: Optional[List[Dict[str, Any]]] = Field(None, description="Workflow edges")
     
     # Legacy fields (for compatibility) - accept any task structure
-    tasks: Optional[List[Dict[str, Any]]] = Field(None, description="Legacy tasks field")
+    tasks: Optional[List[Dict[str, Any]]] = Field(None, description="Legacy tasks field (deprecated)")
     max_retries: int = Field(0, description="Max workflow retries on failure")
     timeout: int = Field(3600, description="Workflow timeout in seconds")
     
@@ -102,13 +103,11 @@ class Workflow(BaseModel):
             raise ValueError("Workflows must have at least one node or task")
         return self
 
-    class Config:
-        use_enum_values = True
-        extra = "allow"  # Allow additional fields
-
 
 class TaskResult(BaseModel):
     """Result of a task execution."""
+    model_config = ConfigDict(use_enum_values=True)
+    
     task_name: str
     status: TaskStatus
     output: Optional[str] = None
@@ -117,12 +116,11 @@ class TaskResult(BaseModel):
     end_time: Optional[datetime] = None
     duration_seconds: Optional[float] = None
 
-    class Config:
-        use_enum_values = True
-
 
 class WorkflowExecution(BaseModel):
     """Workflow execution record."""
+    model_config = ConfigDict(use_enum_values=True)
+    
     workflow_name: str
     execution_id: str
     status: WorkflowStatus
@@ -132,24 +130,22 @@ class WorkflowExecution(BaseModel):
     task_results: List[TaskResult] = []
     error: Optional[str] = None
 
-    class Config:
-        use_enum_values = True
-
 
 class WorkflowExecutionEvent(BaseModel):
     """Real-time execution event for SSE streaming."""
+    model_config = ConfigDict(use_enum_values=True)
+    
     event_type: str = Field(..., description="Event type: workflow_start, task_start, task_complete, workflow_complete")
     workflow_name: str
     execution_id: str
     timestamp: datetime
     data: Dict[str, Any] = Field(default_factory=dict)
 
-    class Config:
-        use_enum_values = True
-
 
 class WorkflowCreate(BaseModel):
     """Request model for creating a workflow."""
+    model_config = ConfigDict(extra="allow")
+    
     id: Optional[str] = None
     name: str
     description: str = ""
@@ -168,14 +164,13 @@ class WorkflowCreate(BaseModel):
     
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
-    
-    class Config:
-        extra = "allow"
 
 
 class WorkflowUpdate(BaseModel):
     """Request model for updating a workflow."""
-    id: Optional[str] = None
+    model_config = ConfigDict(extra="allow")
+    
+    id: Optional[Union[str, int]] = None
     name: Optional[str] = None
     description: Optional[str] = None
     type: Optional[Literal["workflow"]] = None
@@ -188,19 +183,18 @@ class WorkflowUpdate(BaseModel):
     timeout: Optional[int] = None
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
-    
-    class Config:
-        extra = "allow"
 
 
 class WorkflowResponse(BaseModel):
     """Response model for workflow details."""
-    id: Optional[str] = None
+    model_config = ConfigDict(extra="allow")
+    
+    id: Optional[Union[str, int]] = None
     name: str
-    description: str
-    type: Literal["workflow"]
+    description: str = ""
+    type: Optional[Literal["workflow"]] = "workflow"
     schedule: Optional[str] = None
-    enabled: bool
+    enabled: bool = True
     
     # Workflow structure
     nodes: Optional[List[Dict[str, Any]]] = None
@@ -215,9 +209,6 @@ class WorkflowResponse(BaseModel):
     updated_at: Optional[datetime] = None
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
-    
-    class Config:
-        extra = "allow"
 
 
 class HealthResponse(BaseModel):

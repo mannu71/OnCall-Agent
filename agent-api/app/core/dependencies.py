@@ -1,10 +1,8 @@
 """Dependency injection container and factory functions."""
 from functools import lru_cache
 from typing import Optional
-from pathlib import Path
 
 from app.repositories import WorkflowRepository, ExecutionRepository
-from app.config import settings
 
 
 class DependencyContainer:
@@ -22,8 +20,7 @@ class DependencyContainer:
             WorkflowRepository instance
         """
         if self._workflow_repo is None:
-            storage_path = Path(settings.storage_path) / "workflows"
-            self._workflow_repo = WorkflowRepository(storage_path=storage_path)
+            self._workflow_repo = WorkflowRepository()
         return self._workflow_repo
     
     def get_execution_repository(self) -> ExecutionRepository:

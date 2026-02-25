@@ -1,6 +1,26 @@
 version: '3.8'
 
 services:
+  # PostgreSQL with pgvector extension
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: kyc-agent-db
+    environment:
+      POSTGRES_USER: kycuser
+      POSTGRES_PASSWORD: kycpassword
+      POSTGRES_DB: kycagent
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U kycuser -d kycagent" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Agent API Service
   agent-api:
     build:
       context: .
@@ -18,10 +38,16 @@ services:
       - SCHEDULER_TIMEZONE=UTC
       - MAX_CONCURRENT_WORKFLOWS=5
       - LOG_LEVEL=INFO
+      # AWS Configuration for Bedrock
+      # - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      # Database Configuration
+      - DATABASE_URL=postgresql://kycuser:kycpassword@postgres:5432/kycagent
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+
+volumes:
+  postgres_data:

@@ -69,7 +69,7 @@ export const nodeConfigurations = {
     }
   },
 
-  // LLM
+  // LLM (AWS Bedrock)
   llm: {
     icon: '🧠',
     title: 'LLM',
@@ -77,8 +77,14 @@ export const nodeConfigurations = {
     defaultLabel: 'Language Model',
     handles: [baseHandles.sourceLeft('llm-output', '#4285f4')],
     getStatus: (data) => {
-      if (data?.processing) return { text: `Processing (${data?.model || 'LLM'})...`, class: 'processing' };
+      if (data?.processing) return { text: `Processing (${data?.model || 'Bedrock'})...`, class: 'processing' };
       return { text: data?.status || 'Ready', class: 'ready' };
+    },
+    getExtra: (data) => {
+      if (data?.provider === 'AWS Bedrock') {
+        return { text: '☁️ AWS Bedrock', class: 'provider' };
+      }
+      return null;
     }
   },
 

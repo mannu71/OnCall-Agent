@@ -139,31 +139,6 @@ def _validate_orchestrator_nodes(workflow_dict: Dict[str, Any]) -> None:
         )
 
 
-async def _extract_and_save_sql_files(workflow_name: str, workflow_dict: Dict[str, Any], workflow_repo: WorkflowRepository) -> None:
-    """Extract SQL files from orchestrator nodes and save them to disk.
-    
-    Args:
-        workflow_name: Name of the workflow
-        workflow_dict: Workflow dictionary with nodes
-        workflow_repo: Workflow repository instance
-    """
-    nodes = workflow_dict.get('nodes', [])
-    for node in nodes:
-        if node.get('type') == 'orchestrator':
-            node_data = node.get('data', {})
-            file_content = node_data.get('fileContent')
-            file_name = node_data.get('fileName')
-            
-            if file_content and file_name:
-                logger.info(f"Saving SQL file '{file_name}' for workflow '{workflow_name}'")
-                await workflow_repo.save_sql_file(workflow_name, file_name, file_content)
-                
-                # Remove fileContent from node data (keep fileName reference)
-                del node_data['fileContent']
-                # Remove pendingUpload flag if present
-                node_data.pop('pendingUpload', None)
-
-
 @router.get("", response_model=List[WorkflowResponse])
 async def list_workflows(
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
@@ -204,9 +179,6 @@ async def create_workflow(
     
     # Validate orchestrator nodes have SQL files
     _validate_orchestrator_nodes(workflow_dict)
-    
-    # Extract and save SQL files from orchestrator nodes
-    await _extract_and_save_sql_files(workflow_data.name, workflow_dict, workflow_repo)
     
     # Sync scheduler node and fields
     _sync_scheduler_node(workflow_dict)

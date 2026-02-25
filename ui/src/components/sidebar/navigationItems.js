@@ -6,7 +6,8 @@ import {
   Settings,
   Analytics,
   Phone,
-  Chat
+  Chat,
+  Visibility
 } from '@mui/icons-material';
 
 // Check if we're in development mode
@@ -24,6 +25,12 @@ export const navigationItems = [
     title: 'Scheduler',
     path: '/scheduler',
     icon: Schedule,
+  },
+  {
+    id: 'log-watch',
+    title: 'Log Watch',
+    path: '/log-watch',
+    icon: Visibility,
   },
   {
     id: 'chat',

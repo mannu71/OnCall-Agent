@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 # Node types that contain only connection metadata (excluded from sanitized output)
 _TOOL_NODE_KEYS = {'server_id', 'tool_data'}
 
-class WorkflowExecutionEvent:
-    """Represents an execution event."""
+
+class _ExecutionEvent:
+    """Internal execution event for SSE streaming."""
     def __init__(self, event_type: str, data: Dict[str, Any]):
         self.event_type = event_type
         self.data = data
@@ -95,7 +96,7 @@ class VisualWorkflowExecutor:
     
     async def _publish_event(self, execution_id: str, event_type: str, data: Dict[str, Any]):
         """Publish an event to all subscribers."""
-        event = WorkflowExecutionEvent(event_type, data)
+        event = _ExecutionEvent(event_type, data)
         
         # Store in execution state
         if execution_id in self.active_executions:
@@ -482,8 +483,8 @@ class VisualWorkflowExecutor:
     
     async def _execute_agent_node(self, node: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         """Execute agent node."""
-        # Simulate agent work
-        await asyncio.sleep(2)
+        # Agent nodes are processed by the orchestrator - this is a pass-through
+        logger.debug(f"Agent node executed: {node.get('id')}")
         
         return {
             "status": "success",
@@ -565,6 +566,8 @@ class VisualWorkflowExecutor:
             mcp_manager = self.mcp_managers.pop(execution_id)
             try:
                 await mcp_manager.disconnect_all()
+            except asyncio.CancelledError:
+                logger.warning(f"MCP cleanup cancelled for {execution_id}")
             except Exception as e:
                 logger.warning(f"Error during MCP cleanup of {execution_id}: {e}")
         

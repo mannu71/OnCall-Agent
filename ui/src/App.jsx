@@ -8,6 +8,7 @@ import Sidebar from './components/sidebar/Sidebar';
 import Dashboard from './pages/Dashboard';
 import Scheduler from './pages/Scheduler';
 import Settings from './pages/Settings';
+import LogWatchConfig from './components/logwatch/LogWatchConfig';
 import './App.css';
 
 // Lazy load heavy components
@@ -104,6 +105,7 @@ const AppRoutes = () => {
             <Route path="/" element={<Dashboard />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/scheduler" element={<Scheduler />} />
+            <Route path="/log-watch" element={<LogWatchConfig />} />
             {isDevelopment && <Route path="/chat" element={<Chat />} />}
             <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
             <Route path="/workflow" element={<Workflow />} />

@@ -1,0 +1,606 @@
+"""Knowledge base service for RAG-based log analysis.
+
+This service provides vector similarity search for log patterns, known issues,
+and baseline metrics using pgvector.
+"""
+import logging
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any, Tuple
+import json
+
+from sqlalchemy import select, delete
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import sessionmaker
+
+from app.core.database import AsyncSessionLocal
+from app.models.db_models import (
+    LogPatternModel,
+    KnownIssueModel,
+    BaselineMetricModel,
+    AnalysisHistoryModel
+)
+
+logger = logging.getLogger(__name__)
+
+
+class EmbeddingService:
+    """Service for generating embeddings using AWS Bedrock."""
+    
+    def __init__(self, region: str = "us-east-1"):
+        """Initialize embedding service.
+        
+        Args:
+            region: AWS region for Bedrock
+        """
+        self.region = region
+        self._client = None
+    
+    @property
+    def client(self):
+        """Get Bedrock client (lazy initialization)."""
+        if self._client is None:
+            import boto3
+            self._client = boto3.client('bedrock-runtime', region_name=self.region)
+        return self._client
+    
+    async def generate_embedding(self, text: str) -> List[float]:
+        """Generate embedding for text using Amazon Titan.
+        
+        Args:
+            text: Text to embed
+            
+        Returns:
+            Embedding vector (1536 dimensions for Titan)
+        """
+        import asyncio
+        
+        # Truncate text if too long
+        max_tokens = 8000
+        if len(text) > max_tokens:
+            text = text[:max_tokens]
+        
+        # Call Bedrock API
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: self.client.invoke_model(
+                modelId='amazon.titan-embed-text-v1',
+                body=json.dumps({'inputText': text})
+            )
+        )
+        
+        result = json.loads(response['body'].read())
+        return result.get('embedding', [])
+    
+    async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings for multiple texts.
+        
+        Args:
+            texts: List of texts to embed
+            
+        Returns:
+            List of embedding vectors
+        """
+        embeddings = []
+        for text in texts:
+            embedding = await self.generate_embedding(text)
+            embeddings.append(embedding)
+        return embeddings
+
+
+class KnowledgeBaseService:
+    """Service for knowledge base operations using pgvector."""
+    
+    def __init__(self, embedding_service: Optional[EmbeddingService] = None):
+        """Initialize knowledge base service.
+        
+        Args:
+            embedding_service: Embedding service for vector generation
+        """
+        self.embedding_service = embedding_service or EmbeddingService()
+    
+    # ============================================
+    # LOG PATTERN OPERATIONS
+    # ============================================
+    
+    async def add_log_pattern(
+        self,
+        name: str,
+        pattern: str,
+        pattern_type: str,
+        severity: int = 1,
+        description: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Add a log pattern to the knowledge base.
+        
+        Args:
+            name: Pattern name
+            pattern: Pattern regex or text
+            pattern_type: Type of pattern (error, warning, info, custom)
+            severity: Severity level (1-5, 5 being most severe)
+            description: Pattern description
+            
+        Returns:
+            Created pattern
+        """
+        # Generate embedding for pattern
+        embedding = await self.embedding_service.generate_embedding(f"{name} {pattern} {description or ''}")
+        
+        async with AsyncSessionLocal() as session:
+            pattern_model = LogPatternModel(
+                name=name,
+                pattern=pattern,
+                pattern_type=pattern_type,
+                severity=severity,
+                description=description,
+                embedding=embedding,
+                created_at=datetime.now(timezone.utc)
+            )
+            session.add(pattern_model)
+            await session.commit()
+            await session.refresh(pattern_model)
+            
+            return {
+                "id": pattern_model.id,
+                "name": pattern_model.name,
+                "pattern": pattern_model.pattern,
+                "pattern_type": pattern_model.pattern_type,
+                "severity": pattern_model.severity
+            }
+    
+    async def search_similar_patterns(
+        self,
+        query: str,
+        limit: int = 10,
+        threshold: float = 0.7
+    ) -> List[Dict[str, Any]]:
+        """Search for similar log patterns using vector similarity.
+        
+        Args:
+            query: Query text to match
+            limit: Maximum results
+            threshold: Similarity threshold (0-1)
+            
+        Returns:
+            List of similar patterns with similarity scores
+        """
+        # Generate embedding for query
+        query_embedding = await self.embedding_service.generate_embedding(query)
+        
+        async with AsyncSessionLocal() as session:
+            # Use pgvector cosine similarity search
+            # Note: This requires the pgvector extension
+            from sqlalchemy import text
+            
+            query_str = """
+                SELECT id, name, pattern, pattern_type, severity, description,
+                       1 - (embedding <=> :embedding::vector) as similarity
+                FROM log_patterns
+                WHERE 1 - (embedding <=> :embedding::vector) > :threshold
+                ORDER BY similarity DESC
+                LIMIT :limit
+            """
+            
+            result = await session.execute(
+                text(query_str),
+                {
+                    "embedding": str(query_embedding),
+                    "threshold": threshold,
+                    "limit": limit
+                }
+            )
+            
+            patterns = []
+            for row in result:
+                patterns.append({
+                    "id": row.id,
+                    "name": row.name,
+                    "pattern": row.pattern,
+                    "pattern_type": row.pattern_type,
+                    "severity": row.severity,
+                    "description": row.description,
+                    "similarity": float(row.similarity) if row.similarity else 0.0
+                })
+            
+            return patterns
+    
+    async def list_log_patterns(
+        self,
+        pattern_type: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """List all log patterns.
+        
+        Args:
+            pattern_type: Filter by type
+            limit: Maximum results
+            
+        Returns:
+            List of patterns
+        """
+        async with AsyncSessionLocal() as session:
+            query = select(LogPatternModel).limit(limit)
+            if pattern_type:
+                query = query.where(LogPatternModel.pattern_type == pattern_type)
+            
+            result = await session.execute(query)
+            patterns = result.scalars().all()
+            
+            return [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "pattern": p.pattern,
+                    "pattern_type": p.pattern_type,
+                    "severity": p.severity,
+                    "description": p.description
+                }
+                for p in patterns
+            ]
+    
+    # ============================================
+    # KNOWN ISSUE OPERATIONS
+    # ============================================
+    
+    async def add_known_issue(
+        self,
+        title: str,
+        description: str,
+        symptoms: List[str],
+        solution: str,
+        category: str
+    ) -> Dict[str, Any]:
+        """Add a known issue to the knowledge base.
+        
+        Args:
+            title: Issue title
+            description: Detailed description
+            symptoms: List of symptoms/signatures
+            solution: Resolution steps
+            category: Issue category
+            
+        Returns:
+            Created known issue
+        """
+        # Generate embedding from combined text
+        combined_text = f"{title} {description} {' '.join(symptoms)}"
+        embedding = await self.embedding_service.generate_embedding(combined_text)
+        
+        async with AsyncSessionLocal() as session:
+            issue_model = KnownIssueModel(
+                title=title,
+                description=description,
+                symptoms=symptoms,
+                solution=solution,
+                category=category,
+                embedding=embedding,
+                created_at=datetime.now(timezone.utc)
+            )
+            session.add(issue_model)
+            await session.commit()
+            await session.refresh(issue_model)
+            
+            return {
+                "id": issue_model.id,
+                "title": issue_model.title,
+                "category": issue_model.category
+            }
+    
+    async def search_known_issues(
+        self,
+        query: str,
+        category: Optional[str] = None,
+        limit: int = 10,
+        threshold: float = 0.7
+    ) -> List[Dict[str, Any]]:
+        """Search for known issues using vector similarity.
+        
+        Args:
+            query: Query text (e.g., error message)
+            category: Filter by category
+            limit: Maximum results
+            threshold: Similarity threshold
+            
+        Returns:
+            List of matching known issues
+        """
+        query_embedding = await self.embedding_service.generate_embedding(query)
+        
+        async with AsyncSessionLocal() as session:
+            from sqlalchemy import text
+            
+            category_filter = ""
+            params = {
+                "embedding": str(query_embedding),
+                "threshold": threshold,
+                "limit": limit
+            }
+            
+            if category:
+                category_filter = "AND category = :category"
+                params["category"] = category
+            
+            query_str = f"""
+                SELECT id, title, description, symptoms, solution, category,
+                       1 - (embedding <=> :embedding::vector) as similarity
+                FROM known_issues
+                WHERE 1 - (embedding <=> :embedding::vector) > :threshold
+                {category_filter}
+                ORDER BY similarity DESC
+                LIMIT :limit
+            """
+            
+            result = await session.execute(text(query_str), params)
+            
+            issues = []
+            for row in result:
+                issues.append({
+                    "id": row.id,
+                    "title": row.title,
+                    "description": row.description,
+                    "symptoms": row.symptoms,
+                    "solution": row.solution,
+                    "category": row.category,
+                    "similarity": float(row.similarity) if row.similarity else 0.0
+                })
+            
+            return issues
+    
+    # ============================================
+    # BASELINE METRIC OPERATIONS
+    # ============================================
+    
+    async def set_baseline_metric(
+        self,
+        metric_name: str,
+        log_group: str,
+        normal_range_min: float,
+        normal_range_max: float,
+        threshold_warning: float,
+        threshold_critical: float,
+        time_window: str = "5m"
+    ) -> Dict[str, Any]:
+        """Set or update a baseline metric.
+        
+        Args:
+            metric_name: Name of the metric
+            log_group: Associated log group
+            normal_range_min: Minimum normal value
+            normal_range_max: Maximum normal value
+            threshold_warning: Warning threshold
+            threshold_critical: Critical threshold
+            time_window: Time window for the metric
+            
+        Returns:
+            Created/updated baseline metric
+        """
+        async with AsyncSessionLocal() as session:
+            # Check if exists
+            result = await session.execute(
+                select(BaselineMetricModel).where(
+                    BaselineMetricModel.metric_name == metric_name,
+                    BaselineMetricModel.log_group == log_group
+                )
+            )
+            existing = result.scalar_one_or_none()
+            
+            if existing:
+                existing.normal_range_min = normal_range_min
+                existing.normal_range_max = normal_range_max
+                existing.threshold_warning = threshold_warning
+                existing.threshold_critical = threshold_critical
+                existing.time_window = time_window
+                existing.updated_at = datetime.now(timezone.utc)
+                await session.commit()
+                await session.refresh(existing)
+                return {"id": existing.id, "metric_name": existing.metric_name}
+            else:
+                metric = BaselineMetricModel(
+                    metric_name=metric_name,
+                    log_group=log_group,
+                    normal_range_min=normal_range_min,
+                    normal_range_max=normal_range_max,
+                    threshold_warning=threshold_warning,
+                    threshold_critical=threshold_critical,
+                    time_window=time_window,
+                    created_at=datetime.now(timezone.utc)
+                )
+                session.add(metric)
+                await session.commit()
+                await session.refresh(metric)
+                return {"id": metric.id, "metric_name": metric.metric_name}
+    
+    async def get_baseline_metrics(
+        self,
+        log_group: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Get baseline metrics.
+        
+        Args:
+            log_group: Filter by log group
+            
+        Returns:
+            List of baseline metrics
+        """
+        async with AsyncSessionLocal() as session:
+            query = select(BaselineMetricModel)
+            if log_group:
+                query = query.where(BaselineMetricModel.log_group == log_group)
+            
+            result = await session.execute(query)
+            metrics = result.scalars().all()
+            
+            return [
+                {
+                    "id": m.id,
+                    "metric_name": m.metric_name,
+                    "log_group": m.log_group,
+                    "normal_range": {
+                        "min": m.normal_range_min,
+                        "max": m.normal_range_max
+                    },
+                    "thresholds": {
+                        "warning": m.threshold_warning,
+                        "critical": m.threshold_critical
+                    },
+                    "time_window": m.time_window
+                }
+                for m in metrics
+            ]
+    
+    async def check_metric_anomaly(
+        self,
+        metric_name: str,
+        log_group: str,
+        current_value: float
+    ) -> Dict[str, Any]:
+        """Check if a metric value is anomalous.
+        
+        Args:
+            metric_name: Name of the metric
+            log_group: Log group
+            current_value: Current metric value
+            
+        Returns:
+            Anomaly check result
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(BaselineMetricModel).where(
+                    BaselineMetricModel.metric_name == metric_name,
+                    BaselineMetricModel.log_group == log_group
+                )
+            )
+            metric = result.scalar_one_or_none()
+            
+            if not metric:
+                return {
+                    "anomaly": False,
+                    "reason": "No baseline found"
+                }
+            
+            is_anomaly = False
+            severity = "normal"
+            
+            if current_value >= metric.threshold_critical:
+                is_anomaly = True
+                severity = "critical"
+            elif current_value >= metric.threshold_warning:
+                is_anomaly = True
+                severity = "warning"
+            elif current_value < metric.normal_range_min or current_value > metric.normal_range_max:
+                is_anomaly = True
+                severity = "low"
+            
+            return {
+                "anomaly": is_anomaly,
+                "severity": severity,
+                "current_value": current_value,
+                "baseline": {
+                    "normal_range": {
+                        "min": metric.normal_range_min,
+                        "max": metric.normal_range_max
+                    },
+                    "thresholds": {
+                        "warning": metric.threshold_warning,
+                        "critical": metric.threshold_critical
+                    }
+                }
+            }
+    
+    # ============================================
+    # ANALYSIS HISTORY OPERATIONS
+    # ============================================
+    
+    async def record_analysis(
+        self,
+        log_group: str,
+        analysis_type: str,
+        start_time: datetime,
+        end_time: datetime,
+        summary: str,
+        anomalies_found: int = 0,
+        patterns_matched: int = 0
+    ) -> Dict[str, Any]:
+        """Record an analysis for historical tracking.
+        
+        Args:
+            log_group: Analyzed log group
+            analysis_type: Type of analysis
+            start_time: Analysis start time
+            end_time: Analysis end time
+            summary: Analysis summary
+            anomalies_found: Number of anomalies found
+            patterns_matched: Number of patterns matched
+            
+        Returns:
+            Created analysis record
+        """
+        async with AsyncSessionLocal() as session:
+            analysis = AnalysisHistoryModel(
+                log_group=log_group,
+                analysis_type=analysis_type,
+                start_time=start_time,
+                end_time=end_time,
+                summary=summary,
+                anomalies_found=anomalies_found,
+                patterns_matched=patterns_matched,
+                created_at=datetime.now(timezone.utc)
+            )
+            session.add(analysis)
+            await session.commit()
+            await session.refresh(analysis)
+            
+            return {
+                "id": analysis.id,
+                "log_group": analysis.log_group,
+                "analysis_type": analysis.analysis_type
+            }
+    
+    async def get_analysis_history(
+        self,
+        log_group: Optional[str] = None,
+        analysis_type: Optional[str] = None,
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Get analysis history.
+        
+        Args:
+            log_group: Filter by log group
+            analysis_type: Filter by analysis type
+            limit: Maximum results
+            
+        Returns:
+            List of analysis records
+        """
+        async with AsyncSessionLocal() as session:
+            query = select(AnalysisHistoryModel).order_by(
+                AnalysisHistoryModel.created_at.desc()
+            ).limit(limit)
+            
+            if log_group:
+                query = query.where(AnalysisHistoryModel.log_group == log_group)
+            if analysis_type:
+                query = query.where(AnalysisHistoryModel.analysis_type == analysis_type)
+            
+            result = await session.execute(query)
+            analyses = result.scalars().all()
+            
+            return [
+                {
+                    "id": a.id,
+                    "log_group": a.log_group,
+                    "analysis_type": a.analysis_type,
+                    "start_time": a.start_time.isoformat() if a.start_time else None,
+                    "end_time": a.end_time.isoformat() if a.end_time else None,
+                    "summary": a.summary,
+                    "anomalies_found": a.anomalies_found,
+                    "patterns_matched": a.patterns_matched,
+                    "created_at": a.created_at.isoformat() if a.created_at else None
+                }
+                for a in analyses
+            ]
+
+
+# Singleton instances
+embedding_service = EmbeddingService()
+knowledge_base = KnowledgeBaseService(embedding_service)

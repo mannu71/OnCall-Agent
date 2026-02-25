@@ -141,7 +141,7 @@ export const nodeCategories = {
   ai: ["llm"],
   data: ["database"],
   communication: ["teams", "chat", "output"],
-  tools: ["tool", "cloudwatchAnalyzer"],
+  tools: ["cloudwatchAnalyzer"],
   memory: ["memory"],
   workflow: ["orchestrator"],
   scheduling: ["scheduler"]

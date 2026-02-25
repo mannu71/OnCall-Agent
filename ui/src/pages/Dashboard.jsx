@@ -89,27 +89,34 @@ export default function Dashboard() {
 
   const tableContent = useMemo(() => {
     if (loading && executions.length === 0) {
-      return <TableRow><TableCell colSpan={6} align="center">Loading...</TableCell></TableRow>;
+      return <TableRow key="loading"><TableCell colSpan={6} align="center">Loading...</TableCell></TableRow>;
     }
     if (executions.length === 0) {
-      return <TableRow><TableCell colSpan={6} align="center">No recent activity</TableCell></TableRow>;
+      return <TableRow key="empty"><TableCell colSpan={6} align="center">No recent activity</TableCell></TableRow>;
     }
     return paginatedRuns.map((run) => (
-      <TableRow key={run.execution_id} hover>
+      <TableRow key={run.execution_id || run.id} hover>
         <TableCell sx={{ textTransform: 'capitalize', fontWeight: 500, maxWidth: { xs: 120, sm: 200 }, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{run.workflow_name.replaceAll('-', ' ')}</TableCell>
         <TableCell sx={{ whiteSpace: 'nowrap', display: { xs: 'none', sm: 'table-cell' } }}>{formatDate(run.start_time)}</TableCell>
         <TableCell sx={{ display: { xs: 'none', md: 'table-cell' } }}>{run.duration ? `${run.duration.toFixed(1)}s` : '-'}</TableCell>
         <TableCell>
-          {run.output ? (
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-              <Typography variant="body2" sx={{ fontWeight: 600, color: 'primary.main' }}>
-                {run.output.queries_executed || 0}
-              </Typography>
-              {run.output.failures > 0 && (
-                <Chip label={`${run.output.failures} failed`} size="small" color="error" sx={{ height: 20, fontSize: '0.7rem' }} />
-              )}
-            </Box>
-          ) : '-'}
+          {run.output ? (() => {
+            // Find orchestrator node in output
+            const orchestratorKey = Object.keys(run.output).find(k => k.startsWith('orchestrator'));
+            const orchestrator = orchestratorKey ? run.output[orchestratorKey] : null;
+            const queriesExecuted = orchestrator?.queries_executed || run.output.queries_executed || 0;
+            const failures = orchestrator?.failures || run.output.failures || 0;
+            return (
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                <Typography variant="body2" sx={{ fontWeight: 600, color: 'primary.main' }}>
+                  {queriesExecuted}
+                </Typography>
+                {failures > 0 && (
+                  <Chip label={`${failures} failed`} size="small" color="error" sx={{ height: 20, fontSize: '0.7rem' }} />
+                )}
+              </Box>
+            );
+          })() : '-'}
         </TableCell>
         <TableCell>
           <Chip label={run.status} size="small" color={STATUS_COLOR[run.status] || 'warning'} sx={{ fontWeight: 600, textTransform: 'capitalize' }} />
@@ -209,95 +216,104 @@ export default function Dashboard() {
       <Dialog open={Boolean(selectedRun)} onClose={() => setSelectedRun(null)} maxWidth="lg" fullWidth>
         <DialogTitle>Execution Details: {selectedRun?.workflow_name}</DialogTitle>
         <DialogContent dividers>
-          {selectedRun && (
-            <Box>
-              <Box sx={{ mb: 3, p: 2, bgcolor: 'action.hover', borderRadius: 1 }}>
-                <Grid container spacing={2} columns={6}>
-                  <Grid size={2}>
-                    <Typography variant="caption" color="text.secondary">Execution ID</Typography>
-                    <Typography variant="body2" sx={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>
-                      {selectedRun.execution_id}
-                    </Typography>
-                  </Grid>
-                  <Grid size={1}>
-                    <Typography variant="caption" color="text.secondary">Duration</Typography>
-                    <Typography variant="body2">{selectedRun.duration?.toFixed(2)}s</Typography>
-                  </Grid>
-                  <Grid size={1}>
-                    <Typography variant="caption" color="text.secondary">Nodes Executed</Typography>
-                    <Typography variant="body2">{selectedRun.nodes_executed || 0}</Typography>
-                  </Grid>
-                  {selectedRun.output && (
-                    <>
-                      <Grid size={1}>
-                        <Typography variant="caption" color="text.secondary">Queries</Typography>
-                        <Typography variant="body2" sx={{ fontWeight: 600, color: 'primary.main' }}>
-                          {selectedRun.output.queries_executed || 0}
-                        </Typography>
-                      </Grid>
-                      <Grid size={1}>
-                        <Typography variant="caption" color="text.secondary">Failures</Typography>
-                        <Typography variant="body2" sx={{ fontWeight: 600, color: selectedRun.output.failures > 0 ? 'error.main' : 'success.main' }}>
-                          {selectedRun.output.failures || 0}
-                        </Typography>
-                      </Grid>
-                    </>
-                  )}
-                  {selectedRun.output && (
-                    <Grid size={6}>
-                      <Typography variant="caption" color="text.secondary">Success Rate</Typography>
-                      <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                        {selectedRun.output.queries_executed > 0
-                          ? `${(((selectedRun.output.queries_executed - selectedRun.output.failures) / selectedRun.output.queries_executed) * 100).toFixed(1)}%`
-                          : 'N/A'}
+          {selectedRun && (() => {
+            // Find orchestrator node in output
+            const orchestratorKey = Object.keys(selectedRun.output || {}).find(k => k.startsWith('orchestrator'));
+            const orchestrator = orchestratorKey ? selectedRun.output[orchestratorKey] : null;
+            const queriesExecuted = orchestrator?.queries_executed || selectedRun.output?.queries_executed || 0;
+            const failures = orchestrator?.failures || selectedRun.output?.failures || 0;
+            const results = orchestrator?.results || selectedRun.output?.results || [];
+
+            return (
+              <Box>
+                <Box sx={{ mb: 3, p: 2, bgcolor: 'action.hover', borderRadius: 1 }}>
+                  <Grid container spacing={2} columns={6}>
+                    <Grid size={2}>
+                      <Typography variant="caption" color="text.secondary">Execution ID</Typography>
+                      <Typography variant="body2" sx={{ fontFamily: 'monospace', fontSize: '0.85rem' }}>
+                        {selectedRun.execution_id || selectedRun.id}
                       </Typography>
                     </Grid>
-                  )}
-                </Grid>
-              </Box>
-
-              {selectedRun.output?.error && (
-                <Alert severity="error" sx={{ mb: 2 }}>
-                  <Typography variant="body2" sx={{ fontWeight: 600 }}>Workflow Error</Typography>
-                  <Typography variant="caption">{selectedRun.output.error}</Typography>
-                </Alert>
-              )}
-
-              {selectedRun.output?.results && selectedRun.output.results.length > 0 && (
-                <Box sx={{ mt: 2 }}>
-                  <Typography variant="subtitle2" sx={{ fontWeight: 600, mb: 1 }}>Query Results</Typography>
-                  <TableContainer component={Paper} variant="outlined">
-                    <Table size="small">
-                      <TableHead>
-                        <TableRow>
-                          <TableCell sx={{ fontWeight: 600 }}>Label</TableCell>
-                          <TableCell sx={{ fontWeight: 600 }}>Result / Error</TableCell>
-                        </TableRow>
-                      </TableHead>
-                      <TableBody>
-                        {selectedRun.output.results.map((query, idx) => (
-                          <TableRow key={query.query_id || idx} sx={{ bgcolor: query.success ? 'inherit' : 'error.lighter' }}>
-                            <TableCell sx={{ fontWeight: 500, minWidth: 200 }}>{query.label || query.query_id}</TableCell>
-                            <TableCell>
-                              {query.success ? (
-                                <Typography variant="body2" sx={{ fontFamily: 'monospace', color: 'text.primary' }}>
-                                  {formatResult(query.result || query.data)}
-                                </Typography>
-                              ) : (
-                                <Typography variant="body2" color="error">{query.error}</Typography>
-                              )}
-                            </TableCell>
-                          </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
-                  </TableContainer>
+                    <Grid size={1}>
+                      <Typography variant="caption" color="text.secondary">Duration</Typography>
+                      <Typography variant="body2">{selectedRun.duration?.toFixed(2)}s</Typography>
+                    </Grid>
+                    <Grid size={1}>
+                      <Typography variant="caption" color="text.secondary">Nodes Executed</Typography>
+                      <Typography variant="body2">{selectedRun.nodes_executed || 0}</Typography>
+                    </Grid>
+                    {selectedRun.output && (
+                      <>
+                        <Grid size={1}>
+                          <Typography variant="caption" color="text.secondary">Queries</Typography>
+                          <Typography variant="body2" sx={{ fontWeight: 600, color: 'primary.main' }}>
+                            {queriesExecuted}
+                          </Typography>
+                        </Grid>
+                        <Grid size={1}>
+                          <Typography variant="caption" color="text.secondary">Failures</Typography>
+                          <Typography variant="body2" sx={{ fontWeight: 600, color: failures > 0 ? 'error.main' : 'success.main' }}>
+                            {failures}
+                          </Typography>
+                        </Grid>
+                      </>
+                    )}
+                    {selectedRun.output && (
+                      <Grid size={6}>
+                        <Typography variant="caption" color="text.secondary">Success Rate</Typography>
+                        <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                          {queriesExecuted > 0
+                            ? `${(((queriesExecuted - failures) / queriesExecuted) * 100).toFixed(1)}%`
+                            : 'N/A'}
+                        </Typography>
+                      </Grid>
+                    )}
+                  </Grid>
                 </Box>
-              )}
+
+                {selectedRun.output?.error && (
+                  <Alert severity="error" sx={{ mb: 2 }}>
+                    <Typography variant="body2" sx={{ fontWeight: 600 }}>Workflow Error</Typography>
+                    <Typography variant="caption">{selectedRun.output.error}</Typography>
+                  </Alert>
+                )}
+
+                {results.length > 0 && (
+                  <Box sx={{ mt: 2 }}>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 600, mb: 1 }}>Query Results</Typography>
+                    <TableContainer component={Paper} variant="outlined">
+                      <Table size="small">
+                        <TableHead>
+                          <TableRow>
+                            <TableCell sx={{ fontWeight: 600 }}>Label</TableCell>
+                            <TableCell sx={{ fontWeight: 600 }}>Result / Error</TableCell>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {results.map((query, idx) => (
+                            <TableRow key={query.query_id || idx} sx={{ bgcolor: query.success ? 'inherit' : 'error.lighter' }}>
+                              <TableCell sx={{ fontWeight: 500, minWidth: 200 }}>{query.label || query.query_id}</TableCell>
+                              <TableCell>
+                                {query.success ? (
+                                  <Typography variant="body2" sx={{ fontFamily: 'monospace', color: 'text.primary' }}>
+                                    {formatResult(query.result || query.data)}
+                                  </Typography>
+                                ) : (
+                                  <Typography variant="body2" color="error">{query.error}</Typography>
+                                )}
+                              </TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </TableContainer>
+                  </Box>
+                )}
 
 
-            </Box>
-          )}
+              </Box>
+            );
+          })()}
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setSelectedRun(null)}>Close</Button>

@@ -1,19 +1,13 @@
 // LLM Configuration Service
-// Manages loading and saving LLM configurations via Electron file API
+// Manages loading and saving LLM configurations via API
 
-// Cache for config to reduce file reads
+// Cache for config to reduce API calls
 let configCache = null;
 let cacheTimestamp = 0;
 const CACHE_TTL_MS = 5000; // 5 second cache
 
-const DEFAULT_LLMS = {
-  'gpt-4o-mini': {
-    provider: 'OpenAI',
-    model: 'gpt-4o-mini',
-    icon: '⚡',
-    description: 'Fast and efficient GPT-4o Mini'
-  }
-};
+// API base URL
+const API_BASE_URL = 'http://localhost:8000/api/v1';
 
 /**
  * Invalidate the config cache
@@ -24,8 +18,23 @@ export const invalidateCache = () => {
 };
 
 /**
- * Load LLM configuration from file via Electron API
- * Uses caching to prevent excessive file reads
+ * Fetch available Bedrock models from API
+ */
+export const getBedrockModels = async () => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/llm-config/bedrock-models`);
+    if (!response.ok) throw new Error('Failed to fetch Bedrock models');
+    const data = await response.json();
+    return data.models || {};
+  } catch (error) {
+    console.error('Error fetching Bedrock models:', error);
+    return {};
+  }
+};
+
+/**
+ * Load LLM configuration from API
+ * Uses caching to prevent excessive API calls
  */
 export const loadLLMConfig = async () => {
   const now = Date.now();
@@ -34,36 +43,50 @@ export const loadLLMConfig = async () => {
   }
 
   try {
-    if (globalThis.electronAPI?.loadLLMConfig) {
-      const config = await globalThis.electronAPI.loadLLMConfig();
-      configCache = config || { llms: DEFAULT_LLMS };
+    // First try to get configured LLMs
+    const response = await fetch(`${API_BASE_URL}/llm-config`);
+    if (response.ok) {
+      const config = await response.json();
+      // If no LLMs configured, get available Bedrock models
+      if (!config.llms || Object.keys(config.llms).length === 0) {
+        const models = await getBedrockModels();
+        configCache = { llms: models };
+      } else {
+        configCache = config;
+      }
       cacheTimestamp = now;
       return configCache;
     }
-    console.warn('Electron API not available, using defaults');
-    return { llms: DEFAULT_LLMS };
+
+    // If API fails, get available Bedrock models
+    const models = await getBedrockModels();
+    configCache = { llms: models };
+    cacheTimestamp = now;
+    return configCache;
   } catch (error) {
     console.error('Error loading LLM config:', error);
-    return { llms: DEFAULT_LLMS };
+    // Fallback to Bedrock models
+    const models = await getBedrockModels();
+    return { llms: models };
   }
 };
 
 /**
- * Save LLM configuration to file via Electron API
+ * Save LLM configuration via API
  */
 export const saveLLMConfig = async (config) => {
   try {
-    if (globalThis.electronAPI?.saveLLMConfig) {
-      const result = await globalThis.electronAPI.saveLLMConfig(config);
-      if (result.success) {
-        // Update cache on successful save
-        configCache = config;
-        cacheTimestamp = Date.now();
-      }
-      return result.success;
-    }
-    console.error('Electron API not available');
-    return false;
+    const response = await fetch(`${API_BASE_URL}/llm-config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config)
+    });
+    if (!response.ok) throw new Error('Failed to save LLM config');
+
+    // Update cache on successful save
+    configCache = config;
+    cacheTimestamp = Date.now();
+    return true;
   } catch (error) {
     console.error('Error saving LLM config:', error);
     return false;
@@ -95,9 +118,9 @@ export const addLLM = async (name, llmConfig) => {
 export const updateLLM = async (name, llmConfig, newName = null) => {
   invalidateCache();
   const config = await loadLLMConfig();
-  
+
   const actualNewName = newName || name;
-  
+
   // If renaming, delete old and add new
   if (newName && newName !== name) {
     delete config.llms[name];
@@ -105,14 +128,14 @@ export const updateLLM = async (name, llmConfig, newName = null) => {
   } else if (config.llms?.[name]) {
     config.llms[name] = { ...config.llms[name], ...llmConfig };
   }
-  
+
   const success = await saveLLMConfig(config);
-  
+
   // Sync LLM changes to workflows
   if (success) {
     await syncLLMToWorkflows(name, llmConfig, actualNewName);
   }
-  
+
   return config;
 };
 
@@ -126,7 +149,7 @@ const updateLLMNodes = (nodes, oldName, actualNewName, llmConfig) => {
       node.data.label = actualNewName;
       node.data.model = llmConfig.model;
       node.data.provider = llmConfig.provider;
-      node.data.agent = llmConfig.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq';
+      node.data.region = llmConfig.region || 'us-east-1';
       if (llmConfig.temperature !== undefined) {
         node.data.temperature = llmConfig.temperature;
       }
@@ -146,7 +169,8 @@ const updateConnectedAgentNodes = (nodes, edges, updatedLLMNodeIds, llmConfig) =
       const agentNode = nodes.find(n => n.id === edge.target && n.type === 'agent');
       if (agentNode) {
         agentNode.data.model = llmConfig.model;
-        agentNode.data.agent = llmConfig.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq';
+        agentNode.data.provider = llmConfig.provider;
+        agentNode.data.region = llmConfig.region || 'us-east-1';
         updated = true;
       }
     }
@@ -173,29 +197,29 @@ const updateDirectAgentReferences = (nodes, oldName, actualNewName) => {
  */
 export const syncLLMToWorkflows = async (oldName, llmConfig, newName = null) => {
   const actualNewName = newName || oldName;
-  
+
   try {
     const { default: agentApiClient } = await import('../services/agentApiClient.js');
-    
+
     const workflows = await agentApiClient.listWorkflows();
     if (!workflows || !Array.isArray(workflows)) {
       return false;
     }
-    
+
     for (const workflow of workflows) {
       if (!workflow.nodes || !workflow.edges) continue;
-      
+
       const updatedLLMNodeIds = updateLLMNodes(workflow.nodes, oldName, actualNewName, llmConfig);
       const connectedUpdated = updateConnectedAgentNodes(workflow.nodes, workflow.edges, updatedLLMNodeIds, llmConfig);
       const directUpdated = updateDirectAgentReferences(workflow.nodes, oldName, actualNewName);
-      
+
       const workflowUpdated = updatedLLMNodeIds.length > 0 || connectedUpdated || directUpdated;
-      
+
       if (workflowUpdated) {
         await agentApiClient.updateWorkflow(workflow.name, workflow);
       }
     }
-    
+
     return true;
   } catch (error) {
     console.error('Error syncing LLM to workflows:', error);
@@ -231,10 +255,8 @@ export const convertLLMsToNodeItems = (llms) => {
       label: name,
       model: config.model,
       provider: config.provider,
-      agent: config.provider?.toLowerCase() === 'openai' ? 'openai' : 'groq',
+      region: config.region || 'us-east-1',
       temperature: config.temperature ?? 0,
-      // Use environment variable reference instead of hardcoded key
-      apiKeyEnvVar: config.apiKeyEnvVar || '',
       status: 'Available'
     }
   }));

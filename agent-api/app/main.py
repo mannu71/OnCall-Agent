@@ -1,5 +1,4 @@
 """Main FastAPI application."""
-import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,15 +7,12 @@ from app.config import settings
 from app.api.v1.api import api_router
 from app.api.middleware import register_exception_handlers
 from app.core.scheduler import workflow_scheduler
+from app.core.database import init_db
+from app.core.logging import setup_logging, get_logger
 
-
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper()),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-
-logger = logging.getLogger(__name__)
+# Setup logging first
+setup_logging()
+logger = get_logger(__name__)
 
 
 @asynccontextmanager
@@ -24,6 +20,14 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     # Startup
     logger.info("Starting Agent API...")
+    
+    # Initialize database tables
+    try:
+        await init_db()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.warning(f"Database initialization skipped (may already exist): {e}")
+    
     workflow_scheduler.start()
     yield
     # Shutdown
@@ -39,10 +43,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware
+# CORS middleware - configurable via settings
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

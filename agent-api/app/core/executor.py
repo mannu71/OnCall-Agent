@@ -156,8 +156,12 @@ class TaskExecutor:
                 from pathlib import Path
                 workflow_name = Path(workflow_file).stem
             
-            # Load workflow definition
-            workflow_def = workflow_storage.load_workflow(workflow_name)
+            # Load workflow definition from repository
+            workflow_repo = WorkflowRepository()
+            workflow_def = await workflow_repo.get_by_name(workflow_name)
+            
+            if not workflow_def:
+                return None, f"Workflow '{workflow_name}' not found"
             
             # Prepare execution context
             context = {
