@@ -1,4 +1,4 @@
-"""Database-backed repository for workflows, schedules, and executions."""
+"""Database-backed repository for workflows and executions."""
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
@@ -9,7 +9,6 @@ from app.core.database import AsyncSessionLocal
 from app.models.db_models import (
     WorkflowModel,
     ExecutionModel,
-    ScheduleModel,
     LLMConfigModel,
     MCPServerModel
 )
@@ -289,104 +288,6 @@ class DatabaseRepository:
             "output": execution.output,
             "error": execution.error,
             "logs": execution.logs
-        }
-
-    # ============================================
-    # SCHEDULE OPERATIONS
-    # ============================================
-
-    async def create_schedule(self, schedule_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Create a schedule.
-        
-        Args:
-            schedule_data: Schedule data
-            
-        Returns:
-            Created schedule data
-        """
-        async with AsyncSessionLocal() as session:
-            schedule = ScheduleModel(
-                name=schedule_data["name"],
-                workflow_name=schedule_data["workflow_name"],
-                cron_expression=schedule_data["cron_expression"],
-                timezone=schedule_data.get("timezone", "UTC"),
-                enabled=schedule_data.get("enabled", True),
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc)
-            )
-            session.add(schedule)
-            await session.commit()
-            await session.refresh(schedule)
-            return self._schedule_to_dict(schedule)
-
-    async def list_schedules(self) -> List[Dict[str, Any]]:
-        """List all schedules.
-        
-        Returns:
-            List of schedule data
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(select(ScheduleModel))
-            schedules = result.scalars().all()
-            return [self._schedule_to_dict(s) for s in schedules]
-
-    async def update_schedule(self, name: str, schedule_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Update a schedule.
-        
-        Args:
-            name: Schedule name
-            schedule_data: Updated schedule data
-            
-        Returns:
-            Updated schedule data or None if not found
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(ScheduleModel).where(ScheduleModel.name == name)
-            )
-            schedule = result.scalar_one_or_none()
-            if not schedule:
-                return None
-
-            for key, value in schedule_data.items():
-                if hasattr(schedule, key):
-                    setattr(schedule, key, value)
-            schedule.updated_at = datetime.now(timezone.utc)
-            
-            await session.commit()
-            await session.refresh(schedule)
-            return self._schedule_to_dict(schedule)
-
-    async def delete_schedule(self, name: str) -> bool:
-        """Delete a schedule.
-        
-        Args:
-            name: Schedule name
-            
-        Returns:
-            True if deleted, False if not found
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                delete(ScheduleModel).where(ScheduleModel.name == name).returning(ScheduleModel.id)
-            )
-            deleted = result.scalar_one_or_none()
-            await session.commit()
-            return deleted is not None
-
-    def _schedule_to_dict(self, schedule: ScheduleModel) -> Dict[str, Any]:
-        """Convert schedule model to dictionary."""
-        return {
-            "id": schedule.id,
-            "name": schedule.name,
-            "workflow_name": schedule.workflow_name,
-            "cron_expression": schedule.cron_expression,
-            "timezone": schedule.timezone,
-            "enabled": schedule.enabled,
-            "last_run": schedule.last_run.isoformat() if schedule.last_run else None,
-            "next_run": schedule.next_run.isoformat() if schedule.next_run else None,
-            "created_at": schedule.created_at.isoformat() if schedule.created_at else None,
-            "updated_at": schedule.updated_at.isoformat() if schedule.updated_at else None
         }
 
     # ============================================

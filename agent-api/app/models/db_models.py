@@ -40,22 +40,6 @@ class ExecutionModel(Base):
     logs = Column(JSON)
 
 
-class ScheduleModel(Base):
-    """Schedule database model."""
-    __tablename__ = "schedules"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(255), unique=True, nullable=False)
-    workflow_name = Column(String(255), nullable=False)
-    cron_expression = Column(String(100), nullable=False)
-    timezone = Column(String(50), default="UTC")
-    enabled = Column(Boolean, default=True)
-    last_run = Column(DateTime(timezone=True))
-    next_run = Column(DateTime(timezone=True))
-    created_at = Column(DateTime(timezone=True))
-    updated_at = Column(DateTime(timezone=True))
-
-
 class LLMConfigModel(Base):
     """LLM configuration database model."""
     __tablename__ = "llm_configs"

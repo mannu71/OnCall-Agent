@@ -50,7 +50,7 @@ async def init_db():
     """Initialize database tables."""
     # Import models to register them with Base
     from app.models.db_models import (
-        WorkflowModel, ExecutionModel, ScheduleModel,
+        WorkflowModel, ExecutionModel,
         LLMConfigModel, MCPServerModel, LogPatternModel,
         KnownIssueModel, BaselineMetricModel, AnalysisHistoryModel, AlertModel
     )
