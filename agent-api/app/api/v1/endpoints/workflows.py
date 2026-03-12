@@ -215,9 +215,6 @@ async def update_workflow(
     # Validate orchestrator nodes have SQL files
     _validate_orchestrator_nodes(workflow_dict)
     
-    # Extract and save SQL files from orchestrator nodes
-    await _extract_and_save_sql_files(workflow_name, workflow_dict, workflow_repo)
-    
     # Log scheduler node data if present
     if 'nodes' in workflow_dict:
         scheduler_node = next((n for n in workflow_dict['nodes'] if n.get('type') == 'scheduler'), None)
@@ -241,7 +238,8 @@ async def update_workflow(
         if field in existing_workflow:
             workflow_dict[field] = existing_workflow[field]
     
-    saved_workflow = await workflow_repo.save(workflow_dict)
+    # Pass original workflow_name for rename detection
+    saved_workflow = await workflow_repo.save(workflow_dict, original_name=workflow_name)
     await workflow_scheduler.reload_workflows()
     
     return WorkflowResponse(**saved_workflow)

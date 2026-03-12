@@ -151,11 +151,16 @@ const Settings = () => {
     const [certificates, setCertificates] = useState([]);
     const [certUploadLoading, setCertUploadLoading] = useState(false);
 
+    // API Health state
+    const [apiHealth, setApiHealth] = useState(null);
+    const [apiHealthLoading, setApiHealthLoading] = useState(false);
+
     // Load MCP servers and LLMs on mount
     useEffect(() => {
         loadServers();
         loadLLMConfigs();
         loadCertificates();
+        checkApiHealth();
     }, []);
 
     const loadServers = async () => {
@@ -219,6 +224,25 @@ const Settings = () => {
         } catch (error) {
             console.error('Failed to load certificates:', error);
             setCertificates([]);
+        }
+    };
+
+    // API Health check
+    const checkApiHealth = async () => {
+        setApiHealthLoading(true);
+        try {
+            const health = await agentApiClient.getHealth();
+            setApiHealth({
+                status: 'healthy',
+                ...health
+            });
+        } catch (error) {
+            setApiHealth({
+                status: 'error',
+                message: error.message || 'Failed to connect to API'
+            });
+        } finally {
+            setApiHealthLoading(false);
         }
     };
 
@@ -546,6 +570,57 @@ const Settings = () => {
                         {saveMessage}
                     </Alert>
                 )}
+
+                {/* API Health Check Section */}
+                <Paper sx={{ p: 3, mb: 3 }}>
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                        <Typography variant="h6" sx={{ fontWeight: 500 }}>
+                            API Status
+                        </Typography>
+                        <Button
+                            variant="outlined"
+                            startIcon={apiHealthLoading ? <CircularProgress size={20} /> : <RefreshIcon />}
+                            onClick={checkApiHealth}
+                            disabled={apiHealthLoading}
+                        >
+                            {apiHealthLoading ? 'Checking...' : 'Check API'}
+                        </Button>
+                    </Box>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                        {apiHealth ? (
+                            <>
+                                {apiHealth.status === 'healthy' ? (
+                                    <Chip
+                                        icon={<CheckCircleIcon />}
+                                        label="Connected"
+                                        color="success"
+                                    />
+                                ) : (
+                                    <Chip
+                                        icon={<ErrorIcon />}
+                                        label="Error"
+                                        color="error"
+                                    />
+                                )}
+                                <Typography variant="body2" color="text.secondary">
+                                    {apiHealth.status === 'healthy' ? (
+                                        <>
+                                            Scheduler: {apiHealth.scheduler_running ? 'Running' : 'Stopped'}
+                                            {' • '}
+                                            Active Workflows: {apiHealth.active_workflows || 0}
+                                        </>
+                                    ) : (
+                                        apiHealth.message
+                                    )}
+                                </Typography>
+                            </>
+                        ) : (
+                            <Typography variant="body2" color="text.secondary">
+                                Click "Check API" to verify connection
+                            </Typography>
+                        )}
+                    </Box>
+                </Paper>
 
                 <Paper sx={{ p: 3, mb: 3 }}>
                     <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>

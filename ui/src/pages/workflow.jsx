@@ -89,7 +89,7 @@ function Workflow() {
       handleMenuClose();
       return;
     }
-    
+
     try {
       await triggerWorkflow(workflow.name);
       showMessage(`Workflow '${workflow.name}' started`, 'success');
@@ -204,7 +204,15 @@ function Workflow() {
       <Box sx={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
         <AppBar position="static" color="default" elevation={1}>
           <Toolbar>
-            <Typography variant="h6" sx={{ flexGrow: 1 }}>{workflowName}</Typography>
+            <TextField
+              value={workflowName}
+              onChange={(e) => setWorkflowName(e.target.value)}
+              size="small"
+              sx={{ flexGrow: 1, mr: 2 }}
+              InputProps={{
+                sx: { fontSize: '1.25rem', fontWeight: 600 }
+              }}
+            />
             <Button startIcon={<CloseIcon />} onClick={() => setShowWorkflowEditor(false)} sx={{ mr: 1 }}>Cancel</Button>
             <Button variant="contained" startIcon={<SaveIcon />} onClick={handleSaveWorkflowData}>Save</Button>
           </Toolbar>

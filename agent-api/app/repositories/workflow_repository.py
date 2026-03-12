@@ -51,11 +51,12 @@ class WorkflowRepository:
         """
         return await self.db.list_workflows()
     
-    async def save(self, workflow: Dict[str, Any]) -> Dict[str, Any]:
+    async def save(self, workflow: Dict[str, Any], original_name: str = None) -> Dict[str, Any]:
         """Save or update a workflow.
         
         Args:
             workflow: Workflow data
+            original_name: Original workflow name (for rename operations)
             
         Returns:
             Saved workflow
@@ -67,12 +68,14 @@ class WorkflowRepository:
             raise ValueError("Workflow must have a 'name' field")
         
         workflow_name = workflow['name']
-        existing = await self.db.get_workflow(workflow_name)
+        # Use original_name for lookup if provided (handles rename case)
+        lookup_name = original_name if original_name else workflow_name
+        existing = await self.db.get_workflow(lookup_name)
         
         if existing:
-            # Update existing workflow
-            updated = await self.db.update_workflow(workflow_name, workflow)
-            logger.info(f"Updated workflow: {workflow_name}")
+            # Update existing workflow (use lookup_name to find it, workflow_name for the new name)
+            updated = await self.db.update_workflow(lookup_name, workflow)
+            logger.info(f"Updated workflow: {lookup_name} -> {workflow_name}")
             return updated
         else:
             # Create new workflow
