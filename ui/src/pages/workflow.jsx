@@ -1,41 +1,16 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from '@/components/ui/dialog';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { Badge } from '@/components/ui/badge';
 import {
-  Button,
-  TextField,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  Paper,
-  Chip,
-  IconButton,
-  Menu,
-  MenuItem,
-  Alert,
-  Box,
-  Typography,
-  FormControl,
-  InputLabel,
-  Select,
-  AppBar,
-  Toolbar
-} from '@mui/material';
-import {
-  Add as AddIcon,
-  Edit as EditIcon,
-  Delete as DeleteIcon,
-  MoreVert as MoreVertIcon,
-  Close as CloseIcon,
-  Save as SaveIcon,
-  PlayArrow as PlayIcon,
-  Search as SearchIcon
-} from '@mui/icons-material';
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Plus, Edit2, Trash2, MoreVertical, X, Save, Play, Search } from 'lucide-react';
 import WorkflowEditor from '../components/workflow/WorkflowEditor.jsx';
 import { validateWorkflow } from '../utils/workflowValidation.js';
 import agentApiClient from '../services/agentApiClient.js';
@@ -55,7 +30,6 @@ function Workflow() {
   const [showDialog, setShowDialog] = useState(false);
   const [showWorkflowEditor, setShowWorkflowEditor] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
-  const [anchorEl, setAnchorEl] = useState(null);
   const [selectedWorkflow, setSelectedWorkflow] = useState(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
 
@@ -82,18 +56,23 @@ function Workflow() {
     setTimeout(() => removeMessage(id), 4000);
   }, [removeMessage]);
 
+  const getMessageClasses = (type) => {
+    if (type === 'error') return 'bg-red-50 border-red-200 text-red-800';
+    if (type === 'warning') return 'bg-yellow-50 border-yellow-200 text-yellow-800';
+    if (type === 'success') return 'bg-green-50 border-green-200 text-green-800';
+    return 'bg-blue-50 border-blue-200 text-blue-800';
+  };
+
   const handleExecute = async (workflow) => {
     // Prevent duplicate execution if already running
     if (isWorkflowRunning(workflow.name)) {
       showMessage(`Workflow '${workflow.name}' is already running`, 'warning');
-      handleMenuClose();
       return;
     }
 
     try {
       await triggerWorkflow(workflow.name);
       showMessage(`Workflow '${workflow.name}' started`, 'success');
-      handleMenuClose();
     } catch (error) {
       showMessage(`Failed to start workflow: ${error.message}`, 'error');
     }
@@ -122,7 +101,6 @@ function Workflow() {
       setCurrentWorkflowData(fresh);
       setEditorKey(prev => prev + 1);
       setShowWorkflowEditor(true);
-      handleMenuClose();
     } catch (error) {
       console.error('Error loading workflow:', error);
       showMessage('Failed to load workflow details', 'error');
@@ -189,42 +167,39 @@ function Workflow() {
     return workflows.filter(w => w.name.toLowerCase().includes(term));
   }, [workflows, searchTerm]);
 
-  const handleMenuOpen = (e, w) => {
-    setAnchorEl(e.currentTarget);
-    setSelectedWorkflow(w);
-  };
 
-  const handleMenuClose = () => {
-    setAnchorEl(null);
-    setSelectedWorkflow(null);
-  };
 
   if (showWorkflowEditor) {
     return (
-      <Box sx={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
-        <AppBar position="static" color="default" elevation={1}>
-          <Toolbar>
-            <TextField
+      <div className="h-screen flex flex-col">
+        <div className="border-b bg-background">
+          <div className="flex items-center gap-4 px-4 py-3">
+            <Input
               value={workflowName}
               onChange={(e) => setWorkflowName(e.target.value)}
-              size="small"
-              sx={{ flexGrow: 1, mr: 2 }}
-              InputProps={{
-                sx: { fontSize: '1.25rem', fontWeight: 600 }
-              }}
+              className="flex-1 text-xl font-semibold"
             />
-            <Button startIcon={<CloseIcon />} onClick={() => setShowWorkflowEditor(false)} sx={{ mr: 1 }}>Cancel</Button>
-            <Button variant="contained" startIcon={<SaveIcon />} onClick={handleSaveWorkflowData}>Save</Button>
-          </Toolbar>
-        </AppBar>
+            <Button variant="outline" onClick={() => setShowWorkflowEditor(false)}>
+              <X className="w-4 h-4 mr-2" />
+              Cancel
+            </Button>
+            <Button onClick={handleSaveWorkflowData}>
+              <Save className="w-4 h-4 mr-2" />
+              Save
+            </Button>
+          </div>
+        </div>
 
         {messages.map(m => (
-          <Alert key={m.id} severity={m.type} sx={{ position: 'absolute', top: 70, left: '50%', transform: 'translateX(-50%)', zIndex: 2000 }}>
+          <div
+            key={m.id}
+            className={`absolute top-[70px] left-1/2 -translate-x-1/2 z-[2000] px-4 py-3 rounded border ${getMessageClasses(m.type)}`}
+          >
             {m.msg}
-          </Alert>
+          </div>
         ))}
 
-        <Box sx={{ flexGrow: 1, position: 'relative' }}>
+        <div className="flex-1 relative">
           <WorkflowEditor
             key={editorKey}
             ref={workflowEditorRef}
@@ -232,150 +207,174 @@ function Workflow() {
             initialNodes={currentWorkflowData?.nodes || []}
             initialEdges={currentWorkflowData?.edges || []}
           />
-        </Box>
-      </Box>
+        </div>
+      </div>
     );
   }
 
   return (
-    <Box sx={{ p: 4 }}>
-      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 4 }}>
-        <Box>
-          <Typography variant="h4" sx={{ fontWeight: 700 }}>Workflows</Typography>
-          <Typography color="text.secondary">Design and manage agentic processes</Typography>
-        </Box>
-        <Button variant="contained" startIcon={<AddIcon />} onClick={() => { setWorkflowName(''); setShowDialog(true); }}>
+    <div className="p-8">
+      <div className="flex justify-between items-center mb-8">
+        <div>
+          <h1 className="text-4xl font-bold">Workflows</h1>
+          <p className="text-muted-foreground mt-1">Design and manage agentic processes</p>
+        </div>
+        <Button onClick={() => { setWorkflowName(''); setShowDialog(true); }}>
+          <Plus className="w-4 h-4 mr-2" />
           New Workflow
         </Button>
-      </Box>
+      </div>
 
-      <Box sx={{ mb: 3, display: 'flex' }}>
-        <TextField
-          size="small"
-          placeholder="Search workflows..."
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-          slotProps={{
-            input: {
-              startAdornment: (
-                <SearchIcon sx={{ color: 'text.secondary', mr: 1, fontSize: 20 }} />
-              ),
-            },
-          }}
-          sx={{
-            width: '100%',
-            maxWidth: 400,
-            '& .MuiOutlinedInput-root': {
-              borderRadius: 2,
-              bgcolor: 'background.paper',
-              transition: 'all 0.2s ease-in-out',
-              '&:hover': {
-                boxShadow: '0 2px 8px rgba(0,0,0,0.05)',
-                borderColor: 'primary.main',
-              },
-              '&.Mui-focused': {
-                boxShadow: '0 4px 12px rgba(25, 118, 210, 0.1)',
-              }
-            }
-          }}
-        />
-      </Box>
+      <div className="mb-4">
+        <div className="relative max-w-md">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+          <Input
+            placeholder="Search workflows..."
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            className="pl-10"
+          />
+        </div>
+      </div>
 
-      <TableContainer component={Paper} elevation={0} variant="outlined" sx={{ borderRadius: 2 }}>
+      <div className="border rounded-lg bg-white">
         <Table>
-          <TableHead sx={{ bgcolor: 'action.hover' }}>
-            <TableRow>
-              <TableCell sx={{ fontWeight: 600 }}>Name</TableCell>
-              <TableCell sx={{ fontWeight: 600 }}>Type</TableCell>
-              <TableCell sx={{ fontWeight: 600 }}>Schedule</TableCell>
-              <TableCell sx={{ fontWeight: 600 }}>Status</TableCell>
-              <TableCell align="right" sx={{ fontWeight: 600 }}>Actions</TableCell>
+          <TableHeader>
+            <TableRow className="bg-slate-50/50">
+              <TableHead className="text-slate-500 text-xs font-bold uppercase tracking-wider">Name</TableHead>
+              <TableHead className="text-slate-500 text-xs font-bold uppercase tracking-wider">Type</TableHead>
+              <TableHead className="text-slate-500 text-xs font-bold uppercase tracking-wider">Schedule</TableHead>
+              <TableHead className="text-slate-500 text-xs font-bold uppercase tracking-wider">Status</TableHead>
+              <TableHead className="text-slate-500 text-xs font-bold uppercase tracking-wider text-right">Actions</TableHead>
             </TableRow>
-          </TableHead>
-          <TableBody>
+          </TableHeader>
+          <TableBody className="text-sm">
             {filteredWorkflows.map((w) => (
-              <TableRow key={w.name} hover>
-                <TableCell sx={{ fontWeight: 500 }}>{w.name}</TableCell>
-                <TableCell><Chip label={w.type || 'workflow'} size="small" variant="outlined" /></TableCell>
+              <TableRow key={w.name}>
+                <TableCell className="font-semibold text-slate-900">{w.name}</TableCell>
+                <TableCell className="text-slate-600">
+                  <Badge variant="outline">{w.type || 'workflow'}</Badge>
+                </TableCell>
                 <TableCell>
                   {w.startTime ? (
-                    <Typography variant="body2">
-                      {formatTime(w.startTime)}
-                      <Typography component="span" variant="caption" sx={{ ml: 1, color: 'text.secondary' }}>
+                    <div>
+                      <span className="text-sm">{formatTime(w.startTime)}</span>
+                      <span className="text-xs text-muted-foreground ml-2">
                         ({w.schedule ? w.schedule.split(' ').slice(0, 2).join(':') + ' UTC' : 'Manual'})
-                      </Typography>
-                    </Typography>
+                      </span>
+                    </div>
                   ) : (
-                    <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                    <span className="text-sm text-muted-foreground">
                       {w.schedule || 'Manual'}
-                    </Typography>
+                    </span>
                   )}
                 </TableCell>
                 <TableCell>
-                  <Chip
-                    label={w.enabled ? 'Active' : 'Disabled'}
-                    size="small"
-                    color={w.enabled ? 'success' : 'default'}
-                  />
+                  <Badge variant={w.enabled ? 'success' : 'secondary'}>
+                    {w.enabled ? 'Active' : 'Disabled'}
+                  </Badge>
                 </TableCell>
-                <TableCell align="right">
-                  <IconButton size="small" onClick={(e) => handleMenuOpen(e, w)}><MoreVertIcon /></IconButton>
+                <TableCell className="text-right">
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button size="icon" variant="ghost">
+                        <MoreVertical className="w-4 h-4" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem onClick={() => openEditDialog(w)}>
+                        <Edit2 className="w-4 h-4 mr-2" />
+                        Edit
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => handleExecute(w)}>
+                        <Play className="w-4 h-4 mr-2" />
+                        Run Now
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onClick={() => {
+                          setSelectedWorkflow(w);
+                          setDeleteDialogOpen(true);
+                        }}
+                        className="text-red-600"
+                      >
+                        <Trash2 className="w-4 h-4 mr-2" />
+                        Delete
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                 </TableCell>
               </TableRow>
             ))}
             {filteredWorkflows.length === 0 && (
-              <TableRow><TableCell colSpan={5} align="center" sx={{ py: 3 }}>No workflows found</TableCell></TableRow>
+              <TableRow>
+                <TableCell colSpan={5} className="text-center py-6 text-muted-foreground">
+                  No workflows found
+                </TableCell>
+              </TableRow>
             )}
           </TableBody>
         </Table>
-      </TableContainer>
+      </div>
 
-      <Menu anchorEl={anchorEl} open={Boolean(anchorEl)} onClose={handleMenuClose}>
-        <MenuItem onClick={() => openEditDialog(selectedWorkflow)}><EditIcon fontSize="small" sx={{ mr: 1 }} /> Edit</MenuItem>
-        <MenuItem onClick={() => handleExecute(selectedWorkflow)}><PlayIcon fontSize="small" sx={{ mr: 1 }} /> Run Now</MenuItem>
-        <MenuItem onClick={() => setDeleteDialogOpen(true)} sx={{ color: 'error.main' }}><DeleteIcon fontSize="small" sx={{ mr: 1 }} /> Delete</MenuItem>
-      </Menu>
-
-      <Dialog open={deleteDialogOpen} onClose={() => setDeleteDialogOpen(false)}>
-        <DialogTitle>Confirm Delete</DialogTitle>
-        <DialogContent>Are you sure you want to delete "{selectedWorkflow?.name}"?</DialogContent>
-        <DialogActions>
-          <Button onClick={() => setDeleteDialogOpen(false)}>Cancel</Button>
-          <Button onClick={confirmDelete} color="error" variant="contained">Delete</Button>
-        </DialogActions>
+      <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Confirm Delete</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete "{selectedWorkflow?.name}"?
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteDialogOpen(false)}>Cancel</Button>
+            <Button variant="destructive" onClick={confirmDelete}>Delete</Button>
+          </DialogFooter>
+        </DialogContent>
       </Dialog>
 
-      <Dialog open={showDialog} onClose={() => setShowDialog(false)} maxWidth="xs" fullWidth>
-        <DialogTitle>Create Workflow</DialogTitle>
-        <DialogContent>
-          <TextField
-            fullWidth
-            label="Name"
-            value={workflowName}
-            onChange={(e) => setWorkflowName(e.target.value)}
-            sx={{ mt: 1 }}
-            autoFocus
-          />
-          <FormControl fullWidth sx={{ mt: 2 }}>
-            <InputLabel>Type</InputLabel>
-            <Select value={workflowType} label="Type" onChange={(e) => setWorkflowType(e.target.value)}>
-              <MenuItem value="workflow">Standard Workflow</MenuItem>
-              <MenuItem value="agent">Agentic Process</MenuItem>
-            </Select>
-          </FormControl>
+      <Dialog open={showDialog} onOpenChange={setShowDialog}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Create Workflow</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <label htmlFor="workflow-name" className="text-sm font-medium">Name</label>
+              <Input
+                id="workflow-name"
+                value={workflowName}
+                onChange={(e) => setWorkflowName(e.target.value)}
+                autoFocus
+              />
+            </div>
+            <div className="space-y-2">
+              <label htmlFor="workflow-type" className="text-sm font-medium">Type</label>
+              <select
+                id="workflow-type"
+                value={workflowType}
+                onChange={(e) => setWorkflowType(e.target.value)}
+                className="w-full h-10 rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              >
+                <option value="workflow">Standard Workflow</option>
+                <option value="agent">Agentic Process</option>
+              </select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowDialog(false)}>Cancel</Button>
+            <Button onClick={handleProceedToEditor}>Create</Button>
+          </DialogFooter>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setShowDialog(false)}>Cancel</Button>
-          <Button variant="contained" onClick={handleProceedToEditor}>Create</Button>
-        </DialogActions>
       </Dialog>
 
       {messages.map(m => (
-        <Alert key={m.id} severity={m.type} sx={{ position: 'fixed', bottom: 20, right: 20, minWidth: 250 }}>
+        <div
+          key={m.id}
+          className={`fixed bottom-5 right-5 min-w-[250px] px-4 py-3 rounded border ${getMessageClasses(m.type)}`}
+        >
           {m.msg}
-        </Alert>
+        </div>
       ))}
-    </Box>
+    </div>
   );
 }
 

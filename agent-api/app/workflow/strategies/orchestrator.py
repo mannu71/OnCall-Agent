@@ -8,8 +8,10 @@ the steps are known in advance.
 
 from typing import Dict, Any, List, Optional
 import logging
+import re
 
 from app.workflow.strategies.base import BaseStrategy
+from app.repositories.db_repository import db_repository
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +82,7 @@ class OrchestratorStrategy(BaseStrategy):
         
         try:
             # Parse workflow to extract execution graph
-            execution_graph = self._parse_workflow(workflow)
+            execution_graph = await self._parse_workflow(workflow)
             
             logger_instance.info(
                 "OrchestratorStrategy: Workflow parsed",
@@ -186,7 +188,7 @@ class OrchestratorStrategy(BaseStrategy):
         
         return True
     
-    def _parse_workflow(self, workflow: Dict[str, Any]) -> Dict[str, Any]:
+    async def _parse_workflow(self, workflow: Dict[str, Any]) -> Dict[str, Any]:
         """
         Parse workflow to extract execution graph.
         
@@ -223,12 +225,37 @@ class OrchestratorStrategy(BaseStrategy):
         tools = []
         for tool_node in tool_nodes:
             tool_data = tool_node.get("data", {})
-            tools.append({
-                "name": tool_data.get("serverName", ""),
-                "command": tool_data.get("command", ""),
-                "args": tool_data.get("args", []),
-                "env": tool_data.get("env", {})
-            })
+            server_name = tool_data.get("serverName", "")
+            
+            # Check if command is embedded or needs database lookup
+            if tool_data.get("command"):
+                # Use embedded configuration
+                tools.append({
+                    "name": server_name,
+                    "command": tool_data.get("command", ""),
+                    "args": tool_data.get("args", []),
+                    "env": tool_data.get("env", {})
+                })
+            elif server_name:
+                # Load from database
+                db_config = await db_repository.get_mcp_server_by_name(server_name)
+                if db_config:
+                    tools.append({
+                        "name": server_name,
+                        "command": db_config.get("command", ""),
+                        "args": db_config.get("args", []),
+                        "env": db_config.get("env", {})
+                    })
+                    logger.info(f"Loaded MCP server '{server_name}' from database")
+                else:
+                    logger.warning(f"MCP server '{server_name}' not found in database")
+                    # Add with minimal config
+                    tools.append({
+                        "name": server_name,
+                        "command": "",
+                        "args": [],
+                        "env": {}
+                    })
         
         # Extract steps from workflow definition
         steps = workflow_def.get("steps", [])
@@ -328,6 +355,9 @@ class OrchestratorStrategy(BaseStrategy):
         """
         Substitute variables in arguments.
         
+        Supports ${variable_name} syntax for variable substitution.
+        Variables can be nested using dot notation: ${step1.result.field}
+        
         Args:
             args: Arguments dictionary
             variables: Variables for substitution
@@ -335,9 +365,48 @@ class OrchestratorStrategy(BaseStrategy):
         Returns:
             Arguments with substituted values
         """
-        # TODO: Implement variable substitution logic
-        # For now, return args as-is
-        return args
+        def get_nested_value(obj: Any, path: str) -> Any:
+            """Get a nested value using dot notation."""
+            keys = path.split('.')
+            current = obj
+            for key in keys:
+                if isinstance(current, dict):
+                    current = current.get(key)
+                elif isinstance(current, list) and key.isdigit():
+                    idx = int(key)
+                    current = current[idx] if 0 <= idx < len(current) else None
+                else:
+                    return None
+                if current is None:
+                    return None
+            return current
+        
+        def substitute_value(value: Any) -> Any:
+            """Recursively substitute variables in a value."""
+            if isinstance(value, str):
+                # Pattern to match ${variable_name}
+                pattern = r'\$\{([^}]+)\}'
+                
+                def replace_var(match):
+                    var_path = match.group(1)
+                    var_value = get_nested_value(variables, var_path)
+                    if var_value is None:
+                        # Keep original if variable not found
+                        logger.warning(f"Variable '{var_path}' not found, keeping original")
+                        return match.group(0)
+                    return str(var_value)
+                
+                return re.sub(pattern, replace_var, value)
+            
+            elif isinstance(value, dict):
+                return {k: substitute_value(v) for k, v in value.items()}
+            
+            elif isinstance(value, list):
+                return [substitute_value(item) for item in value]
+            
+            return value
+        
+        return substitute_value(args)
     
     def _format_output(
         self,

@@ -170,10 +170,30 @@ class VisualWorkflowExecutor:
                 execution_id, adjacency, start_nodes, parents_of, node_map
             )
             
-            result = self._build_result(
-                execution_id, "success", start_time, len(executed),
-                sanitized_results=self._sanitize_results(execution_results)
-            )
+            # Check if any node failed
+            failed_nodes = [
+                node_id for node_id, node_result in execution_results.items()
+                if isinstance(node_result, dict) and node_result.get('status') == 'failed'
+            ]
+            
+            if failed_nodes:
+                # Mark workflow as failed if any node failed
+                error_messages = []
+                for node_id in failed_nodes:
+                    node_result = execution_results[node_id]
+                    error_msg = node_result.get('error', 'Unknown error')
+                    error_messages.append(f"{node_id}: {error_msg}")
+                
+                result = self._build_result(
+                    execution_id, "failed", start_time, len(executed),
+                    sanitized_results=self._sanitize_results(execution_results),
+                    error=f"Node(s) failed: {'; '.join(error_messages)}"
+                )
+            else:
+                result = self._build_result(
+                    execution_id, "success", start_time, len(executed),
+                    sanitized_results=self._sanitize_results(execution_results)
+                )
             
             self.active_executions[execution_id]['status'] = 'completed'
             self.active_executions[execution_id]['end_time'] = result['end_time']
@@ -395,7 +415,8 @@ class VisualWorkflowExecutor:
         Returns:
             SQL content string or None if not found
         """
-        sql_content = node_data.get('sqlContent')
+        # Check for SQL content in order of preference
+        sql_content = node_data.get('sqlContent') or node_data.get('fileContent')
         if sql_content:
             return sql_content
         

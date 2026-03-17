@@ -1,10 +1,11 @@
 import React, { lazy, Suspense } from 'react';
-import { ThemeProvider, createTheme, CssBaseline, Box, Typography, Container, CircularProgress } from '@mui/material';
 import { BrowserRouter, HashRouter, Routes, Route } from 'react-router-dom';
-import { SidebarProvider, useSidebar } from './context/SidebarContext';
 import { SchedulerProvider } from './context/SchedulerContext';
 import { WorkflowStatusProvider } from './context/WorkflowStatusContext';
-import Sidebar from './components/sidebar/Sidebar';
+import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { Loader2 } from 'lucide-react';
+import { AppSidebar } from './components/sidebar/AppSidebar';
 import Dashboard from './pages/Dashboard';
 import Scheduler from './pages/Scheduler';
 import Settings from './pages/Settings';
@@ -22,118 +23,67 @@ const Router = window.electronAPI ? HashRouter : BrowserRouter;
 // Check if we're in development mode
 const isDevelopment = import.meta.env.DEV;
 
-const theme = createTheme({
-  palette: {
-    mode: 'light',
-    primary: {
-      main: '#1976d2',
-    },
-    secondary: {
-      main: '#dc004e',
-    },
-    background: {
-      default: '#ffffff',
-    },
-  },
-  typography: {
-    h4: {
-      fontWeight: 600,
-    },
-    h5: {
-      fontWeight: 500,
-    },
-  },
-});
-
-
 // Loading component for lazy-loaded routes
 const LoadingFallback = () => (
-  <Box
-    sx={{
-      display: 'flex',
-      justifyContent: 'center',
-      alignItems: 'center',
-      minHeight: '100vh',
-      backgroundColor: 'background.default',
-    }}
-  >
-    <CircularProgress />
-  </Box>
+  <div className="flex justify-center items-center min-h-screen bg-background">
+    <Loader2 className="w-8 h-8 animate-spin text-primary" />
+  </div>
 );
 
 const PlaceholderPage = ({ title }) => {
   return (
-    <Box
-      sx={{
-        p: 4,
-        minHeight: '100vh',
-        backgroundColor: 'background.default',
-      }}
-    >
-      <Container maxWidth="lg" sx={{ px: 0 }}>
-        <Typography variant="h4" gutterBottom sx={{ fontWeight: 600, mb: 3 }}>
+    <div className="p-8 min-h-screen bg-background">
+      <div className="max-w-7xl mx-auto px-0">
+        <h1 className="text-3xl font-semibold mb-6">
           {title}
-        </Typography>
-        <Typography variant="body1" color="text.secondary">
+        </h1>
+        <p className="text-base text-muted-foreground">
           This page is under development.
-        </Typography>
-      </Container>
-    </Box>
+        </p>
+      </div>
+    </div>
   );
 };
 
-// Main app routes component that has access to sidebar context
+// Main app routes component
 const AppRoutes = () => {
-  const { isOpen } = useSidebar();
   return (
-    <Box sx={{ minHeight: '100vh' }}>
-      <Sidebar />
-      <Box
-        component="main"
-        sx={{
-          minHeight: '100vh',
-          ml: {
-            md: isOpen ? '270px' : '64px',
-            xs: 0
-          },
-          transition: 'margin-left 225ms cubic-bezier(0.4, 0, 0.6, 1)',
-          overflowX: 'hidden',
-        }}
-      >
-        <Suspense fallback={<LoadingFallback />}>
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/dashboard" element={<Dashboard />} />
-            <Route path="/scheduler" element={<Scheduler />} />
-            <Route path="/log-watch" element={<LogWatchConfig />} />
-            {isDevelopment && <Route path="/chat" element={<Chat />} />}
-            <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
-            <Route path="/workflow" element={<Workflow />} />
-            <Route path="/alerts" element={<PlaceholderPage title="Alerts" />} />
-            {isDevelopment && <Route path="/analytics" element={<Analytics />} />}
-            <Route path="/emergency" element={<PlaceholderPage title="Emergency Contact" />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="*" element={<Dashboard />} />
-          </Routes>
-        </Suspense>
-      </Box>
-    </Box>
+    <SidebarProvider>
+      <AppSidebar />
+      <SidebarInset>
+        <main className="w-full max-w-full min-h-screen overflow-x-hidden">
+          <Suspense fallback={<LoadingFallback />}>
+            <Routes>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/scheduler" element={<Scheduler />} />
+              <Route path="/log-watch" element={<LogWatchConfig />} />
+              {isDevelopment && <Route path="/chat" element={<Chat />} />}
+              <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
+              <Route path="/workflow" element={<Workflow />} />
+              <Route path="/alerts" element={<PlaceholderPage title="Alerts" />} />
+              {isDevelopment && <Route path="/analytics" element={<Analytics />} />}
+              <Route path="/emergency" element={<PlaceholderPage title="Emergency Contact" />} />
+              <Route path="/settings" element={<Settings />} />
+              <Route path="*" element={<Dashboard />} />
+            </Routes>
+          </Suspense>
+        </main>
+      </SidebarInset>
+    </SidebarProvider>
   );
 };
 
 export default function App() {
   return (
-    <ThemeProvider theme={theme}>
-      <CssBaseline />
-      <SidebarProvider>
-        <SchedulerProvider>
-          <WorkflowStatusProvider>
-            <Router>
-              <AppRoutes />
-            </Router>
-          </WorkflowStatusProvider>
-        </SchedulerProvider>
-      </SidebarProvider>
-    </ThemeProvider>
+    <TooltipProvider>
+      <SchedulerProvider>
+        <WorkflowStatusProvider>
+          <Router>
+            <AppRoutes />
+          </Router>
+        </WorkflowStatusProvider>
+      </SchedulerProvider>
+    </TooltipProvider>
   );
 }

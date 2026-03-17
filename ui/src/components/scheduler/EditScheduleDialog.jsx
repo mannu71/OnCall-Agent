@@ -1,23 +1,8 @@
 import React, { useState, useEffect, memo, useCallback, useMemo } from 'react';
 import PropTypes from 'prop-types';
-import {
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  TextField,
-  Button,
-  Grid,
-  FormControl,
-  InputLabel,
-  Select,
-  MenuItem,
-  Alert,
-  Typography
-} from '@mui/material';
-import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
-import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
-import { TimePicker } from '@mui/x-date-pickers/TimePicker';
+import { Button } from '@/components/ui/button';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
 import { dateToCron, dateToLocalTimeString } from '../../utils/cronUtils';
 import { useScheduler } from '../../context/SchedulerContext';
 
@@ -118,119 +103,117 @@ const EditScheduleDialog = memo(({ open, schedule, onClose, onUpdate }) => {
   }, [onClose]);
 
   return (
-    <Dialog
-      open={open}
-      onClose={handleClose}
-      maxWidth="sm"
-      fullWidth
-      aria-labelledby="edit-schedule-dialog-title"
-    >
-      <DialogTitle id="edit-schedule-dialog-title">
-        Edit Schedule
-      </DialogTitle>
+    <Dialog open={open} onOpenChange={(isOpen) => !isOpen && handleClose()}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>Edit Schedule</DialogTitle>
+        </DialogHeader>
 
-      <DialogContent dividers>
-        <Grid container spacing={2} sx={{ mt: 0.5 }}>
-          <Grid item xs={12}>
-            <TextField
-              fullWidth
-              label="Title"
+        <div className="grid gap-4 py-4">
+          <div>
+            <label htmlFor="title" className="text-sm font-medium mb-2 block">
+              Title <span className="text-red-500">*</span>
+            </label>
+            <Input
+              id="title"
               value={formData.title}
               onChange={handleChange('title')}
-              error={!!errors.title}
-              helperText={errors.title}
-              required
-              variant="outlined"
+              className={errors.title ? 'border-red-500' : ''}
             />
-          </Grid>
+            {errors.title && (
+              <p className="text-sm text-red-500 mt-1">{errors.title}</p>
+            )}
+          </div>
 
-          <Grid item xs={12}>
-            <FormControl fullWidth error={!!errors.workflow}>
-              <InputLabel id="workflow-select-label">Workflow</InputLabel>
-              <Select
-                labelId="workflow-select-label"
-                value={formData.workflow}
-                onChange={handleChange('workflow')}
-                label="Workflow"
-              >
-                {filteredWorkflows.length === 0 ? (
-                  <MenuItem value="" disabled>No workflows available</MenuItem>
-                ) : (
-                  filteredWorkflows.map((wf) => (
-                    <MenuItem key={wf.id} value={wf.name}>
-                      {wf.name}
-                    </MenuItem>
-                  ))
-                )}
-              </Select>
-              {errors.workflow && (
-                <Typography variant="caption" color="error" sx={{ mt: 0.5, ml: 1.5 }}>
-                  {errors.workflow}
-                </Typography>
+          <div>
+            <label htmlFor="workflow" className="text-sm font-medium mb-2 block">
+              Workflow <span className="text-red-500">*</span>
+            </label>
+            <select
+              id="workflow"
+              value={formData.workflow}
+              onChange={handleChange('workflow')}
+              className={`flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ${
+                errors.workflow ? 'border-red-500' : ''
+              }`}
+            >
+              {filteredWorkflows.length === 0 ? (
+                <option value="" disabled>No workflows available</option>
+              ) : (
+                filteredWorkflows.map((wf) => (
+                  <option key={wf.id} value={wf.name}>{wf.name}</option>
+                ))
               )}
-            </FormControl>
-          </Grid>
+            </select>
+            {errors.workflow && (
+              <p className="text-sm text-red-500 mt-1">{errors.workflow}</p>
+            )}
+          </div>
 
-          <Grid item xs={12} sm={6}>
-            <FormControl fullWidth>
-              <InputLabel id="recurrence-label">Recurrence</InputLabel>
-              <Select
-                labelId="recurrence-label"
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="recurrence" className="text-sm font-medium mb-2 block">
+                Recurrence
+              </label>
+              <select
+                id="recurrence"
                 value={formData.recurrence}
                 onChange={handleChange('recurrence')}
-                label="Recurrence"
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
               >
-                <MenuItem value="daily">Daily</MenuItem>
-                <MenuItem value="weekly">Weekly</MenuItem>
-                <MenuItem value="monthly">Monthly</MenuItem>
-              </Select>
-            </FormControl>
-          </Grid>
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+              </select>
+            </div>
 
-          <Grid item xs={12} sm={6}>
-            <LocalizationProvider dateAdapter={AdapterDateFns}>
-              <TimePicker
-                label="Execution Time"
-                value={formData.startTime}
-                onChange={handleChange('startTime')}
-                slotProps={{
-                  textField: {
-                    fullWidth: true,
-                    error: !!errors.startTime,
-                    helperText: errors.startTime
-                  }
+            <div>
+              <label htmlFor="startTime" className="text-sm font-medium mb-2 block">
+                Execution Time
+              </label>
+              <Input
+                id="startTime"
+                type="time"
+                value={`${String(formData.startTime.getHours()).padStart(2, '0')}:${String(formData.startTime.getMinutes()).padStart(2, '0')}`}
+                onChange={(e) => {
+                  const [hours, minutes] = e.target.value.split(':');
+                  const newTime = new Date(formData.startTime);
+                  newTime.setHours(Number.parseInt(hours, 10), Number.parseInt(minutes, 10), 0, 0);
+                  handleChange('startTime')(newTime);
                 }}
+                className={errors.startTime ? 'border-red-500' : ''}
               />
-            </LocalizationProvider>
-          </Grid>
+              {errors.startTime && (
+                <p className="text-sm text-red-500 mt-1">{errors.startTime}</p>
+              )}
+            </div>
+          </div>
 
-          <Grid item xs={12}>
-            <TextField
-              fullWidth
-              label="Description (Optional)"
+          <div>
+            <label htmlFor="description" className="text-sm font-medium mb-2 block">
+              Description (Optional)
+            </label>
+            <textarea
+              id="description"
               value={formData.description}
               onChange={handleChange('description')}
-              multiline
               rows={2}
+              className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
             />
-          </Grid>
-        </Grid>
+          </div>
+        </div>
 
         {Object.keys(errors).length > 0 && !errors.title && !errors.workflow && !errors.startTime && (
-          <Alert severity="error" sx={{ mt: 2 }}>
+          <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded">
             Please fix the errors above before submitting.
-          </Alert>
+          </div>
         )}
-      </DialogContent>
 
-      <DialogActions sx={{ px: 3, py: 2 }}>
-        <Button onClick={handleClose} color="inherit">
-          Cancel
-        </Button>
-        <Button onClick={handleSubmit} variant="contained" disableElevation>
-          Save Changes
-        </Button>
-      </DialogActions>
+        <DialogFooter>
+          <Button variant="outline" onClick={handleClose}>Cancel</Button>
+          <Button onClick={handleSubmit}>Save Changes</Button>
+        </DialogFooter>
+      </DialogContent>
     </Dialog>
   );
 });

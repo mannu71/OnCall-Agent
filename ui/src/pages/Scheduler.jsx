@@ -1,6 +1,6 @@
 import React, { useState, useCallback, memo } from 'react';
-import { Box, Typography, Button, Container } from '@mui/material';
-import { Add as AddIcon } from '@mui/icons-material';
+import { Button } from '@/components/ui/button';
+import { Plus } from 'lucide-react';
 import { SchedulerProvider, useScheduler } from '../context/SchedulerContext';
 import ScheduleList from '../components/scheduler/ScheduleList';
 import AddScheduleDialog from '../components/scheduler/AddScheduleDialog';
@@ -16,21 +16,18 @@ const SchedulerContent = memo(() => {
   }, [addSchedule]);
 
   return (
-    <Box sx={{ p: 4 }}>
-      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 4 }}>
-        <Box>
-          <Typography variant="h4" sx={{ fontWeight: 700 }}>Schedule Management</Typography>
-          <Typography color="text.secondary">Automate and monitor your on-call routines</Typography>
-        </Box>
+    <div className="p-6">
+      <div className="flex justify-between items-center mb-6">
+        <div>
+          <h1 className="text-3xl font-bold tracking-tight">Schedule Management</h1>
+          <p className="text-muted-foreground mt-1">Automate and monitor your on-call routines</p>
+        </div>
 
-        <Button
-          variant="contained"
-          startIcon={<AddIcon />}
-          onClick={() => setAddDialogOpen(true)}
-        >
+        <Button onClick={() => setAddDialogOpen(true)}>
+          <Plus className="w-4 h-4 mr-2" />
           Add Schedule
         </Button>
-      </Box>
+      </div>
 
       {/* Schedule List Component */}
       <ScheduleList />
@@ -41,7 +38,7 @@ const SchedulerContent = memo(() => {
         onClose={() => setAddDialogOpen(false)}
         onAdd={handleAddSchedule}
       />
-    </Box>
+    </div>
   );
 });
 

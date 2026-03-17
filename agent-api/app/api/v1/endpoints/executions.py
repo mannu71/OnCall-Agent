@@ -11,7 +11,7 @@ router = APIRouter(prefix="/executions", tags=["executions"])
 
 def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
     """Extract the main workflow output from execution results."""
-    results = execution.get('results', {})
+    results = execution.get('results') or {}
     
     orchestrator_output = next(
         (v for v in results.values() if isinstance(v, dict) and 'queries_executed' in v),

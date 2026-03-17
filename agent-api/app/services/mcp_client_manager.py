@@ -4,6 +4,7 @@ import logging
 import os
 import os.path
 import glob
+from contextlib import AsyncExitStack
 from typing import Dict, List, Any, Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -66,6 +67,7 @@ class MCPClientManager:
     def __init__(self):
         self.connections: Dict[str, Dict[str, Any]] = {}
         self.tools: Dict[str, List[str]] = {}  # server_id -> list of tool names
+        self._exit_stacks: Dict[str, AsyncExitStack] = {}  # server_id -> exit stack
     
     async def connect_server(self, server_id: str, config: Dict[str, Any]) -> bool:
         """Connect to an MCP server.
@@ -105,12 +107,17 @@ class MCPClientManager:
                 env=env
             )
             
-            stdio_context = stdio_client(server_params)
-            read, write = await stdio_context.__aenter__()
+            # Use AsyncExitStack for proper async context management
+            # This ensures cleanup happens correctly even across task boundaries
+            exit_stack = AsyncExitStack()
+            self._exit_stacks[server_id] = exit_stack
+            
+            # Enter the stdio context using the exit stack
+            read, write = await exit_stack.enter_async_context(stdio_client(server_params))
             logger.info("Stdio streams created for %s", server_id)
             
-            session = ClientSession(read, write)
-            await session.__aenter__()
+            # Enter the session context using the exit stack
+            session = await exit_stack.enter_async_context(ClientSession(read, write))
             logger.info("Session created for %s, initializing...", server_id)
             
             await session.initialize()
@@ -124,7 +131,6 @@ class MCPClientManager:
                 'session': session,
                 'read': read,
                 'write': write,
-                'stdio_context': stdio_context
             }
             self.tools[server_id] = tool_names
             
@@ -134,6 +140,14 @@ class MCPClientManager:
         except Exception as e:
             logger.error("Failed to connect to MCP server %s: %s", server_id, e, exc_info=True)
             logger.error("Config was - command: %s, args: %s", config.get('command'), config.get('args'))
+            # Clean up the exit stack if connection failed
+            if server_id in self._exit_stacks:
+                try:
+                    await self._exit_stacks[server_id].aclose()
+                except Exception as cleanup_error:
+                    logger.debug("Error cleaning up failed connection: %s", cleanup_error)
+                finally:
+                    del self._exit_stacks[server_id]
             return False
     
     async def execute_tool(
@@ -188,50 +202,29 @@ class MCPClientManager:
     
     async def disconnect_all(self):
         """Disconnect from all MCP servers."""
-        # Iterate over items without modifying dict during iteration
-        for server_id, conn in tuple(self.connections.items()):
-            try:
-                # Close session
-                session = conn.get('session')
-                if session:
-                    await session.__aexit__(None, None, None)
-                
-                # Close stdio context
-                stdio_context = conn.get('stdio_context')
-                if stdio_context:
-                    await stdio_context.__aexit__(None, None, None)
-                
-                logger.info("Disconnected from MCP server: %s", server_id)
-            except Exception as e:
-                logger.error("Error disconnecting from %s: %s", server_id, e)
-        
-        # Clear all connections after disconnecting
-        self.connections.clear()
-        self.tools.clear()
+        # Disconnect each server using individual disconnect to handle errors gracefully
+        for server_id in tuple(self._exit_stacks.keys()):
+            await self.disconnect_server(server_id)
     
     async def disconnect_server(self, server_id: str):
         """Disconnect from a specific MCP server."""
-        if server_id in self.connections:
-            try:
-                conn = self.connections[server_id]
-                
-                # Close session
-                session = conn.get('session')
-                if session:
-                    await session.__aexit__(None, None, None)
-                
-                # Close stdio context
-                stdio_context = conn.get('stdio_context')
-                if stdio_context:
-                    await stdio_context.__aexit__(None, None, None)
-                
-                logger.info("Disconnected from MCP server: %s", server_id)
-            except Exception as e:
-                logger.error("Error disconnecting from %s: %s", server_id, e)
-            finally:
-                del self.connections[server_id]
-                if server_id in self.tools:
-                    del self.tools[server_id]
+        if server_id not in self._exit_stacks:
+            return
+            
+        exit_stack = self._exit_stacks.pop(server_id)
+        self.connections.pop(server_id, None)
+        self.tools.pop(server_id, None)
+        
+        # Try to close the exit stack, but suppress all errors since
+        # cross-task cleanup with anyio cancel scopes is fundamentally problematic
+        try:
+            await exit_stack.aclose()
+            logger.info("Disconnected from MCP server: %s", server_id)
+        except Exception:
+            # Silently suppress all cleanup errors
+            # The resources will be garbage collected anyway
+            logger.debug("MCP cleanup completed for %s (errors suppressed)", server_id)
+            pass
     
     def get_available_tools(self, server_id: Optional[str] = None) -> Dict[str, List[str]]:
         """

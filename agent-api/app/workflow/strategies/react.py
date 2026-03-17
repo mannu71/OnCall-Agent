@@ -10,6 +10,7 @@ from typing import Dict, Any, List, Optional
 import logging
 
 from app.workflow.strategies.base import BaseStrategy
+from app.repositories.db_repository import db_repository
 
 logger = logging.getLogger(__name__)
 
@@ -189,12 +190,25 @@ class ReactStrategy(BaseStrategy):
         tools = []
         for tool_node in tool_nodes:
             tool_data = tool_node.get("data", {})
-            tools.append({
-                "name": tool_data.get("serverName", ""),
-                "command": tool_data.get("command", ""),
-                "args": tool_data.get("args", []),
-                "env": tool_data.get("env", {})
-            })
+            server_name = tool_data.get("serverName", "")
+            
+            # Check if command is embedded or mark for database lookup
+            if tool_data.get("command"):
+                # Use embedded configuration
+                tools.append({
+                    "name": server_name,
+                    "command": tool_data.get("command", ""),
+                    "args": tool_data.get("args", []),
+                    "env": tool_data.get("env", {})
+                })
+            else:
+                # Mark for database lookup (will be resolved in _setup_tools)
+                tools.append({
+                    "name": server_name,
+                    "command": None,  # Indicates DB lookup needed
+                    "args": [],
+                    "env": {}
+                })
         
         return tools
     
@@ -212,15 +226,36 @@ class ReactStrategy(BaseStrategy):
             
         Returns:
             List of LangChain tools
+            
+        Raises:
+            NotImplementedError: LangChain tool conversion is not yet implemented
         """
-        # Connect to MCP servers
+        # Resolve database lookups and connect to MCP servers
         for tool_config in tools_config:
-            if not mcp_manager.is_connected(tool_config["name"]):
+            server_name = tool_config["name"]
+            
+            # If command is None, lookup from database
+            if tool_config["command"] is None:
+                db_config = await db_repository.get_mcp_server_by_name(server_name)
+                if db_config:
+                    tool_config["command"] = db_config.get("command", "")
+                    tool_config["args"] = db_config.get("args", [])
+                    tool_config["env"] = db_config.get("env", {})
+                    logger.info(f"Loaded MCP server '{server_name}' from database")
+                else:
+                    logger.warning(f"MCP server '{server_name}' not found in database")
+                    tool_config["command"] = ""
+            
+            # Connect if not already connected
+            if not mcp_manager.is_connected(server_name):
                 await mcp_manager.connect(tool_config)
         
-        # TODO: Convert MCP tools to LangChain tools
-        # For now, return empty list
-        return []
+        # MCP tools are connected but LangChain tool conversion is not yet implemented
+        raise NotImplementedError(
+            "LangChain tool conversion is not yet implemented. "
+            "ReAct workflows require LangChain integration to convert MCP tools "
+            "into LangChain-compatible tool format. See: https://python.langchain.com/docs/modules/tools/"
+        )
     
     async def _build_agent(
         self,

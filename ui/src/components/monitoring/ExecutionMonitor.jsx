@@ -1,20 +1,15 @@
 import React, { useState } from 'react';
 import PropTypes from 'prop-types';
+import { Card, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Separator } from '@/components/ui/separator';
 import {
-    Box,
-    Paper,
-    Typography,
-    IconButton,
-    Collapse,
-    Alert,
-    CircularProgress,
-    Divider
-} from '@mui/material';
-import {
-    ExpandMore as ExpandMoreIcon,
-    ExpandLess as ExpandLessIcon,
-    Refresh as RefreshIcon
-} from '@mui/icons-material';
+    Collapsible,
+    CollapsibleContent,
+    CollapsibleTrigger,
+} from '@/components/ui/collapsible';
+import { ChevronDown, ChevronUp, RefreshCw, Loader2 } from 'lucide-react';
 import { useWorkflowStream } from '../../hooks/useWorkflowStream';
 import StatusBadge from './StatusBadge';
 import ExecutionLog from './ExecutionLog';
@@ -29,96 +24,84 @@ const ExecutionMonitor = ({ workflowName, autoStart = false, onClose }) => {
         autoStart
     );
 
-    const handleToggle = () => {
-        setExpanded(!expanded);
-    };
-
     const handleRefresh = () => {
         clearEvents();
     };
 
     const getConnectionStatus = () => {
         if (isConnected) {
-            return { text: 'Connected', color: 'success' };
+            return { text: 'Connected', color: 'text-green-600' };
         }
         if (error) {
-            return { text: 'Error', color: 'error' };
+            return { text: 'Error', color: 'text-red-600' };
         }
-        return { text: 'Disconnected', color: 'default' };
+        return { text: 'Disconnected', color: 'text-gray-500' };
     };
 
     const connectionStatus = getConnectionStatus();
 
     return (
-        <Paper elevation={3} sx={{ mb: 2 }}>
-            <Box
-                sx={{
-                    p: 2,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    cursor: 'pointer',
-                    '&:hover': { bgcolor: 'action.hover' }
-                }}
-                onClick={handleToggle}
-            >
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flex: 1 }}>
-                    <Typography variant="h6" sx={{ fontWeight: 600 }}>
-                        {workflowName}
-                    </Typography>
-                    <StatusBadge status={status} />
-                    {isConnected && status === 'running' && (
-                        <CircularProgress size={20} />
-                    )}
-                </Box>
+        <Card className="mb-4">
+            <Collapsible open={expanded} onOpenChange={setExpanded}>
+                <div className="p-4 flex items-center justify-between cursor-pointer hover:bg-accent/50"
+                     onClick={() => setExpanded(!expanded)}>
+                    <div className="flex items-center gap-3 flex-1">
+                        <h3 className="text-lg font-semibold">{workflowName}</h3>
+                        <StatusBadge status={status} />
+                        {isConnected && status === 'running' && (
+                            <Loader2 className="w-5 h-5 animate-spin" />
+                        )}
+                    </div>
 
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                    <Typography variant="caption" color="text.secondary">
-                        {connectionStatus.text}
-                    </Typography>
-                    <IconButton
-                        size="small"
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            handleRefresh();
-                        }}
-                    >
-                        <RefreshIcon />
-                    </IconButton>
-                    <IconButton size="small">
-                        {expanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
-                    </IconButton>
-                </Box>
-            </Box>
+                    <div className="flex items-center gap-2">
+                        <span className={`text-xs ${connectionStatus.color}`}>
+                            {connectionStatus.text}
+                        </span>
+                        <Button
+                            size="icon"
+                            variant="ghost"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                handleRefresh();
+                            }}
+                        >
+                            <RefreshCw className="w-4 h-4" />
+                        </Button>
+                        <CollapsibleTrigger asChild>
+                            <Button size="icon" variant="ghost">
+                                {expanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                            </Button>
+                        </CollapsibleTrigger>
+                    </div>
+                </div>
 
-            <Collapse in={expanded}>
-                <Divider />
-                <Box sx={{ p: 2 }}>
-                    {error && (
-                        <Alert severity="error" sx={{ mb: 2 }}>
-                            {error}
-                        </Alert>
-                    )}
+                <CollapsibleContent>
+                    <Separator />
+                    <CardContent className="pt-4">
+                        {error && (
+                            <Alert variant="destructive" className="mb-4">
+                                <AlertDescription>{error}</AlertDescription>
+                            </Alert>
+                        )}
 
-                    {!isConnected && !error && (
-                        <Alert severity="info" sx={{ mb: 2 }}>
-                            Waiting for connection...
-                        </Alert>
-                    )}
+                        {!isConnected && !error && (
+                            <Alert className="mb-4">
+                                <AlertDescription>Waiting for connection...</AlertDescription>
+                            </Alert>
+                        )}
 
-                    <Typography variant="subtitle2" gutterBottom sx={{ fontWeight: 600 }}>
-                        Execution Log
-                    </Typography>
-                    <ExecutionLog events={events} maxHeight={300} />
+                        <h4 className="text-sm font-semibold mb-2">Execution Log</h4>
+                        <ExecutionLog events={events} maxHeight={300} />
 
-                    {events.length > 0 && (
-                        <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-                            {events.length} event{events.length === 1 ? '' : 's'} received
-                        </Typography>
-                    )}
-                </Box>
-            </Collapse>
-        </Paper>
+                        {events.length > 0 && (
+                            <p className="text-xs text-muted-foreground mt-2">
+                                {events.length} event{events.length === 1 ? '' : 's'} received
+                            </p>
+                        )}
+                    </CardContent>
+                </CollapsibleContent>
+            </Collapsible>
+        </Card>
     );
 };
 

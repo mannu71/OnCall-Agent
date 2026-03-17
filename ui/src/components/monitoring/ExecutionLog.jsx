@@ -1,14 +1,7 @@
 import React, { useRef, useEffect } from 'react';
 import PropTypes from 'prop-types';
-import {
-    Box,
-    Paper,
-    Typography,
-    List,
-    ListItem,
-    ListItemText,
-    Chip
-} from '@mui/material';
+import { Card } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
 
 /**
  * Execution log component for displaying real-time logs
@@ -24,15 +17,15 @@ const ExecutionLog = ({ events, maxHeight = 400 }) => {
     const getEventColor = (type) => {
         switch (type) {
             case 'error':
-                return 'error';
+                return 'bg-red-100 text-red-700 hover:bg-red-100 border-red-200';
             case 'complete':
-                return 'success';
+                return 'bg-green-100 text-green-700 hover:bg-green-100 border-green-200';
             case 'progress':
-                return 'info';
+                return 'bg-blue-100 text-blue-700 hover:bg-blue-100 border-blue-200';
             case 'status':
-                return 'primary';
+                return 'bg-purple-100 text-purple-700 hover:bg-purple-100 border-purple-200';
             default:
-                return 'default';
+                return 'bg-gray-100 text-gray-700 hover:bg-gray-100 border-gray-200';
         }
     };
 
@@ -49,70 +42,49 @@ const ExecutionLog = ({ events, maxHeight = 400 }) => {
 
     if (!events || events.length === 0) {
         return (
-            <Paper sx={{ p: 2, bgcolor: '#f5f5f5' }}>
-                <Typography variant="body2" color="text.secondary">
+            <Card className="p-4 bg-gray-50">
+                <p className="text-sm text-muted-foreground">
                     No events yet. Waiting for execution to start...
-                </Typography>
-            </Paper>
+                </p>
+            </Card>
         );
     }
 
     return (
-        <Paper
-            sx={{
-                maxHeight,
-                overflow: 'auto',
-                bgcolor: '#1e1e1e',
-                color: '#d4d4d4',
-                fontFamily: 'monospace',
-                fontSize: '0.875rem'
-            }}
+        <div
+            className="overflow-auto bg-[#1e1e1e] text-[#d4d4d4] font-mono text-sm rounded-lg"
+            style={{ maxHeight: `${maxHeight}px` }}
         >
-            <List dense>
+            <div className="divide-y divide-[#333]">
                 {events.map((event, index) => (
-                    <ListItem
+                    <div
                         key={index}
-                        sx={{
-                            borderBottom: '1px solid #333',
-                            '&:hover': { bgcolor: '#2d2d2d' }
-                        }}
+                        className="px-3 py-2 hover:bg-[#2d2d2d] transition-colors"
                     >
-                        <ListItemText
-                            primary={
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                                    <Typography
-                                        component="span"
-                                        sx={{ color: '#858585', minWidth: 80 }}
-                                    >
-                                        [{formatTimestamp(event.timestamp)}]
-                                    </Typography>
-                                    <Chip
-                                        label={event.type}
-                                        size="small"
-                                        color={getEventColor(event.type)}
-                                        sx={{ minWidth: 80 }}
-                                    />
-                                    <Typography component="span" sx={{ color: '#d4d4d4' }}>
-                                        {event.message || event.step || JSON.stringify(event.data || {})}
-                                    </Typography>
-                                </Box>
-                            }
-                            secondary={
-                                event.error && (
-                                    <Typography
-                                        component="span"
-                                        sx={{ color: '#f48771', ml: 10 }}
-                                    >
-                                        Error: {event.error}
-                                    </Typography>
-                                )
-                            }
-                        />
-                    </ListItem>
+                        <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-[#858585] min-w-[80px]">
+                                [{formatTimestamp(event.timestamp)}]
+                            </span>
+                            <Badge
+                                variant="outline"
+                                className={`min-w-[80px] justify-center ${getEventColor(event.type)}`}
+                            >
+                                {event.type}
+                            </Badge>
+                            <span className="text-[#d4d4d4]">
+                                {event.message || event.step || JSON.stringify(event.data || {})}
+                            </span>
+                        </div>
+                        {event.error && (
+                            <div className="text-[#f48771] ml-[88px] mt-1">
+                                Error: {event.error}
+                            </div>
+                        )}
+                    </div>
                 ))}
                 <div ref={logEndRef} />
-            </List>
-        </Paper>
+            </div>
+        </div>
     );
 };
 

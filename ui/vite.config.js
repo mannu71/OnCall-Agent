@@ -1,44 +1,45 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import path from 'path'
 
-// https://vite.dev/config/
 export default defineConfig({
+  base: './',
   plugins: [react()],
-  base: './', // Use relative paths for Electron
-
-  // Dev server configuration
-  server: {
-    port: 5175,
-    strictPort: true, // Exit if port is already in use
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
   },
-
-  // Build optimizations
+  server: {
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
+    },
+  },
   build: {
     target: 'esnext',
-    sourcemap: false, // Disable sourcemaps in production
+    sourcemap: false,
     chunkSizeWarningLimit: 1000,
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          // Split vendor libraries into separate chunks
-          'react-vendor': ['react', 'react-dom', 'react-router-dom'],
-          'mui': ['@mui/material', '@mui/icons-material', '@emotion/react', '@emotion/styled'],
-          'workflow': ['reactflow'],
-        }
-      }
-    },
-    // Enable minification
     minify: 'terser',
     terserOptions: {
       compress: {
-        drop_console: true, // Remove console.logs in production
+        drop_console: true,
         drop_debugger: true,
-      }
-    }
+      },
+    },
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'react-vendor': ['react', 'react-dom', 'react-router-dom'],
+          'mui': ['@mui/material', '@mui/icons-material', '@emotion/react', '@emotion/styled'],
+          'workflow': ['reactflow'],
+        },
+      },
+    },
   },
-
-  // Optimize dependencies
   optimizeDeps: {
-    include: ['react', 'react-dom', '@mui/material'],
-  }
+    include: ['react', 'react-dom', 'react-router-dom', '@mui/material', '@mui/icons-material', 'reactflow'],
+  },
 })

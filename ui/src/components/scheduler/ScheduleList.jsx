@@ -1,36 +1,16 @@
 import React, { useState, useMemo, memo } from 'react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { Badge } from '@/components/ui/badge';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from '@/components/ui/dialog';
 import {
-  Box,
-  Typography,
-  TextField,
-  Alert,
-  Table,
-  TableBody,
-  TableCell,
-  TableContainer,
-  TableHead,
-  TableRow,
-  Paper,
-  Chip,
-  IconButton,
-  Menu,
-  MenuItem,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogContentText,
-  DialogActions,
-  Button,
-  CircularProgress,
-  Snackbar
-} from '@mui/material';
-import {
-  MoreVert as MoreVertIcon,
-  PlayArrow as PlayArrowIcon,
-  Edit as EditIcon,
-  Delete as DeleteIcon,
-  Search as SearchIcon
-} from '@mui/icons-material';
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Play, Search, MoreVertical, Edit2, Trash2, Loader2 } from 'lucide-react';
 import { useScheduler } from '../../context/SchedulerContext';
 import { useWorkflowStatus } from '../../context/WorkflowStatusContext';
 import EditScheduleDialog from './EditScheduleDialog';
@@ -48,11 +28,8 @@ const ScheduleList = memo(() => {
   const { isWorkflowRunning, markWorkflowPending, clearWorkflowPending } = useWorkflowStatus();
   const [searchTerm, setSearchTerm] = useState('');
   const [editingSchedule, setEditingSchedule] = useState(null);
-  const [anchorEl, setAnchorEl] = useState(null);
-  const [selectedSchedule, setSelectedSchedule] = useState(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [scheduleToDelete, setScheduleToDelete] = useState(null);
-  const [snackbar, setSnackbar] = useState({ open: false, message: '', severity: 'success' });
 
   const filteredSchedules = useMemo(() => {
     const searchLower = searchTerm.toLowerCase();
@@ -63,15 +40,7 @@ const ScheduleList = memo(() => {
     });
   }, [schedules, searchTerm]);
 
-  const handleMenuOpen = (event, schedule) => {
-    setAnchorEl(event.currentTarget);
-    setSelectedSchedule(schedule);
-  };
 
-  const handleMenuClose = () => {
-    setAnchorEl(null);
-    setSelectedSchedule(null);
-  };
 
   const handleEditSchedule = async (schedule) => {
     try {
@@ -79,9 +48,7 @@ const ScheduleList = memo(() => {
       setEditingSchedule(fresh);
     } catch (error) {
       console.error('Error loading schedule:', error);
-      setSnackbar({ open: true, message: 'Failed to load schedule', severity: 'error' });
     }
-    handleMenuClose();
   };
 
   const confirmDelete = () => {
@@ -97,138 +64,144 @@ const ScheduleList = memo(() => {
     
     // Prevent duplicate execution if already running/pending
     if (isWorkflowRunning(name)) {
-      setSnackbar({ open: true, message: `Workflow "${name}" is already running`, severity: 'warning' });
       return;
     }
     
     try {
       markWorkflowPending(name);
       await agentApiClient.executeWorkflow(name, true);
-      setSnackbar({ open: true, message: `Workflow "${name}" started`, severity: 'success' });
     } catch (e) {
       clearWorkflowPending(name);
-      setSnackbar({ open: true, message: `Error: ${e.message}`, severity: 'error' });
+      console.error('Error running workflow:', e);
     }
+  };
+
+  const getEmptyMessage = () => {
+    if (schedules.length === 0) {
+      return "No schedules found.";
+    }
+    return "No schedules match your search.";
+  };
+
+  const renderContent = () => {
+    if (isLoading) {
+      return (
+        <div className="flex justify-center py-8">
+          <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+        </div>
+      );
+    }
+
+    if (filteredSchedules.length === 0) {
+      return (
+        <div className="bg-blue-50 border border-blue-200 text-blue-800 px-4 py-3 rounded">
+          {getEmptyMessage()}
+        </div>
+      );
+    }
+
+    return (
+      <div className="border rounded-lg bg-white">
+        <Table>
+          <TableHeader>
+            <TableRow className="bg-slate-50/50">
+              <TableHead className="text-slate-500 text-xs font-bold uppercase tracking-wider">Title</TableHead>
+              <TableHead className="text-slate-500 text-xs font-bold uppercase tracking-wider">Workflow</TableHead>
+              <TableHead className="text-slate-500 text-xs font-bold uppercase tracking-wider">Local Time</TableHead>
+              <TableHead className="text-slate-500 text-xs font-bold uppercase tracking-wider">Schedule</TableHead>
+              <TableHead className="text-slate-500 text-xs font-bold uppercase tracking-wider text-center">Run</TableHead>
+              <TableHead className="text-slate-500 text-xs font-bold uppercase tracking-wider text-right">Actions</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody className="text-sm">
+            {filteredSchedules.map((schedule) => (
+              <TableRow key={schedule.name}>
+                <TableCell className="font-semibold text-slate-900">{schedule.title || schedule.name}</TableCell>
+                <TableCell className="text-slate-600">
+                  <Badge variant="outline">{schedule.name}</Badge>
+                </TableCell>
+                <TableCell>{schedule.startTime ? formatTime(schedule.startTime) : '-'}</TableCell>
+                <TableCell>
+                  <span className="font-mono text-sm text-muted-foreground">
+                    {schedule.schedule || 'Manual'}
+                  </span>
+                </TableCell>
+                <TableCell className="text-center">
+                  {isWorkflowRunning(schedule.name) ? (
+                    <Loader2 className="w-4 h-4 animate-spin mx-auto" />
+                  ) : (
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      onClick={() => handleRunNow(schedule)}
+                    >
+                      <Play className="w-4 h-4" />
+                    </Button>
+                  )}
+                </TableCell>
+                <TableCell className="text-right">
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button size="icon" variant="ghost">
+                        <MoreVertical className="w-4 h-4" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem onClick={() => handleEditSchedule(schedule)}>
+                        <Edit2 className="w-4 h-4 mr-2" />
+                        Edit
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onClick={() => {
+                          setScheduleToDelete(schedule);
+                          setDeleteDialogOpen(true);
+                        }}
+                        className="text-red-600"
+                      >
+                        <Trash2 className="w-4 h-4 mr-2" />
+                        Delete
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+    );
   };
 
 
   return (
-    <Box>
-      <Box sx={{ mb: 3 }}>
-        <TextField
-          size="small"
-          placeholder="Search schedules..."
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-          slotProps={{
-            input: {
-              startAdornment: (
-                <SearchIcon sx={{ color: 'text.secondary', mr: 1, fontSize: 20 }} />
-              ),
-            },
-          }}
-          sx={{
-            width: '100%',
-            maxWidth: 400,
-            '& .MuiOutlinedInput-root': {
-              borderRadius: 2,
-              bgcolor: 'background.paper',
-              transition: 'all 0.2s ease-in-out',
-              '&:hover': {
-                boxShadow: '0 2px 8px rgba(0,0,0,0.05)',
-                borderColor: 'primary.main',
-              },
-              '&.Mui-focused': {
-                boxShadow: '0 4px 12px rgba(25, 118, 210, 0.1)',
-              }
-            }
-          }}
-        />
-      </Box>
+    <div>
+      <div className="mb-4">
+        <div className="relative max-w-md">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+          <Input
+            placeholder="Search schedules..."
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            className="pl-10"
+          />
+        </div>
+      </div>
 
-      {(() => {
-        if (isLoading) {
-          return (
-            <Box display="flex" justifyContent="center" sx={{ py: 4 }}>
-              <CircularProgress size={30} />
-            </Box>
-          );
-        }
-        if (filteredSchedules.length === 0) {
-          return (
-            <Alert severity="info">
-              {schedules.length === 0 ? "No schedules found." : "No schedules match your search."}
-            </Alert>
-          );
-        }
-        return (
-          <TableContainer component={Paper} elevation={0} variant="outlined" sx={{ borderRadius: 2 }}>
-            <Table>
-              <TableHead sx={{ bgcolor: 'action.hover' }}>
-              <TableRow>
-                <TableCell sx={{ fontWeight: 600 }}>Title</TableCell>
-                <TableCell sx={{ fontWeight: 600 }}>Workflow</TableCell>
-                <TableCell sx={{ fontWeight: 600 }}>Local Time</TableCell>
-                <TableCell sx={{ fontWeight: 600 }}>Schedule</TableCell>
-                <TableCell align="center" sx={{ fontWeight: 600 }}>Run</TableCell>
-                <TableCell align="right" sx={{ fontWeight: 600 }}>Actions</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {filteredSchedules.map((schedule) => (
-                <TableRow key={schedule.name} hover>
-                  <TableCell sx={{ fontWeight: 500 }}>{schedule.title || schedule.name}</TableCell>
-                  <TableCell>
-                    <Chip label={schedule.name} size="small" variant="outlined" />
-                  </TableCell>
-                  <TableCell>{schedule.startTime ? formatTime(schedule.startTime) : '-'}</TableCell>
-                  <TableCell>
-                    <Typography variant="body2" sx={{ fontFamily: 'monospace', color: 'text.secondary' }}>
-                      {schedule.schedule || 'Manual'}
-                    </Typography>
-                  </TableCell>
-                  <TableCell align="center">
-                    {isWorkflowRunning(schedule.name) ? (
-                      <CircularProgress size={20} />
-                    ) : (
-                      <IconButton size="small" color="primary" onClick={() => handleRunNow(schedule)}>
-                        <PlayArrowIcon />
-                      </IconButton>
-                    )}
-                  </TableCell>
-                  <TableCell align="right">
-                    <IconButton size="small" onClick={(e) => handleMenuOpen(e, schedule)}>
-                      <MoreVertIcon />
-                    </IconButton>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </TableContainer>
-        );
-      })()}
+      {renderContent()}
 
-      <Menu anchorEl={anchorEl} open={Boolean(anchorEl)} onClose={handleMenuClose}>
-        <MenuItem onClick={() => handleEditSchedule(selectedSchedule)}>
-          <EditIcon fontSize="small" sx={{ mr: 1 }} /> Edit
-        </MenuItem>
-        <MenuItem onClick={() => { setScheduleToDelete(selectedSchedule); setDeleteDialogOpen(true); handleMenuClose(); }} sx={{ color: 'error.main' }}>
-          <DeleteIcon fontSize="small" sx={{ mr: 1 }} /> Delete
-        </MenuItem>
-      </Menu>
-
-      <Dialog open={deleteDialogOpen} onClose={() => setDeleteDialogOpen(false)}>
-        <DialogTitle>Confirm Delete</DialogTitle>
+      <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
         <DialogContent>
-          <DialogContentText>
-            Are you sure you want to delete the schedule "{scheduleToDelete?.title || scheduleToDelete?.name}"?
-          </DialogContentText>
+          <DialogHeader>
+            <DialogTitle>Confirm Delete</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete the schedule "{scheduleToDelete?.title || scheduleToDelete?.name}"?
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteDialogOpen(false)}>Cancel</Button>
+            <Button variant="destructive" onClick={confirmDelete}>Delete</Button>
+          </DialogFooter>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setDeleteDialogOpen(false)}>Cancel</Button>
-          <Button onClick={confirmDelete} color="error" variant="contained">Delete</Button>
-        </DialogActions>
       </Dialog>
 
       {editingSchedule && (
@@ -239,15 +212,7 @@ const ScheduleList = memo(() => {
           onUpdate={(updated) => { updateSchedule(editingSchedule.name, updated); setEditingSchedule(null); }}
         />
       )}
-
-      <Snackbar
-        open={snackbar.open}
-        autoHideDuration={4000}
-        onClose={() => setSnackbar({ ...snackbar, open: false })}
-      >
-        <Alert severity={snackbar.severity} sx={{ width: '100%' }}>{snackbar.message}</Alert>
-      </Snackbar>
-    </Box>
+    </div>
   );
 });
 

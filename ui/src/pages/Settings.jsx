@@ -1,48 +1,82 @@
 import React, { useState, useEffect } from 'react';
+import { Button } from '@/components/ui/button';
+import { 
+    Dialog, 
+    DialogContent, 
+    DialogHeader, 
+    DialogTitle, 
+    DialogFooter 
+} from '@/components/ui/dialog';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { Badge } from '@/components/ui/badge';
+import { Card, CardContent } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
+import { Alert } from '@/components/ui/alert';
 import {
-    Box,
-    Container,
-    Typography,
-    Paper,
-    Button,
-    TextField,
-    IconButton,
-    Dialog,
-    DialogTitle,
-    DialogContent,
-    DialogActions,
-    Table,
-    TableBody,
-    TableCell,
-    TableContainer,
-    TableHead,
-    TableRow,
-    Chip,
-    Alert,
-    CircularProgress,
     Select,
-    MenuItem,
-    FormControl,
-    InputLabel,
-    InputAdornment,
-    Autocomplete
-} from '@mui/material';
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from '@/components/ui/select';
 import {
-    Add as AddIcon,
-    Edit as EditIcon,
-    Delete as DeleteIcon,
-    Visibility as VisibilityIcon,
-    VisibilityOff as VisibilityOffIcon,
-    Key as KeyIcon,
-    Check as CheckIcon,
-    Refresh as RefreshIcon,
-    CheckCircle as CheckCircleIcon,
-    Error as ErrorIcon,
-    HourglassEmpty as HourglassEmptyIcon
-} from '@mui/icons-material';
+    Plus,
+    Edit2,
+    Trash2,
+    RefreshCw,
+    CheckCircle,
+    XCircle,
+    Clock,
+    Loader2,
+    Eye,
+    EyeOff,
+    Key,
+    Check,
+    Info
+} from 'lucide-react';
 import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer, getMCPInputValues, updateMCPInputValue, invalidateCache } from '../services/mcpService';
 import { getLLMs, addLLM, updateLLM, deleteLLM } from '../services/llmService';
 import agentApiClient from '../services/agentApiClient';
+
+// Icon options for MCP Servers
+const MCP_SERVER_ICONS = [
+    { value: '🔧', label: '🔧 Tool' },
+    { value: '🎭', label: '🎭 Playwright' },
+    { value: '🗄️', label: '🗄️ Database' },
+    { value: '📊', label: '📊 Analytics' },
+    { value: '🐘', label: '🐘 PostgreSQL' },
+    { value: '🔍', label: '🔍 Search' },
+    { value: '📁', label: '📁 FileSystem' },
+    { value: '☁️', label: '☁️ Cloud' },
+    { value: '🌐', label: '🌐 Web' },
+    { value: '📡', label: '📡 API' },
+    { value: '⚡', label: '⚡ Fast' },
+    { value: '🔐', label: '🔐 Security' },
+    { value: '📝', label: '📝 Notes' },
+    { value: '🤖', label: '🤖 Bot' },
+    { value: '💾', label: '💾 Storage' },
+];
+
+// Icon options for LLMs
+const LLM_ICONS = [
+    { value: '🧠', label: '🧠 Brain' },
+    { value: '⚡', label: '⚡ Lightning' },
+    { value: '🤖', label: '🤖 Robot' },
+    { value: '✨', label: '✨ Sparkles' },
+    { value: '🚀', label: '🚀 Rocket' },
+    { value: '💡', label: '💡 Lightbulb' },
+    { value: '🎯', label: '🎯 Target' },
+    { value: '🔮', label: '🔮 Crystal Ball' },
+    { value: '🌟', label: '🌟 Star' },
+    { value: '💫', label: '💫 Dizzy' },
+    { value: '🎓', label: '🎓 Graduation' },
+    { value: '📚', label: '📚 Books' },
+    { value: '🔬', label: '🔬 Microscope' },
+    { value: '🎨', label: '🎨 Art' },
+    { value: '🌈', label: '🌈 Rainbow' },
+];
 
 // Helper to extract ${input:...} variables from args string
 const extractInputVariables = (argsString) => {
@@ -558,667 +592,740 @@ const Settings = () => {
     };
 
     return (
-        <Box sx={{ p: 2, minHeight: '100vh', backgroundColor: 'background.default' }}>
-            <Container maxWidth="lg" sx={{ px: 0 }}>
-                <Box sx={{ mb: 4 }}>
-                    <Typography variant="h4" sx={{ fontWeight: 700, mb: 1 }}>Settings</Typography>
-                    <Typography variant="body1" color="text.secondary">Configure system services, MCP servers, and language models</Typography>
-                </Box>
+        <div className="p-4 min-h-screen bg-background">
+            <div className="max-w-6xl mx-auto px-0">
+                <div className="mb-8">
+                    <h1 className="text-4xl font-bold mb-2">Settings</h1>
+                    <p className="text-muted-foreground">Configure system services, MCP servers, and language models</p>
+                </div>
 
                 {saveMessage && (
-                    <Alert severity="success" sx={{ mb: 2 }}>
+                    <div className="bg-green-50 border border-green-200 text-green-800 px-4 py-3 rounded mb-4">
                         {saveMessage}
-                    </Alert>
+                    </div>
                 )}
 
                 {/* API Health Check Section */}
-                <Paper sx={{ p: 3, mb: 3 }}>
-                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-                        <Typography variant="h6" sx={{ fontWeight: 500 }}>
-                            API Status
-                        </Typography>
-                        <Button
-                            variant="outlined"
-                            startIcon={apiHealthLoading ? <CircularProgress size={20} /> : <RefreshIcon />}
-                            onClick={checkApiHealth}
-                            disabled={apiHealthLoading}
-                        >
-                            {apiHealthLoading ? 'Checking...' : 'Check API'}
-                        </Button>
-                    </Box>
-                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-                        {apiHealth ? (
-                            <>
-                                {apiHealth.status === 'healthy' ? (
-                                    <Chip
-                                        icon={<CheckCircleIcon />}
-                                        label="Connected"
-                                        color="success"
-                                    />
+                <Card className="mb-6">
+                    <CardContent className="pt-6">
+                        <div className="flex justify-between items-center mb-4">
+                            <h2 className="text-xl font-medium">API Status</h2>
+                            <Button
+                                variant="outline"
+                                onClick={checkApiHealth}
+                                disabled={apiHealthLoading}
+                            >
+                                {apiHealthLoading ? (
+                                    <>
+                                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                        Checking...
+                                    </>
                                 ) : (
-                                    <Chip
-                                        icon={<ErrorIcon />}
-                                        label="Error"
-                                        color="error"
-                                    />
+                                    <>
+                                        <RefreshCw className="w-4 h-4 mr-2" />
+                                        Check API
+                                    </>
                                 )}
-                                <Typography variant="body2" color="text.secondary">
+                            </Button>
+                        </div>
+                        <div className="flex items-center gap-4">
+                            {apiHealth ? (
+                                <>
                                     {apiHealth.status === 'healthy' ? (
-                                        <>
-                                            Scheduler: {apiHealth.scheduler_running ? 'Running' : 'Stopped'}
-                                            {' • '}
-                                            Active Workflows: {apiHealth.active_workflows || 0}
-                                        </>
+                                        <Badge variant="default" className="bg-green-600">
+                                            <CheckCircle className="w-3 h-3 mr-1" />
+                                            Connected
+                                        </Badge>
                                     ) : (
-                                        apiHealth.message
+                                        <Badge variant="destructive">
+                                            <XCircle className="w-3 h-3 mr-1" />
+                                            Error
+                                        </Badge>
                                     )}
-                                </Typography>
-                            </>
-                        ) : (
-                            <Typography variant="body2" color="text.secondary">
-                                Click "Check API" to verify connection
-                            </Typography>
-                        )}
-                    </Box>
-                </Paper>
+                                    <p className="text-sm text-muted-foreground">
+                                        {apiHealth.status === 'healthy' ? (
+                                            <>
+                                                Scheduler: {apiHealth.scheduler_running ? 'Running' : 'Stopped'}
+                                                {' • '}
+                                                Active Workflows: {apiHealth.active_workflows || 0}
+                                            </>
+                                        ) : (
+                                            apiHealth.message
+                                        )}
+                                    </p>
+                                </>
+                            ) : (
+                                <p className="text-sm text-muted-foreground">
+                                    Click "Check API" to verify connection
+                                </p>
+                            )}
+                        </div>
+                    </CardContent>
+                </Card>
 
-                <Paper sx={{ p: 3, mb: 3 }}>
-                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-                        <Typography variant="h6" sx={{ fontWeight: 500 }}>
-                            MCP Servers
-                        </Typography>
-                        <Box sx={{ display: 'flex', gap: 1 }}>
-                            <Button
-                                variant="outlined"
-                                startIcon={<RefreshIcon />}
-                                onClick={testAllConnections}
-                                disabled={Object.keys(servers).length === 0}
-                            >
-                                Test All
-                            </Button>
-                            <Button
-                                variant="contained"
-                                startIcon={<AddIcon />}
-                                onClick={() => handleOpenDialog()}
-                            >
-                                Add Server
-                            </Button>
-                        </Box>
-                    </Box>
+                <Card className="mb-6">
+                    <CardContent className="pt-6">
+                        <div className="flex justify-between items-center mb-4">
+                            <h2 className="text-xl font-medium">MCP Servers</h2>
+                            <div className="flex gap-2">
+                                <Button
+                                    variant="outline"
+                                    onClick={testAllConnections}
+                                    disabled={Object.keys(servers).length === 0}
+                                >
+                                    <RefreshCw className="w-4 h-4 mr-2" />
+                                    Test All
+                                </Button>
+                                <Button onClick={() => handleOpenDialog()}>
+                                    <Plus className="w-4 h-4 mr-2" />
+                                    Add Server
+                                </Button>
+                            </div>
+                        </div>
 
-                    <TableContainer>
-                        <Table>
-                            <TableHead sx={{ bgcolor: 'action.hover' }}>
-                                <TableRow>
-                                    <TableCell sx={{ fontWeight: 600 }}>Icon</TableCell>
-                                    <TableCell sx={{ fontWeight: 600 }}>Name</TableCell>
-                                    <TableCell sx={{ fontWeight: 600 }}>Description</TableCell>
-                                    <TableCell sx={{ fontWeight: 600 }}>Command</TableCell>
-                                    <TableCell sx={{ fontWeight: 600 }}>Status</TableCell>
-                                    <TableCell align="right" sx={{ fontWeight: 600 }}>Actions</TableCell>
-                                </TableRow>
-                            </TableHead>
-                            <TableBody>
-                                {Object.entries(servers).map(([name, config]) => {
-                                    const status = connectionStatus[name];
-                                    return (
-                                        <TableRow key={name}>
-                                            <TableCell>{config.icon || '🔧'}</TableCell>
-                                            <TableCell>
-                                                <Typography variant="body2" sx={{ fontWeight: 500 }}>
-                                                    {name}
-                                                </Typography>
-                                            </TableCell>
-                                            <TableCell>{config.description || '-'}</TableCell>
-                                            <TableCell>
-                                                <code style={{ fontSize: '0.85em' }}>{config.command}</code>
-                                            </TableCell>
-                                            <TableCell>
-                                                {status?.status === 'testing' && (
-                                                    <Chip
-                                                        icon={<HourglassEmptyIcon fontSize="small" />}
-                                                        label="Testing..."
-                                                        size="small"
-                                                        color="info"
-                                                    />
-                                                )}
-                                                {status?.status === 'connected' && (
-                                                    <Chip
-                                                        icon={<CheckCircleIcon fontSize="small" />}
-                                                        label="Connected"
-                                                        size="small"
-                                                        color="success"
-                                                    />
-                                                )}
-                                                {status?.status === 'error' && (
-                                                    <Chip
-                                                        icon={<ErrorIcon fontSize="small" />}
-                                                        label={status.message?.substring(0, 20) || 'Error'}
-                                                        size="small"
-                                                        color="error"
-                                                        title={status.message}
-                                                    />
-                                                )}
-                                                {!status && (
-                                                    <Chip
-                                                        label="Not tested"
-                                                        size="small"
-                                                        variant="outlined"
-                                                    />
-                                                )}
-                                            </TableCell>
-                                            <TableCell align="right">
-                                                <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 0.5 }}>
-                                                    <IconButton
-                                                        size="small"
-                                                        onClick={() => testServerConnection(name, config)}
-                                                        color="info"
-                                                        title="Test Connection"
-                                                        disabled={status?.status === 'testing'}
-                                                    >
-                                                        <RefreshIcon fontSize="small" />
-                                                    </IconButton>
-                                                    <IconButton
-                                                        size="small"
-                                                        onClick={() => handleOpenDialog(name)}
-                                                        color="primary"
-                                                        title="Edit"
-                                                    >
-                                                        <EditIcon fontSize="small" />
-                                                    </IconButton>
-                                                    <IconButton
-                                                        size="small"
-                                                        onClick={() => handleDelete(name)}
-                                                        color="error"
-                                                        title="Delete"
-                                                    >
-                                                        <DeleteIcon fontSize="small" />
-                                                    </IconButton>
-                                                </Box>
-                                            </TableCell>
-                                        </TableRow>
-                                    );
-                                })}
-                                {Object.keys(servers).length === 0 && (
+                        <div className="border rounded-lg">
+                            <Table>
+                                <TableHeader>
                                     <TableRow>
-                                        <TableCell colSpan={6} align="center">
-                                            <Typography variant="body2" color="text.secondary">
-                                                No MCP servers configured. Click "Add Server" to get started.
-                                            </Typography>
-                                        </TableCell>
+                                        <TableHead>Icon</TableHead>
+                                        <TableHead>Name</TableHead>
+                                        <TableHead>Description</TableHead>
+                                        <TableHead>Command</TableHead>
+                                        <TableHead>Status</TableHead>
+                                        <TableHead className="text-right">Actions</TableHead>
                                     </TableRow>
-                                )}
-                            </TableBody>
-                        </Table>
-                    </TableContainer>
-                </Paper>
-
-                {/* Certificates Section */}
-                <Paper sx={{ p: 3, mb: 3 }}>
-                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-                        <Typography variant="h6" sx={{ fontWeight: 500 }}>
-                            SSL Certificates
-                        </Typography>
-                        <Button
-                            variant="contained"
-                            component="label"
-                            startIcon={certUploadLoading ? <CircularProgress size={20} color="inherit" /> : <AddIcon />}
-                            disabled={certUploadLoading}
-                        >
-                            Upload Certificate{' '}
-                            <input
-                                type="file"
-                                hidden
-                                accept=".pem,.crt,.cer,.cert"
-                                onChange={handleCertificateUpload}
-                            />
-                        </Button>
-                    </Box>
-                    <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-                        Upload SSL certificates for secure database connections. Certificates are automatically used when configuring MCP servers with SSL.
-                    </Typography>
-                    {certificates.length > 0 ? (
-                        <TableContainer>
-                            <Table size="small">
-                                <TableHead sx={{ bgcolor: 'action.hover' }}>
-                                    <TableRow>
-                                        <TableCell sx={{ fontWeight: 600 }}>Filename</TableCell>
-                                        <TableCell sx={{ fontWeight: 600 }}>Container Path</TableCell>
-                                        <TableCell align="right" sx={{ fontWeight: 600 }}>Actions</TableCell>
-                                    </TableRow>
-                                </TableHead>
+                                </TableHeader>
                                 <TableBody>
-                                    {certificates.map((filename) => (
-                                        <TableRow key={filename}>
-                                            <TableCell>
-                                                <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>
-                                                    {filename}
-                                                </Typography>
-                                            </TableCell>
-                                            <TableCell>
-                                                <Typography variant="body2" sx={{ fontFamily: 'monospace', color: 'text.secondary' }}>
-                                                    /app/data/certs/{filename}
-                                                </Typography>
-                                            </TableCell>
-                                            <TableCell align="right">
-                                                <IconButton
-                                                    size="small"
-                                                    onClick={() => handleDeleteCertificate(filename)}
-                                                    color="error"
-                                                    title="Delete Certificate"
-                                                >
-                                                    <DeleteIcon fontSize="small" />
-                                                </IconButton>
+                                    {Object.entries(servers).map(([name, config]) => {
+                                        const status = connectionStatus[name];
+                                        return (
+                                            <TableRow key={name}>
+                                                <TableCell>{config.icon || '🔧'}</TableCell>
+                                                <TableCell>
+                                                    <span className="text-sm font-medium">{name}</span>
+                                                </TableCell>
+                                                <TableCell>{config.description || '-'}</TableCell>
+                                                <TableCell>
+                                                    <code className="text-xs font-mono">{config.command}</code>
+                                                </TableCell>
+                                                <TableCell>
+                                                    {status?.status === 'testing' && (
+                                                        <Badge variant="outline" className="gap-1">
+                                                            <Clock className="w-3 h-3" />
+                                                            Testing...
+                                                        </Badge>
+                                                    )}
+                                                    {status?.status === 'connected' && (
+                                                        <Badge variant="default" className="bg-green-600 gap-1">
+                                                            <CheckCircle className="w-3 h-3" />
+                                                            Connected
+                                                        </Badge>
+                                                    )}
+                                                    {status?.status === 'error' && (
+                                                        <Badge variant="destructive" className="gap-1" title={status.message}>
+                                                            <XCircle className="w-3 h-3" />
+                                                            {status.message?.substring(0, 20) || 'Error'}
+                                                        </Badge>
+                                                    )}
+                                                    {!status && (
+                                                        <Badge variant="outline">Not tested</Badge>
+                                                    )}
+                                                </TableCell>
+                                                <TableCell className="text-right">
+                                                    <div className="flex justify-end gap-1">
+                                                        <Button
+                                                            size="icon"
+                                                            variant="ghost"
+                                                            onClick={() => testServerConnection(name, config)}
+                                                            title="Test Connection"
+                                                            disabled={status?.status === 'testing'}
+                                                        >
+                                                            <RefreshCw className="w-4 h-4" />
+                                                        </Button>
+                                                        <Button
+                                                            size="icon"
+                                                            variant="ghost"
+                                                            onClick={() => handleOpenDialog(name)}
+                                                            title="Edit"
+                                                        >
+                                                            <Edit2 className="w-4 h-4" />
+                                                        </Button>
+                                                        <Button
+                                                            size="icon"
+                                                            variant="ghost"
+                                                            onClick={() => handleDelete(name)}
+                                                            title="Delete"
+                                                            className="text-red-600 hover:text-red-700"
+                                                        >
+                                                            <Trash2 className="w-4 h-4" />
+                                                        </Button>
+                                                    </div>
+                                                </TableCell>
+                                            </TableRow>
+                                        );
+                                    })}
+                                    {Object.keys(servers).length === 0 && (
+                                        <TableRow>
+                                            <TableCell colSpan={6} className="text-center py-6 text-muted-foreground">
+                                                No MCP servers configured. Click "Add Server" to get started.
                                             </TableCell>
                                         </TableRow>
-                                    ))}
+                                    )}
                                 </TableBody>
                             </Table>
-                        </TableContainer>
-                    ) : (
-                        <Typography variant="body2" color="text.secondary">
-                            No certificates uploaded. Click "Upload Certificate" to add one.
-                        </Typography>
-                    )}
-                </Paper>
+                        </div>
+                    </CardContent>
+                </Card>
+
+                {/* Certificates Section */}
+                <Card className="mb-6">
+                    <CardContent className="pt-6">
+                        <div className="flex justify-between items-center mb-4">
+                            <h2 className="text-xl font-medium">SSL Certificates</h2>
+                            <div>
+                                <input
+                                    id="certificate-upload"
+                                    type="file"
+                                    hidden
+                                    accept=".pem,.crt,.cer,.cert"
+                                    onChange={handleCertificateUpload}
+                                />
+                                <Button 
+                                    asChild
+                                    disabled={certUploadLoading}
+                                >
+                                    <label htmlFor="certificate-upload" className="cursor-pointer">
+                                        {certUploadLoading ? (
+                                            <>
+                                                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                                Uploading...
+                                            </>
+                                        ) : (
+                                            <>
+                                                <Plus className="w-4 h-4 mr-2" />
+                                                Upload Certificate
+                                            </>
+                                        )}
+                                    </label>
+                                </Button>
+                            </div>
+                        </div>
+                        <p className="text-sm text-muted-foreground mb-4">
+                            Upload SSL certificates for secure database connections. Certificates are automatically used when configuring MCP servers with SSL.
+                        </p>
+                        {certificates.length > 0 ? (
+                            <div className="border rounded-lg">
+                                <Table>
+                                    <TableHeader>
+                                        <TableRow>
+                                            <TableHead>Filename</TableHead>
+                                            <TableHead>Container Path</TableHead>
+                                            <TableHead className="text-right">Actions</TableHead>
+                                        </TableRow>
+                                    </TableHeader>
+                                    <TableBody>
+                                        {certificates.map((filename) => (
+                                            <TableRow key={filename}>
+                                                <TableCell>
+                                                    <span className="text-sm font-mono">{filename}</span>
+                                                </TableCell>
+                                                <TableCell>
+                                                    <span className="text-sm font-mono text-muted-foreground">
+                                                        /app/data/certs/{filename}
+                                                    </span>
+                                                </TableCell>
+                                                <TableCell className="text-right">
+                                                    <Button
+                                                        size="icon"
+                                                        variant="ghost"
+                                                        onClick={() => handleDeleteCertificate(filename)}
+                                                        title="Delete Certificate"
+                                                        className="text-red-600 hover:text-red-700"
+                                                    >
+                                                        <Trash2 className="w-4 h-4" />
+                                                    </Button>
+                                                </TableCell>
+                                            </TableRow>
+                                        ))}
+                                    </TableBody>
+                                </Table>
+                            </div>
+                        ) : (
+                            <p className="text-sm text-muted-foreground">
+                                No certificates uploaded. Click "Upload Certificate" to add one.
+                            </p>
+                        )}
+                    </CardContent>
+                </Card>
 
                 {/* LLM Configuration Section */}
-                <Paper sx={{ p: 3, mb: 3 }}>
-                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-                        <Typography variant="h6" sx={{ fontWeight: 500 }}>
-                            Language Models (LLMs)
-                        </Typography>
-                        <Button
-                            variant="contained"
-                            startIcon={<AddIcon />}
-                            onClick={() => handleOpenLLMDialog()}
-                        >
-                            Add LLM
-                        </Button>
-                    </Box>
+                <Card className="mb-6">
+                    <CardContent className="pt-6">
+                        <div className="flex justify-between items-center mb-4">
+                            <h2 className="text-xl font-medium">Language Models (LLMs)</h2>
+                            <Button onClick={() => handleOpenLLMDialog()}>
+                                <Plus className="w-4 h-4 mr-2" />
+                                Add LLM
+                            </Button>
+                        </div>
 
-                    <TableContainer>
-                        <Table>
-                            <TableHead sx={{ bgcolor: 'action.hover' }}>
-                                <TableRow>
-                                    <TableCell sx={{ fontWeight: 600 }}>Icon</TableCell>
-                                    <TableCell sx={{ fontWeight: 600 }}>Name</TableCell>
-                                    <TableCell sx={{ fontWeight: 600 }}>Provider</TableCell>
-                                    <TableCell sx={{ fontWeight: 600 }}>Model</TableCell>
-                                    <TableCell sx={{ fontWeight: 600 }}>Status</TableCell>
-                                    <TableCell align="right" sx={{ fontWeight: 600 }}>Actions</TableCell>
-                                </TableRow>
-                            </TableHead>
-                            <TableBody>
-                                {Object.entries(llms).map(([name, config]) => {
-                                    const status = llmConnectionStatus[name];
-                                    return (
-                                        <TableRow key={name}>
-                                            <TableCell>{config.icon || '🧠'}</TableCell>
-                                            <TableCell>
-                                                <Typography variant="body2" sx={{ fontWeight: 500 }}>
-                                                    {name}
-                                                </Typography>
-                                            </TableCell>
-                                            <TableCell>
-                                                <Chip label={config.provider} size="small" color="primary" variant="outlined" />
-                                            </TableCell>
-                                            <TableCell>
-                                                <code style={{ fontSize: '0.85em' }}>{config.model}</code>
-                                            </TableCell>
-                                            <TableCell>
-                                                {status?.status === 'testing' && (
-                                                    <Chip icon={<HourglassEmptyIcon />} label="Testing..." size="small" color="default" />
-                                                )}
-                                                {status?.status === 'connected' && (
-                                                    <Chip icon={<CheckCircleIcon />} label={status.message} size="small" color="success" />
-                                                )}
-                                                {status?.status === 'error' && (
-                                                    <Chip icon={<ErrorIcon />} label={status.message} size="small" color="error" title={status.message} />
-                                                )}
-                                                {!status && (
-                                                    <Chip label="Not tested" size="small" color="default" variant="outlined" />
-                                                )}
-                                            </TableCell>
-                                            <TableCell align="right">
-                                                <IconButton
-                                                    size="small"
-                                                    onClick={() => testLLMConnection(name, config)}
-                                                    color="default"
-                                                    title="Test Connection"
-                                                >
-                                                    <RefreshIcon fontSize="small" />
-                                                </IconButton>
-                                                <IconButton
-                                                    size="small"
-                                                    onClick={() => handleOpenLLMDialog(name)}
-                                                    color="primary"
-                                                >
-                                                    <EditIcon fontSize="small" />
-                                                </IconButton>
-                                                <IconButton
-                                                    size="small"
-                                                    onClick={() => handleDeleteLLM(name)}
-                                                    color="error"
-                                                >
-                                                    <DeleteIcon fontSize="small" />
-                                                </IconButton>
+                        <div className="border rounded-lg">
+                            <Table>
+                                <TableHeader>
+                                    <TableRow>
+                                        <TableHead>Icon</TableHead>
+                                        <TableHead>Name</TableHead>
+                                        <TableHead>Provider</TableHead>
+                                        <TableHead>Model</TableHead>
+                                        <TableHead>Status</TableHead>
+                                        <TableHead className="text-right">Actions</TableHead>
+                                    </TableRow>
+                                </TableHeader>
+                                <TableBody>
+                                    {Object.entries(llms).map(([name, config]) => {
+                                        const status = llmConnectionStatus[name];
+                                        return (
+                                            <TableRow key={name}>
+                                                <TableCell>{config.icon || '🧠'}</TableCell>
+                                                <TableCell>
+                                                    <span className="text-sm font-medium">{name}</span>
+                                                </TableCell>
+                                                <TableCell>
+                                                    <Badge variant="outline">{config.provider}</Badge>
+                                                </TableCell>
+                                                <TableCell>
+                                                    <code className="text-xs font-mono">{config.model}</code>
+                                                </TableCell>
+                                                <TableCell>
+                                                    {status?.status === 'testing' && (
+                                                        <Badge variant="outline" className="gap-1">
+                                                            <Clock className="w-3 h-3" />
+                                                            Testing...
+                                                        </Badge>
+                                                    )}
+                                                    {status?.status === 'connected' && (
+                                                        <Badge variant="default" className="bg-green-600 gap-1">
+                                                            <CheckCircle className="w-3 h-3" />
+                                                            {status.message}
+                                                        </Badge>
+                                                    )}
+                                                    {status?.status === 'error' && (
+                                                        <Badge variant="destructive" className="gap-1" title={status.message}>
+                                                            <XCircle className="w-3 h-3" />
+                                                            {status.message}
+                                                        </Badge>
+                                                    )}
+                                                    {!status && (
+                                                        <Badge variant="outline">Not tested</Badge>
+                                                    )}
+                                                </TableCell>
+                                                <TableCell className="text-right">
+                                                    <div className="flex justify-end gap-1">
+                                                        <Button
+                                                            size="icon"
+                                                            variant="ghost"
+                                                            onClick={() => testLLMConnection(name, config)}
+                                                            title="Test Connection"
+                                                        >
+                                                            <RefreshCw className="w-4 h-4" />
+                                                        </Button>
+                                                        <Button
+                                                            size="icon"
+                                                            variant="ghost"
+                                                            onClick={() => handleOpenLLMDialog(name)}
+                                                            title="Edit"
+                                                        >
+                                                            <Edit2 className="w-4 h-4" />
+                                                        </Button>
+                                                        <Button
+                                                            size="icon"
+                                                            variant="ghost"
+                                                            onClick={() => handleDeleteLLM(name)}
+                                                            title="Delete"
+                                                            className="text-red-600 hover:text-red-700"
+                                                        >
+                                                            <Trash2 className="w-4 h-4" />
+                                                        </Button>
+                                                    </div>
+                                                </TableCell>
+                                            </TableRow>
+                                        );
+                                    })}
+                                    {Object.keys(llms).length === 0 && (
+                                        <TableRow>
+                                            <TableCell colSpan={6} className="text-center py-6 text-muted-foreground">
+                                                No LLMs configured. Click "Add LLM" to get started.
                                             </TableCell>
                                         </TableRow>
-                                    );
-                                })}
-                                {Object.keys(llms).length === 0 && (
-                                    <TableRow>
-                                        <TableCell colSpan={6} align="center">
-                                            <Typography variant="body2" color="text.secondary">
-                                                No LLMs configured. Click "Add LLM" to get started.
-                                            </Typography>
-                                        </TableCell>
-                                    </TableRow>
-                                )}
-                            </TableBody>
-                        </Table>
-                    </TableContainer>
-                </Paper>
+                                    )}
+                                </TableBody>
+                            </Table>
+                        </div>
+                    </CardContent>
+                </Card>
 
                 {/* Add/Edit MCP Server Dialog */}
-                <Dialog open={openDialog} onClose={handleCloseDialog} maxWidth="md" fullWidth>
-                    <DialogTitle>
-                        {editingServer ? `Edit Server: ${editingServer}` : 'Add New MCP Server'}
-                    </DialogTitle>
-                    <DialogContent>
-                        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 2 }}>
-                            <TextField
-                                label="Server Name"
-                                value={formData.name}
-                                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                                disabled={!!editingServer}
-                                fullWidth
-                                required
-                                helperText="Unique identifier for the server (e.g., 'playwright', 'postgres-dev')"
-                            />
+                <Dialog open={openDialog} onOpenChange={(open) => !open && handleCloseDialog()}>
+                    <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+                        <DialogHeader>
+                            <DialogTitle>
+                                {editingServer ? `Edit Server: ${editingServer}` : 'Add New MCP Server'}
+                            </DialogTitle>
+                        </DialogHeader>
+                        <div className="flex flex-col gap-4 mt-4">
+                            <div className="space-y-2">
+                                <Label htmlFor="server-name">Server Name <span className="text-red-500">*</span></Label>
+                                <Input
+                                    id="server-name"
+                                    value={formData.name}
+                                    onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                                    disabled={!!editingServer}
+                                    placeholder="e.g., playwright, postgres-dev"
+                                />
+                                <p className="text-sm text-muted-foreground">
+                                    Unique identifier for the server
+                                </p>
+                            </div>
 
-                            <TextField
-                                label="Icon"
-                                value={formData.icon}
-                                onChange={(e) => setFormData({ ...formData, icon: e.target.value })}
-                                fullWidth
-                                helperText="Emoji icon for the server (e.g., 🎭, 🗄️, 📊)"
-                            />
+                            <div className="space-y-2">
+                                <Label htmlFor="server-icon">Icon</Label>
+                                <Select
+                                    value={formData.icon}
+                                    onValueChange={(value) => setFormData({ ...formData, icon: value })}
+                                >
+                                    <SelectTrigger id="server-icon">
+                                        <SelectValue placeholder="Select an icon" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {MCP_SERVER_ICONS.map((icon) => (
+                                            <SelectItem key={icon.value} value={icon.value}>
+                                                {icon.label}
+                                            </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                                <p className="text-sm text-muted-foreground">
+                                    Select an emoji icon for the server
+                                </p>
+                            </div>
 
-                            <TextField
-                                label="Description"
-                                value={formData.description}
-                                onChange={(e) => setFormData({ ...formData, description: e.target.value })}
-                                fullWidth
-                                helperText="Brief description of what this server does"
-                            />
+                            <div className="space-y-2">
+                                <Label htmlFor="server-description">Description</Label>
+                                <Input
+                                    id="server-description"
+                                    value={formData.description}
+                                    onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+                                    placeholder="Brief description"
+                                />
+                                <p className="text-sm text-muted-foreground">
+                                    Brief description of what this server does
+                                </p>
+                            </div>
 
-                            <TextField
-                                label="Command"
-                                value={formData.command}
-                                onChange={(e) => setFormData({ ...formData, command: e.target.value })}
-                                fullWidth
-                                required
-                                helperText="Command to execute (e.g., 'npx', 'uvx', 'python')"
-                            />
+                            <div className="space-y-2">
+                                <Label htmlFor="server-command">Command <span className="text-red-500">*</span></Label>
+                                <Input
+                                    id="server-command"
+                                    value={formData.command}
+                                    onChange={(e) => setFormData({ ...formData, command: e.target.value })}
+                                    placeholder="npx"
+                                />
+                                <p className="text-sm text-muted-foreground">
+                                    Command to execute (e.g., 'npx', 'uvx', 'python')
+                                </p>
+                            </div>
 
-                            <TextField
-                                label="Arguments"
-                                value={formData.args}
-                                onChange={(e) => {
-                                    const newArgs = e.target.value;
-                                    setFormData({ ...formData, args: newArgs });
-                                    // Detect input variables and update state
-                                    const vars = extractInputVariables(newArgs);
-                                    setDetectedInputVars(vars);
-                                    if (vars.length > 0) {
-                                        const newInputVarValues = { ...inputVarValues };
-                                        vars.forEach(v => {
-                                            if (!(v in newInputVarValues)) {
-                                                newInputVarValues[v] = '';
-                                            }
-                                        });
-                                        setInputVarValues(newInputVarValues);
-                                    }
-                                }}
-                                fullWidth
-                                multiline
-                                rows={3}
-                                helperText="One argument per line. Use ${input:var_name} for configurable values"
-                            />
+                            <div className="space-y-2">
+                                <Label htmlFor="server-args">Arguments</Label>
+                                <Textarea
+                                    id="server-args"
+                                    value={formData.args}
+                                    onChange={(e) => {
+                                        const newArgs = e.target.value;
+                                        setFormData({ ...formData, args: newArgs });
+                                        // Detect input variables and update state
+                                        const vars = extractInputVariables(newArgs);
+                                        setDetectedInputVars(vars);
+                                        if (vars.length > 0) {
+                                            const newInputVarValues = { ...inputVarValues };
+                                            vars.forEach(v => {
+                                                if (!(v in newInputVarValues)) {
+                                                    newInputVarValues[v] = '';
+                                                }
+                                            });
+                                            setInputVarValues(newInputVarValues);
+                                        }
+                                    }}
+                                    rows={3}
+                                    placeholder="One argument per line"
+                                />
+                                <p className="text-sm text-muted-foreground">
+                                    One argument per line. Use $&#123;input:var_name&#125; for configurable values
+                                </p>
+                            </div>
 
                             {/* Dynamic input variable fields */}
                             {detectedInputVars.length > 0 && (
-                                <Box sx={{
-                                    p: 2,
-                                    bgcolor: 'action.hover',
-                                    borderRadius: 1,
-                                    display: 'flex',
-                                    flexDirection: 'column',
-                                    gap: 2
-                                }}>
-                                    <Typography variant="subtitle2" color="text.secondary">
+                                <div className="p-4 bg-muted rounded-lg flex flex-col gap-3">
+                                    <h4 className="text-sm font-medium text-muted-foreground">
                                         Configure Input Variables
-                                    </Typography>
+                                    </h4>
                                     {detectedInputVars.map((varName) => (
-                                        <TextField
-                                            key={varName}
-                                            label={varName}
-                                            value={inputVarValues[varName] || ''}
-                                            onChange={(e) => setInputVarValues({
-                                                ...inputVarValues,
-                                                [varName]: e.target.value
-                                            })}
-                                            fullWidth
-                                            size="small"
-                                            helperText={`Value for \${input:${varName}}`}
-                                        />
+                                        <div key={varName} className="space-y-2">
+                                            <Label htmlFor={`input-var-${varName}`}>{varName}</Label>
+                                            <Input
+                                                id={`input-var-${varName}`}
+                                                value={inputVarValues[varName] || ''}
+                                                onChange={(e) => setInputVarValues({
+                                                    ...inputVarValues,
+                                                    [varName]: e.target.value
+                                                })}
+                                                placeholder={`Value for $&#123;input:${varName}&#125;`}
+                                            />
+                                        </div>
                                     ))}
-                                </Box>
+                                </div>
                             )}
 
-                            <TextField
-                                label="Type"
-                                value={formData.type}
-                                onChange={(e) => setFormData({ ...formData, type: e.target.value })}
-                                fullWidth
-                                helperText="Connection type (usually 'stdio')"
-                            />
+                            <div className="space-y-2">
+                                <Label htmlFor="server-type">Type</Label>
+                                <Input
+                                    id="server-type"
+                                    value={formData.type}
+                                    onChange={(e) => setFormData({ ...formData, type: e.target.value })}
+                                    placeholder="stdio"
+                                />
+                                <p className="text-sm text-muted-foreground">
+                                    Connection type (usually 'stdio')
+                                </p>
+                            </div>
 
-                            <TextField
-                                label="Environment Variables (JSON)"
-                                value={formData.env}
-                                onChange={(e) => setFormData({ ...formData, env: e.target.value })}
-                                fullWidth
-                                multiline
-                                rows={4}
-                                helperText='Optional JSON object for environment variables (e.g., {"AWS_PROFILE": "default"})'
-                            />
-                        </Box>
+                            <div className="space-y-2">
+                                <Label htmlFor="server-env">Environment Variables (JSON)</Label>
+                                <Textarea
+                                    id="server-env"
+                                    value={formData.env}
+                                    onChange={(e) => setFormData({ ...formData, env: e.target.value })}
+                                    rows={4}
+                                    placeholder='{"AWS_PROFILE": "default"}'
+                                />
+                                <p className="text-sm text-muted-foreground">
+                                    Optional JSON object for environment variables
+                                </p>
+                            </div>
+                        </div>
+                        <DialogFooter className="mt-6">
+                            <Button variant="outline" onClick={handleCloseDialog}>Cancel</Button>
+                            <Button onClick={handleSave} disabled={!formData.name || !formData.command}>
+                                {editingServer ? 'Update' : 'Add'}
+                            </Button>
+                        </DialogFooter>
                     </DialogContent>
-                    <DialogActions>
-                        <Button onClick={handleCloseDialog}>Cancel</Button>
-                        <Button onClick={handleSave} variant="contained" disabled={!formData.name || !formData.command}>
-                            {editingServer ? 'Update' : 'Add'}
-                        </Button>
-                    </DialogActions>
                 </Dialog>
 
                 {/* Add/Edit LLM Dialog */}
-                <Dialog open={openLLMDialog} onClose={handleCloseLLMDialog} maxWidth="sm" fullWidth>
-                    <DialogTitle>
-                        {editingLLM ? `Edit LLM: ${llmFormData.model || editingLLM}` : 'Add New LLM'}
-                    </DialogTitle>
-                    <DialogContent>
-                        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 2 }}>
-                            <TextField
-                                label="Icon"
-                                value={llmFormData.icon}
-                                onChange={(e) => setLLMFormData({ ...llmFormData, icon: e.target.value })}
-                                fullWidth
-                                helperText="Emoji icon (e.g., 🧠, ⚡, 🤖)"
-                            />
-
-                            <FormControl fullWidth>
-                                <InputLabel>Provider</InputLabel>
+                <Dialog open={openLLMDialog} onOpenChange={(open) => !open && handleCloseLLMDialog()}>
+                    <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
+                        <DialogHeader>
+                            <DialogTitle>
+                                {editingLLM ? `Edit LLM: ${llmFormData.model || editingLLM}` : 'Add New LLM'}
+                            </DialogTitle>
+                        </DialogHeader>
+                        <div className="flex flex-col gap-4 mt-4">
+                            <div className="space-y-2">
+                                <Label htmlFor="llm-icon">Icon</Label>
                                 <Select
+                                    value={llmFormData.icon}
+                                    onValueChange={(value) => setLLMFormData({ ...llmFormData, icon: value })}
+                                >
+                                    <SelectTrigger id="llm-icon">
+                                        <SelectValue placeholder="Select an icon" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {LLM_ICONS.map((icon) => (
+                                            <SelectItem key={icon.value} value={icon.value}>
+                                                {icon.label}
+                                            </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                                <p className="text-sm text-muted-foreground">
+                                    Select an emoji icon for the LLM
+                                </p>
+                            </div>
+
+                            <div className="space-y-2">
+                                <Label htmlFor="llm-provider">Provider</Label>
+                                <select
+                                    id="llm-provider"
                                     value={llmFormData.provider}
-                                    label="Provider"
                                     onChange={(e) => setLLMFormData({
                                         ...llmFormData,
                                         provider: e.target.value,
                                         model: '' // Reset model when provider changes
                                     })}
+                                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                                 >
                                     {PROVIDERS.map(provider => (
-                                        <MenuItem key={provider} value={provider}>{provider}</MenuItem>
+                                        <option key={provider} value={provider}>{provider}</option>
                                     ))}
-                                </Select>
-                            </FormControl>
+                                </select>
+                            </div>
 
-                            {llmFormData.provider === 'Custom' ? (
-                                <TextField
-                                    label="Model Name"
+                            <div className="space-y-2">
+                                <Label htmlFor="llm-model">Model</Label>
+                                <Input
+                                    id="llm-model"
                                     value={llmFormData.model}
-                                    onChange={(e) => setLLMFormData({ ...llmFormData, model: e.target.value, name: e.target.value })}
-                                    fullWidth
-                                    placeholder="Enter custom model name"
-                                    helperText="Enter the model identifier"
+                                    onChange={(e) => {
+                                        const newValue = e.target.value;
+                                        setLLMFormData({ ...llmFormData, model: newValue, name: newValue });
+                                    }}
+                                    placeholder={(() => {
+                                        if (llmFormData.provider === 'Ollama') return 'e.g., llama3.2:latest';
+                                        if (llmFormData.provider === 'Custom') return 'Enter custom model name';
+                                        return 'Select or type model name';
+                                    })()}
+                                    list={llmFormData.provider === 'Custom' ? undefined : 'model-suggestions'}
                                 />
-                            ) : (
-                                <Autocomplete
-                                    freeSolo
-                                    options={getModelOptions(llmFormData.provider)}
-                                    value={llmFormData.model}
-                                    onChange={(e, newValue) => setLLMFormData({ ...llmFormData, model: newValue || '', name: newValue || '' })}
-                                    onInputChange={(e, newInputValue) => setLLMFormData({ ...llmFormData, model: newInputValue, name: newInputValue })}
-                                    renderInput={(params) => (
-                                        <TextField
-                                            {...params}
-                                            label="Model"
-                                            placeholder={llmFormData.provider === 'Ollama' ? 'e.g., llama3.2:latest' : 'Select or type model name'}
-                                            helperText="Select from suggestions or type a custom model name"
-                                        />
-                                    )}
-                                />
-                            )}
+                                {llmFormData.provider !== 'Custom' && (
+                                    <datalist id="model-suggestions">
+                                        {getModelOptions(llmFormData.provider).map(model => (
+                                            <option key={model} value={model} />
+                                        ))}
+                                    </datalist>
+                                )}
+                                <p className="text-sm text-muted-foreground">
+                                    {llmFormData.provider === 'Custom' 
+                                        ? 'Enter the model identifier'
+                                        : 'Select from suggestions or type a custom model name'}
+                                </p>
+                            </div>
 
                             {llmFormData.provider === 'Azure OpenAI' && (
-                                <TextField
-                                    label="Endpoint URL"
-                                    value={llmFormData.endpoint || ''}
-                                    onChange={(e) => setLLMFormData({ ...llmFormData, endpoint: e.target.value })}
-                                    fullWidth
-                                    placeholder="https://your-resource.openai.azure.com"
-                                    helperText="Your Azure OpenAI endpoint URL"
-                                />
+                                <div className="space-y-2">
+                                    <Label htmlFor="llm-endpoint">Endpoint URL</Label>
+                                    <Input
+                                        id="llm-endpoint"
+                                        value={llmFormData.endpoint || ''}
+                                        onChange={(e) => setLLMFormData({ ...llmFormData, endpoint: e.target.value })}
+                                        placeholder="https://your-resource.openai.azure.com"
+                                    />
+                                    <p className="text-sm text-muted-foreground">
+                                        Your Azure OpenAI endpoint URL
+                                    </p>
+                                </div>
                             )}
 
                             {llmFormData.provider === 'Ollama' && (
-                                <TextField
-                                    label="Base URL"
-                                    value={llmFormData.baseUrl || 'http://localhost:11434'}
-                                    onChange={(e) => setLLMFormData({ ...llmFormData, baseUrl: e.target.value })}
-                                    fullWidth
-                                    helperText="Ollama server URL (default: http://localhost:11434)"
-                                />
+                                <div className="space-y-2">
+                                    <Label htmlFor="llm-baseUrl">Base URL</Label>
+                                    <Input
+                                        id="llm-baseUrl"
+                                        value={llmFormData.baseUrl || 'http://localhost:11434'}
+                                        onChange={(e) => setLLMFormData({ ...llmFormData, baseUrl: e.target.value })}
+                                    />
+                                    <p className="text-sm text-muted-foreground">
+                                        Ollama server URL (default: http://localhost:11434)
+                                    </p>
+                                </div>
                             )}
 
                             {/* Temperature Setting */}
                             {isReasoningModel(llmFormData.model) ? (
-                                <Alert severity="info" sx={{ mt: 1 }}>
-                                    Reasoning models (o1, o3, o4-mini, etc.) do not support temperature settings.
+                                <Alert className="flex items-start gap-2">
+                                    <Info className="w-4 h-4 mt-0.5" />
+                                    <div>
+                                        <p className="text-sm">
+                                            Reasoning models (o1, o3, o4-mini, etc.) do not support temperature settings.
+                                        </p>
+                                    </div>
                                 </Alert>
                             ) : (
-                                <TextField
-                                    label="Temperature"
-                                    type="number"
-                                    value={llmFormData.temperature}
-                                    onChange={(e) => setLLMFormData({ ...llmFormData, temperature: Math.max(0, Math.min(1, Number.parseFloat(e.target.value) || 0)) })}
-                                    fullWidth
-                                    slotProps={{ htmlInput: { min: 0, max: 1, step: 0.1 } }}
-                                    helperText="Controls randomness (0 = deterministic, 1 = creative)"
-                                />
+                                <div className="space-y-2">
+                                    <Label htmlFor="llm-temperature">Temperature</Label>
+                                    <Input
+                                        id="llm-temperature"
+                                        type="number"
+                                        value={llmFormData.temperature}
+                                        onChange={(e) => setLLMFormData({ 
+                                            ...llmFormData, 
+                                            temperature: Math.max(0, Math.min(1, Number.parseFloat(e.target.value) || 0)) 
+                                        })}
+                                        min="0"
+                                        max="1"
+                                        step="0.1"
+                                    />
+                                    <p className="text-sm text-muted-foreground">
+                                        Controls randomness (0 = deterministic, 1 = creative)
+                                    </p>
+                                </div>
                             )}
 
                             {/* API Key Section */}
                             {llmFormData.provider !== 'Ollama' && (
-                                <Box sx={{
-                                    p: 2,
-                                    bgcolor: 'action.hover',
-                                    borderRadius: 1,
-                                    display: 'flex',
-                                    flexDirection: 'column',
-                                    gap: 2
-                                }}>
-                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                                        <KeyIcon fontSize="small" color="primary" />
-                                        <Typography variant="subtitle2">
-                                            API Key
-                                        </Typography>
-                                    </Box>
+                                <div className="p-4 bg-muted rounded-lg flex flex-col gap-3">
+                                    <div className="flex items-center gap-2">
+                                        <Key className="w-4 h-4 text-primary" />
+                                        <h4 className="text-sm font-medium">API Key</h4>
+                                    </div>
 
                                     {existingApiKey ? (
-                                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                                            <Chip
-                                                icon={<CheckIcon />}
-                                                label={`Key configured: ${existingApiKey}`}
-                                                size="small"
-                                                color="success"
-                                                variant="outlined"
-                                            />
+                                        <div className="flex items-center gap-2">
+                                            <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200">
+                                                <Check className="w-3 h-3 mr-1" />
+                                                Key configured: {existingApiKey}
+                                            </Badge>
                                             <Button
-                                                size="small"
+                                                size="sm"
+                                                variant="ghost"
                                                 onClick={() => setExistingApiKey(null)}
                                             >
                                                 Update Key
                                             </Button>
-                                        </Box>
+                                        </div>
                                     ) : (
-                                        <TextField
-                                            label="API Key"
-                                            value={llmFormData.apiKey}
-                                            onChange={(e) => setLLMFormData({ ...llmFormData, apiKey: e.target.value })}
-                                            fullWidth
-                                            size="small"
-                                            type={showApiKey ? 'text' : 'password'}
-                                            placeholder="sk-..."
-                                            helperText="Your API key will be securely stored locally"
-                                            slotProps={{
-                                                input: {
-                                                    endAdornment: (
-                                                        <InputAdornment position="end">
-                                                            <IconButton
-                                                                onClick={() => setShowApiKey(!showApiKey)}
-                                                                edge="end"
-                                                                size="small"
-                                                            >
-                                                                {showApiKey ? <VisibilityOffIcon /> : <VisibilityIcon />}
-                                                            </IconButton>
-                                                        </InputAdornment>
-                                                    ),
-                                                }
-                                            }}
-                                        />
+                                        <div className="space-y-2">
+                                            <div className="relative">
+                                                <Input
+                                                    id="llm-apiKey"
+                                                    value={llmFormData.apiKey}
+                                                    onChange={(e) => setLLMFormData({ ...llmFormData, apiKey: e.target.value })}
+                                                    type={showApiKey ? 'text' : 'password'}
+                                                    placeholder="sk-..."
+                                                    className="pr-10"
+                                                />
+                                                <Button
+                                                    type="button"
+                                                    size="icon"
+                                                    variant="ghost"
+                                                    onClick={() => setShowApiKey(!showApiKey)}
+                                                    className="absolute right-0 top-0 h-full"
+                                                >
+                                                    {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                                </Button>
+                                            </div>
+                                            <p className="text-sm text-muted-foreground">
+                                                Your API key will be securely stored locally
+                                            </p>
+                                        </div>
                                     )}
-                                </Box>
+                                </div>
                             )}
-                        </Box>
+                        </div>
+                        <DialogFooter className="mt-6">
+                            <Button variant="outline" onClick={handleCloseLLMDialog}>Cancel</Button>
+                            <Button
+                                onClick={handleSaveLLM}
+                                disabled={!llmFormData.model}
+                            >
+                                {editingLLM ? 'Update' : 'Add'}
+                            </Button>
+                        </DialogFooter>
                     </DialogContent>
-                    <DialogActions>
-                        <Button onClick={handleCloseLLMDialog}>Cancel</Button>
-                        <Button
-                            onClick={handleSaveLLM}
-                            variant="contained"
-                            disabled={!llmFormData.model}
-                        >
-                            {editingLLM ? 'Update' : 'Add'}
-                        </Button>
-                    </DialogActions>
                 </Dialog>
-            </Container>
-        </Box>
+            </div>
+        </div>
     );
 };
 

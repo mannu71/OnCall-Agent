@@ -156,11 +156,11 @@ function createWindow() {
     // In packaged app, load from asar
     win.loadFile(path.join(__dirname, "..", "dist", "index.html"));
   } else {
-    const devUrl = "http://localhost:5175";
+    const devUrl = "http://localhost:5173";
     console.log(`Loading dev URL: ${devUrl}`);
     win.loadURL(devUrl).catch(err => {
       console.error('Failed to load URL:', err);
-      console.error('Make sure Vite dev server is running on port 5175');
+      console.error('Make sure Vite dev server is running on port 5173');
     });
   }
 

@@ -1,122 +1,64 @@
 import React, { useState, useEffect } from 'react';
-import {
-    Box,
-    Typography,
-    TextField,
-    Button,
-    Chip,
-    Paper,
-    Table,
-    TableBody,
-    TableCell,
-    TableContainer,
-    TableHead,
-    TableRow,
-    IconButton,
-    Dialog,
-    DialogTitle,
-    DialogContent,
-    DialogActions,
-    FormControl,
-    InputLabel,
-    Select,
-    MenuItem,
-    Alert,
-    Snackbar,
-    Tab,
-    Tabs,
-    Card,
-    CardContent,
-    CardActions,
-    Grid,
-    LinearProgress,
-    Tooltip
-} from '@mui/material';
-import {
-    Add as AddIcon,
-    Delete as DeleteIcon,
-    Edit as EditIcon,
-    PlayArrow as PlayArrowIcon,
-    Refresh as RefreshIcon,
-    Warning as WarningIcon,
-    Error as ErrorIcon,
-    Info as InfoIcon,
-    CheckCircle as CheckCircleIcon,
-    Search as SearchIcon
-} from '@mui/icons-material';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { Badge } from '@/components/ui/badge';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import { 
+    Plus, 
+    Trash2, 
+    Play, 
+    RefreshCw, 
+    Search
+} from 'lucide-react';
 
 const API_BASE_URL = 'http://localhost:8000/api/v1';
 
-// Tab Panel Component
-function TabPanel({ children, value, index, ...other }) {
+// Severity Badge Component
+// eslint-disable-next-line react/prop-types
+function SeverityBadge({ severity }) {
+    const configs = {
+        critical: 'bg-red-100 text-red-800 hover:bg-red-100',
+        high: 'bg-orange-100 text-orange-800 hover:bg-orange-100',
+        medium: 'bg-yellow-100 text-yellow-800 hover:bg-yellow-100',
+        low: 'bg-blue-100 text-blue-800 hover:bg-blue-100',
+        info: 'bg-green-100 text-green-800 hover:bg-green-100'
+    };
+
     return (
-        <div hidden={value !== index} {...other}>
-            {value === index && <Box sx={{ pt: 2 }}>{children}</Box>}
-        </div>
+        <Badge variant="secondary" className={configs[severity] || configs.info}>
+            {severity?.toUpperCase() || 'INFO'}
+        </Badge>
     );
 }
 
-// Severity Chip Component
-function SeverityChip({ severity }) {
-    const colors = {
-        critical: { bg: '#ffebee', color: '#c62828', icon: ErrorIcon },
-        high: { bg: '#fff3e0', color: '#ef6c00', icon: WarningIcon },
-        medium: { bg: '#fff8e1', color: '#f9a825', icon: WarningIcon },
-        low: { bg: '#e3f2fd', color: '#1565c0', icon: InfoIcon },
-        info: { bg: '#e8f5e9', color: '#2e7d32', icon: InfoIcon }
+// Status Badge Component
+// eslint-disable-next-line react/prop-types
+function StatusBadge({ status }) {
+    const configs = {
+        new: 'bg-red-100 text-red-800 hover:bg-red-100',
+        acknowledged: 'bg-orange-100 text-orange-800 hover:bg-orange-100',
+        resolved: 'bg-green-100 text-green-800 hover:bg-green-100',
+        dismissed: 'bg-gray-100 text-gray-800 hover:bg-gray-100'
     };
 
-    const config = colors[severity] || colors.info;
-    const Icon = config.icon;
-
     return (
-        <Chip
-            icon={<Icon sx={{ fontSize: 16 }} />}
-            label={severity.toUpperCase()}
-            size="small"
-            sx={{
-                backgroundColor: config.bg,
-                color: config.color,
-                fontWeight: 600
-            }}
-        />
-    );
-}
-
-// Status Chip Component
-function StatusChip({ status }) {
-    const colors = {
-        new: { bg: '#ffebee', color: '#c62828' },
-        acknowledged: { bg: '#fff3e0', color: '#ef6c00' },
-        resolved: { bg: '#e8f5e9', color: '#2e7d32' },
-        dismissed: { bg: '#f5f5f5', color: '#757575' }
-    };
-
-    const config = colors[status] || colors.new;
-
-    return (
-        <Chip
-            label={status.toUpperCase()}
-            size="small"
-            sx={{
-                backgroundColor: config.bg,
-                color: config.color,
-                fontWeight: 600
-            }}
-        />
+        <Badge variant="secondary" className={configs[status] || configs.new}>
+            {status?.toUpperCase() || 'NEW'}
+        </Badge>
     );
 }
 
 // Log Watch Configuration Component
 export default function LogWatchConfig() {
-    const [tabValue, setTabValue] = useState(0);
+    const [tabValue, setTabValue] = useState('alerts');
     const [alerts, setAlerts] = useState([]);
     const [alertSummary, setAlertSummary] = useState(null);
     const [knownIssues, setKnownIssues] = useState([]);
     const [patterns, setPatterns] = useState([]);
     const [baselines, setBaselines] = useState([]);
     const [loading, setLoading] = useState(false);
-    const [snackbar, setSnackbar] = useState({ open: false, message: '', severity: 'success' });
 
     // Dialog states
     const [watchDialogOpen, setWatchDialogOpen] = useState(false);
@@ -137,15 +79,14 @@ export default function LogWatchConfig() {
         log_group: '',
         alert_type: 'anomaly',
         severity: 'medium',
-        message: '',
-        details: {}
+        message: ''
     });
 
     const [patternForm, setPatternForm] = useState({
         name: '',
         pattern: '',
         pattern_type: 'error',
-        severity: 1,
+        severity: 3,
         description: ''
     });
 
@@ -155,7 +96,7 @@ export default function LogWatchConfig() {
         normal_range_min: 0,
         normal_range_max: 100,
         threshold_warning: 80,
-        threshold_critical: 95,
+        threshold_critical: 90,
         time_window: '5m'
     });
 
@@ -251,9 +192,8 @@ export default function LogWatchConfig() {
             });
             const data = await response.json();
             setWatchResults(data);
-            setSnackbar({ open: true, message: 'Log watch completed', severity: 'success' });
         } catch (error) {
-            setSnackbar({ open: true, message: 'Error watching logs', severity: 'error' });
+            console.error('Error watching logs:', error);
         }
         setLoading(false);
         setWatchDialogOpen(false);
@@ -274,9 +214,8 @@ export default function LogWatchConfig() {
             });
             const data = await response.json();
             setAnomalyResults(data);
-            setSnackbar({ open: true, message: 'Anomaly detection completed', severity: 'success' });
         } catch (error) {
-            setSnackbar({ open: true, message: 'Error detecting anomalies', severity: 'error' });
+            console.error('Error detecting anomalies:', error);
         }
         setLoading(false);
     };
@@ -291,12 +230,11 @@ export default function LogWatchConfig() {
             });
             const data = await response.json();
             if (data.success) {
-                setSnackbar({ open: true, message: 'Alert created', severity: 'success' });
                 fetchAlerts();
                 fetchAlertSummary();
             }
         } catch (error) {
-            setSnackbar({ open: true, message: 'Error creating alert', severity: 'error' });
+            console.error('Error creating alert:', error);
         }
         setAlertDialogOpen(false);
     };
@@ -311,11 +249,10 @@ export default function LogWatchConfig() {
             });
             const data = await response.json();
             if (data.success) {
-                setSnackbar({ open: true, message: 'Alert acknowledged', severity: 'success' });
                 fetchAlerts();
             }
         } catch (error) {
-            setSnackbar({ open: true, message: 'Error acknowledging alert', severity: 'error' });
+            console.error('Error acknowledging alert:', error);
         }
     };
 
@@ -329,12 +266,11 @@ export default function LogWatchConfig() {
             });
             const data = await response.json();
             if (data.success) {
-                setSnackbar({ open: true, message: 'Alert resolved', severity: 'success' });
                 fetchAlerts();
                 fetchAlertSummary();
             }
         } catch (error) {
-            setSnackbar({ open: true, message: 'Error resolving alert', severity: 'error' });
+            console.error('Error resolving alert:', error);
         }
     };
 
@@ -348,11 +284,10 @@ export default function LogWatchConfig() {
             });
             const data = await response.json();
             if (data.id) {
-                setSnackbar({ open: true, message: 'Pattern added', severity: 'success' });
                 fetchPatterns();
             }
         } catch (error) {
-            setSnackbar({ open: true, message: 'Error adding pattern', severity: 'error' });
+            console.error('Error adding pattern:', error);
         }
         setPatternDialogOpen(false);
     };
@@ -363,15 +298,26 @@ export default function LogWatchConfig() {
             const response = await fetch(`${API_BASE_URL}/log-watch/baselines`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(baselineForm)
+                body: JSON.stringify({
+                    metric_name: baselineForm.metric_name,
+                    log_group: baselineForm.log_group,
+                    normal_range: {
+                        min: baselineForm.normal_range_min,
+                        max: baselineForm.normal_range_max
+                    },
+                    thresholds: {
+                        warning: baselineForm.threshold_warning,
+                        critical: baselineForm.threshold_critical
+                    },
+                    time_window: baselineForm.time_window
+                })
             });
             const data = await response.json();
             if (data.id) {
-                setSnackbar({ open: true, message: 'Baseline set', severity: 'success' });
                 fetchBaselines();
             }
         } catch (error) {
-            setSnackbar({ open: true, message: 'Error setting baseline', severity: 'error' });
+            console.error('Error setting baseline:', error);
         }
         setBaselineDialogOpen(false);
     };
@@ -389,653 +335,768 @@ export default function LogWatchConfig() {
             });
             const data = await response.json();
             if (data.success) {
-                setSnackbar({ open: true, message: 'Known issue added', severity: 'success' });
                 fetchKnownIssues();
             }
         } catch (error) {
-            setSnackbar({ open: true, message: 'Error adding known issue', severity: 'error' });
+            console.error('Error adding known issue:', error);
         }
         setIssueDialogOpen(false);
     };
 
     return (
-        <Box sx={{ p: 3 }}>
-            <Typography variant="h4" gutterBottom>
-                CloudWatch Log Watch Analyzer
-            </Typography>
+        <div className="p-6 space-y-6">
+            {/* Header */}
+            <div>
+                <h1 className="text-3xl font-bold tracking-tight">CloudWatch Log Watch Analyzer</h1>
+                <p className="text-muted-foreground mt-1">Monitor and analyze CloudWatch logs with intelligent alerting</p>
+            </div>
 
             {/* Alert Summary Cards */}
             {alertSummary && (
-                <Grid container spacing={2} sx={{ mb: 3 }}>
-                    <Grid item xs={12} sm={6} md={2}>
-                        <Card>
-                            <CardContent>
-                                <Typography color="textSecondary" variant="body2">Total Alerts</Typography>
-                                <Typography variant="h4">{alertSummary.total_alerts}</Typography>
-                            </CardContent>
-                        </Card>
-                    </Grid>
-                    <Grid item xs={12} sm={6} md={2}>
-                        <Card sx={{ bgcolor: '#ffebee' }}>
-                            <CardContent>
-                                <Typography color="error" variant="body2">Critical</Typography>
-                                <Typography variant="h4" color="error">{alertSummary.by_severity?.critical || 0}</Typography>
-                            </CardContent>
-                        </Card>
-                    </Grid>
-                    <Grid item xs={12} sm={6} md={2}>
-                        <Card sx={{ bgcolor: '#fff3e0' }}>
-                            <CardContent>
-                                <Typography color="warning.main" variant="body2">High</Typography>
-                                <Typography variant="h4" color="warning.main">{alertSummary.by_severity?.high || 0}</Typography>
-                            </CardContent>
-                        </Card>
-                    </Grid>
-                    <Grid item xs={12} sm={6} md={2}>
-                        <Card sx={{ bgcolor: '#e3f2fd' }}>
-                            <CardContent>
-                                <Typography color="info.main" variant="body2">New</Typography>
-                                <Typography variant="h4" color="info.main">{alertSummary.by_status?.new || 0}</Typography>
-                            </CardContent>
-                        </Card>
-                    </Grid>
-                    <Grid item xs={12} sm={6} md={2}>
-                        <Card sx={{ bgcolor: '#fff8e1' }}>
-                            <CardContent>
-                                <Typography color="textSecondary" variant="body2">Acknowledged</Typography>
-                                <Typography variant="h4">{alertSummary.by_status?.acknowledged || 0}</Typography>
-                            </CardContent>
-                        </Card>
-                    </Grid>
-                    <Grid item xs={12} sm={6} md={2}>
-                        <Card sx={{ bgcolor: '#e8f5e9' }}>
-                            <CardContent>
-                                <Typography color="success.main" variant="body2">Resolved</Typography>
-                                <Typography variant="h4" color="success.main">{alertSummary.by_status?.resolved || 0}</Typography>
-                            </CardContent>
-                        </Card>
-                    </Grid>
-                </Grid>
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-6 gap-4">
+                    <Card>
+                        <CardHeader className="pb-2">
+                            <CardTitle className="text-sm font-medium text-muted-foreground">Total Alerts</CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                            <div className="text-2xl font-bold">{alertSummary.total_alerts}</div>
+                        </CardContent>
+                    </Card>
+
+                    <Card className="bg-red-50 border-red-200">
+                        <CardHeader className="pb-2">
+                            <CardTitle className="text-sm font-medium text-red-700">Critical</CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                            <div className="text-2xl font-bold text-red-700">{alertSummary.by_severity?.critical || 0}</div>
+                        </CardContent>
+                    </Card>
+
+                    <Card className="bg-orange-50 border-orange-200">
+                        <CardHeader className="pb-2">
+                            <CardTitle className="text-sm font-medium text-orange-700">High</CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                            <div className="text-2xl font-bold text-orange-700">{alertSummary.by_severity?.high || 0}</div>
+                        </CardContent>
+                    </Card>
+
+                    <Card className="bg-blue-50 border-blue-200">
+                        <CardHeader className="pb-2">
+                            <CardTitle className="text-sm font-medium text-blue-700">New</CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                            <div className="text-2xl font-bold text-blue-700">{alertSummary.by_status?.new || 0}</div>
+                        </CardContent>
+                    </Card>
+
+                    <Card className="bg-yellow-50 border-yellow-200">
+                        <CardHeader className="pb-2">
+                            <CardTitle className="text-sm font-medium text-yellow-700">Acknowledged</CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                            <div className="text-2xl font-bold text-yellow-700">{alertSummary.by_status?.acknowledged || 0}</div>
+                        </CardContent>
+                    </Card>
+
+                    <Card className="bg-green-50 border-green-200">
+                        <CardHeader className="pb-2">
+                            <CardTitle className="text-sm font-medium text-green-700">Resolved</CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                            <div className="text-2xl font-bold text-green-700">{alertSummary.by_status?.resolved || 0}</div>
+                        </CardContent>
+                    </Card>
+                </div>
             )}
 
             {/* Tabs */}
-            <Paper sx={{ mb: 2 }}>
-                <Tabs value={tabValue} onChange={(e, v) => setTabValue(v)}>
-                    <Tab label="Alerts" />
-                    <Tab label="Watch Logs" />
-                    <Tab label="Patterns" />
-                    <Tab label="Baselines" />
-                    <Tab label="Known Issues" />
-                </Tabs>
-            </Paper>
+            <Card>
+                <div className="border-b">
+                    <div className="flex space-x-1 p-1">
+                        {['alerts', 'watch', 'patterns', 'baselines', 'issues'].map((tab) => (
+                            <button
+                                key={tab}
+                                onClick={() => setTabValue(tab)}
+                                className={`px-4 py-2 text-sm font-medium rounded transition-colors ${
+                                    tabValue === tab
+                                        ? 'bg-slate-100 text-slate-900'
+                                        : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+                                }`}
+                            >
+                                {tab === 'alerts' && 'Alerts'}
+                                {tab === 'watch' && 'Watch Logs'}
+                                {tab === 'patterns' && 'Patterns'}
+                                {tab === 'baselines' && 'Baselines'}
+                                {tab === 'issues' && 'Known Issues'}
+                            </button>
+                        ))}
+                    </div>
+                </div>
 
-            {loading && <LinearProgress />}
-
-            {/* Alerts Tab */}
-            <TabPanel value={tabValue} index={0}>
-                <Box sx={{ mb: 2 }}>
-                    <Button
-                        variant="contained"
-                        startIcon={<AddIcon />}
-                        onClick={() => setAlertDialogOpen(true)}
-                    >
-                        Create Alert
-                    </Button>
-                    <Button
-                        variant="outlined"
-                        startIcon={<RefreshIcon />}
-                        onClick={fetchAlerts}
-                        sx={{ ml: 1 }}
-                    >
-                        Refresh
-                    </Button>
-                </Box>
-
-                <TableContainer component={Paper}>
-                    <Table>
-                        <TableHead>
-                            <TableRow>
-                                <TableCell>ID</TableCell>
-                                <TableCell>Log Group</TableCell>
-                                <TableCell>Type</TableCell>
-                                <TableCell>Severity</TableCell>
-                                <TableCell>Status</TableCell>
-                                <TableCell>Message</TableCell>
-                                <TableCell>Created</TableCell>
-                                <TableCell>Actions</TableCell>
-                            </TableRow>
-                        </TableHead>
-                        <TableBody>
-                            {alerts.map((alert) => (
-                                <TableRow key={alert.id}>
-                                    <TableCell>{alert.id}</TableCell>
-                                    <TableCell>{alert.log_group}</TableCell>
-                                    <TableCell>{alert.alert_type}</TableCell>
-                                    <TableCell><SeverityChip severity={alert.severity} /></TableCell>
-                                    <TableCell><StatusChip status={alert.status} /></TableCell>
-                                    <TableCell sx={{ maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                                        {alert.message}
-                                    </TableCell>
-                                    <TableCell>
-                                        {alert.created_at ? new Date(alert.created_at).toLocaleString() : '-'}
-                                    </TableCell>
-                                    <TableCell>
-                                        {alert.status === 'new' && (
-                                            <Button size="small" onClick={() => handleAcknowledgeAlert(alert.id)}>
-                                                Ack
-                                            </Button>
-                                        )}
-                                        {alert.status !== 'resolved' && alert.status !== 'dismissed' && (
-                                            <Button size="small" color="success" onClick={() => handleResolveAlert(alert.id)}>
-                                                Resolve
-                                            </Button>
-                                        )}
-                                    </TableCell>
-                                </TableRow>
-                            ))}
-                        </TableBody>
-                    </Table>
-                </TableContainer>
-            </TabPanel>
-
-            {/* Watch Logs Tab */}
-            <TabPanel value={tabValue} index={1}>
-                <Box sx={{ mb: 2 }}>
-                    <Button
-                        variant="contained"
-                        startIcon={<PlayArrowIcon />}
-                        onClick={() => setWatchDialogOpen(true)}
-                    >
-                        Watch Log Groups
-                    </Button>
-                    <Button
-                        variant="outlined"
-                        startIcon={<SearchIcon />}
-                        onClick={handleDetectAnomalies}
-                        sx={{ ml: 1 }}
-                    >
-                        Detect Anomalies
-                    </Button>
-                </Box>
-
-                {watchResults && (
-                    <Paper sx={{ p: 2, mb: 2 }}>
-                        <Typography variant="h6">Watch Results</Typography>
-                        <Typography variant="body2" color="textSecondary">
-                            Total Events: {watchResults.summary?.total_events || 0}
-                        </Typography>
-                        <pre style={{ maxHeight: 300, overflow: 'auto' }}>
-                            {JSON.stringify(watchResults.log_groups, null, 2)}
-                        </pre>
-                    </Paper>
+                {loading && (
+                    <div className="h-1 bg-blue-500 animate-pulse"></div>
                 )}
 
-                {anomalyResults && (
-                    <Paper sx={{ p: 2 }}>
-                        <Typography variant="h6">Anomaly Detection Results</Typography>
-                        <Typography variant="body2" color="textSecondary">
-                            Total Anomalies: {anomalyResults.summary?.total_anomalies || 0}
-                        </Typography>
-                        <pre style={{ maxHeight: 300, overflow: 'auto' }}>
-                            {JSON.stringify(anomalyResults.anomalies, null, 2)}
-                        </pre>
-                    </Paper>
+                {/* Alerts Tab */}
+                {tabValue === 'alerts' && (
+                    <CardContent className="pt-6">
+                        <div className="flex gap-2 mb-4">
+                            <Button onClick={() => setAlertDialogOpen(true)}>
+                                <Plus className="w-4 h-4 mr-2" />
+                                Create Alert
+                            </Button>
+                            <Button variant="outline" onClick={fetchAlerts}>
+                                <RefreshCw className="w-4 h-4 mr-2" />
+                                Refresh
+                            </Button>
+                        </div>
+
+                        <div className="border rounded-lg">
+                            <Table>
+                                <TableHeader>
+                                    <TableRow>
+                                        <TableHead>ID</TableHead>
+                                        <TableHead>Log Group</TableHead>
+                                        <TableHead>Type</TableHead>
+                                        <TableHead>Severity</TableHead>
+                                        <TableHead>Status</TableHead>
+                                        <TableHead>Message</TableHead>
+                                        <TableHead>Created</TableHead>
+                                        <TableHead>Actions</TableHead>
+                                    </TableRow>
+                                </TableHeader>
+                                <TableBody>
+                                    {alerts.length === 0 ? (
+                                        <TableRow>
+                                            <TableCell colSpan={8} className="text-center text-muted-foreground py-8">
+                                                No alerts found
+                                            </TableCell>
+                                        </TableRow>
+                                    ) : (
+                                        alerts.map((alert) => (
+                                            <TableRow key={alert.id}>
+                                                <TableCell className="font-mono text-xs">{alert.id}</TableCell>
+                                                <TableCell>{alert.log_group}</TableCell>
+                                                <TableCell>{alert.alert_type}</TableCell>
+                                                <TableCell><SeverityBadge severity={alert.severity} /></TableCell>
+                                                <TableCell><StatusBadge status={alert.status} /></TableCell>
+                                                <TableCell className="max-w-[300px] truncate">{alert.message}</TableCell>
+                                                <TableCell className="text-sm text-muted-foreground">
+                                                    {alert.created_at ? new Date(alert.created_at).toLocaleString() : '-'}
+                                                </TableCell>
+                                                <TableCell>
+                                                    <div className="flex gap-1">
+                                                        {alert.status === 'new' && (
+                                                            <Button size="sm" variant="outline" onClick={() => handleAcknowledgeAlert(alert.id)}>
+                                                                Ack
+                                                            </Button>
+                                                        )}
+                                                        {alert.status !== 'resolved' && alert.status !== 'dismissed' && (
+                                                            <Button size="sm" variant="outline" onClick={() => handleResolveAlert(alert.id)}>
+                                                                Resolve
+                                                            </Button>
+                                                        )}
+                                                    </div>
+                                                </TableCell>
+                                            </TableRow>
+                                        ))
+                                    )}
+                                </TableBody>
+                            </Table>
+                        </div>
+                    </CardContent>
                 )}
-            </TabPanel>
 
-            {/* Patterns Tab */}
-            <TabPanel value={tabValue} index={2}>
-                <Box sx={{ mb: 2 }}>
-                    <Button
-                        variant="contained"
-                        startIcon={<AddIcon />}
-                        onClick={() => setPatternDialogOpen(true)}
-                    >
-                        Add Pattern
-                    </Button>
-                </Box>
+                {/* Watch Logs Tab */}
+                {tabValue === 'watch' && (
+                    <CardContent className="pt-6">
+                        <div className="flex gap-2 mb-4">
+                            <Button onClick={() => setWatchDialogOpen(true)}>
+                                <Play className="w-4 h-4 mr-2" />
+                                Watch Log Groups
+                            </Button>
+                            <Button variant="outline" onClick={handleDetectAnomalies}>
+                                <Search className="w-4 h-4 mr-2" />
+                                Detect Anomalies
+                            </Button>
+                        </div>
 
-                <TableContainer component={Paper}>
-                    <Table>
-                        <TableHead>
-                            <TableRow>
-                                <TableCell>Name</TableCell>
-                                <TableCell>Pattern</TableCell>
-                                <TableCell>Type</TableCell>
-                                <TableCell>Severity</TableCell>
-                                <TableCell>Description</TableCell>
-                            </TableRow>
-                        </TableHead>
-                        <TableBody>
-                            {patterns.map((pattern) => (
-                                <TableRow key={pattern.id}>
-                                    <TableCell>{pattern.name}</TableCell>
-                                    <TableCell sx={{ fontFamily: 'monospace', fontSize: 12 }}>
-                                        {pattern.pattern}
-                                    </TableCell>
-                                    <TableCell>{pattern.pattern_type}</TableCell>
-                                    <TableCell>{pattern.severity}</TableCell>
-                                    <TableCell>{pattern.description}</TableCell>
-                                </TableRow>
-                            ))}
-                        </TableBody>
-                    </Table>
-                </TableContainer>
-            </TabPanel>
-
-            {/* Baselines Tab */}
-            <TabPanel value={tabValue} index={3}>
-                <Box sx={{ mb: 2 }}>
-                    <Button
-                        variant="contained"
-                        startIcon={<AddIcon />}
-                        onClick={() => setBaselineDialogOpen(true)}
-                    >
-                        Add Baseline
-                    </Button>
-                </Box>
-
-                <TableContainer component={Paper}>
-                    <Table>
-                        <TableHead>
-                            <TableRow>
-                                <TableCell>Metric</TableCell>
-                                <TableCell>Log Group</TableCell>
-                                <TableCell>Normal Range</TableCell>
-                                <TableCell>Warning</TableCell>
-                                <TableCell>Critical</TableCell>
-                                <TableCell>Window</TableCell>
-                            </TableRow>
-                        </TableHead>
-                        <TableBody>
-                            {baselines.map((baseline) => (
-                                <TableRow key={baseline.id}>
-                                    <TableCell>{baseline.metric_name}</TableCell>
-                                    <TableCell>{baseline.log_group}</TableCell>
-                                    <TableCell>
-                                        {baseline.normal_range?.min} - {baseline.normal_range?.max}
-                                    </TableCell>
-                                    <TableCell>{baseline.thresholds?.warning}</TableCell>
-                                    <TableCell>{baseline.thresholds?.critical}</TableCell>
-                                    <TableCell>{baseline.time_window}</TableCell>
-                                </TableRow>
-                            ))}
-                        </TableBody>
-                    </Table>
-                </TableContainer>
-            </TabPanel>
-
-            {/* Known Issues Tab */}
-            <TabPanel value={tabValue} index={4}>
-                <Box sx={{ mb: 2 }}>
-                    <Button
-                        variant="contained"
-                        startIcon={<AddIcon />}
-                        onClick={() => setIssueDialogOpen(true)}
-                    >
-                        Add Known Issue
-                    </Button>
-                </Box>
-
-                <Grid container spacing={2}>
-                    {knownIssues.map((issue) => (
-                        <Grid item xs={12} md={6} key={issue.id}>
+                        {watchResults && (
                             <Card>
+                                <CardHeader>
+                                    <CardTitle>Watch Results</CardTitle>
+                                </CardHeader>
                                 <CardContent>
-                                    <Typography variant="h6">{issue.title}</Typography>
-                                    <Chip label={issue.category} size="small" sx={{ mb: 1 }} />
-                                    <Typography variant="body2" color="textSecondary">
-                                        {issue.description}
-                                    </Typography>
-                                    <Typography variant="body2" sx={{ mt: 1 }}>
-                                        <strong>Symptoms:</strong> {issue.symptoms?.join(', ')}
-                                    </Typography>
-                                    <Typography variant="body2" sx={{ mt: 1 }}>
-                                        <strong>Solution:</strong> {issue.solution}
-                                    </Typography>
+                                    <pre className="bg-slate-50 p-4 rounded-lg overflow-auto text-xs">
+                                        {JSON.stringify(watchResults, null, 2)}
+                                    </pre>
                                 </CardContent>
                             </Card>
-                        </Grid>
-                    ))}
-                </Grid>
-            </TabPanel>
+                        )}
+
+                        {anomalyResults && (
+                            <Card className="mt-4">
+                                <CardHeader>
+                                    <CardTitle>Anomaly Detection Results</CardTitle>
+                                </CardHeader>
+                                <CardContent>
+                                    <pre className="bg-slate-50 p-4 rounded-lg overflow-auto text-xs">
+                                        {JSON.stringify(anomalyResults, null, 2)}
+                                    </pre>
+                                </CardContent>
+                            </Card>
+                        )}
+                    </CardContent>
+                )}
+
+                {/* Patterns Tab */}
+                {tabValue === 'patterns' && (
+                    <CardContent className="pt-6">
+                        <div className="flex gap-2 mb-4">
+                            <Button onClick={() => setPatternDialogOpen(true)}>
+                                <Plus className="w-4 h-4 mr-2" />
+                                Add Pattern
+                            </Button>
+                        </div>
+
+                        <div className="border rounded-lg">
+                            <Table>
+                                <TableHeader>
+                                    <TableRow>
+                                        <TableHead>Name</TableHead>
+                                        <TableHead>Pattern</TableHead>
+                                        <TableHead>Type</TableHead>
+                                        <TableHead>Severity</TableHead>
+                                        <TableHead>Description</TableHead>
+                                    </TableRow>
+                                </TableHeader>
+                                <TableBody>
+                                    {patterns.length === 0 ? (
+                                        <TableRow>
+                                            <TableCell colSpan={5} className="text-center text-muted-foreground py-8">
+                                                No patterns defined
+                                            </TableCell>
+                                        </TableRow>
+                                    ) : (
+                                        patterns.map((pattern) => (
+                                            <TableRow key={pattern.id}>
+                                                <TableCell className="font-medium">{pattern.name}</TableCell>
+                                                <TableCell className="font-mono text-xs">{pattern.pattern}</TableCell>
+                                                <TableCell>{pattern.pattern_type}</TableCell>
+                                                <TableCell>{pattern.severity}</TableCell>
+                                                <TableCell>{pattern.description}</TableCell>
+                                            </TableRow>
+                                        ))
+                                    )}
+                                </TableBody>
+                            </Table>
+                        </div>
+                    </CardContent>
+                )}
+
+                {/* Baselines Tab */}
+                {tabValue === 'baselines' && (
+                    <CardContent className="pt-6">
+                        <div className="flex gap-2 mb-4">
+                            <Button onClick={() => setBaselineDialogOpen(true)}>
+                                <Plus className="w-4 h-4 mr-2" />
+                                Add Baseline
+                            </Button>
+                        </div>
+
+                        <div className="border rounded-lg">
+                            <Table>
+                                <TableHeader>
+                                    <TableRow>
+                                        <TableHead>Metric</TableHead>
+                                        <TableHead>Log Group</TableHead>
+                                        <TableHead>Normal Range</TableHead>
+                                        <TableHead>Warning</TableHead>
+                                        <TableHead>Critical</TableHead>
+                                        <TableHead>Window</TableHead>
+                                    </TableRow>
+                                </TableHeader>
+                                <TableBody>
+                                    {baselines.length === 0 ? (
+                                        <TableRow>
+                                            <TableCell colSpan={6} className="text-center text-muted-foreground py-8">
+                                                No baselines configured
+                                            </TableCell>
+                                        </TableRow>
+                                    ) : (
+                                        baselines.map((baseline) => (
+                                            <TableRow key={baseline.id}>
+                                                <TableCell className="font-medium">{baseline.metric_name}</TableCell>
+                                                <TableCell>{baseline.log_group}</TableCell>
+                                                <TableCell>
+                                                    {baseline.normal_range?.min} - {baseline.normal_range?.max}
+                                                </TableCell>
+                                                <TableCell>{baseline.thresholds?.warning}</TableCell>
+                                                <TableCell>{baseline.thresholds?.critical}</TableCell>
+                                                <TableCell>{baseline.time_window}</TableCell>
+                                            </TableRow>
+                                        ))
+                                    )}
+                                </TableBody>
+                            </Table>
+                        </div>
+                    </CardContent>
+                )}
+
+                {/* Known Issues Tab */}
+                {tabValue === 'issues' && (
+                    <CardContent className="pt-6">
+                        <div className="flex gap-2 mb-4">
+                            <Button onClick={() => setIssueDialogOpen(true)}>
+                                <Plus className="w-4 h-4 mr-2" />
+                                Add Known Issue
+                            </Button>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            {knownIssues.length === 0 ? (
+                                <div className="col-span-2 text-center text-muted-foreground py-8">
+                                    No known issues documented
+                                </div>
+                            ) : (
+                                knownIssues.map((issue) => (
+                                    <Card key={issue.id} className="border">
+                                        <CardHeader>
+                                            <CardTitle className="text-lg">{issue.title}</CardTitle>
+                                            <Badge className="w-fit mt-2">{issue.category}</Badge>
+                                        </CardHeader>
+                                        <CardContent className="space-y-3">
+                                            <div>
+                                                <p className="text-sm text-muted-foreground">{issue.description}</p>
+                                            </div>
+                                            <div>
+                                                <p className="text-sm font-semibold">Symptoms:</p>
+                                                <p className="text-sm text-muted-foreground">{issue.symptoms?.join(', ')}</p>
+                                            </div>
+                                            <div>
+                                                <p className="text-sm font-semibold">Solution:</p>
+                                                <p className="text-sm text-muted-foreground">{issue.solution}</p>
+                                            </div>
+                                        </CardContent>
+                                    </Card>
+                                ))
+                            )}
+                        </div>
+                    </CardContent>
+                )}
+            </Card>
 
             {/* Watch Dialog */}
-            <Dialog open={watchDialogOpen} onClose={() => setWatchDialogOpen(false)} maxWidth="md" fullWidth>
-                <DialogTitle>Watch Log Groups</DialogTitle>
-                <DialogContent>
-                    <Box sx={{ pt: 1 }}>
-                        <Typography variant="subtitle2">Log Group Names</Typography>
-                        {watchForm.log_group_names.map((name, index) => (
-                            <Box key={index} sx={{ display: 'flex', gap: 1, mb: 1 }}>
-                                <TextField
-                                    fullWidth
-                                    value={name}
-                                    onChange={(e) => {
-                                        const newNames = [...watchForm.log_group_names];
-                                        newNames[index] = e.target.value;
-                                        setWatchForm({ ...watchForm, log_group_names: newNames });
-                                    }}
-                                    placeholder="/aws/lambda/my-function"
-                                />
-                                {watchForm.log_group_names.length > 1 && (
-                                    <IconButton onClick={() => {
-                                        const newNames = watchForm.log_group_names.filter((_, i) => i !== index);
-                                        setWatchForm({ ...watchForm, log_group_names: newNames });
-                                    }}>
-                                        <DeleteIcon />
-                                    </IconButton>
-                                )}
-                            </Box>
-                        ))}
-                        <Button
-                            onClick={() => setWatchForm({ ...watchForm, log_group_names: [...watchForm.log_group_names, ''] })}
-                        >
-                            Add Log Group
-                        </Button>
+            <Dialog open={watchDialogOpen} onOpenChange={setWatchDialogOpen}>
+                <DialogContent className="max-w-2xl">
+                    <DialogHeader>
+                        <DialogTitle>Watch Log Groups</DialogTitle>
+                        <DialogDescription>Configure CloudWatch log groups to watch</DialogDescription>
+                    </DialogHeader>
+                    
+                    <div className="space-y-4 py-4">
+                        <div>
+                            <label htmlFor="log-group-names" className="text-sm font-medium mb-2 block">Log Group Names</label>
+                            {watchForm.log_group_names.map((name, index) => (
+                                <div key={`log-group-${index}`} className="flex gap-2 mb-2">
+                                    <Input
+                                        value={name}
+                                        onChange={(e) => {
+                                            const newNames = [...watchForm.log_group_names];
+                                            newNames[index] = e.target.value;
+                                            setWatchForm({ ...watchForm, log_group_names: newNames });
+                                        }}
+                                        placeholder="/aws/lambda/my-function"
+                                    />
+                                    {watchForm.log_group_names.length > 1 && (
+                                        <Button
+                                            variant="outline"
+                                            size="icon"
+                                            onClick={() => {
+                                                const newNames = watchForm.log_group_names.filter((_, i) => i !== index);
+                                                setWatchForm({ ...watchForm, log_group_names: newNames });
+                                            }}
+                                        >
+                                            <Trash2 className="w-4 h-4" />
+                                        </Button>
+                                    )}
+                                </div>
+                            ))}
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => setWatchForm({ ...watchForm, log_group_names: [...watchForm.log_group_names, ''] })}
+                            >
+                                Add Log Group
+                            </Button>
+                        </div>
 
-                        <TextField
-                            fullWidth
-                            label="Time Range (minutes)"
-                            type="number"
-                            value={watchForm.time_range_minutes}
-                            onChange={(e) => setWatchForm({ ...watchForm, time_range_minutes: parseInt(e.target.value) })}
-                            sx={{ mt: 2 }}
-                        />
+                        <div>
+                            <label htmlFor="time-range" className="text-sm font-medium mb-2 block">Time Range (minutes)</label>
+                            <Input
+                                id="time-range"
+                                type="number"
+                                value={watchForm.time_range_minutes}
+                                onChange={(e) => setWatchForm({ ...watchForm, time_range_minutes: Number.parseInt(e.target.value, 10) })}
+                            />
+                        </div>
 
-                        <TextField
-                            fullWidth
-                            label="Filter Pattern (optional)"
-                            value={watchForm.filter_pattern}
-                            onChange={(e) => setWatchForm({ ...watchForm, filter_pattern: e.target.value })}
-                            sx={{ mt: 2 }}
-                            placeholder="[timestamp, message, level=ERROR*]"
-                        />
+                        <div>
+                            <label htmlFor="filter-pattern" className="text-sm font-medium mb-2 block">Filter Pattern (optional)</label>
+                            <Input
+                                id="filter-pattern"
+                                value={watchForm.filter_pattern}
+                                onChange={(e) => setWatchForm({ ...watchForm, filter_pattern: e.target.value })}
+                                placeholder="[timestamp, message, level=ERROR*]"
+                            />
+                        </div>
 
-                        <FormControl fullWidth sx={{ mt: 2 }}>
-                            <InputLabel>Region</InputLabel>
-                            <Select
+                        <div>
+                            <label htmlFor="region" className="text-sm font-medium mb-2 block">Region</label>
+                            <select
+                                id="region"
+                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                                 value={watchForm.region}
                                 onChange={(e) => setWatchForm({ ...watchForm, region: e.target.value })}
                             >
-                                <MenuItem value="us-east-1">us-east-1</MenuItem>
-                                <MenuItem value="us-west-2">us-west-2</MenuItem>
-                                <MenuItem value="eu-west-1">eu-west-1</MenuItem>
-                            </Select>
-                        </FormControl>
-                    </Box>
+                                <option value="us-east-1">us-east-1</option>
+                                <option value="us-west-2">us-west-2</option>
+                                <option value="eu-west-1">eu-west-1</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setWatchDialogOpen(false)}>Cancel</Button>
+                        <Button onClick={handleWatchLogs}>Watch</Button>
+                    </DialogFooter>
                 </DialogContent>
-                <DialogActions>
-                    <Button onClick={() => setWatchDialogOpen(false)}>Cancel</Button>
-                    <Button onClick={handleWatchLogs} variant="contained">Watch</Button>
-                </DialogActions>
             </Dialog>
 
             {/* Alert Dialog */}
-            <Dialog open={alertDialogOpen} onClose={() => setAlertDialogOpen(false)}>
-                <DialogTitle>Create Alert</DialogTitle>
+            <Dialog open={alertDialogOpen} onOpenChange={setAlertDialogOpen}>
                 <DialogContent>
-                    <TextField
-                        fullWidth
-                        label="Log Group"
-                        value={alertForm.log_group}
-                        onChange={(e) => setAlertForm({ ...alertForm, log_group: e.target.value })}
-                        sx={{ mt: 1 }}
-                    />
-                    <FormControl fullWidth sx={{ mt: 2 }}>
-                        <InputLabel>Alert Type</InputLabel>
-                        <Select
-                            value={alertForm.alert_type}
-                            onChange={(e) => setAlertForm({ ...alertForm, alert_type: e.target.value })}
-                        >
-                            <MenuItem value="anomaly">Anomaly</MenuItem>
-                            <MenuItem value="pattern_match">Pattern Match</MenuItem>
-                            <MenuItem value="error_spike">Error Spike</MenuItem>
-                            <MenuItem value="correlation">Correlation</MenuItem>
-                        </Select>
-                    </FormControl>
-                    <FormControl fullWidth sx={{ mt: 2 }}>
-                        <InputLabel>Severity</InputLabel>
-                        <Select
-                            value={alertForm.severity}
-                            onChange={(e) => setAlertForm({ ...alertForm, severity: e.target.value })}
-                        >
-                            <MenuItem value="critical">Critical</MenuItem>
-                            <MenuItem value="high">High</MenuItem>
-                            <MenuItem value="medium">Medium</MenuItem>
-                            <MenuItem value="low">Low</MenuItem>
-                            <MenuItem value="info">Info</MenuItem>
-                        </Select>
-                    </FormControl>
-                    <TextField
-                        fullWidth
-                        label="Message"
-                        multiline
-                        rows={3}
-                        value={alertForm.message}
-                        onChange={(e) => setAlertForm({ ...alertForm, message: e.target.value })}
-                        sx={{ mt: 2 }}
-                    />
+                    <DialogHeader>
+                        <DialogTitle>Create Alert</DialogTitle>
+                        <DialogDescription>Create a new alert configuration</DialogDescription>
+                    </DialogHeader>
+                    
+                    <div className="space-y-4 py-4">
+                        <div>
+                            <label htmlFor="alert-log-group" className="text-sm font-medium mb-2 block">Log Group</label>
+                            <Input
+                                id="alert-log-group"
+                                value={alertForm.log_group}
+                                onChange={(e) => setAlertForm({ ...alertForm, log_group: e.target.value })}
+                            />
+                        </div>
+
+                        <div>
+                            <label htmlFor="alert-type" className="text-sm font-medium mb-2 block">Alert Type</label>
+                            <select
+                                id="alert-type"
+                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                value={alertForm.alert_type}
+                                onChange={(e) => setAlertForm({ ...alertForm, alert_type: e.target.value })}
+                            >
+                                <option value="anomaly">Anomaly</option>
+                                <option value="pattern_match">Pattern Match</option>
+                                <option value="error_spike">Error Spike</option>
+                                <option value="correlation">Correlation</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label htmlFor="alert-severity" className="text-sm font-medium mb-2 block">Severity</label>
+                            <select
+                                id="alert-severity"
+                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                value={alertForm.severity}
+                                onChange={(e) => setAlertForm({ ...alertForm, severity: e.target.value })}
+                            >
+                                <option value="critical">Critical</option>
+                                <option value="high">High</option>
+                                <option value="medium">Medium</option>
+                                <option value="low">Low</option>
+                                <option value="info">Info</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label htmlFor="alert-message" className="text-sm font-medium mb-2 block">Message</label>
+                            <textarea
+                                id="alert-message"
+                                className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                value={alertForm.message}
+                                onChange={(e) => setAlertForm({ ...alertForm, message: e.target.value })}
+                                rows={3}
+                            />
+                        </div>
+                    </div>
+
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setAlertDialogOpen(false)}>Cancel</Button>
+                        <Button onClick={handleCreateAlert}>Create</Button>
+                    </DialogFooter>
                 </DialogContent>
-                <DialogActions>
-                    <Button onClick={() => setAlertDialogOpen(false)}>Cancel</Button>
-                    <Button onClick={handleCreateAlert} variant="contained">Create</Button>
-                </DialogActions>
             </Dialog>
 
             {/* Pattern Dialog */}
-            <Dialog open={patternDialogOpen} onClose={() => setPatternDialogOpen(false)}>
-                <DialogTitle>Add Log Pattern</DialogTitle>
+            <Dialog open={patternDialogOpen} onOpenChange={setPatternDialogOpen}>
                 <DialogContent>
-                    <TextField
-                        fullWidth
-                        label="Pattern Name"
-                        value={patternForm.name}
-                        onChange={(e) => setPatternForm({ ...patternForm, name: e.target.value })}
-                        sx={{ mt: 1 }}
-                    />
-                    <TextField
-                        fullWidth
-                        label="Pattern (regex or text)"
-                        value={patternForm.pattern}
-                        onChange={(e) => setPatternForm({ ...patternForm, pattern: e.target.value })}
-                        sx={{ mt: 2 }}
-                    />
-                    <FormControl fullWidth sx={{ mt: 2 }}>
-                        <InputLabel>Pattern Type</InputLabel>
-                        <Select
-                            value={patternForm.pattern_type}
-                            onChange={(e) => setPatternForm({ ...patternForm, pattern_type: e.target.value })}
-                        >
-                            <MenuItem value="error">Error</MenuItem>
-                            <MenuItem value="warning">Warning</MenuItem>
-                            <MenuItem value="info">Info</MenuItem>
-                            <MenuItem value="custom">Custom</MenuItem>
-                        </Select>
-                    </FormControl>
-                    <TextField
-                        fullWidth
-                        label="Severity (1-5)"
-                        type="number"
-                        value={patternForm.severity}
-                        onChange={(e) => setPatternForm({ ...patternForm, severity: parseInt(e.target.value) })}
-                        sx={{ mt: 2 }}
-                        inputProps={{ min: 1, max: 5 }}
-                    />
-                    <TextField
-                        fullWidth
-                        label="Description"
-                        multiline
-                        value={patternForm.description}
-                        onChange={(e) => setPatternForm({ ...patternForm, description: e.target.value })}
-                        sx={{ mt: 2 }}
-                    />
+                    <DialogHeader>
+                        <DialogTitle>Add Log Pattern</DialogTitle>
+                        <DialogDescription>Define a pattern to match in log messages</DialogDescription>
+                    </DialogHeader>
+                    
+                    <div className="space-y-4 py-4">
+                        <div>
+                            <label htmlFor="pattern-name" className="text-sm font-medium mb-2 block">Pattern Name</label>
+                            <Input
+                                id="pattern-name"
+                                value={patternForm.name}
+                                onChange={(e) => setPatternForm({ ...patternForm, name: e.target.value })}
+                            />
+                        </div>
+
+                        <div>
+                            <label htmlFor="pattern-regex" className="text-sm font-medium mb-2 block">Pattern (regex or text)</label>
+                            <Input
+                                id="pattern-regex"
+                                value={patternForm.pattern}
+                                onChange={(e) => setPatternForm({ ...patternForm, pattern: e.target.value })}
+                            />
+                        </div>
+
+                        <div>
+                            <label htmlFor="pattern-type" className="text-sm font-medium mb-2 block">Pattern Type</label>
+                            <select
+                                id="pattern-type"
+                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                value={patternForm.pattern_type}
+                                onChange={(e) => setPatternForm({ ...patternForm, pattern_type: e.target.value })}
+                            >
+                                <option value="error">Error</option>
+                                <option value="warning">Warning</option>
+                                <option value="info">Info</option>
+                                <option value="custom">Custom</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label htmlFor="pattern-severity" className="text-sm font-medium mb-2 block">Severity (1-5)</label>
+                            <Input
+                                id="pattern-severity"
+                                type="number"
+                                min="1"
+                                max="5"
+                                value={patternForm.severity}
+                                onChange={(e) => setPatternForm({ ...patternForm, severity: Number.parseInt(e.target.value, 10) })}
+                            />
+                        </div>
+
+                        <div>
+                            <label htmlFor="pattern-description" className="text-sm font-medium mb-2 block">Description</label>
+                            <textarea
+                                id="pattern-description"
+                                className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                value={patternForm.description}
+                                onChange={(e) => setPatternForm({ ...patternForm, description: e.target.value })}
+                            />
+                        </div>
+                    </div>
+
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setPatternDialogOpen(false)}>Cancel</Button>
+                        <Button onClick={handleAddPattern}>Add</Button>
+                    </DialogFooter>
                 </DialogContent>
-                <DialogActions>
-                    <Button onClick={() => setPatternDialogOpen(false)}>Cancel</Button>
-                    <Button onClick={handleAddPattern} variant="contained">Add</Button>
-                </DialogActions>
             </Dialog>
 
             {/* Baseline Dialog */}
-            <Dialog open={baselineDialogOpen} onClose={() => setBaselineDialogOpen(false)}>
-                <DialogTitle>Add Baseline Metric</DialogTitle>
+            <Dialog open={baselineDialogOpen} onOpenChange={setBaselineDialogOpen}>
                 <DialogContent>
-                    <TextField
-                        fullWidth
-                        label="Metric Name"
-                        value={baselineForm.metric_name}
-                        onChange={(e) => setBaselineForm({ ...baselineForm, metric_name: e.target.value })}
-                        sx={{ mt: 1 }}
-                    />
-                    <TextField
-                        fullWidth
-                        label="Log Group"
-                        value={baselineForm.log_group}
-                        onChange={(e) => setBaselineForm({ ...baselineForm, log_group: e.target.value })}
-                        sx={{ mt: 2 }}
-                    />
-                    <Grid container spacing={2} sx={{ mt: 1 }}>
-                        <Grid item xs={6}>
-                            <TextField
-                                fullWidth
-                                label="Normal Min"
-                                type="number"
-                                value={baselineForm.normal_range_min}
-                                onChange={(e) => setBaselineForm({ ...baselineForm, normal_range_min: parseFloat(e.target.value) })}
+                    <DialogHeader>
+                        <DialogTitle>Add Baseline Metric</DialogTitle>
+                        <DialogDescription>Configure a baseline for anomaly detection</DialogDescription>
+                    </DialogHeader>
+                    
+                    <div className="space-y-4 py-4">
+                        <div>
+                            <label htmlFor="metric-name" className="text-sm font-medium mb-2 block">Metric Name</label>
+                            <Input
+                                id="metric-name"
+                                value={baselineForm.metric_name}
+                                onChange={(e) => setBaselineForm({ ...baselineForm, metric_name: e.target.value })}
                             />
-                        </Grid>
-                        <Grid item xs={6}>
-                            <TextField
-                                fullWidth
-                                label="Normal Max"
-                                type="number"
-                                value={baselineForm.normal_range_max}
-                                onChange={(e) => setBaselineForm({ ...baselineForm, normal_range_max: parseFloat(e.target.value) })}
+                        </div>
+
+                        <div>
+                            <label htmlFor="baseline-log-group" className="text-sm font-medium mb-2 block">Log Group</label>
+                            <Input
+                                id="baseline-log-group"
+                                value={baselineForm.log_group}
+                                onChange={(e) => setBaselineForm({ ...baselineForm, log_group: e.target.value })}
                             />
-                        </Grid>
-                    </Grid>
-                    <Grid container spacing={2} sx={{ mt: 1 }}>
-                        <Grid item xs={6}>
-                            <TextField
-                                fullWidth
-                                label="Warning Threshold"
-                                type="number"
-                                value={baselineForm.threshold_warning}
-                                onChange={(e) => setBaselineForm({ ...baselineForm, threshold_warning: parseFloat(e.target.value) })}
-                            />
-                        </Grid>
-                        <Grid item xs={6}>
-                            <TextField
-                                fullWidth
-                                label="Critical Threshold"
-                                type="number"
-                                value={baselineForm.threshold_critical}
-                                onChange={(e) => setBaselineForm({ ...baselineForm, threshold_critical: parseFloat(e.target.value) })}
-                            />
-                        </Grid>
-                    </Grid>
-                    <FormControl fullWidth sx={{ mt: 2 }}>
-                        <InputLabel>Time Window</InputLabel>
-                        <Select
-                            value={baselineForm.time_window}
-                            onChange={(e) => setBaselineForm({ ...baselineForm, time_window: e.target.value })}
-                        >
-                            <MenuItem value="1m">1 minute</MenuItem>
-                            <MenuItem value="5m">5 minutes</MenuItem>
-                            <MenuItem value="15m">15 minutes</MenuItem>
-                            <MenuItem value="1h">1 hour</MenuItem>
-                        </Select>
-                    </FormControl>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                            <div>
+                                <label htmlFor="normal-min" className="text-sm font-medium mb-2 block">Normal Min</label>
+                                <Input
+                                    id="normal-min"
+                                    type="number"
+                                    value={baselineForm.normal_range_min}
+                                    onChange={(e) => setBaselineForm({ ...baselineForm, normal_range_min: Number.parseFloat(e.target.value) })}
+                                />
+                            </div>
+                            <div>
+                                <label htmlFor="normal-max" className="text-sm font-medium mb-2 block">Normal Max</label>
+                                <Input
+                                    id="normal-max"
+                                    type="number"
+                                    value={baselineForm.normal_range_max}
+                                    onChange={(e) => setBaselineForm({ ...baselineForm, normal_range_max: Number.parseFloat(e.target.value) })}
+                                />
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                            <div>
+                                <label htmlFor="threshold-warning" className="text-sm font-medium mb-2 block">Warning Threshold</label>
+                                <Input
+                                    id="threshold-warning"
+                                    type="number"
+                                    value={baselineForm.threshold_warning}
+                                    onChange={(e) => setBaselineForm({ ...baselineForm, threshold_warning: Number.parseFloat(e.target.value) })}
+                                />
+                            </div>
+                            <div>
+                                <label htmlFor="threshold-critical" className="text-sm font-medium mb-2 block">Critical Threshold</label>
+                                <Input
+                                    id="threshold-critical"
+                                    type="number"
+                                    value={baselineForm.threshold_critical}
+                                    onChange={(e) => setBaselineForm({ ...baselineForm, threshold_critical: Number.parseFloat(e.target.value) })}
+                                />
+                            </div>
+                        </div>
+
+                        <div>
+                            <label htmlFor="time-window" className="text-sm font-medium mb-2 block">Time Window</label>
+                            <select
+                                id="time-window"
+                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                value={baselineForm.time_window}
+                                onChange={(e) => setBaselineForm({ ...baselineForm, time_window: e.target.value })}
+                            >
+                                <option value="1m">1 minute</option>
+                                <option value="5m">5 minutes</option>
+                                <option value="15m">15 minutes</option>
+                                <option value="1h">1 hour</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setBaselineDialogOpen(false)}>Cancel</Button>
+                        <Button onClick={handleAddBaseline}>Add</Button>
+                    </DialogFooter>
                 </DialogContent>
-                <DialogActions>
-                    <Button onClick={() => setBaselineDialogOpen(false)}>Cancel</Button>
-                    <Button onClick={handleAddBaseline} variant="contained">Add</Button>
-                </DialogActions>
             </Dialog>
 
             {/* Known Issue Dialog */}
-            <Dialog open={issueDialogOpen} onClose={() => setIssueDialogOpen(false)} maxWidth="md" fullWidth>
-                <DialogTitle>Add Known Issue</DialogTitle>
-                <DialogContent>
-                    <TextField
-                        fullWidth
-                        label="Title"
-                        value={issueForm.title}
-                        onChange={(e) => setIssueForm({ ...issueForm, title: e.target.value })}
-                        sx={{ mt: 1 }}
-                    />
-                    <TextField
-                        fullWidth
-                        label="Description"
-                        multiline
-                        rows={2}
-                        value={issueForm.description}
-                        onChange={(e) => setIssueForm({ ...issueForm, description: e.target.value })}
-                        sx={{ mt: 2 }}
-                    />
-                    <Typography variant="subtitle2" sx={{ mt: 2 }}>Symptoms</Typography>
-                    {issueForm.symptoms.map((symptom, index) => (
-                        <Box key={index} sx={{ display: 'flex', gap: 1, mb: 1 }}>
-                            <TextField
-                                fullWidth
-                                value={symptom}
-                                onChange={(e) => {
-                                    const newSymptoms = [...issueForm.symptoms];
-                                    newSymptoms[index] = e.target.value;
-                                    setIssueForm({ ...issueForm, symptoms: newSymptoms });
-                                }}
+            <Dialog open={issueDialogOpen} onOpenChange={setIssueDialogOpen}>
+                <DialogContent className="max-w-2xl">
+                    <DialogHeader>
+                        <DialogTitle>Add Known Issue</DialogTitle>
+                        <DialogDescription>Document a known issue and its resolution</DialogDescription>
+                    </DialogHeader>
+                    
+                    <div className="space-y-4 py-4">
+                        <div>
+                            <label htmlFor="issue-title" className="text-sm font-medium mb-2 block">Title</label>
+                            <Input
+                                id="issue-title"
+                                value={issueForm.title}
+                                onChange={(e) => setIssueForm({ ...issueForm, title: e.target.value })}
                             />
-                            {issueForm.symptoms.length > 1 && (
-                                <IconButton onClick={() => {
-                                    const newSymptoms = issueForm.symptoms.filter((_, i) => i !== index);
-                                    setIssueForm({ ...issueForm, symptoms: newSymptoms });
-                                }}>
-                                    <DeleteIcon />
-                                </IconButton>
-                            )}
-                        </Box>
-                    ))}
-                    <Button onClick={() => setIssueForm({ ...issueForm, symptoms: [...issueForm.symptoms, ''] })}>
-                        Add Symptom
-                    </Button>
-                    <TextField
-                        fullWidth
-                        label="Solution"
-                        multiline
-                        rows={3}
-                        value={issueForm.solution}
-                        onChange={(e) => setIssueForm({ ...issueForm, solution: e.target.value })}
-                        sx={{ mt: 2 }}
-                    />
-                    <FormControl fullWidth sx={{ mt: 2 }}>
-                        <InputLabel>Category</InputLabel>
-                        <Select
-                            value={issueForm.category}
-                            onChange={(e) => setIssueForm({ ...issueForm, category: e.target.value })}
-                        >
-                            <MenuItem value="database">Database</MenuItem>
-                            <MenuItem value="network">Network</MenuItem>
-                            <MenuItem value="authentication">Authentication</MenuItem>
-                            <MenuItem value="performance">Performance</MenuItem>
-                            <MenuItem value="general">General</MenuItem>
-                        </Select>
-                    </FormControl>
-                </DialogContent>
-                <DialogActions>
-                    <Button onClick={() => setIssueDialogOpen(false)}>Cancel</Button>
-                    <Button onClick={handleAddKnownIssue} variant="contained">Add</Button>
-                </DialogActions>
-            </Dialog>
+                        </div>
 
-            {/* Snackbar */}
-            <Snackbar
-                open={snackbar.open}
-                autoHideDuration={3000}
-                onClose={() => setSnackbar({ ...snackbar, open: false })}
-            >
-                <Alert severity={snackbar.severity}>{snackbar.message}</Alert>
-            </Snackbar>
-        </Box>
+                        <div>
+                            <label htmlFor="issue-description" className="text-sm font-medium mb-2 block">Description</label>
+                            <textarea
+                                id="issue-description"
+                                className="flex min-h-[60px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                value={issueForm.description}
+                                onChange={(e) => setIssueForm({ ...issueForm, description: e.target.value })}
+                                rows={2}
+                            />
+                        </div>
+
+                        <div>
+                            <label htmlFor="issue-symptoms" className="text-sm font-medium mb-2 block">Symptoms</label>
+                            {issueForm.symptoms.map((symptom, index) => (
+                                <div key={`symptom-${index}`} className="flex gap-2 mb-2">
+                                    <Input
+                                        value={symptom}
+                                        onChange={(e) => {
+                                            const newSymptoms = [...issueForm.symptoms];
+                                            newSymptoms[index] = e.target.value;
+                                            setIssueForm({ ...issueForm, symptoms: newSymptoms });
+                                        }}
+                                    />
+                                    {issueForm.symptoms.length > 1 && (
+                                        <Button
+                                            variant="outline"
+                                            size="icon"
+                                            onClick={() => {
+                                                const newSymptoms = issueForm.symptoms.filter((_, i) => i !== index);
+                                                setIssueForm({ ...issueForm, symptoms: newSymptoms });
+                                            }}
+                                        >
+                                            <Trash2 className="w-4 h-4" />
+                                        </Button>
+                                    )}
+                                </div>
+                            ))}
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => setIssueForm({ ...issueForm, symptoms: [...issueForm.symptoms, ''] })}
+                            >
+                                Add Symptom
+                            </Button>
+                        </div>
+
+                        <div>
+                            <label htmlFor="issue-solution" className="text-sm font-medium mb-2 block">Solution</label>
+                            <textarea
+                                id="issue-solution"
+                                className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                value={issueForm.solution}
+                                onChange={(e) => setIssueForm({ ...issueForm, solution: e.target.value })}
+                                rows={3}
+                            />
+                        </div>
+
+                        <div>
+                            <label htmlFor="issue-category" className="text-sm font-medium mb-2 block">Category</label>
+                            <Input
+                                id="issue-category"
+                                value={issueForm.category}
+                                onChange={(e) => setIssueForm({ ...issueForm, category: e.target.value })}
+                            />
+                        </div>
+                    </div>
+
+                    <DialogFooter>
+                        <Button variant="outline" onClick={() => setIssueDialogOpen(false)}>Cancel</Button>
+                        <Button onClick={handleAddKnownIssue}>Add</Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+        </div>
     );
 }

@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS workflows (
     nodes JSONB NOT NULL,
     edges JSONB NOT NULL,
     viewport JSONB,
+    enabled BOOLEAN DEFAULT true,
+    schedule VARCHAR(100),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -30,23 +32,6 @@ CREATE TABLE IF NOT EXISTS executions (
     output JSONB,
     error TEXT,
     logs TEXT
-);
-
--- ============================================
--- SCHEDULES TABLE
--- ============================================
-
-CREATE TABLE IF NOT EXISTS schedules (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(255) NOT NULL UNIQUE,
-    workflow_name VARCHAR(255) NOT NULL,
-    cron_expression VARCHAR(100) NOT NULL,
-    timezone VARCHAR(50) DEFAULT 'UTC',
-    enabled BOOLEAN DEFAULT true,
-    last_run TIMESTAMP,
-    next_run TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ============================================
@@ -169,11 +154,11 @@ CREATE INDEX IF NOT EXISTS known_issues_embedding_idx ON known_issues USING ivff
 -- ============================================
 
 CREATE INDEX IF NOT EXISTS workflows_name_idx ON workflows(name);
+CREATE INDEX IF NOT EXISTS workflows_enabled_idx ON workflows(enabled);
+CREATE INDEX IF NOT EXISTS workflows_schedule_idx ON workflows(schedule) WHERE schedule IS NOT NULL;
 CREATE INDEX IF NOT EXISTS executions_workflow_id_idx ON executions(workflow_id);
 CREATE INDEX IF NOT EXISTS executions_status_idx ON executions(status);
 CREATE INDEX IF NOT EXISTS executions_started_at_idx ON executions(started_at);
-CREATE INDEX IF NOT EXISTS schedules_workflow_name_idx ON schedules(workflow_name);
-CREATE INDEX IF NOT EXISTS schedules_enabled_idx ON schedules(enabled);
 CREATE INDEX IF NOT EXISTS log_patterns_type_idx ON log_patterns(pattern_type);
 CREATE INDEX IF NOT EXISTS known_issues_category_idx ON known_issues(category);
 CREATE INDEX IF NOT EXISTS alerts_status_idx ON alerts(status);
