@@ -262,6 +262,21 @@ export const agentApiClient = {
         const response = await client.get(`/api/v1/certificates/${encodeURIComponent(filename)}/exists`);
         return response.data;
     },
+
+    // ==================== CloudWatch Log Watch ====================
+
+    /**
+     * Test AWS CloudWatch connection
+     */
+    async testCloudWatchConnection(region, credentials) {
+        const response = await client.post('/api/v1/log-watch/test-connection', {
+            region,
+            credentials: {
+                aws_profile: credentials.awsProfile || null
+            }
+        });
+        return response.data;
+    },
 };
 
 export default agentApiClient;

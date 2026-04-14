@@ -33,13 +33,13 @@ export default defineConfig({
       output: {
         manualChunks: {
           'react-vendor': ['react', 'react-dom', 'react-router-dom'],
-          'mui': ['@mui/material', '@mui/icons-material', '@emotion/react', '@emotion/styled'],
+
           'workflow': ['reactflow'],
         },
       },
     },
   },
   optimizeDeps: {
-    include: ['react', 'react-dom', 'react-router-dom', '@mui/material', '@mui/icons-material', 'reactflow'],
+    include: ['react', 'react-dom', 'react-router-dom', 'reactflow'],
   },
 })

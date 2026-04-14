@@ -268,7 +268,7 @@ export default function Dashboard() {
                   <TableHead className="text-slate-500 text-[10px] md:text-xs font-bold uppercase tracking-wider px-3 md:px-6 py-3 md:py-4">Workflow</TableHead>
                   <TableHead className="text-slate-500 text-[10px] md:text-xs font-bold uppercase tracking-wider px-3 md:px-6 py-3 md:py-4 hidden sm:table-cell">Started</TableHead>
                   <TableHead className="text-slate-500 text-[10px] md:text-xs font-bold uppercase tracking-wider px-3 md:px-6 py-3 md:py-4 hidden md:table-cell">Duration</TableHead>
-                  <TableHead className="text-slate-500 text-[10px] md:text-xs font-bold uppercase tracking-wider px-3 md:px-6 py-3 md:py-4">Queries</TableHead>
+                  <TableHead className="text-slate-500 text-[10px] md:text-xs font-bold uppercase tracking-wider px-3 md:px-6 py-3 md:py-4">Details</TableHead>
                   <TableHead className="text-slate-500 text-[10px] md:text-xs font-bold uppercase tracking-wider px-3 md:px-6 py-3 md:py-4">Status</TableHead>
                   <TableHead className="text-slate-500 text-[10px] md:text-xs font-bold uppercase tracking-wider px-3 md:px-6 py-3 md:py-4 text-right">Details</TableHead>
                 </TableRow>
@@ -287,6 +287,9 @@ export default function Dashboard() {
                     const orchestratorKey = Object.keys(run.output || {}).find(k => k.startsWith('orchestrator'));
                     const orchestrator = orchestratorKey ? run.output[orchestratorKey] : null;
                     const queriesExecuted = orchestrator?.queries_executed || run.output?.queries_executed || 0;
+                    const isCloudWatch = run.output?.analysis_type;
+                    const logGroupsAnalyzed = run.output?.log_groups_analyzed?.length || 0;
+                    const anomaliesCount = run.output?.alerts?.length || 0;
 
                     return (
                       <TableRow key={run.execution_id || run.id}>
@@ -298,9 +301,15 @@ export default function Dashboard() {
                           {run.duration ? `${run.duration.toFixed(1)}s` : '—'}
                         </TableCell>
                         <TableCell className="px-3 md:px-6 py-3 md:py-4">
-                          <span className={queriesExecuted > 0 ? "text-red-600 font-medium" : "text-slate-400"}>
-                            {queriesExecuted > 0 ? queriesExecuted : '—'}
-                          </span>
+                          {isCloudWatch ? (
+                            <span className={logGroupsAnalyzed > 0 ? "text-red-600 font-medium" : "text-slate-400"}>
+                              {logGroupsAnalyzed > 0 ? `${logGroupsAnalyzed} log group${logGroupsAnalyzed !== 1 ? 's' : ''}` : '—'}
+                            </span>
+                          ) : (
+                            <span className={queriesExecuted > 0 ? "text-red-600 font-medium" : "text-slate-400"}>
+                              {queriesExecuted > 0 ? queriesExecuted : '—'}
+                            </span>
+                          )}
                         </TableCell>
                         <TableCell className="px-3 md:px-6 py-3 md:py-4">
                           <Badge variant={run.status === 'success' ? 'success' : 'destructive'} className="text-[10px] md:text-xs">
@@ -394,18 +403,41 @@ export default function Dashboard() {
           <div className="p-8 space-y-8 bg-slate-50 overflow-y-auto custom-scrollbar">
             {/* Execution Metrics Grid */}
             {(() => {
-              // Use 'result' field which contains the full orchestrator node data
               const resultData = selectedRun?.result || {};
               const orchestratorKey = Object.keys(resultData).find(k => k.startsWith('orchestrator'));
               const orchestrator = orchestratorKey ? resultData[orchestratorKey] : null;
+              const isCloudWatch = selectedRun?.output?.analysis_type;
 
-              // Fallback to the simplified 'output' field if orchestrator not found
               const queriesExecuted = orchestrator?.queries_executed || selectedRun?.output?.queries_executed || 0;
               const failures = orchestrator?.failures || selectedRun?.output?.failures || 0;
               const duration = selectedRun?.duration ? selectedRun.duration.toFixed(2) : 'N/A';
+              const logGroupsAnalyzed = selectedRun?.output?.log_groups_analyzed?.length || 0;
+              const alertsCount = selectedRun?.output?.alerts?.length || 0;
+
+              if (isCloudWatch) {
+                return (
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Execution ID</p>
+                      <p className="mt-2 text-4xl font-bold text-slate-900">{selectedRun?.execution_id || selectedRun?.id}</p>
+                    </div>
+                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Duration</p>
+                      <p className="mt-2 text-4xl font-bold text-slate-900">{duration}<span className="text-xl ml-1 text-slate-400">s</span></p>
+                    </div>
+                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Log Groups</p>
+                      <p className="mt-2 text-4xl font-bold text-blue-700">{logGroupsAnalyzed}</p>
+                    </div>
+                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Alerts</p>
+                      <p className="mt-2 text-4xl font-bold text-emerald-600">{alertsCount}</p>
+                    </div>
+                  </div>
+                );
+              }
 
               return (
-                /* Summary Cards */
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
                   <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
                     <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Execution ID</p>
@@ -427,17 +459,128 @@ export default function Dashboard() {
               );
             })()}
 
-            {/* Query Results Table */}
+            {/* Results Section */}
             {(() => {
-              // Use 'result' field which contains the full orchestrator node data
               const resultData = selectedRun?.result || {};
               const orchestratorKey = Object.keys(resultData).find(k => k.startsWith('orchestrator'));
               const orchestrator = orchestratorKey ? resultData[orchestratorKey] : null;
+              const isCloudWatch = selectedRun?.output?.analysis_type;
 
-              // Get results from orchestrator node, or fallback to simplified output field
               const results = orchestrator?.results || selectedRun?.output?.results || [];
 
-              // If results is an array (from SQL queries)
+              if (isCloudWatch) {
+                const cwResults = selectedRun?.output?.results || {};
+                const cwAlerts = selectedRun?.output?.alerts || [];
+                const analysisType = selectedRun.output.analysis_type;
+                const logGroupsAnalyzed = selectedRun.output.log_groups_analyzed || [];
+                const timeRange = selectedRun.output.time_range || '—';
+
+                return (
+                  <div>
+                    <div className="flex items-center justify-between mb-6">
+                      <h3 className="text-xl font-bold text-slate-900">CloudWatch Analysis</h3>
+                      <span className="px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-xs font-medium uppercase">{analysisType}</span>
+                    </div>
+                    <div className="border border-slate-200 rounded-lg overflow-hidden shadow-sm">
+                      <Table>
+                        <TableHeader>
+                          <TableRow className="bg-slate-50 border-b border-slate-200">
+                            <TableHead className="px-6 py-4 text-sm font-bold text-slate-700 uppercase">Property</TableHead>
+                            <TableHead className="px-6 py-4 text-sm font-bold text-slate-700 uppercase">Value</TableHead>
+                          </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                          <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                            <TableCell className="px-6 py-4 text-slate-600 font-medium">Analysis Type</TableCell>
+                            <TableCell className="px-6 py-4">
+                              <span className="px-2 py-1 bg-slate-100 rounded text-xs font-medium">{analysisType}</span>
+                            </TableCell>
+                          </TableRow>
+                          <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                            <TableCell className="px-6 py-4 text-slate-600 font-medium">Time Range</TableCell>
+                            <TableCell className="px-6 py-4 font-semibold text-slate-900">{timeRange}</TableCell>
+                          </TableRow>
+                          <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                            <TableCell className="px-6 py-4 text-slate-600 font-medium">Log Groups</TableCell>
+                            <TableCell className="px-6 py-4">
+                              <div className="flex flex-wrap gap-1">
+                                {logGroupsAnalyzed.map((lg, i) => (
+                                  <code key={i} className="px-2 py-0.5 bg-slate-100 rounded text-xs font-mono text-slate-800 border border-slate-200">{lg}</code>
+                                ))}
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                          {cwResults.summary && (
+                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Summary</TableCell>
+                              <TableCell className="px-6 py-4">
+                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
+                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.summary, null, 2)}</pre>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                          {cwResults.patterns && (
+                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Patterns</TableCell>
+                              <TableCell className="px-6 py-4">
+                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
+                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.patterns, null, 2)}</pre>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                          {cwResults.anomalies && (
+                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Anomalies</TableCell>
+                              <TableCell className="px-6 py-4">
+                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
+                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.anomalies, null, 2)}</pre>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                          {cwResults.timeline && (
+                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Timeline</TableCell>
+                              <TableCell className="px-6 py-4">
+                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
+                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.timeline, null, 2)}</pre>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                          {cwResults.log_groups && (
+                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Log Group Details</TableCell>
+                              <TableCell className="px-6 py-4">
+                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
+                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.log_groups, null, 2)}</pre>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                          {cwAlerts.length > 0 && (
+                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Alerts</TableCell>
+                              <TableCell className="px-6 py-4">
+                                <div className="space-y-2">
+                                  {cwAlerts.map((alert, i) => (
+                                    <div key={i} className={`px-3 py-2 rounded text-xs font-medium ${alert.severity === 'high' ? 'bg-red-50 border border-red-200 text-red-800' : alert.severity === 'medium' ? 'bg-amber-50 border border-amber-200 text-amber-800' : 'bg-slate-50 border border-slate-200 text-slate-800'}`}>
+                                      <span className="font-bold uppercase">{alert.severity}</span>: {alert.message}
+                                    </div>
+                                  ))}
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                        </TableBody>
+                      </Table>
+                    </div>
+                  </div>
+                );
+              }
+
               if (Array.isArray(results) && results.length > 0) {
                 return (
                   <div>

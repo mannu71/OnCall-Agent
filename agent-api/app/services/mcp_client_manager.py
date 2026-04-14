@@ -67,6 +67,7 @@ class MCPClientManager:
     def __init__(self):
         self.connections: Dict[str, Dict[str, Any]] = {}
         self.tools: Dict[str, List[str]] = {}  # server_id -> list of tool names
+        self.tool_objects: Dict[str, Dict[str, Any]] = {}  # server_id -> {tool_name -> MCP Tool obj}
         self._exit_stacks: Dict[str, AsyncExitStack] = {}  # server_id -> exit stack
     
     async def connect_server(self, server_id: str, config: Dict[str, Any]) -> bool:
@@ -133,6 +134,8 @@ class MCPClientManager:
                 'write': write,
             }
             self.tools[server_id] = tool_names
+            # Store full tool objects for schema/description access by LangChain adapter
+            self.tool_objects[server_id] = {tool.name: tool for tool in tools_result.tools}
             
             logger.info("Connected to %s with %d tools: %s", server_id, len(tool_names), tool_names)
             return True
@@ -214,6 +217,7 @@ class MCPClientManager:
         exit_stack = self._exit_stacks.pop(server_id)
         self.connections.pop(server_id, None)
         self.tools.pop(server_id, None)
+        self.tool_objects.pop(server_id, None)
         
         # Try to close the exit stack, but suppress all errors since
         # cross-task cleanup with anyio cancel scopes is fundamentally problematic

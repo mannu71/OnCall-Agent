@@ -670,6 +670,30 @@
   width: calc(100% - 50px);
 }
 
+.config-field.checkbox-field {
+  margin-bottom: 16px;
+}
+
+.config-field.checkbox-field label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: 500;
+  margin-bottom: 0;
+}
+
+.config-field.checkbox-field input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.config-field.checkbox-field span {
+  color: #333;
+}
+
 .checkbox-group {
   display: flex;
   flex-direction: column;

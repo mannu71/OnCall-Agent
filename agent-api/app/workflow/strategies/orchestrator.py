@@ -273,14 +273,20 @@ class OrchestratorStrategy(BaseStrategy):
     ) -> None:
         """
         Connect to MCP tool servers.
-        
+
         Args:
             tools: List of tool configurations
-            mcp_manager: MCP client manager
+            mcp_manager: MCPClientManager instance
         """
         for tool in tools:
-            if not mcp_manager.is_connected(tool["name"]):
-                await mcp_manager.connect(tool)
+            server_id = tool["name"]
+            if not mcp_manager.is_connected(server_id):
+                config = {
+                    "command": tool.get("command", ""),
+                    "args": tool.get("args", []),
+                    "env": tool.get("env", {}),
+                }
+                await mcp_manager.connect_server(server_id, config)
     
     async def _execute_steps(
         self,

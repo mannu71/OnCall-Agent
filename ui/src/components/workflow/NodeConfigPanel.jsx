@@ -1,10 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import PropTypes from 'prop-types';
 import { localTimeToCron, cronToLocalTime } from '../../utils/cronUtils';
+import { agentApiClient } from '../../services/agentApiClient';
 
 const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
   const [config, setConfig] = useState(node?.data || {});
   const fileInputRef = useRef(null);
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState(null);
   const [timeInput, setTimeInput] = useState(() => {
     // Initialize time from startTime first (most reliable), then cronExpression, or default to current time
     if (node?.data?.startTime) {
@@ -38,6 +41,28 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
     const newConfig = { ...config, [key]: value };
     setConfig(newConfig);
     onUpdate(node.id, newConfig);
+  };
+
+  const handleTestConnection = async () => {
+    setTestingConnection(true);
+    setConnectionStatus(null);
+    
+    try {
+      const result = await agentApiClient.testCloudWatchConnection(
+        config.awsRegion || 'us-east-1',
+        {
+          awsProfile: config.awsProfile
+        }
+      );
+      setConnectionStatus(result);
+    } catch (error) {
+      setConnectionStatus({
+        success: false,
+        message: `Connection failed: ${error.message}`
+      });
+    } finally {
+      setTestingConnection(false);
+    }
   };
 
   const handleKeyDown = (e) => {
@@ -428,6 +453,78 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
             </div>
 
             <div className="config-field">
+              <label htmlFor="aws-region">AWS Region</label>
+              <input
+                id="aws-region"
+                type="text"
+                value={config.awsRegion || ''}
+                onChange={(e) => handleConfigChange('awsRegion', e.target.value)}
+                placeholder="us-east-1"
+              />
+            </div>
+
+            <div className="config-field">
+              <label htmlFor="aws-profile">AWS Profile</label>
+              <input
+                id="aws-profile"
+                type="text"
+                value={config.awsProfile || ''}
+                onChange={(e) => handleConfigChange('awsProfile', e.target.value)}
+                placeholder="default"
+              />
+              <small style={{ color: '#666', fontSize: '11px' }}>
+                AWS profile name from ~/.aws/credentials
+              </small>
+            </div>
+
+            <div className="config-field">
+              <button
+                type="button"
+                onClick={handleTestConnection}
+                disabled={testingConnection}
+                style={{
+                  background: testingConnection ? '#9e9e9e' : '#2196f3',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: testingConnection ? 'not-allowed' : 'pointer',
+                  padding: '10px 16px',
+                  width: '100%',
+                  fontSize: '13px',
+                  fontWeight: 500,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '8px'
+                }}
+              >
+                {testingConnection ? 'Testing...' : 'Test Connection'}
+              </button>
+              {connectionStatus && (
+                <div style={{
+                  marginTop: '10px',
+                  padding: '10px',
+                  borderRadius: '4px',
+                  background: connectionStatus.success ? '#e8f5e9' : '#ffebee',
+                  border: `1px solid ${connectionStatus.success ? '#4caf50' : '#f44336'}`,
+                  fontSize: '12px'
+                }}>
+                  <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    color: connectionStatus.success ? '#2e7d32' : '#c62828'
+                  }}>
+                    <span style={{ fontSize: '16px' }}>
+                      {connectionStatus.success ? '✓' : '✕'}
+                    </span>
+                    <span>{connectionStatus.message}</span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="config-field">
               <label>Log Groups</label>
               <div className="log-groups-list" style={{ maxHeight: '200px', overflowY: 'auto', marginBottom: '10px' }}>
                 {(config.logGroups || []).map((group, index) => (
@@ -518,14 +615,14 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
               <small style={{ color: '#666', fontSize: '11px' }}>Alert if error count exceeds this value</small>
             </div>
 
-            <div className="config-field">
-              <label className="checkbox-label" style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+            <div className="config-field checkbox-field">
+              <label className="checkbox-label">
                 <input
                   type="checkbox"
                   checked={config.enableAlerts || false}
                   onChange={(e) => handleConfigChange('enableAlerts', e.target.checked)}
                 />
-                Enable Alerts
+                <span>Enable Alerts</span>
               </label>
             </div>
           </>

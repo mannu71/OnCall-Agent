@@ -49,16 +49,41 @@ def handle_exceptions(func: Callable) -> Callable:
 class CloudWatchLogWatcher:
     """CloudWatch Logs watcher for multiple log groups."""
     
-    def __init__(self, region: str = "us-east-1"):
+    def __init__(
+        self,
+        region: str = "us-east-1",
+        aws_access_key_id: Optional[str] = None,
+        aws_secret_access_key: Optional[str] = None,
+        aws_profile: Optional[str] = None,
+        use_env_credentials: bool = False
+    ):
         """Initialize CloudWatch Logs client.
         
         Args:
             region: AWS region
+            aws_access_key_id: AWS Access Key ID (optional)
+            aws_secret_access_key: AWS Secret Access Key (optional)
+            aws_profile: AWS profile name from ~/.aws/credentials (optional)
+            use_env_credentials: Use environment variables for credentials
         """
         self.region = region
-        self.client = boto3.client('logs', region_name=region)
         self._watch_tasks: Dict[str, asyncio.Task] = {}
         self._callbacks: Dict[str, List[Callable]] = {}
+        
+        if use_env_credentials:
+            session = boto3.Session(region_name=region)
+        elif aws_access_key_id and aws_secret_access_key:
+            session = boto3.Session(
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                region_name=region
+            )
+        elif aws_profile:
+            session = boto3.Session(profile_name=aws_profile, region_name=region)
+        else:
+            session = boto3.Session(region_name=region)
+        
+        self.client = session.client('logs')
     
     async def fetch_logs(
         self,
@@ -176,23 +201,52 @@ class CloudWatchLogWatcher:
             await asyncio.sleep(1)
 
 
-# Global watcher instance
-_watcher: Optional[CloudWatchLogWatcher] = None
-
-
-def get_watcher(region: str = "us-east-1") -> CloudWatchLogWatcher:
-    """Get or create CloudWatch Log watcher instance.
+def get_watcher(
+    region: str = "us-east-1",
+    aws_access_key_id: Optional[str] = None,
+    aws_secret_access_key: Optional[str] = None,
+    aws_profile: Optional[str] = None,
+    use_env_credentials: bool = False
+) -> CloudWatchLogWatcher:
+    """Create CloudWatch Log watcher instance with credentials.
     
     Args:
         region: AWS region
+        aws_access_key_id: AWS Access Key ID (optional)
+        aws_secret_access_key: AWS Secret Access Key (optional)
+        aws_profile: AWS profile name from ~/.aws/credentials (optional)
+        use_env_credentials: Use environment variables for credentials
         
     Returns:
         CloudWatchLogWatcher instance
     """
-    global _watcher
-    if _watcher is None:
-        _watcher = CloudWatchLogWatcher(region=region)
-    return _watcher
+    return CloudWatchLogWatcher(
+        region=region,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        aws_profile=aws_profile,
+        use_env_credentials=use_env_credentials
+    )
+
+
+def _extract_credentials(credentials: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract AWS credentials from credentials dict.
+    
+    Args:
+        credentials: Credentials dictionary or None
+        
+    Returns:
+        Dictionary with credential parameters for get_watcher
+    """
+    if not credentials:
+        return {}
+    
+    return {
+        "aws_access_key_id": credentials.get("aws_access_key_id"),
+        "aws_secret_access_key": credentials.get("aws_secret_access_key"),
+        "aws_profile": credentials.get("aws_profile"),
+        "use_env_credentials": credentials.get("use_env_credentials", False)
+    }
 
 
 # ============================================
@@ -204,7 +258,8 @@ async def watch_log_groups(
     log_group_names: List[str],
     time_range_minutes: int = 60,
     filter_pattern: Optional[str] = None,
-    region: str = "us-east-1"
+    region: str = "us-east-1",
+    credentials: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """Watch multiple CloudWatch log groups and fetch recent logs.
     
@@ -216,6 +271,7 @@ async def watch_log_groups(
         time_range_minutes: Time range in minutes to look back (default: 60)
         filter_pattern: Optional CloudWatch Logs filter pattern
         region: AWS region (default: us-east-1)
+        credentials: AWS credentials configuration (optional)
         
     Returns:
         Dictionary containing logs from each log group and summary statistics
@@ -232,7 +288,7 @@ async def watch_log_groups(
         )
         ```
     """
-    watcher = get_watcher(region)
+    watcher = get_watcher(region=region, **_extract_credentials(credentials))
     
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=time_range_minutes)
@@ -293,7 +349,8 @@ async def analyze_log_patterns(
     log_group_names: List[str],
     time_range_minutes: int = 60,
     pattern_types: Optional[List[str]] = None,
-    region: str = "us-east-1"
+    region: str = "us-east-1",
+    credentials: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """Analyze log patterns across multiple log groups.
     
@@ -305,6 +362,7 @@ async def analyze_log_patterns(
         time_range_minutes: Time range in minutes to analyze
         pattern_types: Types of patterns to look for (error, warning, info, custom)
         region: AWS region
+        credentials: AWS credentials configuration (optional)
         
     Returns:
         Pattern analysis results including frequencies and trends
@@ -317,7 +375,7 @@ async def analyze_log_patterns(
         )
         ```
     """
-    watcher = get_watcher(region)
+    watcher = get_watcher(region=region, **_extract_credentials(credentials))
     
     if pattern_types is None:
         pattern_types = ["error", "warning", "info"]
@@ -397,9 +455,10 @@ async def analyze_log_patterns(
 async def detect_anomalies(
     log_group_names: List[str],
     time_range_minutes: int = 60,
-    baseline_minutes: int = 1440,  # 24 hours
+    baseline_minutes: int = 1440,
     sensitivity: str = "medium",
-    region: str = "us-east-1"
+    region: str = "us-east-1",
+    credentials: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """Detect anomalies in log patterns compared to baseline.
     
@@ -412,6 +471,7 @@ async def detect_anomalies(
         baseline_minutes: Baseline time range for comparison (default: 24 hours)
         sensitivity: Anomaly detection sensitivity (low, medium, high)
         region: AWS region
+        credentials: AWS credentials configuration (optional)
         
     Returns:
         Detected anomalies with severity scores and details
@@ -424,7 +484,7 @@ async def detect_anomalies(
         )
         ```
     """
-    watcher = get_watcher(region)
+    watcher = get_watcher(region=region, **_extract_credentials(credentials))
     
     end_time = datetime.now(timezone.utc)
     current_start = end_time - timedelta(minutes=time_range_minutes)
@@ -538,7 +598,8 @@ async def correlate_logs(
     correlation_id: Optional[str] = None,
     time_range_minutes: int = 60,
     trace_id: Optional[str] = None,
-    region: str = "us-east-1"
+    region: str = "us-east-1",
+    credentials: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """Correlate logs across multiple services using trace ID or correlation ID.
     
@@ -551,6 +612,7 @@ async def correlate_logs(
         time_range_minutes: Time range in minutes to search
         trace_id: AWS X-Ray trace ID to correlate
         region: AWS region
+        credentials: AWS credentials configuration (optional)
         
     Returns:
         Correlated log events across services with timeline
@@ -563,7 +625,7 @@ async def correlate_logs(
         )
         ```
     """
-    watcher = get_watcher(region)
+    watcher = get_watcher(region=region, **_extract_credentials(credentials))
     
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=time_range_minutes)

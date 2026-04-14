@@ -104,8 +104,8 @@ class WorkflowEngine:
         )
         
         try:
-            # 1. Select appropriate strategy
-            strategy = self.select_strategy(workflow)
+            # 1. Select appropriate strategy (node-type first, then intent)
+            strategy = self.select_strategy(workflow, context)
             logger.info(
                 "Strategy selected",
                 extra={
@@ -188,30 +188,55 @@ class WorkflowEngine:
                 }
             )
     
-    def select_strategy(self, workflow: Dict[str, Any]) -> BaseStrategy:
+    def select_strategy(self, workflow: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> BaseStrategy:
         """
         Select the appropriate strategy for a workflow.
-        
+
+        Uses a two-pass approach:
+        1. Node-type matching (orchestrator nodes → OrchestratorStrategy,
+           agent+llm nodes → ReactStrategy)
+        2. Intent classification fallback — if a user_query is present in context
+           and no explicit orchestrator nodes exist, route to ReactStrategy.
+
         Args:
             workflow: The workflow definition
-            
+            context: Optional execution context (used for intent classification)
+
         Returns:
             Strategy instance
-            
+
         Raises:
             ValueError: If no strategy can handle the workflow
         """
+        # Pass 1: explicit node-type matching
         for strategy in self.strategies:
             if strategy.can_handle(workflow):
                 logger.debug(
-                    "Strategy matched",
+                    "Strategy matched (node-type)",
                     extra={
                         "strategy": strategy.__class__.__name__,
-                        "workflow_id": workflow.get("id")
-                    }
+                        "workflow_id": workflow.get("id"),
+                    },
                 )
                 return strategy
-        
+
+        # Pass 2: intent classification — user_query present without agent nodes
+        if context and context.get("user_query"):
+            nodes = workflow.get("nodes", [])
+            has_orchestrator = any(n.get("type") == "orchestrator" for n in nodes)
+
+            if not has_orchestrator:
+                # Natural language query on a workflow that doesn't have explicit
+                # agent/llm nodes — inject a synthetic agent node and route to ReAct.
+                logger.info(
+                    "Strategy selected via intent classification (user_query present, no orchestrator nodes)",
+                    extra={"workflow_id": workflow.get("id")},
+                )
+                # Find each ReactStrategy in self.strategies
+                for strategy in self.strategies:
+                    if strategy.__class__.__name__ == "ReactStrategy":
+                        return strategy
+
         available = ", ".join(s.__class__.__name__ for s in self.strategies)
         raise ValueError(
             f"No strategy found for workflow: {workflow.get('name')} "
@@ -259,7 +284,7 @@ class WorkflowEngine:
             Validation result dictionary
         """
         try:
-            strategy = self.select_strategy(workflow)
+            strategy = self.select_strategy(workflow, context=None)
             strategy.validate_workflow(workflow)
             
             return {

@@ -33,12 +33,27 @@ router = APIRouter(prefix="/log-watch", tags=["Log Watch Analyzer"])
 # REQUEST/RESPONSE MODELS
 # ============================================
 
+class AWSCredentials(BaseModel):
+    """AWS credentials configuration."""
+    aws_access_key_id: Optional[str] = Field(None, description="AWS Access Key ID")
+    aws_secret_access_key: Optional[str] = Field(None, description="AWS Secret Access Key")
+    aws_profile: Optional[str] = Field(None, description="AWS profile name from ~/.aws/credentials")
+    use_env_credentials: bool = Field(False, description="Use environment variables for credentials")
+
+
+class TestConnectionRequest(BaseModel):
+    """Request model for testing AWS credentials."""
+    region: str = Field("us-east-1", description="AWS region")
+    credentials: Optional[AWSCredentials] = Field(None, description="AWS credentials")
+
+
 class WatchLogGroupsRequest(BaseModel):
     """Request model for watching log groups."""
     log_group_names: List[str] = Field(..., description="List of CloudWatch log group names")
     time_range_minutes: int = Field(60, description="Time range in minutes to look back")
     filter_pattern: Optional[str] = Field(None, description="CloudWatch Logs filter pattern")
     region: str = Field("us-east-1", description="AWS region")
+    credentials: Optional[AWSCredentials] = Field(None, description="AWS credentials")
 
 
 class AnalyzePatternsRequest(BaseModel):
@@ -47,6 +62,7 @@ class AnalyzePatternsRequest(BaseModel):
     time_range_minutes: int = Field(60, description="Time range in minutes to analyze")
     pattern_types: Optional[List[str]] = Field(None, description="Pattern types to analyze")
     region: str = Field("us-east-1", description="AWS region")
+    credentials: Optional[AWSCredentials] = Field(None, description="AWS credentials")
 
 
 class DetectAnomaliesRequest(BaseModel):
@@ -56,6 +72,7 @@ class DetectAnomaliesRequest(BaseModel):
     baseline_minutes: int = Field(1440, description="Baseline time range for comparison")
     sensitivity: str = Field("medium", description="Detection sensitivity (low, medium, high)")
     region: str = Field("us-east-1", description="AWS region")
+    credentials: Optional[AWSCredentials] = Field(None, description="AWS credentials")
 
 
 class CorrelateLogsRequest(BaseModel):
@@ -65,6 +82,7 @@ class CorrelateLogsRequest(BaseModel):
     trace_id: Optional[str] = Field(None, description="AWS X-Ray trace ID")
     time_range_minutes: int = Field(60, description="Time range in minutes to search")
     region: str = Field("us-east-1", description="AWS region")
+    credentials: Optional[AWSCredentials] = Field(None, description="AWS credentials")
 
 
 class CreateAlertRequest(BaseModel):
@@ -123,6 +141,98 @@ class SetBaselineRequest(BaseModel):
 # LOG WATCHING ENDPOINTS
 # ============================================
 
+@router.post("/test-connection")
+async def test_aws_connection(request: TestConnectionRequest) -> Dict[str, Any]:
+    """Test AWS credentials by attempting to connect to CloudWatch Logs."""
+    import boto3
+    import os
+    from botocore.exceptions import ClientError, NoCredentialsError, BotoCoreError
+    from botocore.config import Config
+    
+    credentials = request.credentials.model_dump() if request.credentials else None
+    
+    try:
+        session_kwargs = {}
+        if credentials:
+            if credentials.get('aws_profile'):
+                session_kwargs['profile_name'] = credentials['aws_profile']
+            elif credentials.get('aws_access_key_id') and credentials.get('aws_secret_access_key'):
+                session_kwargs['aws_access_key_id'] = credentials['aws_access_key_id']
+                session_kwargs['aws_secret_access_key'] = credentials['aws_secret_access_key']
+        
+        session = boto3.Session(**session_kwargs)
+        
+        config = Config()
+        if os.environ.get('AWS_SSL_VERIFY', 'true').lower() == 'false':
+            config = Config(
+                connect_timeout=10,
+                read_timeout=10,
+                retries={'max_attempts': 2}
+            )
+        
+        client = session.client(
+            'logs',
+            region_name=request.region,
+            config=config,
+            verify=(os.environ.get('AWS_CA_BUNDLE') if os.environ.get('AWS_CA_BUNDLE') else 
+                    False if os.environ.get('AWS_SSL_VERIFY', 'true').lower() == 'false' else None)
+        )
+        
+        client.describe_log_groups(limit=1)
+        
+        return {
+            "success": True,
+            "message": "Successfully connected to CloudWatch Logs",
+            "region": request.region
+        }
+    except NoCredentialsError:
+        return {
+            "success": False,
+            "message": "No AWS credentials found. Please provide valid credentials.",
+            "region": request.region
+        }
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        error_msg = e.response.get('Error', {}).get('Message', str(e))
+        
+        if error_code == 'InvalidClientTokenId':
+            return {
+                "success": False,
+                "message": "Invalid AWS Access Key ID or Secret Access Key",
+                "region": request.region
+            }
+        elif error_code == 'UnrecognizedClientException':
+            return {
+                "success": False,
+                "message": "AWS credentials are not valid or have expired",
+                "region": request.region
+            }
+        elif error_code == 'AccessDenied':
+            return {
+                "success": False,
+                "message": "Access denied. Check IAM permissions for CloudWatch Logs",
+                "region": request.region
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"AWS Error: {error_msg}",
+                "region": request.region
+            }
+    except BotoCoreError as e:
+        return {
+            "success": False,
+            "message": f"Connection error: {str(e)}",
+            "region": request.region
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Unexpected error: {str(e)}",
+            "region": request.region
+        }
+
+
 @router.post("/watch")
 async def watch_logs(request: WatchLogGroupsRequest) -> Dict[str, Any]:
     """Watch multiple CloudWatch log groups and fetch recent logs.
@@ -130,11 +240,13 @@ async def watch_logs(request: WatchLogGroupsRequest) -> Dict[str, Any]:
     This endpoint retrieves logs from multiple log groups simultaneously,
     enabling cross-service log analysis.
     """
+    credentials = request.credentials.model_dump() if request.credentials else None
     return await watch_log_groups(
         log_group_names=request.log_group_names,
         time_range_minutes=request.time_range_minutes,
         filter_pattern=request.filter_pattern,
-        region=request.region
+        region=request.region,
+        credentials=credentials
     )
 
 
@@ -145,11 +257,13 @@ async def analyze_patterns(request: AnalyzePatternsRequest) -> Dict[str, Any]:
     This endpoint identifies common patterns, error frequencies, and trends
     across the specified log groups.
     """
+    credentials = request.credentials.model_dump() if request.credentials else None
     return await analyze_log_patterns(
         log_group_names=request.log_group_names,
         time_range_minutes=request.time_range_minutes,
         pattern_types=request.pattern_types,
-        region=request.region
+        region=request.region,
+        credentials=credentials
     )
 
 
@@ -160,12 +274,14 @@ async def detect_log_anomalies(request: DetectAnomaliesRequest) -> Dict[str, Any
     This endpoint compares current log patterns against a historical baseline
     to identify unusual activity, error spikes, or pattern deviations.
     """
+    credentials = request.credentials.model_dump() if request.credentials else None
     return await detect_anomalies(
         log_group_names=request.log_group_names,
         time_range_minutes=request.time_range_minutes,
         baseline_minutes=request.baseline_minutes,
         sensitivity=request.sensitivity,
-        region=request.region
+        region=request.region,
+        credentials=credentials
     )
 
 
@@ -176,12 +292,14 @@ async def correlate_log_events(request: CorrelateLogsRequest) -> Dict[str, Any]:
     This endpoint traces requests across multiple log groups to identify
     the full request flow and pinpoint issues.
     """
+    credentials = request.credentials.model_dump() if request.credentials else None
     return await correlate_logs(
         log_group_names=request.log_group_names,
         correlation_id=request.correlation_id,
         time_range_minutes=request.time_range_minutes,
         trace_id=request.trace_id,
-        region=request.region
+        region=request.region,
+        credentials=credentials
     )
 
 

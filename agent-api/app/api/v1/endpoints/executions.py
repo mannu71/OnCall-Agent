@@ -28,6 +28,21 @@ def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
             output['error'] = orchestrator_output['error']
         execution['output'] = output
     
+    if not orchestrator_output:
+        cloudwatch_output = next(
+            (v for v in results.values() if isinstance(v, dict) and 'analysis_type' in v),
+            None
+        )
+        if cloudwatch_output:
+            output = {
+                'analysis_type': cloudwatch_output.get('analysis_type'),
+                'log_groups_analyzed': cloudwatch_output.get('log_groups_analyzed', []),
+                'results': cloudwatch_output.get('data', {}),
+            }
+            if cloudwatch_output.get('alerts'):
+                output['alerts'] = cloudwatch_output['alerts']
+            execution['output'] = output
+    
     return execution
 
 
@@ -75,8 +90,8 @@ async def clear_active_executions():
     ]
     
     # Clean up all executions
-    for execution_id in visual_executor.active_executions.copy():
-        visual_executor.cleanup_execution(execution_id)
+    for execution_id in list(visual_executor.active_executions.keys()):
+        await visual_executor.cleanup_execution(execution_id)
     
     return {
         "message": f"Cleared {cleared_count} active executions",
@@ -104,7 +119,7 @@ async def cancel_workflow_by_name(workflow_name: str):
     
     # Clean up all matching executions
     for execution_id in execution_ids_to_clear:
-        visual_executor.cleanup_execution(execution_id)
+        await visual_executor.cleanup_execution(execution_id)
     
     return {
         "message": f"Cancelled {len(execution_ids_to_clear)} execution(s) for workflow '{workflow_name}'",

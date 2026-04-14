@@ -29,6 +29,7 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      - ~/.aws:/root/.aws:ro
     environment:
       - API_HOST=0.0.0.0
       - API_PORT=8000
@@ -38,11 +39,7 @@ services:
       - SCHEDULER_TIMEZONE=UTC
       - MAX_CONCURRENT_WORKFLOWS=5
       - LOG_LEVEL=INFO
-      # AWS Configuration for Bedrock
-      # - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
-      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
-      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
-      # Database Configuration
+      - AWS_SSL_VERIFY=false
       - DATABASE_URL=postgresql://kycuser:kycpassword@postgres:5432/kycagent
     depends_on:
       postgres:

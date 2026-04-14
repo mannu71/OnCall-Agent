@@ -10,6 +10,12 @@ from pathlib import Path
 from app.repositories import ExecutionRepository
 from app.services.mcp_client_manager import MCPClientManager
 from app.services.sql_orchestrator import SQLOrchestrator
+from app.mcp.tools.watch_tools import (
+    watch_log_groups,
+    analyze_log_patterns,
+    detect_anomalies,
+    correlate_logs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +61,14 @@ class VisualWorkflowExecutor:
             node_result['results'] = value.get('results', [])
             if value.get('error'):
                 node_result['error'] = value['error']
+        
+        if 'analysis_type' in value:
+            node_result['analysis_type'] = value['analysis_type']
+            node_result['log_groups_analyzed'] = value.get('log_groups_analyzed', [])
+            node_result['time_range'] = value.get('time_range')
+            node_result['data'] = value.get('data', {})
+            if value.get('alerts'):
+                node_result['alerts'] = value['alerts']
         
         return node_result
     
@@ -142,6 +156,7 @@ class VisualWorkflowExecutor:
             "id": execution_id,
             "workflow_name": workflow_name,
             "workflow_id": workflow.get('id'),
+            "workflow": workflow,  # Full workflow stored for agent node access
             "status": "running",
             "start_time": start_time.isoformat().replace('+00:00', 'Z'),
             "nodes_completed": [],
@@ -354,6 +369,7 @@ class VisualWorkflowExecutor:
             'orchestrator': self._execute_orchestrator_node,
             'agent': self._execute_agent_node,
             'tool': self._execute_tool_node,
+            'cloudwatchAnalyzer': self._execute_cloudwatch_node,
         }
         
         try:
@@ -503,15 +519,81 @@ class VisualWorkflowExecutor:
             }
     
     async def _execute_agent_node(self, node: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute agent node."""
-        # Agent nodes are processed by the orchestrator - this is a pass-through
-        logger.debug(f"Agent node executed: {node.get('id')}")
-        
-        return {
-            "status": "success",
-            "output": "Agent task completed",
-            "agent_data": node.get('data', {})
+        """
+        Execute agent node by delegating to ReactStrategy (LangGraph ReAct loop).
+
+        The agent node's 'instructions' or the workflow's 'user_query' input drives
+        the investigation. The shared MCP manager for this execution is passed so the
+        agent can reuse already-connected database servers from preceding tool nodes.
+        """
+        from app.workflow.strategies.react import ReactStrategy
+
+        node_id = node.get('id')
+        node_data = node.get('data', {})
+        execution_id = context.get('execution_id')
+
+        # Build a minimal workflow stub so ReactStrategy can parse nodes/edges
+        active = self.active_executions.get(execution_id, {})
+        workflow = active.get('workflow') or {
+            'name': context.get('workflow_name', 'unknown'),
+            'nodes': [node],
+            'edges': [],
         }
+
+        # user_query from workflow inputs, then fall back to agent instructions
+        user_query = (
+            context.get('inputs', {}).get('user_query')
+            or context.get('inputs', {}).get('query')
+            or node_data.get('instructions')
+            or node_data.get('description')
+            or ''
+        )
+
+        if not user_query:
+            return {
+                'status': 'skipped',
+                'output': 'Agent node has no user_query or instructions configured.',
+                'agent_data': node_data,
+            }
+
+        # Reuse the execution-scoped MCP manager so already-connected tool nodes
+        # are available to the agent without re-connecting.
+        mcp_manager = self.mcp_managers.get(execution_id)
+
+        strategy_context = {
+            'execution_id': execution_id,
+            'user_query': user_query,
+            'mcp_manager': mcp_manager,
+            'inputs': context.get('inputs', {}),
+            'logger': logger,
+        }
+
+        try:
+            react_strategy = ReactStrategy()
+            result = await react_strategy.execute(workflow, strategy_context)
+
+            return {
+                'status': 'success',
+                'output': result.get('final_answer', 'Agent completed (no answer returned).'),
+                'final_answer': result.get('final_answer'),
+                'messages': result.get('messages', []),
+                'message_count': result.get('message_count', 0),
+                'tool_calls': result.get('tool_calls', []),
+                'model': result.get('model'),
+                'provider': result.get('provider'),
+                'agent_data': node_data,
+            }
+
+        except Exception as e:
+            logger.error(
+                "Agent node execution failed: %s (node_id=%s, execution_id=%s)",
+                e, node_id, execution_id,
+            )
+            return {
+                'status': 'failed',
+                'error': str(e),
+                'agent_data': node_data,
+            }
     
     async def _execute_tool_node(self, node: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         """Execute tool node by connecting to MCP server."""
@@ -577,6 +659,188 @@ class VisualWorkflowExecutor:
                 "tool_data": node_data
             }
     
+    @staticmethod
+    def _parse_time_range_minutes(time_range: str) -> int:
+        """Convert time range string (e.g. '15m', '1h', '7d') to minutes."""
+        units = {'m': 1, 'h': 60, 'd': 1440}
+        if not time_range:
+            return 60
+        suffix = time_range[-1]
+        if suffix not in units:
+            return 60
+        try:
+            value = int(time_range[:-1])
+            return value * units[suffix]
+        except (ValueError, IndexError):
+            return 60
+
+    async def _execute_cloudwatch_node(self, node: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute CloudWatch Analyzer node by running log analysis."""
+        node_data = node.get('data', {})
+        log_groups = node_data.get('logGroups', [])
+        analysis_type = node_data.get('analysisType', 'error-patterns')
+        time_range = node_data.get('timeRange', '1h')
+        error_threshold = node_data.get('errorThreshold', 10)
+        aws_region = node_data.get('awsRegion', 'us-east-1')
+        aws_profile = node_data.get('awsProfile')
+        enable_alerts = node_data.get('enableAlerts', False)
+
+        if not log_groups:
+            return {
+                "status": "failed",
+                "error": "No log groups configured for CloudWatch Analyzer"
+            }
+
+        log_groups = [lg for lg in log_groups if lg]
+        if not log_groups:
+            return {
+                "status": "failed",
+                "error": "All configured log groups are empty"
+            }
+
+        time_range_minutes = self._parse_time_range_minutes(time_range)
+        credentials = {}
+        if aws_profile:
+            credentials["aws_profile"] = aws_profile
+
+        try:
+            if analysis_type == 'error-patterns':
+                result = await analyze_log_patterns(
+                    log_group_names=log_groups,
+                    time_range_minutes=time_range_minutes,
+                    pattern_types=["error", "warning"],
+                    region=aws_region,
+                    credentials=credentials if credentials else None,
+                )
+            elif analysis_type == 'activity-summary':
+                result = await watch_log_groups(
+                    log_group_names=log_groups,
+                    time_range_minutes=time_range_minutes,
+                    region=aws_region,
+                    credentials=credentials if credentials else None,
+                )
+            elif analysis_type == 'anomaly-detection':
+                result = await detect_anomalies(
+                    log_group_names=log_groups,
+                    time_range_minutes=time_range_minutes,
+                    sensitivity="medium",
+                    region=aws_region,
+                    credentials=credentials if credentials else None,
+                )
+            elif analysis_type == 'correlation':
+                result = await correlate_logs(
+                    log_group_names=log_groups,
+                    time_range_minutes=time_range_minutes,
+                    region=aws_region,
+                    credentials=credentials if credentials else None,
+                )
+            else:
+                return {
+                    "status": "failed",
+                    "error": f"Unknown analysis type: {analysis_type}"
+                }
+
+            if isinstance(result, dict) and result.get('error'):
+                return {
+                    "status": "failed",
+                    "error": result.get('message', str(result.get('error')))
+                }
+
+            output_summary = self._build_cloudwatch_summary(result, analysis_type, log_groups)
+
+            alerts = []
+            if enable_alerts and isinstance(result, dict):
+                alerts = self._check_cloudwatch_alerts(result, analysis_type, error_threshold)
+
+            return {
+                "status": "success",
+                "output": output_summary,
+                "analysis_type": analysis_type,
+                "log_groups_analyzed": log_groups,
+                "time_range": time_range,
+                "data": result,
+                "alerts": alerts if alerts else None,
+            }
+
+        except Exception as e:
+            logger.error(f"CloudWatch Analyzer execution failed: {e}")
+            return {
+                "status": "failed",
+                "error": str(e)
+            }
+
+    @staticmethod
+    def _build_cloudwatch_summary(result: Dict[str, Any], analysis_type: str, log_groups: list) -> str:
+        """Build a human-readable summary from CloudWatch analysis results."""
+        if not isinstance(result, dict):
+            return f"Analysis complete ({analysis_type})"
+
+        if analysis_type == 'error-patterns':
+            patterns = result.get('patterns', {})
+            pattern_summaries = []
+            for ptype, pdata in patterns.items():
+                status = pdata.get('status', 'unknown')
+                if status == 'Complete':
+                    data_count = len(pdata.get('data', []))
+                    pattern_summaries.append(f"{ptype}: {data_count} results")
+                else:
+                    pattern_summaries.append(f"{ptype}: {status}")
+            return f"Pattern analysis: {', '.join(pattern_summaries)} across {len(log_groups)} log group(s)"
+
+        elif analysis_type == 'activity-summary':
+            summary = result.get('summary', {})
+            total_events = summary.get('total_events', 0)
+            successful = summary.get('successful_log_groups', 0)
+            return f"Activity summary: {total_events} events across {successful}/{len(log_groups)} log group(s)"
+
+        elif analysis_type == 'anomaly-detection':
+            anomaly_summary = result.get('summary', {})
+            total = anomaly_summary.get('total_anomalies', 0)
+            high = anomaly_summary.get('high_severity', 0)
+            medium = anomaly_summary.get('medium_severity', 0)
+            low = anomaly_summary.get('low_severity', 0)
+            return f"Anomaly detection: {total} anomalies (high: {high}, medium: {medium}, low: {low})"
+
+        elif analysis_type == 'correlation':
+            summary = result.get('summary', {})
+            total_events = summary.get('total_events', 0)
+            services = summary.get('services_involved', [])
+            return f"Log correlation: {total_events} events across {len(services)} service(s)"
+
+        return f"Analysis complete ({analysis_type})"
+
+    @staticmethod
+    def _check_cloudwatch_alerts(result: Dict[str, Any], analysis_type: str, error_threshold: int) -> list:
+        """Check analysis results against thresholds and generate alerts."""
+        alerts = []
+
+        if analysis_type == 'error-patterns':
+            patterns = result.get('patterns', {})
+            error_data = patterns.get('error', {})
+            for entry in error_data.get('data', []):
+                for field in entry:
+                    if field.get('field') == 'count()':
+                        try:
+                            count = float(field.get('value', 0))
+                            if count > error_threshold:
+                                alerts.append({
+                                    "type": "error_threshold_exceeded",
+                                    "message": f"Error count {count} exceeds threshold {error_threshold}",
+                                    "severity": "high" if count > error_threshold * 2 else "medium"
+                                })
+                        except (ValueError, TypeError):
+                            pass
+
+        elif analysis_type == 'anomaly-detection':
+            for anomaly in result.get('anomalies', []):
+                alerts.append({
+                    "type": "anomaly_detected",
+                    "message": f"Anomaly at {anomaly.get('timestamp')}: {anomaly.get('current_count')} events ({anomaly.get('deviation_factor')}x baseline)",
+                    "severity": anomaly.get('severity', 'medium')
+                })
+
+        return alerts
+
     def get_execution_status(self, execution_id: str) -> Optional[Dict[str, Any]]:
         """Get status of an execution."""
         return self.active_executions.get(execution_id)
