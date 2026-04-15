@@ -164,15 +164,3 @@ CREATE INDEX IF NOT EXISTS known_issues_category_idx ON known_issues(category);
 CREATE INDEX IF NOT EXISTS alerts_status_idx ON alerts(status);
 CREATE INDEX IF NOT EXISTS alerts_created_at_idx ON alerts(created_at);
 CREATE INDEX IF NOT EXISTS analysis_history_log_group_idx ON analysis_history(log_group);
-
--- ============================================
--- INSERT DEFAULT BEDROCK MODELS
--- ============================================
-
-INSERT INTO llm_configs (name, provider, model, region, icon, description) VALUES
-('claude-3-sonnet', 'AWS Bedrock', 'anthropic.claude-3-sonnet-20240229-v1:0', 'us-east-1', '🤖', 'Claude 3 Sonnet - Balanced performance'),
-('claude-3-haiku', 'AWS Bedrock', 'anthropic.claude-3-haiku-20240307-v1:0', 'us-east-1', '⚡', 'Claude 3 Haiku - Fast and efficient'),
-('claude-3-opus', 'AWS Bedrock', 'anthropic.claude-3-opus-20240229-v1:0', 'us-east-1', '🧠', 'Claude 3 Opus - Most capable'),
-('titan-text', 'AWS Bedrock', 'amazon.titan-text-express-v1', 'us-east-1', '📝', 'Amazon Titan Text Express'),
-('llama-3', 'AWS Bedrock', 'meta.llama3-70b-instruct-v1:0', 'us-east-1', '🦙', 'Llama 3 70B Instruct')
-ON CONFLICT (name) DO NOTHING;

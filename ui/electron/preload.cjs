@@ -176,6 +176,27 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   loadLLMConfig: async () => apiRequest('/llm-config'),
 
+  discoverBedrockModels: async (creds) => {
+    return apiRequest('/llm-config/discover', {
+      method: 'POST',
+      body: JSON.stringify(creds || {}),
+    });
+  },
+
+  addDiscoveredModels: async (models, region) => {
+    return apiRequest('/llm-config/discover/add', {
+      method: 'POST',
+      body: JSON.stringify({ models, region }),
+    });
+  },
+
+  bulkDeleteLLMs: async (names) => {
+    return apiRequest('/llm-config/bulk-delete', {
+      method: 'POST',
+      body: JSON.stringify({ names }),
+    });
+  },
+
   saveLLMConfig: async (config) => {
     // Save each LLM config individually
     const results = [];

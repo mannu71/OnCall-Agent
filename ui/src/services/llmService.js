@@ -1,41 +1,99 @@
 // LLM Configuration Service
 // Manages loading and saving LLM configurations via API
 
-// Cache for config to reduce API calls
 let configCache = null;
 let cacheTimestamp = 0;
-const CACHE_TTL_MS = 5000; // 5 second cache
+const CACHE_TTL_MS = 5000;
 
-// API base URL
 const API_BASE_URL = 'http://localhost:8000/api/v1';
 
-/**
- * Invalidate the config cache
- */
 export const invalidateCache = () => {
   configCache = null;
   cacheTimestamp = 0;
 };
 
-/**
- * Fetch available Bedrock models from API
- */
-export const getBedrockModels = async () => {
+export const discoverBedrockModels = async (creds) => {
+  invalidateCache();
   try {
-    const response = await fetch(`${API_BASE_URL}/llm-config/bedrock-models`);
-    if (!response.ok) throw new Error('Failed to fetch Bedrock models');
-    const data = await response.json();
-    return data.models || {};
+    const response = await fetch(`${API_BASE_URL}/llm-config/discover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(creds || {}),
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to discover Bedrock models');
+    }
+    const result = await response.json();
+    return result;
   } catch (error) {
-    console.error('Error fetching Bedrock models:', error);
-    return {};
+    console.error('Error discovering Bedrock models:', error);
+    throw error;
   }
 };
 
-/**
- * Load LLM configuration from API
- * Uses caching to prevent excessive API calls
- */
+export const discoverModels = async (provider) => {
+  invalidateCache();
+  try {
+    const response = await fetch(`${API_BASE_URL}/llm-config/discover/models`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider }),
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || `Failed to discover models for ${provider}`);
+    }
+    const result = await response.json();
+    return result;
+  } catch (error) {
+    console.error('Error discovering models:', error);
+    throw error;
+  }
+};
+
+export const addDiscoveredModels = async (models, region) => {
+  invalidateCache();
+  try {
+    const response = await fetch(`${API_BASE_URL}/llm-config/discover/add`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ models, region }),
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to add discovered models');
+    }
+    const result = await response.json();
+    configCache = null;
+    return result;
+  } catch (error) {
+    console.error('Error adding discovered models:', error);
+    throw error;
+  }
+};
+
+export const bulkDeleteLLMs = async (names) => {
+  invalidateCache();
+  try {
+    const response = await fetch(`${API_BASE_URL}/llm-config/bulk-delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names }),
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to delete LLM configs');
+    }
+    const result = await response.json();
+    configCache = null;
+    return result;
+  } catch (error) {
+    console.error('Error bulk deleting LLM configs:', error);
+    throw error;
+  }
+};
+
 export const loadLLMConfig = async () => {
   const now = Date.now();
   if (configCache && (now - cacheTimestamp) < CACHE_TTL_MS) {
@@ -43,53 +101,17 @@ export const loadLLMConfig = async () => {
   }
 
   try {
-    // First try to get configured LLMs
     const response = await fetch(`${API_BASE_URL}/llm-config`);
     if (response.ok) {
       const config = await response.json();
-      // If no LLMs configured, get available Bedrock models
-      if (!config.llms || Object.keys(config.llms).length === 0) {
-        const models = await getBedrockModels();
-        configCache = { llms: models };
-      } else {
-        configCache = config;
-      }
+      configCache = config;
       cacheTimestamp = now;
       return configCache;
     }
-
-    // If API fails, get available Bedrock models
-    const models = await getBedrockModels();
-    configCache = { llms: models };
-    cacheTimestamp = now;
-    return configCache;
+    return { llms: {} };
   } catch (error) {
     console.error('Error loading LLM config:', error);
-    // Fallback to Bedrock models
-    const models = await getBedrockModels();
-    return { llms: models };
-  }
-};
-
-/**
- * Save LLM configuration via API
- */
-export const saveLLMConfig = async (config) => {
-  try {
-    const response = await fetch(`${API_BASE_URL}/llm-config`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config)
-    });
-    if (!response.ok) throw new Error('Failed to save LLM config');
-
-    // Update cache on successful save
-    configCache = config;
-    cacheTimestamp = Date.now();
-    return true;
-  } catch (error) {
-    console.error('Error saving LLM config:', error);
-    return false;
+    return { llms: {} };
   }
 };
 
@@ -105,11 +127,24 @@ export const getLLMs = async () => {
  * Add a new LLM configuration
  */
 export const addLLM = async (name, llmConfig) => {
-  const config = await loadLLMConfig();
-  config.llms = config.llms || {};
-  config.llms[name] = llmConfig;
-  await saveLLMConfig(config);
-  return config;
+  invalidateCache();
+  try {
+    const response = await fetch(`${API_BASE_URL}/llm-config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, ...llmConfig }),
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to create LLM config');
+    }
+    const result = await response.json();
+    configCache = null;
+    return result;
+  } catch (error) {
+    console.error('Error adding LLM config:', error);
+    throw error;
+  }
 };
 
 /**
@@ -117,26 +152,33 @@ export const addLLM = async (name, llmConfig) => {
  */
 export const updateLLM = async (name, llmConfig, newName = null) => {
   invalidateCache();
-  const config = await loadLLMConfig();
-
   const actualNewName = newName || name;
 
-  // If renaming, delete old and add new
-  if (newName && newName !== name) {
-    delete config.llms[name];
-    config.llms[newName] = llmConfig;
-  } else if (config.llms?.[name]) {
-    config.llms[name] = { ...config.llms[name], ...llmConfig };
-  }
+  try {
+    const body = { ...llmConfig };
+    if (newName && newName !== name) {
+      body.name = newName;
+    }
 
-  const success = await saveLLMConfig(config);
+    const response = await fetch(`${API_BASE_URL}/llm-config/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to update LLM config');
+    }
 
-  // Sync LLM changes to workflows
-  if (success) {
+    // Sync LLM changes to workflows
     await syncLLMToWorkflows(name, llmConfig, actualNewName);
-  }
 
-  return config;
+    configCache = null;
+    return await response.json();
+  } catch (error) {
+    console.error('Error updating LLM config:', error);
+    throw error;
+  }
 };
 
 /**
@@ -231,12 +273,21 @@ export const syncLLMToWorkflows = async (oldName, llmConfig, newName = null) => 
  * Delete an LLM configuration
  */
 export const deleteLLM = async (name) => {
-  const config = await loadLLMConfig();
-  if (config.llms) {
-    delete config.llms[name];
-    await saveLLMConfig(config);
+  invalidateCache();
+  try {
+    const response = await fetch(`${API_BASE_URL}/llm-config/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok && response.status !== 204) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to delete LLM config');
+    }
+    configCache = null;
+    return true;
+  } catch (error) {
+    console.error('Error deleting LLM config:', error);
+    throw error;
   }
-  return config;
 };
 
 /**

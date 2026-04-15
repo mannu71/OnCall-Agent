@@ -215,10 +215,44 @@ export async function getLLMConfig() {
     return apiRequest('/llm-config');
 }
 
-export async function saveLLMConfig(config) {
+export async function discoverBedrockModels(creds) {
+    return apiRequest('/llm-config/discover', {
+        method: 'POST',
+        body: JSON.stringify(creds || {}),
+    });
+}
+
+export async function addDiscoveredModels(models, region) {
+    return apiRequest('/llm-config/discover/add', {
+        method: 'POST',
+        body: JSON.stringify({ models, region }),
+    });
+}
+
+export async function bulkDeleteLLMs(names) {
+    return apiRequest('/llm-config/bulk-delete', {
+        method: 'POST',
+        body: JSON.stringify({ names }),
+    });
+}
+
+export async function createLLMConfig(name, config) {
     return apiRequest('/llm-config', {
         method: 'POST',
+        body: JSON.stringify({ name, ...config }),
+    });
+}
+
+export async function updateLLMConfig(name, config) {
+    return apiRequest(`/llm-config/${encodeURIComponent(name)}`, {
+        method: 'PUT',
         body: JSON.stringify(config),
+    });
+}
+
+export async function deleteLLMConfig(name) {
+    return apiRequest(`/llm-config/${encodeURIComponent(name)}`, {
+        method: 'DELETE',
     });
 }
 
@@ -330,7 +364,12 @@ export const apiClient = {
 
     // LLM Config
     getLLMConfig,
-    saveLLMConfig,
+    discoverBedrockModels,
+    addDiscoveredModels,
+    bulkDeleteLLMs,
+    createLLMConfig,
+    updateLLMConfig,
+    deleteLLMConfig,
     setLLMApiKey,
     getLLMApiKeyMasked,
     hasLLMApiKey,

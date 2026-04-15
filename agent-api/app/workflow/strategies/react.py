@@ -209,19 +209,17 @@ class ReactStrategy(BaseStrategy):
 
     async def _resolve_llm_config(self, workflow: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Resolve LLM configuration, preferring DB-stored configs over inline node data.
+        Resolve LLM configuration from DB-stored configs or inline node data.
 
         Priority order:
         1. Inline config in LLM node data (model + provider set directly)
         2. Named config reference (configName / llmConfigId) → lookup in DB
         3. First available config in DB
-        4. Default fallback (Bedrock Claude)
         """
         nodes = workflow.get("nodes", [])
         llm_node = next((n for n in nodes if n.get("type") == "llm"), None)
         llm_data = llm_node.get("data", {}) if llm_node else {}
 
-        # Check for inline config
         if llm_data.get("model") and llm_data.get("provider"):
             return {
                 "provider": llm_data["provider"],
@@ -233,54 +231,45 @@ class ReactStrategy(BaseStrategy):
                 "api_key": llm_data.get("apiKey") or llm_data.get("api_key"),
             }
 
-        # Try named config from DB
         config_name = llm_data.get("configName") or llm_data.get("llmConfigId")
         if config_name:
             try:
-                db_configs = await db_repository.list_llm_configs()
-                if config_name in db_configs:
-                    cfg = db_configs[config_name]
+                cfg = await db_repository.get_llm_config(config_name, include_api_key=True)
+                if cfg:
                     return {
-                        "provider": cfg.get("provider", "bedrock"),
-                        "model": cfg.get("model", "anthropic.claude-3-sonnet-20240229-v1:0"),
+                        "provider": cfg["provider"],
+                        "model": cfg["model"],
                         "temperature": cfg.get("temperature", 0.1),
                         "max_tokens": cfg.get("max_tokens", 4096),
                         "region": cfg.get("region", "us-east-1"),
                         "base_url": cfg.get("base_url"),
-                        "api_key": None,
+                        "api_key": cfg.get("api_key"),
                     }
             except Exception as e:
                 logger.warning("Could not load LLM config '%s' from DB: %s", config_name, e)
 
-        # Fall back to first available DB config
         try:
-            db_configs = await db_repository.list_llm_configs()
+            db_configs = await db_repository.list_llm_configs(include_api_key=True)
             if db_configs:
                 first_name, cfg = next(iter(db_configs.items()))
                 logger.info("ReactStrategy: using first available LLM config '%s'", first_name)
                 return {
-                    "provider": cfg.get("provider", "bedrock"),
-                    "model": cfg.get("model", "anthropic.claude-3-sonnet-20240229-v1:0"),
+                    "provider": cfg["provider"],
+                    "model": cfg["model"],
                     "temperature": cfg.get("temperature", 0.1),
                     "max_tokens": cfg.get("max_tokens", 4096),
                     "region": cfg.get("region", "us-east-1"),
                     "base_url": cfg.get("base_url"),
-                    "api_key": None,
+                    "api_key": cfg.get("api_key"),
                 }
+                return result
         except Exception as e:
             logger.warning("Could not load LLM configs from DB: %s", e)
 
-        # Hard fallback — AWS Bedrock Claude 3 Sonnet
-        logger.warning("ReactStrategy: using hard-coded Bedrock fallback LLM config")
-        return {
-            "provider": "bedrock",
-            "model": "anthropic.claude-3-sonnet-20240229-v1:0",
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "region": "us-east-1",
-            "base_url": None,
-            "api_key": None,
-        }
+        raise ValueError(
+            "No LLM configuration available. Configure an LLM in Settings or "
+            "add an LLM node to the workflow."
+        )
 
     def _extract_tools_config(self, workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Extract tool node configurations from workflow."""

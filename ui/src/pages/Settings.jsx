@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Button } from '@/components/ui/button';
 import { 
     Dialog, 
@@ -34,10 +34,13 @@ import {
     EyeOff,
     Key,
     Check,
-    Info
+    Info,
+    Shield,
+    Cloud
 } from 'lucide-react';
 import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer, getMCPInputValues, updateMCPInputValue, invalidateCache } from '../services/mcpService';
-import { getLLMs, addLLM, updateLLM, deleteLLM } from '../services/llmService';
+import { getLLMs, addLLM, updateLLM, deleteLLM, discoverModels, addDiscoveredModels, bulkDeleteLLMs } from '../services/llmService';
+import { getModelKeys, upsertModelKey, deleteModelKey } from '../services/modelKeyService';
 import agentApiClient from '../services/agentApiClient';
 
 // Icon options for MCP Servers
@@ -164,11 +167,28 @@ const Settings = () => {
         model: '',
         icon: '🧠',
         description: '',
-        apiKey: '', // Direct API key input
+        apiKey: '',
         endpoint: '',
         baseUrl: '',
-        temperature: 0
+        temperature: 0,
+        aws_access_key_id: '',
+        aws_secret_access_key: '',
+        aws_session_token: '',
     });
+
+    const [openAWSDialog, setOpenAWSDialog] = useState(false);
+    const [discoverProvider, setDiscoverProvider] = useState('');
+    const [awsFormData, setAWSFormData] = useState({
+        region: 'us-east-1',
+        aws_access_key_id: '',
+        aws_secret_access_key: '',
+        aws_session_token: '',
+    });
+    const [awsDiscovering, setAwsDiscovering] = useState(false);
+    const [discoveredModels, setDiscoveredModels] = useState([]);
+    const [selectedModels, setSelectedModels] = useState([]);
+    const [awsAdding, setAwsAdding] = useState(false);
+    const [selectedForDelete, setSelectedForDelete] = useState([]);
 
     // OpenAI reasoning models that don't support temperature parameter
     const REASONING_MODELS = ['o1', 'o1-mini', 'o1-preview', 'o3', 'o3-mini', 'o4-mini'];
@@ -189,12 +209,80 @@ const Settings = () => {
     const [apiHealth, setApiHealth] = useState(null);
     const [apiHealthLoading, setApiHealthLoading] = useState(false);
 
+    // Model Keys state
+    const [modelKeys, setModelKeys] = useState([]);
+    const [openModelKeyDialog, setOpenModelKeyDialog] = useState(false);
+    const [editingModelKeyProvider, setEditingModelKeyProvider] = useState(null);
+    const [modelKeyFormData, setModelKeyFormData] = useState({
+        provider: 'OpenAI',
+        api_key: '',
+        secret_key: '',
+        endpoint: '',
+        region: '',
+        aws_access_key_id: '',
+        aws_secret_access_key: '',
+        aws_session_token: '',
+        description: '',
+    });
+    const [showModelKeyFields, setShowModelKeyFields] = useState({});
+    const originalMaskedValues = useRef({});
+
+    const MODEL_KEY_PROVIDERS = [
+        { value: 'OpenAI', label: 'OpenAI', icon: '🧠', fields: ['api_key'] },
+        { value: 'Anthropic', label: 'Anthropic', icon: '🤖', fields: ['api_key'] },
+        { value: 'Google', label: 'Google AI', icon: '✨', fields: ['api_key'] },
+        { value: 'Groq', label: 'Groq', icon: '⚡', fields: ['api_key'] },
+        { value: 'Azure OpenAI', label: 'Azure OpenAI', icon: '☁️', fields: ['api_key', 'endpoint'] },
+        { value: 'AWS Bedrock', label: 'AWS Bedrock', icon: '🌩️', fields: ['aws_access_key_id', 'aws_secret_access_key', 'aws_session_token', 'region'] },
+        { value: 'Ollama', label: 'Ollama', icon: '🦙', fields: ['endpoint'] },
+        { value: 'Custom', label: 'Custom', icon: '🔧', fields: ['api_key', 'secret_key', 'endpoint'] },
+    ];
+
+    const emptyModelKeyForm = (provider) => {
+        const base = {
+            provider: provider || 'OpenAI',
+            api_key: '',
+            secret_key: '',
+            endpoint: '',
+            region: '',
+            aws_access_key_id: '',
+            aws_secret_access_key: '',
+            aws_session_token: '',
+            description: '',
+        };
+        if (provider === 'Azure OpenAI') base.endpoint = 'https://your-resource.openai.azure.com';
+        if (provider === 'Ollama') base.endpoint = 'http://localhost:11434';
+        if (provider === 'AWS Bedrock') base.region = 'us-east-1';
+        return base;
+    };
+
+    const discoverableProviders = (() => {
+        const providers = [];
+        const supportedForDiscovery = ['OpenAI', 'Anthropic', 'Google', 'Groq', 'Azure OpenAI', 'Ollama', 'AWS Bedrock'];
+        for (const mk of modelKeys) {
+            if (!supportedForDiscovery.includes(mk.provider)) continue;
+            const hasCreds = mk.has_api_key || mk.has_secret_key || mk.has_aws_credentials || mk.endpoint;
+            if (!hasCreds) continue;
+            const providerCfg = MODEL_KEY_PROVIDERS.find(p => p.value === mk.provider);
+            providers.push({
+                provider: mk.provider,
+                icon: providerCfg?.icon || '🔧',
+                label: providerCfg?.label || mk.provider,
+                region: mk.region,
+                endpoint: mk.endpoint,
+                source: 'model-keys',
+            });
+        }
+        return providers;
+    })();
+
     // Load MCP servers and LLMs on mount
     useEffect(() => {
         loadServers();
         loadLLMConfigs();
         loadCertificates();
         checkApiHealth();
+        loadModelKeys();
     }, []);
 
     const loadServers = async () => {
@@ -248,6 +336,85 @@ const Settings = () => {
     const loadLLMConfigs = async () => {
         const llmConfigs = await getLLMs();
         setLlms(llmConfigs);
+    };
+
+    const loadModelKeys = async () => {
+        try {
+            const keys = await getModelKeys();
+            setModelKeys(keys);
+        } catch (error) {
+            console.error('Failed to load model keys:', error);
+            setModelKeys([]);
+        }
+    };
+
+    const handleOpenModelKeyDialog = (provider = null) => {
+        if (provider) {
+            const existing = modelKeys.find(k => k.provider === provider);
+            setEditingModelKeyProvider(provider);
+            const formData = {
+                provider,
+                api_key: existing?.api_key || '',
+                secret_key: existing?.secret_key || '',
+                endpoint: existing?.endpoint || '',
+                region: existing?.region || '',
+                aws_access_key_id: existing?.aws_access_key_id || '',
+                aws_secret_access_key: existing?.aws_secret_access_key || '',
+                aws_session_token: existing?.aws_session_token || '',
+                description: existing?.description || '',
+            };
+            setModelKeyFormData(formData);
+            originalMaskedValues.current = { ...formData };
+        } else {
+            setEditingModelKeyProvider(null);
+            setModelKeyFormData(emptyModelKeyForm());
+            originalMaskedValues.current = {};
+        }
+        setOpenModelKeyDialog(true);
+    };
+
+    const handleCloseModelKeyDialog = () => {
+        setOpenModelKeyDialog(false);
+        setEditingModelKeyProvider(null);
+    };
+
+    const handleSaveModelKey = async () => {
+        try {
+            const providerConfig = MODEL_KEY_PROVIDERS.find(p => p.value === modelKeyFormData.provider);
+            const data = { provider: modelKeyFormData.provider };
+            if (providerConfig) {
+                providerConfig.fields.forEach(field => {
+                    const value = modelKeyFormData[field];
+                    if (value && value !== originalMaskedValues.current[field]) {
+                        data[field] = value;
+                    }
+                });
+            }
+            if (modelKeyFormData.description) data.description = modelKeyFormData.description;
+            if (modelKeyFormData.region && modelKeyFormData.provider === 'AWS Bedrock') data.region = modelKeyFormData.region;
+            await upsertModelKey(data);
+            setSaveMessage(`Saved keys for ${modelKeyFormData.provider}`);
+            await loadModelKeys();
+            handleCloseModelKeyDialog();
+        } catch (error) {
+            console.error('Error saving model key:', error);
+            alert('Failed to save: ' + error.message);
+        }
+        setTimeout(() => setSaveMessage(''), 3000);
+    };
+
+    const handleDeleteModelKey = async (provider) => {
+        if (globalThis.confirm(`Delete all keys for "${provider}"?`)) {
+            try {
+                await deleteModelKey(provider);
+                setSaveMessage(`Deleted keys for ${provider}`);
+                await loadModelKeys();
+            } catch (error) {
+                console.error('Error deleting model key:', error);
+                alert('Failed to delete: ' + error.message);
+            }
+            setTimeout(() => setSaveMessage(''), 3000);
+        }
     };
 
     // Certificate management functions
@@ -325,7 +492,7 @@ const Settings = () => {
         }));
 
         try {
-            const result = await globalThis.electronAPI.testLLM(llmName, llmConfig);
+            const result = await globalThis.electronAPI.testLLM(llmName, {});
 
             if (result.success) {
                 setLLMConnectionStatus(prev => ({
@@ -519,23 +686,22 @@ const Settings = () => {
                 provider: llmFormData.provider,
                 model: llmFormData.model,
                 icon: llmFormData.icon,
-                // Only save temperature for non-reasoning models
                 ...(!isReasoningModel(llmFormData.model) && { temperature: llmFormData.temperature }),
                 ...(llmFormData.endpoint && { endpoint: llmFormData.endpoint }),
-                ...(llmFormData.baseUrl && { baseUrl: llmFormData.baseUrl })
+                ...(llmFormData.baseUrl && { baseUrl: llmFormData.baseUrl }),
+                ...(llmFormData.aws_access_key_id && { aws_access_key_id: llmFormData.aws_access_key_id }),
+                ...(llmFormData.aws_secret_access_key && { aws_secret_access_key: llmFormData.aws_secret_access_key }),
+                ...(llmFormData.aws_session_token && { aws_session_token: llmFormData.aws_session_token }),
             };
 
-            // Use model name as the identifier
             const llmName = llmFormData.model;
 
-            // First save the LLM config
             if (editingLLM) {
                 await updateLLM(editingLLM, llmConfig, llmName);
             } else {
                 await addLLM(llmName, llmConfig);
             }
 
-            // Then save API key if provided (LLM must exist first)
             if (llmFormData.apiKey && globalThis.electronAPI?.setApiKey) {
                 const keyResult = await globalThis.electronAPI.setApiKey(llmName, llmFormData.apiKey);
                 if (!keyResult.success) {
@@ -863,16 +1029,65 @@ const Settings = () => {
                     <CardContent className="pt-6">
                         <div className="flex justify-between items-center mb-4">
                             <h2 className="text-xl font-medium">Language Models (LLMs)</h2>
-                            <Button onClick={() => handleOpenLLMDialog()}>
-                                <Plus className="w-4 h-4 mr-2" />
-                                Add LLM
-                            </Button>
+                            <div className="flex gap-2">
+                                <Button variant="outline" onClick={() => {
+                                    setDiscoverProvider('');
+                                    setAWSFormData({ region: 'us-east-1', aws_access_key_id: '', aws_secret_access_key: '', aws_session_token: '' });
+                                    loadModelKeys();
+                                    setDiscoveredModels([]);
+                                    setSelectedModels([]);
+                                    setOpenAWSDialog(true);
+                                }}>
+                                    <RefreshCw className="w-4 h-4 mr-2" />
+                                    Discover Models
+                                </Button>
+                                <Button onClick={() => handleOpenLLMDialog()}>
+                                    <Plus className="w-4 h-4 mr-2" />
+                                    Add LLM
+                                </Button>
+                            </div>
                         </div>
+
+                        {selectedForDelete.length > 0 && (
+                            <div className="flex items-center gap-3 mt-2 p-2 border rounded-md bg-muted/50">
+                                <span className="text-sm text-muted-foreground">{selectedForDelete.length} selected</span>
+                                <Button
+                                    variant="destructive"
+                                    size="sm"
+                                    onClick={async () => {
+                                        try {
+                                            await bulkDeleteLLMs(selectedForDelete);
+                                            setSaveMessage(`Deleted ${selectedForDelete.length} models`);
+                                            setSelectedForDelete([]);
+                                            await loadLLMConfigs();
+                                            setTimeout(() => setSaveMessage(''), 3000);
+                                        } catch (err) {
+                                            alert('Failed to delete models: ' + err.message);
+                                        }
+                                    }}
+                                >
+                                    <Trash2 className="w-3 h-3 mr-1" />
+                                    Delete Selected
+                                </Button>
+                                <Button variant="ghost" size="sm" onClick={() => setSelectedForDelete([])}>
+                                    Clear
+                                </Button>
+                            </div>
+                        )}
 
                         <div className="border rounded-lg">
                             <Table>
                                 <TableHeader>
                                     <TableRow>
+                                        <TableHead className="w-12">
+                                            <input
+                                                type="checkbox"
+                                                checked={selectedForDelete.length > 0 && selectedForDelete.length === Object.keys(llms).length}
+                                                onChange={() => {
+                                                    setSelectedForDelete(selectedForDelete.length === Object.keys(llms).length ? [] : Object.keys(llms));
+                                                }}
+                                            />
+                                        </TableHead>
                                         <TableHead>Icon</TableHead>
                                         <TableHead>Name</TableHead>
                                         <TableHead>Provider</TableHead>
@@ -886,6 +1101,19 @@ const Settings = () => {
                                         const status = llmConnectionStatus[name];
                                         return (
                                             <TableRow key={name}>
+                                                <TableCell>
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={selectedForDelete.includes(name)}
+                                                        onChange={(e) => {
+                                                            if (e.target.checked) {
+                                                                setSelectedForDelete([...selectedForDelete, name]);
+                                                            } else {
+                                                                setSelectedForDelete(selectedForDelete.filter(n => n !== name));
+                                                            }
+                                                        }}
+                                                    />
+                                                </TableCell>
                                                 <TableCell>{config.icon || '🧠'}</TableCell>
                                                 <TableCell>
                                                     <span className="text-sm font-medium">{name}</span>
@@ -953,13 +1181,114 @@ const Settings = () => {
                                     })}
                                     {Object.keys(llms).length === 0 && (
                                         <TableRow>
-                                            <TableCell colSpan={6} className="text-center py-6 text-muted-foreground">
+                                            <TableCell colSpan={7} className="text-center py-6 text-muted-foreground">
                                                 No LLMs configured. Click "Add LLM" to get started.
                                             </TableCell>
                                         </TableRow>
                                     )}
                                 </TableBody>
                             </Table>
+                        </div>
+                    </CardContent>
+                </Card>
+
+                {/* Model Keys Section */}
+                <Card className="mb-6">
+                    <CardContent className="pt-6">
+                        <div className="flex justify-between items-center mb-2">
+                            <h2 className="text-xl font-medium">Model Keys</h2>
+                            <Button onClick={() => handleOpenModelKeyDialog()}>
+                                <Plus className="w-4 h-4 mr-2" />
+                                Add Provider Key
+                            </Button>
+                        </div>
+                        <p className="text-sm text-muted-foreground mb-4">
+                            Centralized API key and secret key management for all model providers
+                        </p>
+                        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+                            {MODEL_KEY_PROVIDERS.map((provider) => {
+                                const existing = modelKeys.find(k => k.provider === provider.value);
+                                return (
+                                    <div key={provider.value} className="border rounded-lg p-4">
+                                        <div className="flex items-start justify-between mb-2">
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-xl">{provider.icon}</span>
+                                                <span className="font-medium text-sm">{provider.label}</span>
+                                            </div>
+                                            <div className="flex gap-1">
+                                                <Button
+                                                    size="icon"
+                                                    variant="ghost"
+                                                    className="h-7 w-7"
+                                                    onClick={() => handleOpenModelKeyDialog(provider.value)}
+                                                    title="Edit"
+                                                >
+                                                    <Edit2 className="w-3.5 h-3.5" />
+                                                </Button>
+                                                {existing && (
+                                                    <Button
+                                                        size="icon"
+                                                        variant="ghost"
+                                                        className="h-7 w-7 text-red-600 hover:text-red-700"
+                                                        onClick={() => handleDeleteModelKey(provider.value)}
+                                                        title="Delete"
+                                                    >
+                                                        <Trash2 className="w-3.5 h-3.5" />
+                                                    </Button>
+                                                )}
+                                            </div>
+                                        </div>
+                                        <div className="flex flex-wrap gap-1 mb-1">
+                                            {existing ? (
+                                                <>
+                                                    {existing.has_api_key && (
+                                                        <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200 gap-1 text-xs">
+                                                            <Key className="w-3 h-3" /> API Key
+                                                        </Badge>
+                                                    )}
+                                                    {existing.has_secret_key && (
+                                                        <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200 gap-1 text-xs">
+                                                            <Shield className="w-3 h-3" /> Secret
+                                                        </Badge>
+                                                    )}
+                                                    {existing.has_aws_credentials && (
+                                                        <Badge variant="outline" className="bg-orange-50 text-orange-700 border-orange-200 gap-1 text-xs">
+                                                            <Cloud className="w-3 h-3" /> AWS
+                                                        </Badge>
+                                                    )}
+                                                    {existing.endpoint && (
+                                                        <Badge variant="outline" className="bg-purple-50 text-purple-700 border-purple-200 gap-1 text-xs">
+                                                            Endpoint
+                                                        </Badge>
+                                                    )}
+                                                </>
+                                            ) : (
+                                                <Badge variant="outline" className="text-muted-foreground text-xs">
+                                                    Not configured
+                                                </Badge>
+                                            )}
+                                        </div>
+                                        {existing?.endpoint && (
+                                            <p className="text-xs text-muted-foreground font-mono truncate" title={existing.endpoint}>
+                                                {existing.endpoint}
+                                            </p>
+                                        )}
+                                        {existing?.region && (
+                                            <p className="text-xs text-muted-foreground">Region: {existing.region}</p>
+                                        )}
+                                        {!existing && (
+                                            <Button
+                                                variant="outline"
+                                                size="sm"
+                                                className="mt-2 w-full text-xs h-7"
+                                                onClick={() => handleOpenModelKeyDialog(provider.value)}
+                                            >
+                                                <Plus className="w-3 h-3 mr-1" /> Configure
+                                            </Button>
+                                        )}
+                                    </div>
+                                );
+                            })}
                         </div>
                     </CardContent>
                 </Card>
@@ -1312,6 +1641,47 @@ const Settings = () => {
                                     )}
                                 </div>
                             )}
+
+                            {/* AWS Credentials Section */}
+                            {(llmFormData.provider === 'AWS Bedrock' || llmFormData.provider === 'Bedrock' || llmFormData.provider === 'bedrock') && (
+                                <div className="p-4 bg-muted rounded-lg flex flex-col gap-3">
+                                    <div className="flex items-center gap-2">
+                                        <Key className="w-4 h-4 text-primary" />
+                                        <h4 className="text-sm font-medium">AWS Credentials</h4>
+                                    </div>
+                                    <div className="space-y-2">
+                                        <Label htmlFor="llm-aws-access-key">Access Key ID</Label>
+                                        <Input
+                                            id="llm-aws-access-key"
+                                            type="password"
+                                            placeholder="AKIA..."
+                                            value={llmFormData.aws_access_key_id}
+                                            onChange={(e) => setLLMFormData({ ...llmFormData, aws_access_key_id: e.target.value })}
+                                        />
+                                    </div>
+                                    <div className="space-y-2">
+                                        <Label htmlFor="llm-aws-secret-key">Secret Access Key</Label>
+                                        <Input
+                                            id="llm-aws-secret-key"
+                                            type="password"
+                                            placeholder="Secret key"
+                                            value={llmFormData.aws_secret_access_key}
+                                            onChange={(e) => setLLMFormData({ ...llmFormData, aws_secret_access_key: e.target.value })}
+                                        />
+                                    </div>
+                                    <div className="space-y-2">
+                                        <Label htmlFor="llm-aws-session-token">Session Token <span className="text-muted-foreground">(optional)</span></Label>
+                                        <Input
+                                            id="llm-aws-session-token"
+                                            type="password"
+                                            placeholder="For temporary credentials"
+                                            value={llmFormData.aws_session_token}
+                                            onChange={(e) => setLLMFormData({ ...llmFormData, aws_session_token: e.target.value })}
+                                        />
+                                    </div>
+                                    <p className="text-xs text-muted-foreground">Credentials are stored in the database and used automatically when running workflows.</p>
+                                </div>
+                            )}
                         </div>
                         <DialogFooter className="mt-6">
                             <Button variant="outline" onClick={handleCloseLLMDialog}>Cancel</Button>
@@ -1324,6 +1694,377 @@ const Settings = () => {
                         </DialogFooter>
                     </DialogContent>
                 </Dialog>
+
+                {/* AWS Bedrock Discovery Dialog */}
+                <Dialog open={openAWSDialog} onOpenChange={(open) => {
+                    if (!open) { setDiscoveredModels([]); setSelectedModels([]); }
+                    setOpenAWSDialog(open);
+                }}>
+                    <DialogContent className="sm:max-w-[600px] max-h-[80vh]">
+                        <DialogHeader>
+                            <DialogTitle>Discover Models</DialogTitle>
+                        </DialogHeader>
+                        {discoveredModels.length === 0 ? (
+                            <div className="flex flex-col gap-4 mt-4">
+                                <div className="space-y-2">
+                                    <Label htmlFor="discover-provider-select">Provider Configuration</Label>
+                                    <select
+                                        id="discover-provider-select"
+                                        value={discoverProvider}
+                                        onChange={(e) => setDiscoverProvider(e.target.value)}
+                                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                                    >
+                                        <option value="">-- Select a configured provider --</option>
+                                        {discoverableProviders.map(p => (
+                                            <option key={p.provider} value={p.provider}>
+                                                {p.icon} {p.label}{p.region ? ` (${p.region})` : ''}{p.endpoint ? ` - ${p.endpoint}` : ''}
+                                            </option>
+                                        ))}
+                                    </select>
+                                    <p className="text-xs text-muted-foreground">
+                                        Select a provider with credentials configured in Model Keys
+                                    </p>
+                                </div>
+
+                                {discoverableProviders.length === 0 && (
+                                    <div className="rounded-md border bg-yellow-50 border-yellow-200 p-3 text-sm text-yellow-800">
+                                        No providers configured. Go to Model Keys section below to configure API credentials first.
+                                    </div>
+                                )}
+
+                                {discoverProvider && (
+                                    <div className="rounded-md border bg-muted/50 p-3 text-sm text-muted-foreground">
+                                        {(() => {
+                                            const cfg = discoverableProviders.find(p => p.provider === discoverProvider);
+                                            if (!cfg) return 'Provider not found.';
+                                            const parts = [`Using ${cfg.label} credentials from Model Keys.`];
+                                            if (cfg.region) parts.push(`Region: ${cfg.region}`);
+                                            if (cfg.endpoint) parts.push(`Endpoint: ${cfg.endpoint}`);
+                                            return parts.join(' ');
+                                        })()}
+                                    </div>
+                                )}
+                            </div>
+                        ) : (
+                            <div className="flex flex-col gap-3 mt-4">
+                                <p className="text-sm text-muted-foreground">
+                                    {discoveredModels.length} models found for {discoverProvider}
+                                    {discoveredModels[0]?.region ? ` in ${discoveredModels[0].region}` : ''}
+                                </p>
+                                <div className="border rounded-md overflow-y-auto max-h-[50vh]">
+                                    <Table>
+                                        <TableHeader>
+                                            <TableRow>
+                                                <TableHead className="w-12">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={discoveredModels.filter(m => !m.already_exists).length > 0 && selectedModels.length === discoveredModels.filter(m => !m.already_exists).length}
+                                                        onChange={() => {
+                                                            const addable = discoveredModels.filter(m => !m.already_exists).map(m => m.name);
+                                                            setSelectedModels(selectedModels.length === addable.length ? [] : addable);
+                                                        }}
+                                                    />
+                                                </TableHead>
+                                                <TableHead>Model</TableHead>
+                                                <TableHead>ID</TableHead>
+                                                <TableHead>Status</TableHead>
+                                            </TableRow>
+                                        </TableHeader>
+                                        <TableBody>
+                                            {discoveredModels.map((model) => (
+                                                <TableRow key={model.name} className={model.already_exists ? 'opacity-50' : ''}>
+                                                    <TableCell>
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={selectedModels.includes(model.name)}
+                                                            disabled={model.already_exists}
+                                                            onChange={(e) => {
+                                                                if (e.target.checked) {
+                                                                    setSelectedModels([...selectedModels, model.name]);
+                                                                } else {
+                                                                    setSelectedModels(selectedModels.filter(n => n !== model.name));
+                                                                }
+                                                            }}
+                                                        />
+                                                    </TableCell>
+                                                    <TableCell>
+                                                        <span className="mr-1">{model.icon}</span>
+                                                        <span className="font-medium">{model.name}</span>
+                                                    </TableCell>
+                                                    <TableCell>
+                                                        <code className="text-xs">{model.model}</code>
+                                                    </TableCell>
+                                                    <TableCell>
+                                                        {model.already_exists ? (
+                                                            <Badge variant="secondary">Exists</Badge>
+                                                        ) : (
+                                                            <Badge variant="outline">New</Badge>
+                                                        )}
+                                                    </TableCell>
+                                                </TableRow>
+                                            ))}
+                                        </TableBody>
+                                    </Table>
+                                </div>
+                            </div>
+                        )}
+                        <DialogFooter className="mt-4">
+                            <Button variant="outline" onClick={() => {
+                                setOpenAWSDialog(false);
+                                setDiscoveredModels([]);
+                                setSelectedModels([]);
+                            }}>Cancel</Button>
+                            {discoveredModels.length === 0 ? (
+                                <Button
+                                    onClick={async () => {
+                                        if (!discoverProvider) return;
+                                        setAwsDiscovering(true);
+                                        try {
+                                            let result;
+                                            if (globalThis.electronAPI?.discoverModels) {
+                                                result = await globalThis.electronAPI.discoverModels(discoverProvider);
+                                            } else {
+                                                result = await discoverModels(discoverProvider);
+                                            }
+                                            setDiscoveredModels(result.models || []);
+                                            setSelectedModels((result.models || []).filter(m => !m.already_exists).map(m => m.name));
+                                        } catch (err) {
+                                            alert('Failed to discover models: ' + err.message);
+                                        } finally {
+                                            setAwsDiscovering(false);
+                                        }
+                                    }}
+                                    disabled={awsDiscovering || !discoverProvider}
+                                >
+                                    {awsDiscovering ? (
+                                        <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Discovering...</>
+                                    ) : 'Discover Models'}
+                                </Button>
+                            ) : (
+                                <Button
+                                    onClick={async () => {
+                                        if (selectedModels.length === 0) return;
+                                        setAwsAdding(true);
+                                        try {
+                                            const modelsToAdd = discoveredModels.filter(m => selectedModels.includes(m.name));
+                                            const region = discoveredModels[0]?.region || awsFormData.region;
+                                            let result;
+                                            if (globalThis.electronAPI?.addDiscoveredModels) {
+                                                result = await globalThis.electronAPI.addDiscoveredModels(modelsToAdd, region);
+                                            } else {
+                                                result = await addDiscoveredModels(modelsToAdd, region);
+                                            }
+                                            setSaveMessage(`Added ${result.added_count} models, skipped ${result.skipped_count} existing`);
+                                            setOpenAWSDialog(false);
+                                            setDiscoveredModels([]);
+                                            setSelectedModels([]);
+                                            await loadLLMConfigs();
+                                            setTimeout(() => setSaveMessage(''), 3000);
+                                        } catch (err) {
+                                            alert('Failed to add models: ' + err.message);
+                                        } finally {
+                                            setAwsAdding(false);
+                                        }
+                                    }}
+                                    disabled={selectedModels.length === 0 || awsAdding}
+                                >
+                                    {awsAdding ? (
+                                        <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Adding...</>
+                                    ) : `Add Selected (${selectedModels.length})`}
+                                </Button>
+                            )}
+                        </DialogFooter>
+                    </DialogContent>
+                </Dialog>
+
+                {/* Add/Edit Model Key Dialog */}
+                <Dialog open={openModelKeyDialog} onOpenChange={(open) => !open && handleCloseModelKeyDialog()}>
+                    <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
+                        <DialogHeader>
+                            <DialogTitle>
+                                {editingModelKeyProvider ? `Edit Keys: ${editingModelKeyProvider}` : 'Configure Provider Keys'}
+                            </DialogTitle>
+                        </DialogHeader>
+                        <div className="flex flex-col gap-4 mt-4">
+                            {!editingModelKeyProvider && (
+                                <div className="space-y-2">
+                                    <Label htmlFor="mk-provider-select">Provider</Label>
+                                    <select
+                                        id="mk-provider-select"
+                                        value={modelKeyFormData.provider}
+                                        onChange={(e) => setModelKeyFormData(emptyModelKeyForm(e.target.value))}
+                                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                                    >
+                                        {MODEL_KEY_PROVIDERS.map(p => (
+                                            <option key={p.value} value={p.value}>{p.icon} {p.label}</option>
+                                        ))}
+                                    </select>
+                                </div>
+                            )}
+
+                            {modelKeyFormData.provider && (() => {
+                                const providerCfg = MODEL_KEY_PROVIDERS.find(p => p.value === modelKeyFormData.provider);
+                                if (!providerCfg) return null;
+                                return providerCfg.fields.map(field => {
+                                    if (field === 'api_key') {
+                                        return (
+                                            <div key={field} className="space-y-2">
+                                                <Label htmlFor="mk-api-key">API Key</Label>
+                                                <div className="relative">
+                                                    <Input
+                                                        id="mk-api-key"
+                                                        value={modelKeyFormData.api_key}
+                                                        onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, api_key: e.target.value })}
+                                                        type={showModelKeyFields.api_key ? 'text' : 'password'}
+                                                        placeholder={modelKeyFormData.provider === 'OpenAI' ? 'sk-...' : modelKeyFormData.provider === 'Anthropic' ? 'sk-ant-...' : 'Enter API key'}
+                                                        className="pr-10"
+                                                    />
+                                                    <Button
+                                                        type="button"
+                                                        size="icon"
+                                                        variant="ghost"
+                                                        onClick={() => setShowModelKeyFields(prev => ({ ...prev, api_key: !prev.api_key }))}
+                                                        className="absolute right-0 top-0 h-full"
+                                                    >
+                                                        {showModelKeyFields.api_key ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                                    </Button>
+                                                </div>
+                                                {editingModelKeyProvider && (
+                                                    <p className="text-xs text-muted-foreground">Clear or change to update; leave as-is to keep existing</p>
+                                                )}
+                                            </div>
+                                        );
+                                    }
+                                    if (field === 'secret_key') {
+                                        return (
+                                            <div key={field} className="space-y-2">
+                                                <Label htmlFor="mk-secret-key">Secret Key</Label>
+                                                <div className="relative">
+                                                    <Input
+                                                        id="mk-secret-key"
+                                                        value={modelKeyFormData.secret_key}
+                                                        onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, secret_key: e.target.value })}
+                                                        type={showModelKeyFields.secret_key ? 'text' : 'password'}
+                                                        placeholder="Enter secret key"
+                                                        className="pr-10"
+                                                    />
+                                                    <Button
+                                                        type="button"
+                                                        size="icon"
+                                                        variant="ghost"
+                                                        onClick={() => setShowModelKeyFields(prev => ({ ...prev, secret_key: !prev.secret_key }))}
+                                                        className="absolute right-0 top-0 h-full"
+                                                    >
+                                                        {showModelKeyFields.secret_key ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                                    </Button>
+                                                </div>
+                                                {editingModelKeyProvider && (
+                                                    <p className="text-xs text-muted-foreground">Clear or change to update; leave as-is to keep existing</p>
+                                                )}
+                                            </div>
+                                        );
+                                    }
+                                    if (field === 'endpoint') {
+                                        return (
+                                            <div key={field} className="space-y-2">
+                                                <Label htmlFor="mk-endpoint">
+                                                    {modelKeyFormData.provider === 'Ollama' ? 'Base URL' : 'Endpoint URL'}
+                                                </Label>
+                                                <Input
+                                                    id="mk-endpoint"
+                                                    value={modelKeyFormData.endpoint}
+                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, endpoint: e.target.value })}
+                                                    placeholder={modelKeyFormData.provider === 'Ollama' ? 'http://localhost:11434' : 'https://...'}
+                                                />
+                                            </div>
+                                        );
+                                    }
+                                    if (field === 'region') {
+                                        return (
+                                            <div key={field} className="space-y-2">
+                                                <Label htmlFor="mk-region">AWS Region</Label>
+                                                <Input
+                                                    id="mk-region"
+                                                    value={modelKeyFormData.region}
+                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, region: e.target.value })}
+                                                    placeholder="us-east-1"
+                                                />
+                                            </div>
+                                        );
+                                    }
+                                    if (field === 'aws_access_key_id') {
+                                        return (
+                                            <div key={field} className="space-y-2">
+                                                <Label htmlFor="mk-aws-access-key">AWS Access Key ID</Label>
+                                                <Input
+                                                    id="mk-aws-access-key"
+                                                    type="password"
+                                                    value={modelKeyFormData.aws_access_key_id}
+                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, aws_access_key_id: e.target.value })}
+                                                    placeholder="AKIA..."
+                                                />
+                                            </div>
+                                        );
+                                    }
+                                    if (field === 'aws_secret_access_key') {
+                                        return (
+                                            <div key={field} className="space-y-2">
+                                                <Label htmlFor="mk-aws-secret-key">AWS Secret Access Key</Label>
+                                                <Input
+                                                    id="mk-aws-secret-key"
+                                                    type="password"
+                                                    value={modelKeyFormData.aws_secret_access_key}
+                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, aws_secret_access_key: e.target.value })}
+                                                    placeholder="Secret key"
+                                                />
+                                            </div>
+                                        );
+                                    }
+                                    if (field === 'aws_session_token') {
+                                        return (
+                                            <div key={field} className="space-y-2">
+                                                <Label htmlFor="mk-aws-session-token">AWS Session Token <span className="text-muted-foreground">(optional)</span></Label>
+                                                <Input
+                                                    id="mk-aws-session-token"
+                                                    type="password"
+                                                    value={modelKeyFormData.aws_session_token}
+                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, aws_session_token: e.target.value })}
+                                                    placeholder="For temporary credentials"
+                                                />
+                                            </div>
+                                        );
+                                    }
+                                    return null;
+                                });
+                            })()}
+
+                            <div className="space-y-2">
+                                <Label htmlFor="mk-description">Description <span className="text-muted-foreground">(optional)</span></Label>
+                                <Input
+                                    id="mk-description"
+                                    value={modelKeyFormData.description}
+                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, description: e.target.value })}
+                                    placeholder="e.g., Production OpenAI key"
+                                />
+                            </div>
+
+                            <div className="rounded-md border bg-muted/50 p-3 text-sm text-muted-foreground">
+                                <div className="flex items-center gap-2 mb-1">
+                                    <Shield className="w-4 h-4" />
+                                    <span className="font-medium">Secure Storage</span>
+                                </div>
+                                Keys are stored in the database and masked when retrieved.
+                            </div>
+                        </div>
+                        <DialogFooter className="mt-6">
+                            <Button variant="outline" onClick={handleCloseModelKeyDialog}>Cancel</Button>
+                            <Button onClick={handleSaveModelKey}>
+                                {editingModelKeyProvider ? 'Update' : 'Save'}
+                            </Button>
+                        </DialogFooter>
+                    </DialogContent>
+                </Dialog>
+
             </div>
         </div>
     );

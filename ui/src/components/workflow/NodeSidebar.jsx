@@ -173,28 +173,20 @@ const NodeSidebar = () => {
       ]
     },
     {
-      title: 'AWS Bedrock Models',
+      title: 'LLM Models',
       items: isLoadingLLM
         ? [
           {
             type: 'llm',
             icon: '⏳',
             title: 'Loading...',
-            description: 'Loading AWS Bedrock models',
+            description: 'Loading LLM models',
             data: { label: 'Loading...', model: '', status: 'Loading' }
           }
         ]
         : llmModels.length > 0
           ? llmModels
-          : [
-            {
-              type: 'llm',
-              icon: '☁️',
-              title: 'Claude 3 Sonnet',
-              description: 'AWS Bedrock - Balanced performance',
-              data: { label: 'Claude 3 Sonnet', model: 'anthropic.claude-3-sonnet-20240229-v1:0', provider: 'AWS Bedrock', status: 'Ready' }
-            }
-          ]
+          : []
     },
     {
       title: 'Communication',

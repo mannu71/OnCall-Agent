@@ -55,6 +55,25 @@ class LLMConfigModel(Base):
     region = Column(String(50), default="us-east-1")
     icon = Column(String(10))
     description = Column(Text)
+    api_key = Column(String(500))
+    created_at = Column(DateTime(timezone=True))
+    updated_at = Column(DateTime(timezone=True))
+
+
+class ModelKeyModel(Base):
+    """Provider-level API key storage model."""
+    __tablename__ = "model_keys"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    provider = Column(String(100), unique=True, nullable=False)
+    api_key = Column(String(500))
+    secret_key = Column(String(500))
+    endpoint = Column(String(500))
+    region = Column(String(50))
+    aws_access_key_id = Column(String(500))
+    aws_secret_access_key = Column(String(500))
+    aws_session_token = Column(String(500))
+    description = Column(Text)
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
 

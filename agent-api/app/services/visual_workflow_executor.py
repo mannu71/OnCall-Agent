@@ -558,7 +558,10 @@ class VisualWorkflowExecutor:
 
         # Reuse the execution-scoped MCP manager so already-connected tool nodes
         # are available to the agent without re-connecting.
-        mcp_manager = self.mcp_managers.get(execution_id)
+        if execution_id not in self.mcp_managers:
+            self.mcp_managers[execution_id] = MCPClientManager()
+
+        mcp_manager = self.mcp_managers[execution_id]
 
         strategy_context = {
             'execution_id': execution_id,

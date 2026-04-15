@@ -10,7 +10,8 @@ from app.models.db_models import (
     WorkflowModel,
     ExecutionModel,
     LLMConfigModel,
-    MCPServerModel
+    MCPServerModel,
+    ModelKeyModel,
 )
 
 logger = logging.getLogger(__name__)
@@ -294,8 +295,11 @@ class DatabaseRepository:
     # LLM CONFIG OPERATIONS
     # ============================================
 
-    async def list_llm_configs(self) -> Dict[str, Dict[str, Any]]:
+    async def list_llm_configs(self, include_api_key: bool = False) -> Dict[str, Dict[str, Any]]:
         """List all LLM configurations.
+        
+        Args:
+            include_api_key: If True, include the api_key field in the result.
         
         Returns:
             Dictionary of LLM configurations keyed by name
@@ -304,22 +308,282 @@ class DatabaseRepository:
             result = await session.execute(select(LLMConfigModel))
             configs = result.scalars().all()
             return {
-                config.name: {
-                    "provider": config.provider,
-                    "model": config.model,
-                    "endpoint": config.endpoint,
-                    "base_url": config.base_url,
-                    "temperature": config.temperature,
-                    "max_tokens": config.max_tokens,
-                    "region": config.region,
-                    "icon": config.icon,
-                    "description": config.description
-                }
+                config.name: self._llm_config_to_dict(config, include_api_key=include_api_key)
                 for config in configs
             }
 
+    async def get_llm_config(self, name: str, include_api_key: bool = False) -> Optional[Dict[str, Any]]:
+        """Get a specific LLM configuration by name.
+
+        Args:
+            name: Configuration name
+            include_api_key: If True, include the api_key field.
+
+        Returns:
+            LLM configuration dict or None
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(LLMConfigModel).where(LLMConfigModel.name == name)
+            )
+            config = result.scalar_one_or_none()
+            return self._llm_config_to_dict(config, include_api_key=include_api_key) if config else None
+
+    async def create_llm_config(self, config_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new LLM configuration.
+
+        Args:
+            config_data: Configuration data including name, provider, model, etc.
+
+        Returns:
+            Created configuration dict
+        """
+        async with AsyncSessionLocal() as session:
+            config = LLMConfigModel(
+                name=config_data["name"],
+                provider=config_data["provider"],
+                model=config_data.get("model", ""),
+                endpoint=config_data.get("endpoint"),
+                base_url=config_data.get("baseUrl") or config_data.get("base_url"),
+                temperature=config_data.get("temperature", 0.7),
+                max_tokens=config_data.get("maxTokens") or config_data.get("max_tokens", 4096),
+                region=config_data.get("region", "us-east-1"),
+                icon=config_data.get("icon"),
+                description=config_data.get("description"),
+                api_key=config_data.get("apiKey") or config_data.get("api_key"),
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            session.add(config)
+            await session.commit()
+            await session.refresh(config)
+            return self._llm_config_to_dict(config)
+
+    async def update_llm_config(self, name: str, config_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update an existing LLM configuration.
+
+        Args:
+            name: Configuration name
+            config_data: Fields to update
+
+        Returns:
+            Updated configuration dict or None if not found
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(LLMConfigModel).where(LLMConfigModel.name == name)
+            )
+            config = result.scalar_one_or_none()
+            if not config:
+                return None
+
+            field_map = {
+                "provider": "provider",
+                "model": "model",
+                "endpoint": "endpoint",
+                "baseUrl": "base_url",
+                "base_url": "base_url",
+                "temperature": "temperature",
+                "maxTokens": "max_tokens",
+                "max_tokens": "max_tokens",
+                "region": "region",
+                "icon": "icon",
+                "description": "description",
+                "apiKey": "api_key",
+                "api_key": "api_key",
+            }
+            for json_key, col_name in field_map.items():
+                if json_key in config_data:
+                    setattr(config, col_name, config_data[json_key])
+
+            if "name" in config_data and config_data["name"] != name:
+                config.name = config_data["name"]
+
+            config.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            await session.refresh(config)
+            return self._llm_config_to_dict(config)
+
+    async def upsert_llm_config(self, name: str, config_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Insert or update an LLM configuration by name.
+
+        Args:
+            name: Configuration name (used as the unique key)
+            config_data: Fields to set
+
+        Returns:
+            The upserted config dict
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(LLMConfigModel).where(LLMConfigModel.name == name)
+            )
+            config = result.scalar_one_or_none()
+            if config:
+                field_map = {
+                    "provider": "provider",
+                    "model": "model",
+                    "endpoint": "endpoint",
+                    "baseUrl": "base_url",
+                    "base_url": "base_url",
+                    "temperature": "temperature",
+                    "maxTokens": "max_tokens",
+                    "max_tokens": "max_tokens",
+                    "region": "region",
+                    "icon": "icon",
+                    "description": "description",
+                    "apiKey": "api_key",
+                    "api_key": "api_key",
+                    "aws_config_name": "aws_config_name",
+                }
+                for json_key, col_name in field_map.items():
+                    if json_key in config_data:
+                        setattr(config, col_name, config_data[json_key])
+                config.updated_at = datetime.now(timezone.utc)
+            else:
+                config = LLMConfigModel(
+                    name=name,
+                    provider=config_data.get("provider", ""),
+                    model=config_data.get("model", ""),
+                    endpoint=config_data.get("endpoint"),
+                    base_url=config_data.get("baseUrl") or config_data.get("base_url"),
+                    temperature=config_data.get("temperature", 0.7),
+                    max_tokens=config_data.get("maxTokens") or config_data.get("max_tokens", 4096),
+                    region=config_data.get("region", "us-east-1"),
+                    icon=config_data.get("icon"),
+                    description=config_data.get("description"),
+                    api_key=config_data.get("apiKey") or config_data.get("api_key"),
+                    aws_config_name=config_data.get("aws_config_name"),
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
+                )
+                session.add(config)
+            await session.commit()
+            await session.refresh(config)
+            return self._llm_config_to_dict(config)
+
+    async def delete_llm_config(self, name: str) -> bool:
+        """Delete an LLM configuration.
+
+        Args:
+            name: Configuration name
+
+        Returns:
+            True if deleted, False if not found
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                delete(LLMConfigModel).where(LLMConfigModel.name == name).returning(LLMConfigModel.id)
+            )
+            deleted = result.scalar_one_or_none()
+            await session.commit()
+            return deleted is not None
+
+    async def llm_config_exists(self, name: str) -> bool:
+        """Check if an LLM configuration exists.
+
+        Args:
+            name: Configuration name
+
+        Returns:
+            True if exists
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(LLMConfigModel.id).where(LLMConfigModel.name == name)
+            )
+            return result.scalar_one_or_none() is not None
+
+    async def set_llm_api_key(self, name: str, api_key: str) -> Optional[Dict[str, Any]]:
+        """Set the API key for an LLM configuration.
+
+        Args:
+            name: Configuration name
+            api_key: API key value
+
+        Returns:
+            Updated config dict or None if not found
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(LLMConfigModel).where(LLMConfigModel.name == name)
+            )
+            config = result.scalar_one_or_none()
+            if not config:
+                return None
+            config.api_key = api_key
+            config.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            await session.refresh(config)
+            return self._llm_config_to_dict(config, include_api_key=True)
+
+    async def get_llm_api_key(self, name: str) -> Optional[str]:
+        """Get the API key for an LLM configuration.
+
+        Args:
+            name: Configuration name
+
+        Returns:
+            API key string or None
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(LLMConfigModel.api_key).where(LLMConfigModel.name == name)
+            )
+            return result.scalar_one_or_none()
+
+    async def delete_llm_api_key(self, name: str) -> bool:
+        """Delete the API key for an LLM configuration.
+
+        Args:
+            name: Configuration name
+
+        Returns:
+            True if deleted, False if not found
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(LLMConfigModel).where(LLMConfigModel.name == name)
+            )
+            config = result.scalar_one_or_none()
+            if not config:
+                return False
+            config.api_key = None
+            config.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            return True
+
+    def _llm_config_to_dict(self, config: LLMConfigModel, include_api_key: bool = False) -> Dict[str, Any]:
+        """Convert LLM config model to dictionary.
+
+        Args:
+            config: LLM config model
+            include_api_key: If True, include the api_key field.
+
+        Returns:
+            Dictionary representation with both snake_case and camelCase keys
+            for backward compatibility with the frontend.
+        """
+        d = {
+            "provider": config.provider,
+            "model": config.model,
+            "endpoint": config.endpoint,
+            "base_url": config.base_url,
+            "baseUrl": config.base_url,
+            "temperature": config.temperature,
+            "max_tokens": config.max_tokens,
+            "maxTokens": config.max_tokens,
+            "region": config.region,
+            "icon": config.icon,
+            "description": config.description,
+        }
+        if include_api_key:
+            d["api_key"] = config.api_key
+            d["apiKey"] = config.api_key
+        return d
+
     # ============================================
-    # MCP SERVER OPERATIONS
+    # MODEL KEY OPERATIONS
     # ============================================
 
     async def list_mcp_servers(self, include_disabled: bool = False) -> List[Dict[str, Any]]:
@@ -473,6 +737,128 @@ class DatabaseRepository:
             "created_at": server.created_at.isoformat() if server.created_at else None,
             "updated_at": server.updated_at.isoformat() if server.updated_at else None
         }
+
+    # ============================================
+    # MODEL KEY OPERATIONS
+    # ============================================
+
+    async def list_model_keys(self, include_secrets: bool = False) -> List[Dict[str, Any]]:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(ModelKeyModel))
+            keys = result.scalars().all()
+            return [self._model_key_to_dict(k, include_secrets) for k in keys]
+
+    async def get_model_key(self, provider: str, include_secrets: bool = False) -> Optional[Dict[str, Any]]:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(ModelKeyModel).where(ModelKeyModel.provider == provider)
+            )
+            k = result.scalar_one_or_none()
+            return self._model_key_to_dict(k, include_secrets) if k else None
+
+    async def create_model_key(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        async with AsyncSessionLocal() as session:
+            key = ModelKeyModel(
+                provider=data["provider"],
+                api_key=data.get("api_key"),
+                secret_key=data.get("secret_key"),
+                endpoint=data.get("endpoint"),
+                region=data.get("region"),
+                aws_access_key_id=data.get("aws_access_key_id"),
+                aws_secret_access_key=data.get("aws_secret_access_key"),
+                aws_session_token=data.get("aws_session_token"),
+                description=data.get("description"),
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            session.add(key)
+            await session.commit()
+            await session.refresh(key)
+            return self._model_key_to_dict(key, include_secrets=True)
+
+    async def update_model_key(self, provider: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(ModelKeyModel).where(ModelKeyModel.provider == provider)
+            )
+            key = result.scalar_one_or_none()
+            if not key:
+                return None
+            for field in ("api_key", "secret_key", "endpoint", "region",
+                         "aws_access_key_id", "aws_secret_access_key",
+                         "aws_session_token", "description"):
+                if field in data:
+                    setattr(key, field, data[field])
+            key.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            await session.refresh(key)
+            return self._model_key_to_dict(key, include_secrets=True)
+
+    async def upsert_model_key(self, provider: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(ModelKeyModel).where(ModelKeyModel.provider == provider)
+            )
+            key = result.scalar_one_or_none()
+            if key:
+                for field in ("api_key", "secret_key", "endpoint", "region",
+                             "aws_access_key_id", "aws_secret_access_key",
+                             "aws_session_token", "description"):
+                    if field in data:
+                        setattr(key, field, data[field])
+                key.updated_at = datetime.now(timezone.utc)
+            else:
+                key = ModelKeyModel(
+                    provider=provider,
+                    api_key=data.get("api_key"),
+                    secret_key=data.get("secret_key"),
+                    endpoint=data.get("endpoint"),
+                    region=data.get("region"),
+                    aws_access_key_id=data.get("aws_access_key_id"),
+                    aws_secret_access_key=data.get("aws_secret_access_key"),
+                    aws_session_token=data.get("aws_session_token"),
+                    description=data.get("description"),
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
+                )
+                session.add(key)
+            await session.commit()
+            await session.refresh(key)
+            return self._model_key_to_dict(key, include_secrets=True)
+
+    async def delete_model_key(self, provider: str) -> bool:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                delete(ModelKeyModel).where(ModelKeyModel.provider == provider).returning(ModelKeyModel.id)
+            )
+            deleted = result.scalar_one_or_none()
+            await session.commit()
+            return deleted is not None
+
+    async def model_key_exists(self, provider: str) -> bool:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(ModelKeyModel.id).where(ModelKeyModel.provider == provider)
+            )
+            return result.scalar_one_or_none() is not None
+
+    def _model_key_to_dict(self, key: ModelKeyModel, include_secrets: bool = False) -> Dict[str, Any]:
+        d = {
+            "provider": key.provider,
+            "has_api_key": bool(key.api_key),
+            "has_secret_key": bool(key.secret_key),
+            "has_aws_credentials": bool(key.aws_access_key_id and key.aws_secret_access_key),
+            "endpoint": key.endpoint,
+            "region": key.region,
+            "description": key.description,
+        }
+        if include_secrets:
+            d["api_key"] = key.api_key
+            d["secret_key"] = key.secret_key
+            d["aws_access_key_id"] = key.aws_access_key_id
+            d["aws_secret_access_key"] = key.aws_secret_access_key
+            d["aws_session_token"] = key.aws_session_token
+        return d
 
 
 # Singleton instance
