@@ -9,6 +9,8 @@ from typing import Dict, List, Any, Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from app.core.retry import with_retry
+
 logger = logging.getLogger(__name__)
 
 # Default certificate directory in container
@@ -70,6 +72,10 @@ class MCPClientManager:
         self.tool_objects: Dict[str, Dict[str, Any]] = {}  # server_id -> {tool_name -> MCP Tool obj}
         self._exit_stacks: Dict[str, AsyncExitStack] = {}  # server_id -> exit stack
     
+    # Timeout (seconds) for the entire connect + initialize + list_tools sequence.
+    # npx must download the package on first run, so allow generous time.
+    CONNECT_TIMEOUT = 90
+
     async def connect_server(self, server_id: str, config: Dict[str, Any]) -> bool:
         """Connect to an MCP server.
         
@@ -80,6 +86,27 @@ class MCPClientManager:
         Returns:
             True if connection successful
         """
+        try:
+            return await asyncio.wait_for(
+                self._connect_server_inner(server_id, config),
+                timeout=self.CONNECT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "MCP server %s connection timed out after %ss",
+                server_id, self.CONNECT_TIMEOUT,
+            )
+            if server_id in self._exit_stacks:
+                try:
+                    await self._exit_stacks[server_id].aclose()
+                except Exception:
+                    pass
+                finally:
+                    self._exit_stacks.pop(server_id, None)
+            return False
+
+    async def _connect_server_inner(self, server_id: str, config: Dict[str, Any]) -> bool:
+        """Internal connection logic wrapped by connect_server timeout."""
         try:
             logger.info("Connecting to MCP server: %s", server_id)
             
@@ -178,7 +205,10 @@ class MCPClientManager:
             
             session = self.connections[server_id]['session']
             
-            result = await session.call_tool(tool_name, arguments)
+            async def _call_tool():
+                return await session.call_tool(tool_name, arguments)
+            
+            result = await with_retry(_call_tool, max_retries=2)
             
             logger.info("Tool '%s' executed successfully", tool_name)
             

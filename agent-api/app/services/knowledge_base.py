@@ -247,7 +247,8 @@ class KnowledgeBaseService:
         description: str,
         symptoms: List[str],
         solution: str,
-        category: str
+        category: str,
+        source: str = "manual",
     ) -> Dict[str, Any]:
         """Add a known issue to the knowledge base.
         
@@ -257,6 +258,7 @@ class KnowledgeBaseService:
             symptoms: List of symptoms/signatures
             solution: Resolution steps
             category: Issue category
+            source: Provenance — 'manual', 'agent', or 'verified'
             
         Returns:
             Created known issue
@@ -272,6 +274,7 @@ class KnowledgeBaseService:
                 symptoms=symptoms,
                 solution=solution,
                 category=category,
+                source=source,
                 embedding=embedding,
                 created_at=datetime.now(timezone.utc)
             )
@@ -282,8 +285,124 @@ class KnowledgeBaseService:
             return {
                 "id": issue_model.id,
                 "title": issue_model.title,
-                "category": issue_model.category
+                "category": issue_model.category,
+                "source": issue_model.source,
             }
+
+    async def upsert_playbook(
+        self,
+        title: str,
+        symptoms: List[str],
+        solution: str,
+        category: str,
+        source: str = "agent",
+    ) -> Dict[str, Any]:
+        """Create or update a runbook/playbook for a known issue type.
+
+        Matches on (title, category). Updates solution and updated_at when an
+        existing entry is found; creates a new entry otherwise.
+
+        Args:
+            title: Short issue title (used as the match key alongside category).
+            symptoms: List of symptom strings.
+            solution: Resolution steps or investigation procedure.
+            category: Issue category.
+            source: Provenance — typically 'agent' when written by the agent.
+
+        Returns:
+            Dict with id, title, category, source, and whether it was created or updated.
+        """
+        combined_text = f"{title} {' '.join(symptoms)} {solution}"
+        embedding = await self.embedding_service.generate_embedding(combined_text)
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(KnownIssueModel).where(
+                    KnownIssueModel.title == title,
+                    KnownIssueModel.category == category,
+                )
+            )
+            existing = result.scalar_one_or_none()
+
+            if existing:
+                existing.symptoms = symptoms
+                existing.solution = solution
+                existing.source = source
+                existing.embedding = embedding
+                existing.updated_at = datetime.now(timezone.utc)
+                await session.commit()
+                await session.refresh(existing)
+                return {
+                    "id": existing.id,
+                    "title": existing.title,
+                    "category": existing.category,
+                    "source": existing.source,
+                    "action": "updated",
+                }
+            else:
+                issue_model = KnownIssueModel(
+                    title=title,
+                    description=solution[:500],
+                    symptoms=symptoms,
+                    solution=solution,
+                    category=category,
+                    source=source,
+                    embedding=embedding,
+                    created_at=datetime.now(timezone.utc),
+                )
+                session.add(issue_model)
+                await session.commit()
+                await session.refresh(issue_model)
+                return {
+                    "id": issue_model.id,
+                    "title": issue_model.title,
+                    "category": issue_model.category,
+                    "source": issue_model.source,
+                    "action": "created",
+                }
+
+    async def patch_playbook_solution(
+        self,
+        issue_id: int,
+        new_solution: str,
+        source: str = "agent",
+    ) -> Dict[str, Any]:
+        """Update the solution field of an existing known issue.
+
+        Args:
+            issue_id: Primary key of the KnownIssueModel to update.
+            new_solution: Replacement solution text.
+            source: Provenance of the update.
+
+        Returns:
+            Dict with id, title, and source, or an error key if not found.
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(KnownIssueModel).where(KnownIssueModel.id == issue_id)
+            )
+            existing = result.scalar_one_or_none()
+
+            if not existing:
+                return {"error": f"KnownIssue id={issue_id} not found"}
+
+            existing.solution = new_solution
+            existing.source = source
+            existing.updated_at = datetime.now(timezone.utc)
+
+            # Regenerate embedding to reflect updated solution content.
+            combined_text = f"{existing.title} {' '.join(existing.symptoms or [])} {new_solution}"
+            existing.embedding = await self.embedding_service.generate_embedding(combined_text)
+
+            await session.commit()
+            await session.refresh(existing)
+            return {
+                "id": existing.id,
+                "title": existing.title,
+                "source": existing.source,
+                "action": "patched",
+            }
+
     
     async def search_known_issues(
         self,
@@ -506,7 +625,95 @@ class KnowledgeBaseService:
                     }
                 }
             }
-    
+
+    async def recalibrate_baseline(
+        self,
+        metric_name: str,
+        log_group: str,
+        observed_value: float,
+        calibration_window: int = 5,
+    ) -> Dict[str, Any]:
+        """Auto-calibrate a baseline metric using a dampened moving average.
+
+        Checks the last ``calibration_window`` analysis records for this log
+        group.  If all of them report anomalies, the baseline is likely stale
+        and is nudged towards the observed value at a learning rate of 0.2.
+        Each calibration event is recorded in ``analysis_history`` with type
+        ``"baseline_calibration"`` so humans can audit drift.
+
+        Args:
+            metric_name: Name of the metric to calibrate.
+            log_group: Log group the metric belongs to.
+            observed_value: The current observed value that triggered recalibration.
+            calibration_window: Number of recent analyses to check (default 5).
+
+        Returns:
+            Dict describing whether calibration occurred and old/new range values.
+        """
+        async with AsyncSessionLocal() as session:
+            # Load existing baseline.
+            result = await session.execute(
+                select(BaselineMetricModel).where(
+                    BaselineMetricModel.metric_name == metric_name,
+                    BaselineMetricModel.log_group == log_group,
+                )
+            )
+            metric = result.scalar_one_or_none()
+            if not metric:
+                return {"recalibrated": False, "reason": "no baseline found"}
+
+            # Check recent analysis anomaly counts.
+            history_result = await session.execute(
+                select(AnalysisHistoryModel)
+                .where(AnalysisHistoryModel.log_group == log_group)
+                .order_by(AnalysisHistoryModel.created_at.desc())
+                .limit(calibration_window)
+            )
+            recent = history_result.scalars().all()
+
+            if len(recent) < calibration_window:
+                return {"recalibrated": False, "reason": "insufficient history"}
+
+            all_anomalous = all((r.anomalies_found or 0) > 0 for r in recent)
+            if not all_anomalous:
+                return {"recalibrated": False, "reason": "not all recent analyses show anomalies"}
+
+            # Apply dampened moving average (learning rate = 0.2).
+            alpha = 0.2
+            old_min = float(metric.normal_range_min or 0.0)
+            old_max = float(metric.normal_range_max or 0.0)
+            new_min = (1 - alpha) * old_min + alpha * min(observed_value, old_min)
+            new_max = (1 - alpha) * old_max + alpha * max(observed_value, old_max)
+
+            metric.normal_range_min = new_min
+            metric.normal_range_max = new_max
+            metric.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+
+        # Record the calibration event in analysis history.
+        await self.record_analysis(
+            log_group=log_group,
+            analysis_type="baseline_calibration",
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            summary=(
+                f"Auto-recalibrated '{metric_name}': "
+                f"range [{old_min:.3f}, {old_max:.3f}] → [{new_min:.3f}, {new_max:.3f}] "
+                f"based on observed_value={observed_value:.3f}"
+            ),
+            anomalies_found=0,
+            patterns_matched=0,
+        )
+
+        return {
+            "recalibrated": True,
+            "metric_name": metric_name,
+            "log_group": log_group,
+            "old_range": {"min": old_min, "max": old_max},
+            "new_range": {"min": new_min, "max": new_max},
+            "observed_value": observed_value,
+        }
+
     # ============================================
     # ANALYSIS HISTORY OPERATIONS
     # ============================================

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from app.config import settings
+from app.core.logging_filter import RedactingFilter
 
 
 class JSONFormatter(logging.Formatter):
@@ -70,6 +71,12 @@ def setup_logging():
     
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
+    
+    # Attach secret-redaction filter to all handlers
+    redacting_filter = RedactingFilter()
+    root_logger.addFilter(redacting_filter)
+    for handler in root_logger.handlers:
+        handler.addFilter(redacting_filter)
     
     # Set specific log levels for noisy libraries
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)

@@ -13,6 +13,7 @@ from app.models.db_models import (
     MCPServerModel,
     ModelKeyModel,
 )
+from app.core.redact import redact
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +352,7 @@ class DatabaseRepository:
                 icon=config_data.get("icon"),
                 description=config_data.get("description"),
                 api_key=config_data.get("apiKey") or config_data.get("api_key"),
+                aws_profile=config_data.get("aws_profile"),
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
             )
@@ -391,6 +393,7 @@ class DatabaseRepository:
                 "description": "description",
                 "apiKey": "api_key",
                 "api_key": "api_key",
+                "aws_profile": "aws_profile",
             }
             for json_key, col_name in field_map.items():
                 if json_key in config_data:
@@ -434,7 +437,7 @@ class DatabaseRepository:
                     "description": "description",
                     "apiKey": "api_key",
                     "api_key": "api_key",
-                    "aws_config_name": "aws_config_name",
+                    "aws_profile": "aws_profile",
                 }
                 for json_key, col_name in field_map.items():
                     if json_key in config_data:
@@ -453,7 +456,7 @@ class DatabaseRepository:
                     icon=config_data.get("icon"),
                     description=config_data.get("description"),
                     api_key=config_data.get("apiKey") or config_data.get("api_key"),
-                    aws_config_name=config_data.get("aws_config_name"),
+                    aws_profile=config_data.get("aws_profile"),
                     created_at=datetime.now(timezone.utc),
                     updated_at=datetime.now(timezone.utc),
                 )
@@ -576,6 +579,7 @@ class DatabaseRepository:
             "region": config.region,
             "icon": config.icon,
             "description": config.description,
+            "aws_profile": config.aws_profile,
         }
         if include_api_key:
             d["api_key"] = config.api_key

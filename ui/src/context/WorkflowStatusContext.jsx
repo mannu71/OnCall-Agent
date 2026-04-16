@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import PropTypes from 'prop-types';
 import { agentApiClient } from '../services/agentApiClient';
 
@@ -16,6 +16,7 @@ export const WorkflowStatusProvider = ({ children }) => {
   const [runningWorkflows, setRunningWorkflows] = useState([]);
   const [pendingWorkflows, setPendingWorkflows] = useState([]);
   const [lastCheck, setLastCheck] = useState(0);
+  const activeStreamsRef = useRef(new Map());
 
   const checkRunningWorkflows = useCallback(async () => {
     try {
@@ -30,10 +31,8 @@ export const WorkflowStatusProvider = ({ children }) => {
   useEffect(() => {
     checkRunningWorkflows();
 
-    // Check every 10 seconds (less aggressive than 2s)
     const interval = setInterval(checkRunningWorkflows, 10000);
 
-    // If window returns to focus, check immediately
     const handleFocus = () => checkRunningWorkflows();
     window.addEventListener('focus', handleFocus);
 
@@ -55,7 +54,45 @@ export const WorkflowStatusProvider = ({ children }) => {
     setPendingWorkflows(prev => prev.filter(w => w !== workflowName));
   }, []);
 
-  // Synchronize pending and running
+  const subscribeToWorkflow = useCallback((workflowName) => {
+    if (activeStreamsRef.current.has(workflowName)) {
+      return activeStreamsRef.current.get(workflowName);
+    }
+
+    const eventSource = agentApiClient.streamWorkflowExecution(workflowName);
+    activeStreamsRef.current.set(workflowName, eventSource);
+
+    eventSource.addEventListener('workflow_completed', () => {
+      activeStreamsRef.current.delete(workflowName);
+      eventSource.close();
+      checkRunningWorkflows();
+      clearWorkflowPending(workflowName);
+    });
+
+    eventSource.addEventListener('workflow_failed', () => {
+      activeStreamsRef.current.delete(workflowName);
+      eventSource.close();
+      checkRunningWorkflows();
+      clearWorkflowPending(workflowName);
+    });
+
+    eventSource.onerror = () => {
+      activeStreamsRef.current.delete(workflowName);
+      eventSource.close();
+      checkRunningWorkflows();
+    };
+
+    return eventSource;
+  }, [checkRunningWorkflows, clearWorkflowPending]);
+
+  const unsubscribeFromWorkflow = useCallback((workflowName) => {
+    const es = activeStreamsRef.current.get(workflowName);
+    if (es) {
+      es.close();
+      activeStreamsRef.current.delete(workflowName);
+    }
+  }, []);
+
   useEffect(() => {
     if (runningWorkflows.length > 0) {
       setPendingWorkflows(prev => prev.filter(w => !runningWorkflows.includes(w)));
@@ -72,9 +109,11 @@ export const WorkflowStatusProvider = ({ children }) => {
     isWorkflowRunning,
     markWorkflowPending,
     clearWorkflowPending,
+    subscribeToWorkflow,
+    unsubscribeFromWorkflow,
     count: allRunningWorkflows.length,
     lastCheck
-  }), [allRunningWorkflows, isWorkflowRunning, markWorkflowPending, clearWorkflowPending, lastCheck]);
+  }), [allRunningWorkflows, isWorkflowRunning, markWorkflowPending, clearWorkflowPending, subscribeToWorkflow, unsubscribeFromWorkflow, lastCheck]);
 
   return (
     <WorkflowStatusContext.Provider value={value}>

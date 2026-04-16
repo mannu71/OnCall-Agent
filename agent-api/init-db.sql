@@ -164,3 +164,16 @@ CREATE INDEX IF NOT EXISTS known_issues_category_idx ON known_issues(category);
 CREATE INDEX IF NOT EXISTS alerts_status_idx ON alerts(status);
 CREATE INDEX IF NOT EXISTS alerts_created_at_idx ON alerts(created_at);
 CREATE INDEX IF NOT EXISTS analysis_history_log_group_idx ON analysis_history(log_group);
+
+-- ============================================
+-- SCHEMA MIGRATIONS (idempotent ALTER TABLE statements)
+-- ============================================
+
+-- Phase 2.1: source provenance on known_issues (manual | agent | verified)
+ALTER TABLE known_issues ADD COLUMN IF NOT EXISTS source VARCHAR(50) DEFAULT 'manual';
+
+-- Phase 3.1: full message trajectory on executions for analysis and training
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS trajectory JSONB;
+
+-- Index for filtering agent-created entries
+CREATE INDEX IF NOT EXISTS known_issues_source_idx ON known_issues(source);

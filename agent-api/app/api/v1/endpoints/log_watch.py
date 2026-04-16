@@ -1,4 +1,5 @@
 """API endpoints for CloudWatch Log Watch Analyzer."""
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
@@ -23,6 +24,7 @@ from app.mcp.tools.alert_tools import (
     create_known_issue
 )
 from app.services.knowledge_base import knowledge_base
+from app.core.retry import with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +180,10 @@ async def test_aws_connection(request: TestConnectionRequest) -> Dict[str, Any]:
                     False if os.environ.get('AWS_SSL_VERIFY', 'true').lower() == 'false' else None)
         )
         
-        client.describe_log_groups(limit=1)
+        async def _call_describe_log_groups():
+            return client.describe_log_groups(limit=1)
+        
+        await with_retry(_call_describe_log_groups, max_retries=3)
         
         return {
             "success": True,
@@ -241,12 +246,14 @@ async def watch_logs(request: WatchLogGroupsRequest) -> Dict[str, Any]:
     enabling cross-service log analysis.
     """
     credentials = request.credentials.model_dump() if request.credentials else None
-    return await watch_log_groups(
+    return await with_retry(
+        watch_log_groups,
         log_group_names=request.log_group_names,
         time_range_minutes=request.time_range_minutes,
         filter_pattern=request.filter_pattern,
         region=request.region,
-        credentials=credentials
+        credentials=credentials,
+        max_retries=2,
     )
 
 
@@ -258,12 +265,14 @@ async def analyze_patterns(request: AnalyzePatternsRequest) -> Dict[str, Any]:
     across the specified log groups.
     """
     credentials = request.credentials.model_dump() if request.credentials else None
-    return await analyze_log_patterns(
+    return await with_retry(
+        analyze_log_patterns,
         log_group_names=request.log_group_names,
         time_range_minutes=request.time_range_minutes,
         pattern_types=request.pattern_types,
         region=request.region,
-        credentials=credentials
+        credentials=credentials,
+        max_retries=2,
     )
 
 
@@ -275,13 +284,15 @@ async def detect_log_anomalies(request: DetectAnomaliesRequest) -> Dict[str, Any
     to identify unusual activity, error spikes, or pattern deviations.
     """
     credentials = request.credentials.model_dump() if request.credentials else None
-    return await detect_anomalies(
+    return await with_retry(
+        detect_anomalies,
         log_group_names=request.log_group_names,
         time_range_minutes=request.time_range_minutes,
         baseline_minutes=request.baseline_minutes,
         sensitivity=request.sensitivity,
         region=request.region,
-        credentials=credentials
+        credentials=credentials,
+        max_retries=2,
     )
 
 
@@ -293,13 +304,15 @@ async def correlate_log_events(request: CorrelateLogsRequest) -> Dict[str, Any]:
     the full request flow and pinpoint issues.
     """
     credentials = request.credentials.model_dump() if request.credentials else None
-    return await correlate_logs(
+    return await with_retry(
+        correlate_logs,
         log_group_names=request.log_group_names,
         correlation_id=request.correlation_id,
         time_range_minutes=request.time_range_minutes,
         trace_id=request.trace_id,
         region=request.region,
-        credentials=credentials
+        credentials=credentials,
+        max_retries=2,
     )
 
 

@@ -392,6 +392,16 @@ async def stream_workflow_execution(
     """Stream events for an already-running workflow execution via SSE.
     
     Monitors an existing execution. Does NOT start a new one.
+    
+    Event types emitted:
+    - workflow_started, workflow_completed, workflow_failed
+    - node_started, node_completed, node_failed
+    - llm_token:   real-time LLM output token
+    - tool_call:   agent invoking a tool
+    - tool_result: tool execution result
+    - agent_error: error from agent execution
+    - agent_complete: agent finished
+    - keepalive:   connection keep-alive
     """
     
     async def event_generator():
@@ -408,12 +418,18 @@ async def stream_workflow_execution(
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=60.0)
-                    yield f"data: {json.dumps(event.dict())}\n\n"
                     
-                    if event.event_type in ("workflow_completed", "workflow_failed"):
+                    event_type = event.event_type
+                    event_data = event.dict()
+                    
+                    if event_type in ("llm_token", "tool_call", "tool_result", "agent_error", "agent_complete"):
+                        yield f"event: {event_type}\ndata: {json.dumps(event_data)}\n\n"
+                    else:
+                        yield f"data: {json.dumps(event_data)}\n\n"
+                    
+                    if event_type in ("workflow_completed", "workflow_failed"):
                         break
                 except asyncio.TimeoutError:
-                    # Check if execution is still active
                     if exec_id not in visual_executor.active_executions:
                         break
                     yield f"data: {json.dumps({'event': 'keepalive'})}\n\n"

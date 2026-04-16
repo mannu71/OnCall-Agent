@@ -16,11 +16,51 @@ from app.mcp.tools.watch_tools import (
     detect_anomalies,
     correlate_logs,
 )
+from app.core.redact import redact
 
 logger = logging.getLogger(__name__)
 
 # Node types that contain only connection metadata (excluded from sanitized output)
 _TOOL_NODE_KEYS = {'server_id', 'tool_data'}
+
+
+class _AgentStreamCallback:
+    """Adapts StreamCallback protocol events to VisualWorkflowExecutor._publish_event."""
+
+    def __init__(self, executor: "VisualWorkflowExecutor", execution_id: str, node_id: str):
+        self._executor = executor
+        self._execution_id = execution_id
+        self._node_id = node_id
+
+    async def on_llm_token(self, token: str) -> None:
+        await self._executor._publish_event(
+            self._execution_id, "llm_token",
+            {"token": token, "node_id": self._node_id},
+        )
+
+    async def on_tool_call(self, tool_name: str, args: dict) -> None:
+        await self._executor._publish_event(
+            self._execution_id, "tool_call",
+            {"tool": tool_name, "args": args, "node_id": self._node_id},
+        )
+
+    async def on_tool_result(self, tool_name: str, result: str) -> None:
+        await self._executor._publish_event(
+            self._execution_id, "tool_result",
+            {"tool": tool_name, "result": redact(result)[:2000], "node_id": self._node_id},
+        )
+
+    async def on_error(self, error: str) -> None:
+        await self._executor._publish_event(
+            self._execution_id, "agent_error",
+            {"error": redact(error), "node_id": self._node_id},
+        )
+
+    async def on_complete(self, output: str) -> None:
+        await self._executor._publish_event(
+            self._execution_id, "agent_complete",
+            {"output": redact(output)[:500], "node_id": self._node_id},
+        )
 
 
 class _ExecutionEvent:
@@ -337,11 +377,22 @@ class VisualWorkflowExecutor:
         """Save execution result to storage."""
         try:
             execution_repo = ExecutionRepository()
+
+            # Collect the full message trajectory from any agent node results so
+            # it can be stored for later analysis, insight queries, and training.
+            trajectory: list = []
+            node_results = result.get("results") or {}
+            if isinstance(node_results, dict):
+                for node_result in node_results.values():
+                    if isinstance(node_result, dict) and node_result.get("messages"):
+                        trajectory.extend(node_result["messages"])
+
             await execution_repo.save({
                 **result,
                 "workflow_name": workflow.get('name'),
                 "workflow_id": workflow.get('id'),
-                "events": self.active_executions[execution_id].get('events', [])
+                "events": self.active_executions[execution_id].get('events', []),
+                "trajectory": trajectory or None,
             })
         except Exception as e:
             logger.error(f"Failed to save execution to storage: {e}")
@@ -532,7 +583,6 @@ class VisualWorkflowExecutor:
         node_data = node.get('data', {})
         execution_id = context.get('execution_id')
 
-        # Build a minimal workflow stub so ReactStrategy can parse nodes/edges
         active = self.active_executions.get(execution_id, {})
         workflow = active.get('workflow') or {
             'name': context.get('workflow_name', 'unknown'),
@@ -540,7 +590,6 @@ class VisualWorkflowExecutor:
             'edges': [],
         }
 
-        # user_query from workflow inputs, then fall back to agent instructions
         user_query = (
             context.get('inputs', {}).get('user_query')
             or context.get('inputs', {}).get('query')
@@ -556,12 +605,12 @@ class VisualWorkflowExecutor:
                 'agent_data': node_data,
             }
 
-        # Reuse the execution-scoped MCP manager so already-connected tool nodes
-        # are available to the agent without re-connecting.
         if execution_id not in self.mcp_managers:
             self.mcp_managers[execution_id] = MCPClientManager()
 
         mcp_manager = self.mcp_managers[execution_id]
+
+        stream_callback = _AgentStreamCallback(self, execution_id, node_id)
 
         strategy_context = {
             'execution_id': execution_id,
@@ -569,6 +618,7 @@ class VisualWorkflowExecutor:
             'mcp_manager': mcp_manager,
             'inputs': context.get('inputs', {}),
             'logger': logger,
+            'stream_callback': stream_callback,
         }
 
         try:

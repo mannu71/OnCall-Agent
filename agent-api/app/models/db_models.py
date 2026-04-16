@@ -38,6 +38,7 @@ class ExecutionModel(Base):
     output = Column(JSON)
     error = Column(Text)
     logs = Column(JSON)
+    trajectory = Column(JSON)  # Full message trace for analysis and training
 
 
 class LLMConfigModel(Base):
@@ -56,6 +57,7 @@ class LLMConfigModel(Base):
     icon = Column(String(10))
     description = Column(Text)
     api_key = Column(String(500))
+    aws_profile = Column(String(100))
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
 
@@ -118,6 +120,7 @@ class KnownIssueModel(Base):
     symptoms = Column(JSON)  # Array of strings
     solution = Column(Text)
     category = Column(String(100))
+    source = Column(String(50), default="manual")  # manual | agent | verified
     embedding = Column(Vector(1536))
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))

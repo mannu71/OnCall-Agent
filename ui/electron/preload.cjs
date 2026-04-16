@@ -167,6 +167,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return apiRequest(`/mcp-config/test/${encodeURIComponent(serverName)}`, {
       method: 'POST',
       body: JSON.stringify(serverConfig),
+      signal: AbortSignal.timeout(100000), // 100s — matches backend 90s + buffer
     });
   },
 

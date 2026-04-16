@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.repositories.db_repository import db_repository
+from app.core.redact import redact
 
 router = APIRouter(prefix="/llm-config", tags=["llm-config"])
 logger = logging.getLogger(__name__)
@@ -319,7 +320,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Error discovering models for %s: %s", provider, e)
+        logger.error("Error discovering models for %s: %s", provider, redact(str(e)))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -400,7 +401,7 @@ async def discover_bedrock_models(request: Optional[AWSDiscoverRequest] = None):
         client = boto3.client("bedrock", **kwargs)
         response = client.list_foundation_models()
     except ClientError as e:
-        logger.error("Failed to list Bedrock models: %s", e)
+        logger.error("Failed to list Bedrock models: %s", redact(str(e)))
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Failed to query AWS Bedrock: {e}",
@@ -827,5 +828,5 @@ async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] =
     except httpx.ConnectError:
         return {"success": False, "error": "Connection refused - check if service is running"}
     except Exception as e:
-        logger.error("Error testing LLM connection: %s", e)
+        logger.error("Error testing LLM connection: %s", redact(str(e)))
         return {"success": False, "error": str(e)}
