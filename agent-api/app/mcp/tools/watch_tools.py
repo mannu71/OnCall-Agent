@@ -9,7 +9,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Callable
 from functools import wraps
 
+import os
+import ssl
+
+# Disable SSL certificate verification when AWS_SSL_VERIFY=false.
+if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
+    ssl._create_default_https_context = ssl._create_unverified_context
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+
 import boto3
+from botocore.config import Config as BotocoreConfig
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
@@ -54,6 +67,7 @@ class CloudWatchLogWatcher:
         region: str = "us-east-1",
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
+        aws_session_token: Optional[str] = None,
         aws_profile: Optional[str] = None,
         use_env_credentials: bool = False
     ):
@@ -63,6 +77,7 @@ class CloudWatchLogWatcher:
             region: AWS region
             aws_access_key_id: AWS Access Key ID (optional)
             aws_secret_access_key: AWS Secret Access Key (optional)
+            aws_session_token: AWS Session Token for temporary credentials (optional)
             aws_profile: AWS profile name from ~/.aws/credentials (optional)
             use_env_credentials: Use environment variables for credentials
         """
@@ -76,6 +91,7 @@ class CloudWatchLogWatcher:
             session = boto3.Session(
                 aws_access_key_id=aws_access_key_id,
                 aws_secret_access_key=aws_secret_access_key,
+                aws_session_token=aws_session_token,
                 region_name=region
             )
         elif aws_profile:
@@ -83,7 +99,13 @@ class CloudWatchLogWatcher:
         else:
             session = boto3.Session(region_name=region)
         
-        self.client = session.client('logs')
+        ssl_verify = os.environ.get("AWS_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
+        client_kwargs: Dict[str, Any] = {"region_name": region}
+        if not ssl_verify:
+            client_kwargs["verify"] = False
+            client_kwargs["config"] = BotocoreConfig(retries={"max_attempts": 3})
+
+        self.client = session.client("logs", **client_kwargs)
     
     async def fetch_logs(
         self,
@@ -205,6 +227,7 @@ def get_watcher(
     region: str = "us-east-1",
     aws_access_key_id: Optional[str] = None,
     aws_secret_access_key: Optional[str] = None,
+    aws_session_token: Optional[str] = None,
     aws_profile: Optional[str] = None,
     use_env_credentials: bool = False
 ) -> CloudWatchLogWatcher:
@@ -214,6 +237,7 @@ def get_watcher(
         region: AWS region
         aws_access_key_id: AWS Access Key ID (optional)
         aws_secret_access_key: AWS Secret Access Key (optional)
+        aws_session_token: AWS Session Token for temporary credentials (optional)
         aws_profile: AWS profile name from ~/.aws/credentials (optional)
         use_env_credentials: Use environment variables for credentials
         
@@ -224,6 +248,7 @@ def get_watcher(
         region=region,
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key,
+        aws_session_token=aws_session_token,
         aws_profile=aws_profile,
         use_env_credentials=use_env_credentials
     )
@@ -241,12 +266,17 @@ def _extract_credentials(credentials: Optional[Dict[str, Any]]) -> Dict[str, Any
     if not credentials:
         return {}
     
-    return {
-        "aws_access_key_id": credentials.get("aws_access_key_id"),
-        "aws_secret_access_key": credentials.get("aws_secret_access_key"),
+    result: Dict[str, Any] = {
+        "aws_access_key_id": credentials.get("access_key_id"),
+        "aws_secret_access_key": credentials.get("secret_access_key"),
         "aws_profile": credentials.get("aws_profile"),
-        "use_env_credentials": credentials.get("use_env_credentials", False)
+        "use_env_credentials": credentials.get("use_env_credentials", False),
     }
+    # Include session_token only when present so temporary STS credentials work
+    session_token = credentials.get("session_token")
+    if session_token:
+        result["aws_session_token"] = session_token
+    return result
 
 
 # ============================================

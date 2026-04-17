@@ -50,6 +50,26 @@ CREATE TABLE IF NOT EXISTS llm_configs (
     region VARCHAR(50) DEFAULT 'us-east-1',
     icon VARCHAR(10),
     description TEXT,
+    aws_profile VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- PROVIDER API KEY TABLE
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS model_keys (
+    id SERIAL PRIMARY KEY,
+    provider VARCHAR(100) NOT NULL UNIQUE,
+    api_key VARCHAR(500),
+    secret_key VARCHAR(500),
+    endpoint VARCHAR(500),
+    region VARCHAR(50),
+    access_key_id VARCHAR(500),
+    secret_access_key VARCHAR(500),
+    session_token VARCHAR(500),
+    description TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

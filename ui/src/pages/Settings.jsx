@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+﻿import React, { useState, useEffect, useRef } from 'react';
 import { Button } from '@/components/ui/button';
 import { 
     Dialog, 
@@ -33,7 +33,6 @@ import {
     Eye,
     EyeOff,
     Key,
-    Check,
     Info,
     Shield,
     Cloud
@@ -42,6 +41,7 @@ import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer, getMCPIn
 import { getLLMs, addLLM, updateLLM, deleteLLM, discoverModels, addDiscoveredModels, bulkDeleteLLMs } from '../services/llmService';
 import { getModelKeys, upsertModelKey, deleteModelKey } from '../services/modelKeyService';
 import agentApiClient from '../services/agentApiClient';
+import { testLLMConnection as testLLMConnectionAPI } from '../services/apiClient';
 
 // Icon options for MCP Servers
 const MCP_SERVER_ICONS = [
@@ -167,22 +167,21 @@ const Settings = () => {
         model: '',
         icon: '🧠',
         description: '',
-        apiKey: '',
         endpoint: '',
         baseUrl: '',
         temperature: 0,
-        aws_access_key_id: '',
-        aws_secret_access_key: '',
-        aws_session_token: '',
+        access_key_id: '',
+        secret_access_key: '',
+        session_token: '',
     });
 
     const [openAWSDialog, setOpenAWSDialog] = useState(false);
     const [discoverProvider, setDiscoverProvider] = useState('');
     const [awsFormData, setAWSFormData] = useState({
         region: 'us-east-1',
-        aws_access_key_id: '',
-        aws_secret_access_key: '',
-        aws_session_token: '',
+        access_key_id: '',
+        secret_access_key: '',
+        session_token: '',
     });
     const [awsDiscovering, setAwsDiscovering] = useState(false);
     const [discoveredModels, setDiscoveredModels] = useState([]);
@@ -197,8 +196,6 @@ const Settings = () => {
         const modelLower = model.toLowerCase();
         return REASONING_MODELS.some(rm => modelLower.startsWith(rm));
     };
-    const [showApiKey, setShowApiKey] = useState(false);
-    const [existingApiKey, setExistingApiKey] = useState(null); // To show if key exists
     const [llmConnectionStatus, setLLMConnectionStatus] = useState({}); // { llmName: { status: 'untested' | 'testing' | 'connected' | 'error', message: '' } }
 
     // Certificates state
@@ -219,9 +216,9 @@ const Settings = () => {
         secret_key: '',
         endpoint: '',
         region: '',
-        aws_access_key_id: '',
-        aws_secret_access_key: '',
-        aws_session_token: '',
+        access_key_id: '',
+        secret_access_key: '',
+        session_token: '',
         description: '',
     });
     const [showModelKeyFields, setShowModelKeyFields] = useState({});
@@ -233,7 +230,7 @@ const Settings = () => {
         { value: 'Google', label: 'Google AI', icon: '✨', fields: ['api_key'] },
         { value: 'Groq', label: 'Groq', icon: '⚡', fields: ['api_key'] },
         { value: 'Azure OpenAI', label: 'Azure OpenAI', icon: '☁️', fields: ['api_key', 'endpoint'] },
-        { value: 'AWS Bedrock', label: 'AWS Bedrock', icon: '🌩️', fields: ['aws_access_key_id', 'aws_secret_access_key', 'aws_session_token', 'region'] },
+        { value: 'AWS Bedrock', label: 'AWS Bedrock', icon: '🌩️', fields: ['access_key_id', 'secret_access_key', 'session_token', 'region'] },
         { value: 'Ollama', label: 'Ollama', icon: '🦙', fields: ['endpoint'] },
         { value: 'Custom', label: 'Custom', icon: '🔧', fields: ['api_key', 'secret_key', 'endpoint'] },
     ];
@@ -245,9 +242,9 @@ const Settings = () => {
             secret_key: '',
             endpoint: '',
             region: '',
-            aws_access_key_id: '',
-            aws_secret_access_key: '',
-            aws_session_token: '',
+            access_key_id: '',
+            secret_access_key: '',
+            session_token: '',
             description: '',
         };
         if (provider === 'Azure OpenAI') base.endpoint = 'https://your-resource.openai.azure.com';
@@ -261,7 +258,7 @@ const Settings = () => {
         const supportedForDiscovery = ['OpenAI', 'Anthropic', 'Google', 'Groq', 'Azure OpenAI', 'Ollama', 'AWS Bedrock'];
         for (const mk of modelKeys) {
             if (!supportedForDiscovery.includes(mk.provider)) continue;
-            const hasCreds = mk.has_api_key || mk.has_secret_key || mk.has_aws_credentials || mk.endpoint;
+            const hasCreds = mk.has_api_key || mk.has_secret_key || mk.has_access_credentials || mk.endpoint;
             if (!hasCreds) continue;
             const providerCfg = MODEL_KEY_PROVIDERS.find(p => p.value === mk.provider);
             providers.push({
@@ -358,9 +355,9 @@ const Settings = () => {
                 secret_key: existing?.secret_key || '',
                 endpoint: existing?.endpoint || '',
                 region: existing?.region || '',
-                aws_access_key_id: existing?.aws_access_key_id || '',
-                aws_secret_access_key: existing?.aws_secret_access_key || '',
-                aws_session_token: existing?.aws_session_token || '',
+                access_key_id: existing?.access_key_id || '',
+                secret_access_key: existing?.secret_access_key || '',
+                session_token: existing?.session_token || '',
                 description: existing?.description || '',
             };
             setModelKeyFormData(formData);
@@ -480,19 +477,15 @@ const Settings = () => {
 
     // Test LLM connection
     const testLLMConnection = async (llmName, llmConfig) => {
-        if (!globalThis.electronAPI?.testLLM) {
-            setSaveMessage('LLM connection test is only available in the desktop app');
-            setTimeout(() => setSaveMessage(''), 3000);
-            return;
-        }
-
         setLLMConnectionStatus(prev => ({
             ...prev,
             [llmName]: { status: 'testing', message: 'Testing connection...' }
         }));
 
         try {
-            const result = await globalThis.electronAPI.testLLM(llmName, {});
+            const result = globalThis.electronAPI?.testLLM
+                ? await globalThis.electronAPI.testLLM(llmName, {})
+                : await testLLMConnectionAPI(llmName, {});
 
             if (result.success) {
                 setLLMConnectionStatus(prev => ({
@@ -633,9 +626,6 @@ const Settings = () => {
 
     // LLM Dialog handlers
     const handleOpenLLMDialog = async (llmName = null) => {
-        setShowApiKey(false);
-        setExistingApiKey(null);
-
         if (llmName) {
             const llm = llms[llmName];
             setEditingLLM(llmName);
@@ -644,19 +634,10 @@ const Settings = () => {
                 provider: llm.provider || 'OpenAI',
                 model: llm.model || '',
                 icon: llm.icon || '🧠',
-                apiKey: '', // Don't load actual key, just check if exists
                 endpoint: llm.endpoint || '',
                 baseUrl: llm.baseUrl || '',
                 temperature: llm.temperature ?? 0
             });
-
-            // Check if API key exists for this LLM
-            if (globalThis.electronAPI?.getApiKeyMasked) {
-                const result = await globalThis.electronAPI.getApiKeyMasked(llmName);
-                if (result.success && result.masked) {
-                    setExistingApiKey(result.masked);
-                }
-            }
         } else {
             setEditingLLM(null);
             setLLMFormData({
@@ -664,7 +645,6 @@ const Settings = () => {
                 provider: 'OpenAI',
                 model: '',
                 icon: '🧠',
-                apiKey: '',
                 endpoint: '',
                 baseUrl: '',
                 temperature: 0
@@ -676,8 +656,6 @@ const Settings = () => {
     const handleCloseLLMDialog = () => {
         setOpenLLMDialog(false);
         setEditingLLM(null);
-        setShowApiKey(false);
-        setExistingApiKey(null);
     };
 
     const handleSaveLLM = async () => {
@@ -689,9 +667,9 @@ const Settings = () => {
                 ...(!isReasoningModel(llmFormData.model) && { temperature: llmFormData.temperature }),
                 ...(llmFormData.endpoint && { endpoint: llmFormData.endpoint }),
                 ...(llmFormData.baseUrl && { baseUrl: llmFormData.baseUrl }),
-                ...(llmFormData.aws_access_key_id && { aws_access_key_id: llmFormData.aws_access_key_id }),
-                ...(llmFormData.aws_secret_access_key && { aws_secret_access_key: llmFormData.aws_secret_access_key }),
-                ...(llmFormData.aws_session_token && { aws_session_token: llmFormData.aws_session_token }),
+                ...(llmFormData.access_key_id && { access_key_id: llmFormData.access_key_id }),
+                ...(llmFormData.secret_access_key && { secret_access_key: llmFormData.secret_access_key }),
+                ...(llmFormData.session_token && { session_token: llmFormData.session_token }),
             };
 
             const llmName = llmFormData.model;
@@ -700,13 +678,6 @@ const Settings = () => {
                 await updateLLM(editingLLM, llmConfig, llmName);
             } else {
                 await addLLM(llmName, llmConfig);
-            }
-
-            if (llmFormData.apiKey && globalThis.electronAPI?.setApiKey) {
-                const keyResult = await globalThis.electronAPI.setApiKey(llmName, llmFormData.apiKey);
-                if (!keyResult.success) {
-                    console.error('Failed to save API key:', keyResult.error);
-                }
             }
 
             setSaveMessage(editingLLM ? `Updated LLM: ${llmName}` : `Added new LLM: ${llmName}`);
@@ -812,8 +783,6 @@ const Settings = () => {
                                         {apiHealth.status === 'healthy' ? (
                                             <>
                                                 Scheduler: {apiHealth.scheduler_running ? 'Running' : 'Stopped'}
-                                                {' • '}
-                                                Active Workflows: {apiHealth.active_workflows || 0}
                                             </>
                                         ) : (
                                             apiHealth.message
@@ -1032,7 +1001,7 @@ const Settings = () => {
                             <div className="flex gap-2">
                                 <Button variant="outline" onClick={() => {
                                     setDiscoverProvider('');
-                                    setAWSFormData({ region: 'us-east-1', aws_access_key_id: '', aws_secret_access_key: '', aws_session_token: '' });
+                                    setAWSFormData({ region: 'us-east-1', access_key_id: '', secret_access_key: '', session_token: '' });
                                     loadModelKeys();
                                     setDiscoveredModels([]);
                                     setSelectedModels([]);
@@ -1591,57 +1560,6 @@ const Settings = () => {
                                 </div>
                             )}
 
-                            {/* API Key Section */}
-                            {llmFormData.provider !== 'Ollama' && (
-                                <div className="p-4 bg-muted rounded-lg flex flex-col gap-3">
-                                    <div className="flex items-center gap-2">
-                                        <Key className="w-4 h-4 text-primary" />
-                                        <h4 className="text-sm font-medium">API Key</h4>
-                                    </div>
-
-                                    {existingApiKey ? (
-                                        <div className="flex items-center gap-2">
-                                            <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200">
-                                                <Check className="w-3 h-3 mr-1" />
-                                                Key configured: {existingApiKey}
-                                            </Badge>
-                                            <Button
-                                                size="sm"
-                                                variant="ghost"
-                                                onClick={() => setExistingApiKey(null)}
-                                            >
-                                                Update Key
-                                            </Button>
-                                        </div>
-                                    ) : (
-                                        <div className="space-y-2">
-                                            <div className="relative">
-                                                <Input
-                                                    id="llm-apiKey"
-                                                    value={llmFormData.apiKey}
-                                                    onChange={(e) => setLLMFormData({ ...llmFormData, apiKey: e.target.value })}
-                                                    type={showApiKey ? 'text' : 'password'}
-                                                    placeholder="sk-..."
-                                                    className="pr-10"
-                                                />
-                                                <Button
-                                                    type="button"
-                                                    size="icon"
-                                                    variant="ghost"
-                                                    onClick={() => setShowApiKey(!showApiKey)}
-                                                    className="absolute right-0 top-0 h-full"
-                                                >
-                                                    {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                                                </Button>
-                                            </div>
-                                            <p className="text-sm text-muted-foreground">
-                                                Your API key will be securely stored locally
-                                            </p>
-                                        </div>
-                                    )}
-                                </div>
-                            )}
-
                             {/* AWS Credentials Section */}
                             {(llmFormData.provider === 'AWS Bedrock' || llmFormData.provider === 'Bedrock' || llmFormData.provider === 'bedrock') && (
                                 <div className="p-4 bg-muted rounded-lg flex flex-col gap-3">
@@ -1655,8 +1573,8 @@ const Settings = () => {
                                             id="llm-aws-access-key"
                                             type="password"
                                             placeholder="AKIA..."
-                                            value={llmFormData.aws_access_key_id}
-                                            onChange={(e) => setLLMFormData({ ...llmFormData, aws_access_key_id: e.target.value })}
+                                            value={llmFormData.access_key_id}
+                                            onChange={(e) => setLLMFormData({ ...llmFormData, access_key_id: e.target.value })}
                                         />
                                     </div>
                                     <div className="space-y-2">
@@ -1665,8 +1583,8 @@ const Settings = () => {
                                             id="llm-aws-secret-key"
                                             type="password"
                                             placeholder="Secret key"
-                                            value={llmFormData.aws_secret_access_key}
-                                            onChange={(e) => setLLMFormData({ ...llmFormData, aws_secret_access_key: e.target.value })}
+                                            value={llmFormData.secret_access_key}
+                                            onChange={(e) => setLLMFormData({ ...llmFormData, secret_access_key: e.target.value })}
                                         />
                                     </div>
                                     <div className="space-y-2">
@@ -1675,8 +1593,8 @@ const Settings = () => {
                                             id="llm-aws-session-token"
                                             type="password"
                                             placeholder="For temporary credentials"
-                                            value={llmFormData.aws_session_token}
-                                            onChange={(e) => setLLMFormData({ ...llmFormData, aws_session_token: e.target.value })}
+                                            value={llmFormData.session_token}
+                                            onChange={(e) => setLLMFormData({ ...llmFormData, session_token: e.target.value })}
                                         />
                                     </div>
                                     <p className="text-xs text-muted-foreground">Credentials are stored in the database and used automatically when running workflows.</p>
@@ -1992,43 +1910,43 @@ const Settings = () => {
                                             </div>
                                         );
                                     }
-                                    if (field === 'aws_access_key_id') {
+                                    if (field === 'access_key_id') {
                                         return (
                                             <div key={field} className="space-y-2">
-                                                <Label htmlFor="mk-aws-access-key">AWS Access Key ID</Label>
+                                                <Label htmlFor="mk-aws-access-key">Access Key ID</Label>
                                                 <Input
                                                     id="mk-aws-access-key"
                                                     type="password"
-                                                    value={modelKeyFormData.aws_access_key_id}
-                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, aws_access_key_id: e.target.value })}
+                                                    value={modelKeyFormData.access_key_id}
+                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, access_key_id: e.target.value })}
                                                     placeholder="AKIA..."
                                                 />
                                             </div>
                                         );
                                     }
-                                    if (field === 'aws_secret_access_key') {
+                                    if (field === 'secret_access_key') {
                                         return (
                                             <div key={field} className="space-y-2">
-                                                <Label htmlFor="mk-aws-secret-key">AWS Secret Access Key</Label>
+                                                <Label htmlFor="mk-aws-secret-key">Secret Access Key</Label>
                                                 <Input
                                                     id="mk-aws-secret-key"
                                                     type="password"
-                                                    value={modelKeyFormData.aws_secret_access_key}
-                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, aws_secret_access_key: e.target.value })}
+                                                    value={modelKeyFormData.secret_access_key}
+                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, secret_access_key: e.target.value })}
                                                     placeholder="Secret key"
                                                 />
                                             </div>
                                         );
                                     }
-                                    if (field === 'aws_session_token') {
+                                    if (field === 'session_token') {
                                         return (
                                             <div key={field} className="space-y-2">
-                                                <Label htmlFor="mk-aws-session-token">AWS Session Token <span className="text-muted-foreground">(optional)</span></Label>
+                                                <Label htmlFor="mk-aws-session-token">Session Token <span className="text-muted-foreground">(optional)</span></Label>
                                                 <Input
                                                     id="mk-aws-session-token"
                                                     type="password"
-                                                    value={modelKeyFormData.aws_session_token}
-                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, aws_session_token: e.target.value })}
+                                                    value={modelKeyFormData.session_token}
+                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, session_token: e.target.value })}
                                                     placeholder="For temporary credentials"
                                                 />
                                             </div>

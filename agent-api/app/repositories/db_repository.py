@@ -296,7 +296,7 @@ class DatabaseRepository:
     # LLM CONFIG OPERATIONS
     # ============================================
 
-    async def list_llm_configs(self, include_api_key: bool = False) -> Dict[str, Dict[str, Any]]:
+    async def list_llm_configs(self) -> Dict[str, Dict[str, Any]]:
         """List all LLM configurations.
         
         Args:
@@ -309,11 +309,11 @@ class DatabaseRepository:
             result = await session.execute(select(LLMConfigModel))
             configs = result.scalars().all()
             return {
-                config.name: self._llm_config_to_dict(config, include_api_key=include_api_key)
+                config.name: self._llm_config_to_dict(config)
                 for config in configs
             }
 
-    async def get_llm_config(self, name: str, include_api_key: bool = False) -> Optional[Dict[str, Any]]:
+    async def get_llm_config(self, name: str) -> Optional[Dict[str, Any]]:
         """Get a specific LLM configuration by name.
 
         Args:
@@ -328,7 +328,7 @@ class DatabaseRepository:
                 select(LLMConfigModel).where(LLMConfigModel.name == name)
             )
             config = result.scalar_one_or_none()
-            return self._llm_config_to_dict(config, include_api_key=include_api_key) if config else None
+            return self._llm_config_to_dict(config) if config else None
 
     async def create_llm_config(self, config_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new LLM configuration.
@@ -351,7 +351,6 @@ class DatabaseRepository:
                 region=config_data.get("region", "us-east-1"),
                 icon=config_data.get("icon"),
                 description=config_data.get("description"),
-                api_key=config_data.get("apiKey") or config_data.get("api_key"),
                 aws_profile=config_data.get("aws_profile"),
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
@@ -391,8 +390,6 @@ class DatabaseRepository:
                 "region": "region",
                 "icon": "icon",
                 "description": "description",
-                "apiKey": "api_key",
-                "api_key": "api_key",
                 "aws_profile": "aws_profile",
             }
             for json_key, col_name in field_map.items():
@@ -435,8 +432,6 @@ class DatabaseRepository:
                     "region": "region",
                     "icon": "icon",
                     "description": "description",
-                    "apiKey": "api_key",
-                    "api_key": "api_key",
                     "aws_profile": "aws_profile",
                 }
                 for json_key, col_name in field_map.items():
@@ -455,7 +450,6 @@ class DatabaseRepository:
                     region=config_data.get("region", "us-east-1"),
                     icon=config_data.get("icon"),
                     description=config_data.get("description"),
-                    api_key=config_data.get("apiKey") or config_data.get("api_key"),
                     aws_profile=config_data.get("aws_profile"),
                     created_at=datetime.now(timezone.utc),
                     updated_at=datetime.now(timezone.utc),
@@ -497,66 +491,7 @@ class DatabaseRepository:
             )
             return result.scalar_one_or_none() is not None
 
-    async def set_llm_api_key(self, name: str, api_key: str) -> Optional[Dict[str, Any]]:
-        """Set the API key for an LLM configuration.
-
-        Args:
-            name: Configuration name
-            api_key: API key value
-
-        Returns:
-            Updated config dict or None if not found
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(LLMConfigModel).where(LLMConfigModel.name == name)
-            )
-            config = result.scalar_one_or_none()
-            if not config:
-                return None
-            config.api_key = api_key
-            config.updated_at = datetime.now(timezone.utc)
-            await session.commit()
-            await session.refresh(config)
-            return self._llm_config_to_dict(config, include_api_key=True)
-
-    async def get_llm_api_key(self, name: str) -> Optional[str]:
-        """Get the API key for an LLM configuration.
-
-        Args:
-            name: Configuration name
-
-        Returns:
-            API key string or None
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(LLMConfigModel.api_key).where(LLMConfigModel.name == name)
-            )
-            return result.scalar_one_or_none()
-
-    async def delete_llm_api_key(self, name: str) -> bool:
-        """Delete the API key for an LLM configuration.
-
-        Args:
-            name: Configuration name
-
-        Returns:
-            True if deleted, False if not found
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(LLMConfigModel).where(LLMConfigModel.name == name)
-            )
-            config = result.scalar_one_or_none()
-            if not config:
-                return False
-            config.api_key = None
-            config.updated_at = datetime.now(timezone.utc)
-            await session.commit()
-            return True
-
-    def _llm_config_to_dict(self, config: LLMConfigModel, include_api_key: bool = False) -> Dict[str, Any]:
+    def _llm_config_to_dict(self, config: LLMConfigModel) -> Dict[str, Any]:
         """Convert LLM config model to dictionary.
 
         Args:
@@ -581,9 +516,6 @@ class DatabaseRepository:
             "description": config.description,
             "aws_profile": config.aws_profile,
         }
-        if include_api_key:
-            d["api_key"] = config.api_key
-            d["apiKey"] = config.api_key
         return d
 
     # ============================================
@@ -768,9 +700,9 @@ class DatabaseRepository:
                 secret_key=data.get("secret_key"),
                 endpoint=data.get("endpoint"),
                 region=data.get("region"),
-                aws_access_key_id=data.get("aws_access_key_id"),
-                aws_secret_access_key=data.get("aws_secret_access_key"),
-                aws_session_token=data.get("aws_session_token"),
+                access_key_id=data.get("access_key_id"),
+                secret_access_key=data.get("secret_access_key"),
+                session_token=data.get("session_token"),
                 description=data.get("description"),
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
@@ -789,8 +721,8 @@ class DatabaseRepository:
             if not key:
                 return None
             for field in ("api_key", "secret_key", "endpoint", "region",
-                         "aws_access_key_id", "aws_secret_access_key",
-                         "aws_session_token", "description"):
+                         "access_key_id", "secret_access_key",
+                         "session_token", "description"):
                 if field in data:
                     setattr(key, field, data[field])
             key.updated_at = datetime.now(timezone.utc)
@@ -806,8 +738,8 @@ class DatabaseRepository:
             key = result.scalar_one_or_none()
             if key:
                 for field in ("api_key", "secret_key", "endpoint", "region",
-                             "aws_access_key_id", "aws_secret_access_key",
-                             "aws_session_token", "description"):
+                             "access_key_id", "secret_access_key",
+                             "session_token", "description"):
                     if field in data:
                         setattr(key, field, data[field])
                 key.updated_at = datetime.now(timezone.utc)
@@ -818,9 +750,9 @@ class DatabaseRepository:
                     secret_key=data.get("secret_key"),
                     endpoint=data.get("endpoint"),
                     region=data.get("region"),
-                    aws_access_key_id=data.get("aws_access_key_id"),
-                    aws_secret_access_key=data.get("aws_secret_access_key"),
-                    aws_session_token=data.get("aws_session_token"),
+                    access_key_id=data.get("access_key_id"),
+                    secret_access_key=data.get("secret_access_key"),
+                    session_token=data.get("session_token"),
                     description=data.get("description"),
                     created_at=datetime.now(timezone.utc),
                     updated_at=datetime.now(timezone.utc),
@@ -851,7 +783,7 @@ class DatabaseRepository:
             "provider": key.provider,
             "has_api_key": bool(key.api_key),
             "has_secret_key": bool(key.secret_key),
-            "has_aws_credentials": bool(key.aws_access_key_id and key.aws_secret_access_key),
+            "has_access_credentials": bool(key.access_key_id and key.secret_access_key),
             "endpoint": key.endpoint,
             "region": key.region,
             "description": key.description,
@@ -859,9 +791,9 @@ class DatabaseRepository:
         if include_secrets:
             d["api_key"] = key.api_key
             d["secret_key"] = key.secret_key
-            d["aws_access_key_id"] = key.aws_access_key_id
-            d["aws_secret_access_key"] = key.aws_secret_access_key
-            d["aws_session_token"] = key.aws_session_token
+            d["access_key_id"] = key.access_key_id
+            d["secret_access_key"] = key.secret_access_key
+            d["session_token"] = key.session_token
         return d
 
 

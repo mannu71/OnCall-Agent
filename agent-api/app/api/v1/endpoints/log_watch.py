@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Any
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
+from app.repositories import db_repository
 
 from app.mcp.tools.watch_tools import (
     watch_log_groups,
@@ -29,6 +30,35 @@ from app.core.retry import with_retry
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/log-watch", tags=["Log Watch Analyzer"])
+
+
+async def _resolve_aws_credentials(
+    request_credentials: Optional[Any],
+    region: str,
+) -> tuple[Optional[Dict[str, Any]], str]:
+    """Return (credentials_dict, region) from request body or DB fallback."""
+    if request_credentials:
+        return request_credentials.model_dump(), region
+
+    # Fall back to credentials stored in the model_keys table
+    try:
+        for key_name in ("AWS CloudWatch", "cloudwatch", "AWS Bedrock", "bedrock", "aws bedrock", "aws"):
+            mk = await db_repository.get_model_key(key_name, include_secrets=True)
+            if mk and mk.get("access_key_id"):
+                creds: Dict[str, Any] = {
+                    "access_key_id": mk["access_key_id"],
+                    "secret_access_key": mk.get("secret_access_key"),
+                }
+                if mk.get("session_token"):
+                    creds["session_token"] = mk["session_token"]
+                # Use stored region only when caller left it at default
+                if mk.get("region") and region == "us-east-1":
+                    region = mk["region"]
+                return creds, region
+    except Exception as e:
+        logger.warning("Could not load AWS credentials from model_keys: %s", e)
+
+    return None, region
 
 
 # ============================================
@@ -245,13 +275,13 @@ async def watch_logs(request: WatchLogGroupsRequest) -> Dict[str, Any]:
     This endpoint retrieves logs from multiple log groups simultaneously,
     enabling cross-service log analysis.
     """
-    credentials = request.credentials.model_dump() if request.credentials else None
+    credentials, region = await _resolve_aws_credentials(request.credentials, request.region)
     return await with_retry(
         watch_log_groups,
         log_group_names=request.log_group_names,
         time_range_minutes=request.time_range_minutes,
         filter_pattern=request.filter_pattern,
-        region=request.region,
+        region=region,
         credentials=credentials,
         max_retries=2,
     )
@@ -264,13 +294,13 @@ async def analyze_patterns(request: AnalyzePatternsRequest) -> Dict[str, Any]:
     This endpoint identifies common patterns, error frequencies, and trends
     across the specified log groups.
     """
-    credentials = request.credentials.model_dump() if request.credentials else None
+    credentials, region = await _resolve_aws_credentials(request.credentials, request.region)
     return await with_retry(
         analyze_log_patterns,
         log_group_names=request.log_group_names,
         time_range_minutes=request.time_range_minutes,
         pattern_types=request.pattern_types,
-        region=request.region,
+        region=region,
         credentials=credentials,
         max_retries=2,
     )
@@ -283,14 +313,14 @@ async def detect_log_anomalies(request: DetectAnomaliesRequest) -> Dict[str, Any
     This endpoint compares current log patterns against a historical baseline
     to identify unusual activity, error spikes, or pattern deviations.
     """
-    credentials = request.credentials.model_dump() if request.credentials else None
+    credentials, region = await _resolve_aws_credentials(request.credentials, request.region)
     return await with_retry(
         detect_anomalies,
         log_group_names=request.log_group_names,
         time_range_minutes=request.time_range_minutes,
         baseline_minutes=request.baseline_minutes,
         sensitivity=request.sensitivity,
-        region=request.region,
+        region=region,
         credentials=credentials,
         max_retries=2,
     )
@@ -303,14 +333,14 @@ async def correlate_log_events(request: CorrelateLogsRequest) -> Dict[str, Any]:
     This endpoint traces requests across multiple log groups to identify
     the full request flow and pinpoint issues.
     """
-    credentials = request.credentials.model_dump() if request.credentials else None
+    credentials, region = await _resolve_aws_credentials(request.credentials, request.region)
     return await with_retry(
         correlate_logs,
         log_group_names=request.log_group_names,
         correlation_id=request.correlation_id,
         time_range_minutes=request.time_range_minutes,
         trace_id=request.trace_id,
-        region=request.region,
+        region=region,
         credentials=credentials,
         max_retries=2,
     )

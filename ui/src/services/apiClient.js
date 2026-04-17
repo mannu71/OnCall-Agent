@@ -109,7 +109,7 @@ export async function executeWorkflow(workflowName, input = null) {
 
 export async function executeWorkflowStream(workflowName, input = null, onProgress) {
     const params = input ? `?input=${encodeURIComponent(input)}` : '';
-    const url = `${getApiBaseUrl()}/workflows/${encodeURIComponent(workflowName)}/execute/stream${params}`;
+    const url = `${getApiBaseUrl()}/workflows/${encodeURIComponent(workflowName)}/stream${params}`;
 
     const response = await fetch(url, { method: 'POST' });
 

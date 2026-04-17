@@ -1,7 +1,19 @@
 """Main FastAPI application."""
+import os
+import ssl
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# Disable SSL certificate verification globally when AWS_SSL_VERIFY=false.
+# Required in environments where a self-signed CA is in the certificate chain.
+if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
+    ssl._create_default_https_context = ssl._create_unverified_context
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
 
 from app.config import settings
 from app.api.v1.api import api_router

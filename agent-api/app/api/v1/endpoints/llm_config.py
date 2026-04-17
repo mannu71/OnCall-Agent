@@ -20,10 +20,6 @@ class LLMProviderConfig(BaseModel):
     maxTokens: Optional[int] = Field(4096, description="Max tokens")
 
 
-class ApiKeyRequest(BaseModel):
-    api_key: str = Field(..., description="API key value")
-
-
 class DiscoverModelsRequest(BaseModel):
     provider: str = Field(..., description="Provider name from Model Keys (OpenAI, Anthropic, etc.)")
 
@@ -55,9 +51,9 @@ async def discover_provider_models(request: DiscoverModelsRequest):
     secret_key = mk.get("secret_key")
     endpoint = mk.get("endpoint")
     region = mk.get("region")
-    aws_access_key_id = mk.get("aws_access_key_id")
-    aws_secret_access_key = mk.get("aws_secret_access_key")
-    aws_session_token = mk.get("aws_session_token")
+    access_key_id = mk.get("access_key_id")
+    secret_access_key = mk.get("secret_access_key")
+    session_token = mk.get("session_token")
 
     ICON_MAP = {
         "gpt": "🧠",
@@ -92,11 +88,11 @@ async def discover_provider_models(request: DiscoverModelsRequest):
         if provider == "AWS Bedrock":
             bedrock_region = region or "us-east-1"
             kwargs = {"region_name": bedrock_region}
-            if aws_access_key_id and aws_secret_access_key:
-                kwargs["aws_access_key_id"] = aws_access_key_id
-                kwargs["aws_secret_access_key"] = aws_secret_access_key
-                if aws_session_token:
-                    kwargs["aws_session_token"] = aws_session_token
+            if access_key_id and secret_access_key:
+                kwargs["aws_access_key_id"] = access_key_id
+                kwargs["aws_secret_access_key"] = secret_access_key
+                if session_token:
+                    kwargs["aws_session_token"] = session_token
             import os
             if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
                 from botocore.config import Config
@@ -326,9 +322,9 @@ async def discover_provider_models(request: DiscoverModelsRequest):
 
 class AWSDiscoverRequest(BaseModel):
     region: Optional[str] = Field("us-east-1", description="AWS region")
-    aws_access_key_id: Optional[str] = Field(None, description="AWS Access Key ID")
-    aws_secret_access_key: Optional[str] = Field(None, description="AWS Secret Access Key")
-    aws_session_token: Optional[str] = Field(None, description="AWS Session Token")
+    access_key_id: Optional[str] = Field(None, description="Access Key ID")
+    secret_access_key: Optional[str] = Field(None, description="Secret Access Key")
+    session_token: Optional[str] = Field(None, description="Session Token")
 
 
 class LLMConfigCreate(BaseModel):
@@ -380,16 +376,16 @@ async def discover_bedrock_models(request: Optional[AWSDiscoverRequest] = None):
     from botocore.exceptions import ClientError
 
     region = (request.region if request else None) or "us-east-1"
-    aws_access_key_id = request.aws_access_key_id if request else None
-    aws_secret_access_key = request.aws_secret_access_key if request else None
-    aws_session_token = request.aws_session_token if request else None
+    access_key_id = request.access_key_id if request else None
+    secret_access_key = request.secret_access_key if request else None
+    session_token = request.session_token if request else None
 
     kwargs = {"region_name": region}
-    if aws_access_key_id and aws_secret_access_key:
-        kwargs["aws_access_key_id"] = aws_access_key_id
-        kwargs["aws_secret_access_key"] = aws_secret_access_key
-        if aws_session_token:
-            kwargs["aws_session_token"] = aws_session_token
+    if access_key_id and secret_access_key:
+        kwargs["aws_access_key_id"] = access_key_id
+        kwargs["aws_secret_access_key"] = secret_access_key
+        if session_token:
+            kwargs["aws_session_token"] = session_token
 
     import os
     if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
@@ -496,40 +492,34 @@ async def add_discovered_models(request: AddDiscoveredModelsRequest):
 
 @router.get("", response_model=Dict[str, Any])
 async def get_llm_config():
-    configs = await db_repository.list_llm_configs(include_api_key=True)
+    configs = await db_repository.list_llm_configs()
     masked_llms = {}
     for name, cfg in configs.items():
         masked = {**cfg}
-        if masked.get("api_key"):
-            masked["api_key"] = mask_api_key(masked["api_key"])
-            masked["apiKey"] = mask_api_key(masked["apiKey"])
-        if masked.get("aws_access_key_id"):
-            masked["aws_access_key_id"] = mask_api_key(masked["aws_access_key_id"])
-        if masked.get("aws_secret_access_key"):
-            masked["aws_secret_access_key"] = mask_api_key(masked["aws_secret_access_key"])
-        if masked.get("aws_session_token"):
-            masked["aws_session_token"] = mask_api_key(masked["aws_session_token"])
+        if masked.get("access_key_id"):
+            masked["access_key_id"] = mask_api_key(masked["access_key_id"])
+        if masked.get("secret_access_key"):
+            masked["secret_access_key"] = mask_api_key(masked["secret_access_key"])
+        if masked.get("session_token"):
+            masked["session_token"] = mask_api_key(masked["session_token"])
         masked_llms[name] = masked
     return {"llms": masked_llms}
 
 
 @router.get("/{llm_name}", response_model=Dict[str, Any])
 async def get_llm_by_name(llm_name: str):
-    cfg = await db_repository.get_llm_config(llm_name, include_api_key=True)
+    cfg = await db_repository.get_llm_config(llm_name)
     if not cfg:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"LLM configuration '{llm_name}' not found"
         )
-    if cfg.get("api_key"):
-        cfg["api_key"] = mask_api_key(cfg["api_key"])
-        cfg["apiKey"] = mask_api_key(cfg["apiKey"])
-    if cfg.get("aws_access_key_id"):
-        cfg["aws_access_key_id"] = mask_api_key(cfg["aws_access_key_id"])
-    if cfg.get("aws_secret_access_key"):
-        cfg["aws_secret_access_key"] = mask_api_key(cfg["aws_secret_access_key"])
-    if cfg.get("aws_session_token"):
-        cfg["aws_session_token"] = mask_api_key(cfg["aws_session_token"])
+    if cfg.get("access_key_id"):
+        cfg["access_key_id"] = mask_api_key(cfg["access_key_id"])
+    if cfg.get("secret_access_key"):
+        cfg["secret_access_key"] = mask_api_key(cfg["secret_access_key"])
+    if cfg.get("session_token"):
+        cfg["session_token"] = mask_api_key(cfg["session_token"])
     return {"name": llm_name, **cfg}
 
 
@@ -600,66 +590,23 @@ async def bulk_delete_llm_configs(request: BulkDeleteRequest):
     }
 
 
-@router.post("/{llm_name}/api-key", response_model=Dict[str, Any])
-async def set_api_key(llm_name: str, request: ApiKeyRequest):
-    result = await db_repository.set_llm_api_key(llm_name, request.api_key)
-    if not result:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"LLM configuration '{llm_name}' not found"
-        )
-    logger.info("Set API key for LLM: %s", llm_name)
-    return {"success": True, "message": f"API key set for {llm_name}"}
-
-
-@router.get("/{llm_name}/api-key/masked", response_model=Dict[str, Any])
-async def get_api_key_masked(llm_name: str):
-    api_key = await db_repository.get_llm_api_key(llm_name)
-    if api_key is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"LLM configuration '{llm_name}' not found"
-        )
-    masked = mask_api_key(api_key) if api_key else ""
-    return {"success": True, "masked": masked}
-
-
-@router.get("/{llm_name}/api-key/exists", response_model=Dict[str, Any])
-async def check_api_key_exists(llm_name: str):
-    api_key = await db_repository.get_llm_api_key(llm_name)
-    exists = bool(api_key)
-    return {"success": True, "exists": exists}
-
-
-@router.delete("/{llm_name}/api-key", response_model=Dict[str, Any])
-async def delete_api_key(llm_name: str):
-    deleted = await db_repository.delete_llm_api_key(llm_name)
-    if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"LLM configuration '{llm_name}' not found"
-        )
-    logger.info("Deleted API key for LLM: %s", llm_name)
-    return {"success": True, "message": f"API key deleted for {llm_name}"}
-
-
 class LLMTestRequest(BaseModel):
     provider: Optional[str] = Field(None, description="Override provider")
     model: Optional[str] = Field(None, description="Override model")
     endpoint: Optional[str] = Field(None, description="Override endpoint URL")
     baseUrl: Optional[str] = Field(None, description="Override base URL")
-    api_key: Optional[str] = Field(None, description="API key for non-AWS providers")
-    aws_access_key_id: Optional[str] = Field(None, description="AWS Access Key ID")
-    aws_secret_access_key: Optional[str] = Field(None, description="AWS Secret Access Key")
-    aws_session_token: Optional[str] = Field(None, description="AWS Session Token")
-    region: Optional[str] = Field(None, description="AWS region override")
+    api_key: Optional[str] = Field(None, description="API key override")
+    access_key_id: Optional[str] = Field(None, description="Access Key ID")
+    secret_access_key: Optional[str] = Field(None, description="Secret Access Key")
+    session_token: Optional[str] = Field(None, description="Session Token")
+    region: Optional[str] = Field(None, description="Region override")
 
 
 @router.post("/{llm_name}/test", response_model=Dict[str, Any])
 async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] = None):
     import httpx
 
-    cfg = await db_repository.get_llm_config(llm_name, include_api_key=True)
+    cfg = await db_repository.get_llm_config(llm_name)
     if not cfg:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -678,12 +625,12 @@ async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] =
             test_config["base_url"] = request.baseUrl
         if request.api_key:
             test_config["api_key"] = request.api_key
-        if request.aws_access_key_id:
-            test_config["aws_access_key_id"] = request.aws_access_key_id
-        if request.aws_secret_access_key:
-            test_config["aws_secret_access_key"] = request.aws_secret_access_key
-        if request.aws_session_token:
-            test_config["aws_session_token"] = request.aws_session_token
+        if request.access_key_id:
+            test_config["access_key_id"] = request.access_key_id
+        if request.secret_access_key:
+            test_config["secret_access_key"] = request.secret_access_key
+        if request.session_token:
+            test_config["session_token"] = request.session_token
         if request.region:
             test_config["region"] = request.region
 
@@ -691,7 +638,7 @@ async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] =
     model = test_config.get("model", "")
     endpoint = test_config.get("endpoint", "")
     base_url = test_config.get("base_url") or test_config.get("baseUrl", "")
-    api_key = test_config.get("api_key") or test_config.get("apiKey", "")
+    api_key = ""
 
     if not api_key and provider not in ("AWS Bedrock", "Bedrock", "bedrock", "Ollama"):
         mk = await db_repository.get_model_key(provider, include_secrets=True)
@@ -784,27 +731,27 @@ async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] =
                 from botocore.exceptions import ClientError as BotoClientError
 
                 region = test_config.get("region", "us-east-1")
-                aws_access_key_id = test_config.get("aws_access_key_id")
-                aws_secret_access_key = test_config.get("aws_secret_access_key")
-                aws_session_token = test_config.get("aws_session_token")
+                access_key_id = test_config.get("access_key_id")
+                secret_access_key = test_config.get("secret_access_key")
+                session_token = test_config.get("session_token")
 
                 mk = await db_repository.get_model_key("AWS Bedrock", include_secrets=True)
                 if mk:
-                    if not aws_access_key_id and mk.get("aws_access_key_id"):
-                        aws_access_key_id = mk["aws_access_key_id"]
-                    if not aws_secret_access_key and mk.get("aws_secret_access_key"):
-                        aws_secret_access_key = mk["aws_secret_access_key"]
-                    if not aws_session_token and mk.get("aws_session_token"):
-                        aws_session_token = mk["aws_session_token"]
+                    if not access_key_id and mk.get("access_key_id"):
+                        access_key_id = mk["access_key_id"]
+                    if not secret_access_key and mk.get("secret_access_key"):
+                        secret_access_key = mk["secret_access_key"]
+                    if not session_token and mk.get("session_token"):
+                        session_token = mk["session_token"]
                     if (not region or region == "us-east-1") and mk.get("region"):
                         region = mk["region"]
 
                 boto_kwargs = {"region_name": region}
-                if aws_access_key_id and aws_secret_access_key:
-                    boto_kwargs["aws_access_key_id"] = aws_access_key_id
-                    boto_kwargs["aws_secret_access_key"] = aws_secret_access_key
-                    if aws_session_token:
-                        boto_kwargs["aws_session_token"] = aws_session_token
+                if access_key_id and secret_access_key:
+                    boto_kwargs["aws_access_key_id"] = access_key_id
+                    boto_kwargs["aws_secret_access_key"] = secret_access_key
+                    if session_token:
+                        boto_kwargs["aws_session_token"] = session_token
                 if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
                     boto_kwargs["verify"] = False
 

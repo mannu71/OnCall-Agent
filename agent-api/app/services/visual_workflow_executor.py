@@ -752,9 +752,29 @@ class VisualWorkflowExecutor:
             }
 
         time_range_minutes = self._parse_time_range_minutes(time_range)
-        credentials = {}
+        credentials: Dict[str, Any] = {}
+
+        # Prefer aws_profile from node config (e.g. test-dev refreshed via aws-azure-login).
+        # Fall back to DB-stored access keys if no profile is set.
         if aws_profile:
             credentials["aws_profile"] = aws_profile
+        else:
+            try:
+                from app.repositories import db_repository
+                for key_name in ("AWS CloudWatch", "cloudwatch", "AWS Bedrock", "bedrock", "aws bedrock", "aws"):
+                    mk = await db_repository.get_model_key(key_name, include_secrets=True)
+                    if mk and mk.get("access_key_id"):
+                        credentials["access_key_id"] = mk["access_key_id"]
+                        if mk.get("secret_access_key"):
+                            credentials["secret_access_key"] = mk["secret_access_key"]
+                        if mk.get("session_token"):
+                            credentials["session_token"] = mk["session_token"]
+                        if mk.get("region") and (not aws_region or aws_region == "us-east-1"):
+                            aws_region = mk["region"]
+                        break
+            except Exception as _cred_err:
+                logger.warning("Could not load AWS credentials from model_keys: %s", _cred_err)
+
 
         try:
             if analysis_type == 'error-patterns':

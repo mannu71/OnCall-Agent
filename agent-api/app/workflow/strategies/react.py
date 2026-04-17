@@ -463,14 +463,13 @@ class ReactStrategy(BaseStrategy):
                 "max_tokens": llm_data.get("maxTokens") or llm_data.get("max_tokens") or 4096,
                 "region": llm_data.get("region", "us-east-1"),
                 "base_url": llm_data.get("baseUrl") or llm_data.get("base_url"),
-                "api_key": llm_data.get("apiKey") or llm_data.get("api_key"),
             }
 
         if not resolved:
             config_name = llm_data.get("configName") or llm_data.get("llmConfigId")
             if config_name:
                 try:
-                    cfg = await db_repository.get_llm_config(config_name, include_api_key=True)
+                    cfg = await db_repository.get_llm_config(config_name)
                     if cfg:
                         resolved = {
                             "provider": cfg["provider"],
@@ -479,14 +478,13 @@ class ReactStrategy(BaseStrategy):
                             "max_tokens": cfg.get("max_tokens", 4096),
                             "region": cfg.get("region", "us-east-1"),
                             "base_url": cfg.get("base_url"),
-                            "api_key": cfg.get("api_key"),
                         }
                 except Exception as e:
                     logger.warning("Could not load LLM config '%s' from DB: %s", config_name, e)
 
         if not resolved:
             try:
-                db_configs = await db_repository.list_llm_configs(include_api_key=True)
+                db_configs = await db_repository.list_llm_configs()
                 if db_configs:
                     first_name, cfg = next(iter(db_configs.items()))
                     logger.info("ReactStrategy: using first available LLM config '%s'", first_name)
@@ -497,7 +495,6 @@ class ReactStrategy(BaseStrategy):
                         "max_tokens": cfg.get("max_tokens", 4096),
                         "region": cfg.get("region", "us-east-1"),
                         "base_url": cfg.get("base_url"),
-                        "api_key": cfg.get("api_key"),
                     }
             except Exception as e:
                 logger.warning("Could not load LLM configs from DB: %s", e)
@@ -527,12 +524,12 @@ class ReactStrategy(BaseStrategy):
                 for bedrock_key in ("AWS Bedrock", "bedrock", "aws bedrock", "aws"):
                     mk = await db_repository.get_model_key(bedrock_key, include_secrets=True)
                     if mk:
-                        if mk.get("aws_access_key_id"):
-                            resolved["aws_access_key_id"] = mk["aws_access_key_id"]
-                        if mk.get("aws_secret_access_key"):
-                            resolved["aws_secret_access_key"] = mk["aws_secret_access_key"]
-                        if mk.get("aws_session_token"):
-                            resolved["aws_session_token"] = mk["aws_session_token"]
+                        if mk.get("access_key_id"):
+                            resolved["access_key_id"] = mk["access_key_id"]
+                        if mk.get("secret_access_key"):
+                            resolved["secret_access_key"] = mk["secret_access_key"]
+                        if mk.get("session_token"):
+                            resolved["session_token"] = mk["session_token"]
                         if mk.get("region") and (not resolved.get("region") or resolved["region"] == "us-east-1"):
                             resolved["region"] = mk["region"]
                         break
@@ -737,20 +734,35 @@ class ReactStrategy(BaseStrategy):
             from langchain_aws import ChatBedrockConverse
             import boto3
             from botocore.config import Config as BotocoreConfig
-            aws_access_key_id = llm_config.get("aws_access_key_id")
-            aws_secret_access_key = llm_config.get("aws_secret_access_key")
-            aws_session_token = llm_config.get("aws_session_token")
+            access_key_id = llm_config.get("access_key_id")
+            secret_access_key = llm_config.get("secret_access_key")
+            session_token = llm_config.get("session_token")
             aws_profile = llm_config.get("aws_profile") or llm_config.get("profile")
+            # Newer Bedrock models (e.g. Claude 3.5/4.x) require a cross-region
+            # inference profile ID instead of the bare model ID for on-demand calls.
+            # Automatically prepend the region prefix when the model ID looks like a
+            # plain foundation model ID (e.g. "anthropic.claude-*") with no prefix.
+            _INFERENCE_PROFILE_PREFIXES = ("us.", "eu.", "ap.")
+            _NEEDS_PROFILE_PROVIDERS = ("anthropic.", "amazon.", "meta.", "mistral.")
+            if not any(model.startswith(p) for p in _INFERENCE_PROFILE_PREFIXES) and \
+                    any(model.startswith(p) for p in _NEEDS_PROFILE_PROVIDERS):
+                if region.startswith("eu-"):
+                    model = f"eu.{model}"
+                elif region.startswith("ap-"):
+                    model = f"ap.{model}"
+                else:
+                    model = f"us.{model}"
+                logger.info("ReactStrategy: remapped model to inference profile ID: %s", model)
             logger.info(
                 "ReactStrategy: using ChatBedrockConverse model=%s region=%s has_explicit_creds=%s profile=%s",
-                model, region, bool(aws_access_key_id), aws_profile,
+                model, region, bool(access_key_id), aws_profile,
             )
-            if aws_access_key_id and aws_secret_access_key:
+            if access_key_id and secret_access_key:
                 boto_session = boto3.Session(
                     region_name=region,
-                    aws_access_key_id=aws_access_key_id,
-                    aws_secret_access_key=aws_secret_access_key,
-                    aws_session_token=aws_session_token,
+                    aws_access_key_id=access_key_id,
+                    aws_secret_access_key=secret_access_key,
+                    aws_session_token=session_token,
                 )
             else:
                 boto_session = boto3.Session(region_name=region, profile_name=aws_profile)
