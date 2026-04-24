@@ -37,12 +37,58 @@ def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
             output = {
                 'analysis_type': cloudwatch_output.get('analysis_type'),
                 'log_groups_analyzed': cloudwatch_output.get('log_groups_analyzed', []),
+                'time_range': cloudwatch_output.get('time_range'),
                 'results': cloudwatch_output.get('data', {}),
+                            User Query
+                    │
+                    ▼
+                KB Recall (knowledge_base.search_known_issues / search_similar_patterns)
+                    │  prepends matching past resolutions as <memory-context> to the query
+                    ▼
+                _extract_cloudwatch_config()
+                    │  BFS over workflow edges — finds all cloudwatchAnalyzer nodes
+                    │  reachable from an agent node, merges their logGroups/region/profile
+                    ▼
+                _setup_tools()  (MCP tools)
+                    │  connects to MCP servers → LangChain BaseTool list
+                    ▼
+                build_cloudwatch_agent_tools()  [only if CW node is wired up]
+                    │  resolves AWS credentials via resolve_aws_credentials()
+                    │  wraps 5 async functions as LangChain StructuredTools
+                    │  appends them to the tool list
+                    ▼
+                cloudwatch_context injection (if upstream CW analysis already ran)
+                    │  prepends [Pre-computed CloudWatch Analysis] JSON into augmented query
+                    ▼
+                _build_agent()  → LangGraph create_react_agent StateGraph
+                    │  LLM + all tools → ReAct graph
+                    ▼
+                _execute_agent()  → agent.astream_events()
+                    │  ReAct loop: Thought → Tool Call → Observation → repeat → Final Answer
+                    ▼
+                _auto_learn()  → knowledge_base.record_analysis / add_known_issue    'output': cloudwatch_output.get('output'),
+                'model': cloudwatch_output.get('model'),
             }
             if cloudwatch_output.get('alerts'):
                 output['alerts'] = cloudwatch_output['alerts']
             execution['output'] = output
-    
+
+    if not orchestrator_output and not execution.get('output'):
+        react_output = next(
+            (v for v in results.values() if isinstance(v, dict) and v.get('type') == 'react'),
+            None
+        )
+        if react_output:
+            execution['output'] = {
+                'type': 'react',
+                'final_answer': react_output.get('final_answer'),
+                'user_query': react_output.get('user_query'),
+                'message_count': react_output.get('message_count', 0),
+                'tool_calls': react_output.get('tool_calls', []),
+                'model': react_output.get('model'),
+                'provider': react_output.get('provider'),
+            }
+
     return execution
 
 

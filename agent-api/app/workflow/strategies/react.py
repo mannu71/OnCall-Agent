@@ -248,6 +248,7 @@ class ReactStrategy(BaseStrategy):
             agent_config = self._extract_agent_config(workflow)
             llm_config = await self._resolve_llm_config(workflow)
             tools_config = self._extract_tools_config(workflow)
+            cloudwatch_config = self._extract_cloudwatch_config(workflow)
 
             # ------------------------------------------------------------------
             # Pre-execution recall: inject relevant past knowledge into the query.
@@ -277,9 +278,57 @@ class ReactStrategy(BaseStrategy):
 
             tools = await self._setup_tools(tools_config, mcp_manager, execution_id)
 
+            # ------------------------------------------------------------------
+            # CloudWatch tools: only injected when a cloudwatchAnalyzer node is
+            # connected to the agent node via workflow edges.
+            # ------------------------------------------------------------------
+            if cloudwatch_config:
+                try:
+                    from app.core.aws_credentials import resolve_aws_credentials
+                    from app.workflow.tools.cloudwatch_agent_tools import build_cloudwatch_agent_tools
+
+                    cw_creds, cw_region = await resolve_aws_credentials(
+                        aws_profile=cloudwatch_config.get("aws_profile"),
+                        aws_region=cloudwatch_config.get("aws_region", "us-east-1"),
+                    )
+                    cw_tools = build_cloudwatch_agent_tools(
+                        region=cw_region,
+                        credentials=cw_creds,
+                        log_groups=cloudwatch_config.get("log_groups"),
+                    )
+                    tools.extend(cw_tools)
+                    logger_instance.info(
+                        "ReactStrategy: added %d CloudWatch tools to agent",
+                        len(cw_tools),
+                        extra={"execution_id": execution_id},
+                    )
+                except Exception as _cw_err:
+                    logger_instance.warning(
+                        "ReactStrategy: failed to build CloudWatch tools (non-fatal): %s",
+                        redact(str(_cw_err)),
+                        extra={"execution_id": execution_id},
+                    )
+
+            # ------------------------------------------------------------------
+            # Cross-node data: inject upstream CloudWatch results into context.
+            # ------------------------------------------------------------------
+            cw_context = context.get("cloudwatch_context")
+            if cw_context:
+                import json
+                cw_summary = json.dumps(cw_context, indent=2, default=str)
+                augmented_query = (
+                    f"[Pre-computed CloudWatch Analysis]\n{cw_summary}"
+                    f"\n\n---\n\n{augmented_query}"
+                )
+                logger_instance.info(
+                    "ReactStrategy: injected CloudWatch context (%d chars) into query",
+                    len(cw_summary),
+                    extra={"execution_id": execution_id},
+                )
+
             llm = self._build_llm(llm_config)
 
-            agent = self._build_agent(llm, tools, agent_config)
+            agent = self._build_agent(llm, tools, agent_config, has_cloudwatch=bool(cloudwatch_config))
 
             result = await self._execute_agent(
                 agent, augmented_query, logger_instance, execution_id, stream_callback
@@ -538,10 +587,89 @@ class ReactStrategy(BaseStrategy):
 
         return resolved
 
-    def _extract_tools_config(self, workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Extract tool node configurations from workflow."""
+    @staticmethod
+    def _get_connected_node_ids(
+        workflow: Dict[str, Any],
+        target_type: str,
+    ) -> List[str]:
+        """Return IDs of nodes of *target_type* connected to any ``agent`` node.
+
+        Uses undirected BFS across the workflow edges so that connection is
+        detected regardless of edge direction.  This is the single source of
+        truth for "is this node wired to the agent?".
+
+        Args:
+            workflow: Full workflow definition (nodes + edges).
+            target_type: The ``type`` value to look for (e.g. ``"tool"``,
+                ``"cloudwatchAnalyzer"``).
+
+        Returns:
+            List of node IDs of type *target_type* reachable from at least one
+            agent node.
+        """
         nodes = workflow.get("nodes", [])
-        tool_nodes = [n for n in nodes if n.get("type") == "tool"]
+        edges = workflow.get("edges", [])
+
+        agent_ids = {n["id"] for n in nodes if n.get("type") == "agent"}
+        target_ids = {n["id"] for n in nodes if n.get("type") == target_type}
+
+        if not agent_ids or not target_ids:
+            return []
+
+        # Build undirected adjacency.
+        neighbours: Dict[str, set] = {}
+        for edge in edges:
+            src = edge.get("source")
+            tgt = edge.get("target")
+            if src and tgt:
+                neighbours.setdefault(src, set()).add(tgt)
+                neighbours.setdefault(tgt, set()).add(src)
+
+        # BFS from every agent node.
+        visited: set = set()
+        queue = list(agent_ids)
+        connected: List[str] = []
+
+        while queue:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            if current in target_ids:
+                connected.append(current)
+            for neighbour in neighbours.get(current, set()):
+                if neighbour not in visited:
+                    queue.append(neighbour)
+
+        return connected
+
+    def _extract_tools_config(self, workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Extract tool node configurations from workflow.
+
+        Only tool nodes connected to the agent via edges are included.
+        This prevents stray/unconnected tool nodes from being registered
+        on the agent.
+        """
+        nodes = workflow.get("nodes", [])
+        connected_ids = set(self._get_connected_node_ids(workflow, "tool"))
+
+        tool_nodes = [
+            n for n in nodes
+            if n.get("type") == "tool" and n.get("id") in connected_ids
+        ]
+
+        if not tool_nodes:
+            # Backwards-compat: if the graph has no edges at all (e.g. a
+            # minimal/legacy workflow), fall back to including all tool nodes
+            # so existing workflows don't break silently.
+            edges = workflow.get("edges", [])
+            if not edges:
+                tool_nodes = [n for n in nodes if n.get("type") == "tool"]
+                if tool_nodes:
+                    logger.info(
+                        "ReactStrategy: no edges in workflow — falling back to all %d tool node(s)",
+                        len(tool_nodes),
+                    )
 
         tools = []
         for tool_node in tool_nodes:
@@ -568,6 +696,55 @@ class ReactStrategy(BaseStrategy):
                 })
 
         return tools
+
+    def _extract_cloudwatch_config(
+        self, workflow: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Extract CloudWatch config from CW nodes connected to the agent node.
+
+        Only returns a config when a ``cloudwatchAnalyzer`` node is reachable
+        from (connected to) an ``agent`` node via the workflow's edges.  This
+        ensures CW tools are **only** registered when explicitly wired up.
+
+        Returns:
+            Merged CloudWatch config dict, or ``None`` if no CW node is
+            connected to the agent.
+        """
+        nodes = workflow.get("nodes", [])
+        connected_cw_ids = self._get_connected_node_ids(workflow, "cloudwatchAnalyzer")
+
+        if not connected_cw_ids:
+            return None
+
+        cw_nodes = {n["id"]: n for n in nodes if n.get("type") == "cloudwatchAnalyzer"}
+
+        # Merge configs from all connected CW nodes.
+        merged_log_groups: List[str] = []
+        merged_region = "us-east-1"
+        merged_profile: Optional[str] = None
+
+        for cw_id in connected_cw_ids:
+            cw_data = cw_nodes[cw_id].get("data", {})
+            for lg in cw_data.get("logGroups", []):
+                if lg and lg not in merged_log_groups:
+                    merged_log_groups.append(lg)
+            if cw_data.get("awsRegion"):
+                merged_region = cw_data["awsRegion"]
+            if cw_data.get("awsProfile"):
+                merged_profile = cw_data["awsProfile"]
+
+        logger.info(
+            "ReactStrategy: %d cloudwatchAnalyzer node(s) connected to agent, "
+            "log_groups=%s",
+            len(connected_cw_ids),
+            merged_log_groups,
+        )
+
+        return {
+            "log_groups": merged_log_groups,
+            "aws_region": merged_region,
+            "aws_profile": merged_profile,
+        }
 
     # ------------------------------------------------------------------
     # Tool setup (MCP → LangChain)
@@ -895,6 +1072,7 @@ class ReactStrategy(BaseStrategy):
         llm: Any,
         tools: List[Any],
         agent_config: Dict[str, Any],
+        has_cloudwatch: bool = False,
     ) -> Any:
         """
         Build a LangGraph ReAct agent graph.
@@ -906,6 +1084,7 @@ class ReactStrategy(BaseStrategy):
             llm: LangChain chat model instance.
             tools: List of LangChain BaseTool instances.
             agent_config: Agent node data with optional system prompt / instructions.
+            has_cloudwatch: If True, add CloudWatch-specific instructions.
 
         Returns:
             Compiled LangGraph agent (CompiledGraph).
@@ -926,6 +1105,21 @@ class ReactStrategy(BaseStrategy):
             "to record the resolution so future investigations can benefit from it.",
         ]
 
+        # CloudWatch-specific instructions when CW nodes are connected.
+        if has_cloudwatch:
+            system_parts.append(
+                "\nYou also have access to CloudWatch log analysis tools. "
+                "Use them to investigate log patterns, detect anomalies, and correlate "
+                "events across services. When analysing logs:\n"
+                "- Start with cloudwatch_analyze_patterns to identify error trends.\n"
+                "- Use cloudwatch_detect_anomalies to compare current activity against baselines.\n"
+                "- Use cloudwatch_correlate_logs with a correlation or trace ID to trace requests across services.\n"
+                "- Use cloudwatch_search_logs for custom Insights queries when you need specific data.\n"
+                "- Use cloudwatch_watch_logs to retrieve raw log events for detailed inspection.\n"
+                "- Look for error spikes, unusual patterns, and cross-service correlations.\n"
+                "- If pre-computed CloudWatch analysis is provided, review it before making additional queries."
+            )
+
         if instructions:
             system_parts.append(f"\nAdditional instructions:\n{instructions}")
 
@@ -942,10 +1136,11 @@ class ReactStrategy(BaseStrategy):
         all_tools = list(tools) + playbook_tools
 
         logger.info(
-            "ReactStrategy: building LangGraph ReAct agent with %d tool(s) (%d playbook), mode=%s",
+            "ReactStrategy: building LangGraph ReAct agent with %d tool(s) (%d playbook), mode=%s, cloudwatch=%s",
             len(all_tools),
             len(playbook_tools),
             agent_mode,
+            has_cloudwatch,
         )
 
         agent = create_react_agent(

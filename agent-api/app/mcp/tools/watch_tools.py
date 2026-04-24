@@ -450,6 +450,33 @@ async def analyze_log_patterns(
                 "error": str(e)
             }
     
+    # -------------------------------------------------------------------
+    # Unique patterns: group errors by message to identify distinct issues
+    # instead of just counting them in 5-minute buckets.
+    # -------------------------------------------------------------------
+    unique_patterns = []
+    try:
+        unique_query = """
+        fields @timestamp, @message, @logStream
+        | filter level = "ERROR" OR @message like /(?i)(error|exception|fail)/
+        | stats count() as occurrence_count,
+                count_distinct(@logStream) as affected_streams,
+                min(@timestamp) as first_seen,
+                max(@timestamp) as last_seen
+          by substr(@message, 0, 200) as error_pattern
+        | sort occurrence_count desc
+        | limit 50
+        """
+        unique_result = await watcher.query_with_insights(
+            log_group_names=log_group_names,
+            query_string=unique_query,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        unique_patterns = unique_result.get("results", [])[:50]
+    except Exception as e:
+        logger.warning("analyze_log_patterns: unique_patterns query failed: %s", e)
+
     # Get overall statistics
     stats_query = """
     fields @timestamp, @message
@@ -471,6 +498,7 @@ async def analyze_log_patterns(
     return {
         "success": True,
         "patterns": results,
+        "unique_patterns": unique_patterns,
         "statistics": stats_result,
         "time_range": {
             "start": start_time.isoformat(),
@@ -564,7 +592,7 @@ async def detect_anomalies(
             end_time=baseline_end
         )
         
-        # Calculate baseline average
+        # Calculate baseline statistics for z-score analysis.
         baseline_counts = []
         for result in baseline_result.get("results", []):
             for field in result:
@@ -575,8 +603,23 @@ async def detect_anomalies(
                         pass
         
         baseline_avg = sum(baseline_counts) / len(baseline_counts) if baseline_counts else 0
+
+        # Compute standard deviation for z-score based anomaly detection.
+        if len(baseline_counts) >= 2:
+            variance = sum((x - baseline_avg) ** 2 for x in baseline_counts) / len(baseline_counts)
+            baseline_std = variance ** 0.5
+        else:
+            baseline_std = 0.0
+
+        # Map sensitivity to z-score thresholds.
+        z_thresholds = {
+            "low": 3.0,
+            "medium": 2.0,
+            "high": 1.5,
+        }
+        z_threshold = z_thresholds.get(sensitivity, 2.0)
         
-        # Check current period for anomalies
+        # Check current period for anomalies using z-score.
         for result in current_result.get("results", []):
             timestamp = None
             count = 0
@@ -590,14 +633,38 @@ async def detect_anomalies(
                     except (ValueError, TypeError):
                         pass
             
-            if baseline_avg > 0 and count > baseline_avg * threshold:
-                deviation = count / baseline_avg if baseline_avg > 0 else float('inf')
+            # Use z-score when we have enough baseline data; fall back to the
+            # simple deviation multiplier otherwise.
+            is_anomaly = False
+            z_score = 0.0
+            deviation = 0.0
+
+            if baseline_std > 0:
+                z_score = (count - baseline_avg) / baseline_std
+                is_anomaly = z_score > z_threshold
+            elif baseline_avg > 0:
+                deviation = count / baseline_avg
+                is_anomaly = deviation > threshold
+
+            if is_anomaly:
+                # Classify severity from z-score ranges.
+                if z_score >= 4.0 or deviation >= 4.0:
+                    severity = "critical"
+                elif z_score >= 3.0 or deviation >= 3.0:
+                    severity = "high"
+                elif z_score >= 2.0 or deviation >= 2.0:
+                    severity = "medium"
+                else:
+                    severity = "low"
+
                 anomalies.append({
                     "timestamp": timestamp,
                     "current_count": count,
                     "baseline_average": round(baseline_avg, 2),
-                    "deviation_factor": round(deviation, 2),
-                    "severity": "high" if deviation > 3 else "medium" if deviation > 2 else "low"
+                    "baseline_std_dev": round(baseline_std, 2),
+                    "z_score": round(z_score, 2),
+                    "deviation_factor": round(count / baseline_avg, 2) if baseline_avg > 0 else None,
+                    "severity": severity,
                 })
     
     except Exception as e:
@@ -611,12 +678,15 @@ async def detect_anomalies(
         "anomalies": anomalies,
         "summary": {
             "total_anomalies": len(anomalies),
+            "critical_severity": len([a for a in anomalies if a["severity"] == "critical"]),
             "high_severity": len([a for a in anomalies if a["severity"] == "high"]),
             "medium_severity": len([a for a in anomalies if a["severity"] == "medium"]),
             "low_severity": len([a for a in anomalies if a["severity"] == "low"]),
             "baseline_period_minutes": baseline_minutes,
             "current_period_minutes": time_range_minutes,
-            "sensitivity": sensitivity
+            "sensitivity": sensitivity,
+            "baseline_average": round(baseline_avg, 2),
+            "baseline_std_dev": round(baseline_std, 2) if baseline_std else None,
         },
         "log_groups_analyzed": log_group_names
     }

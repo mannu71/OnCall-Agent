@@ -407,6 +407,7 @@ export default function Dashboard() {
               const orchestratorKey = Object.keys(resultData).find(k => k.startsWith('orchestrator'));
               const orchestrator = orchestratorKey ? resultData[orchestratorKey] : null;
               const isCloudWatch = selectedRun?.output?.analysis_type;
+              const isReact = selectedRun?.output?.type === 'react';
 
               const queriesExecuted = orchestrator?.queries_executed || selectedRun?.output?.queries_executed || 0;
               const failures = orchestrator?.failures || selectedRun?.output?.failures || 0;
@@ -432,6 +433,31 @@ export default function Dashboard() {
                     <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
                       <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Alerts</p>
                       <p className="mt-2 text-4xl font-bold text-emerald-600">{alertsCount}</p>
+                    </div>
+                  </div>
+                );
+              }
+
+              if (isReact) {
+                const msgCount = selectedRun?.output?.message_count || 0;
+                const toolCalls = selectedRun?.output?.tool_calls?.length || 0;
+                return (
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Execution ID</p>
+                      <p className="mt-2 text-4xl font-bold text-slate-900">{selectedRun?.execution_id || selectedRun?.id}</p>
+                    </div>
+                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Duration</p>
+                      <p className="mt-2 text-4xl font-bold text-slate-900">{duration}<span className="text-xl ml-1 text-slate-400">s</span></p>
+                    </div>
+                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Messages</p>
+                      <p className="mt-2 text-4xl font-bold text-blue-700">{msgCount}</p>
+                    </div>
+                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Tool Calls</p>
+                      <p className="mt-2 text-4xl font-bold text-emerald-600">{toolCalls}</p>
                     </div>
                   </div>
                 );
@@ -465,6 +491,7 @@ export default function Dashboard() {
               const orchestratorKey = Object.keys(resultData).find(k => k.startsWith('orchestrator'));
               const orchestrator = orchestratorKey ? resultData[orchestratorKey] : null;
               const isCloudWatch = selectedRun?.output?.analysis_type;
+              const isReact = selectedRun?.output?.type === 'react';
 
               const results = orchestrator?.results || selectedRun?.output?.results || [];
 
@@ -474,13 +501,34 @@ export default function Dashboard() {
                 const analysisType = selectedRun.output.analysis_type;
                 const logGroupsAnalyzed = selectedRun.output.log_groups_analyzed || [];
                 const timeRange = selectedRun.output.time_range || '—';
+                const llmOutput = selectedRun.output.output;
+                const modelUsed = selectedRun.output.model;
 
                 return (
                   <div>
                     <div className="flex items-center justify-between mb-6">
                       <h3 className="text-xl font-bold text-slate-900">CloudWatch Analysis</h3>
-                      <span className="px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-xs font-medium uppercase">{analysisType}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-xs font-medium uppercase">{analysisType}</span>
+                        {modelUsed && (
+                          <span className="px-3 py-1 bg-violet-100 text-violet-700 rounded-full text-xs font-medium">{modelUsed}</span>
+                        )}
+                      </div>
                     </div>
+
+                    {/* LLM Analysis (primary output) */}
+                    {llmOutput && (
+                      <div className="bg-white rounded-lg border border-slate-200 overflow-hidden mb-6">
+                        <div className="px-4 py-3 bg-slate-50 border-b border-slate-200">
+                          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Analysis</p>
+                        </div>
+                        <div className="px-4 py-4">
+                          <pre className="text-sm text-slate-900 whitespace-pre-wrap break-words font-sans">{llmOutput}</pre>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Metadata table */}
                     <div className="border border-slate-200 rounded-lg overflow-hidden shadow-sm">
                       <Table>
                         <TableHeader>
@@ -510,56 +558,6 @@ export default function Dashboard() {
                               </div>
                             </TableCell>
                           </TableRow>
-                          {cwResults.summary && (
-                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
-                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Summary</TableCell>
-                              <TableCell className="px-6 py-4">
-                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
-                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.summary, null, 2)}</pre>
-                                </div>
-                              </TableCell>
-                            </TableRow>
-                          )}
-                          {cwResults.patterns && (
-                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
-                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Patterns</TableCell>
-                              <TableCell className="px-6 py-4">
-                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
-                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.patterns, null, 2)}</pre>
-                                </div>
-                              </TableCell>
-                            </TableRow>
-                          )}
-                          {cwResults.anomalies && (
-                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
-                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Anomalies</TableCell>
-                              <TableCell className="px-6 py-4">
-                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
-                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.anomalies, null, 2)}</pre>
-                                </div>
-                              </TableCell>
-                            </TableRow>
-                          )}
-                          {cwResults.timeline && (
-                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
-                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Timeline</TableCell>
-                              <TableCell className="px-6 py-4">
-                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
-                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.timeline, null, 2)}</pre>
-                                </div>
-                              </TableCell>
-                            </TableRow>
-                          )}
-                          {cwResults.log_groups && (
-                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
-                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Log Group Details</TableCell>
-                              <TableCell className="px-6 py-4">
-                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
-                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.log_groups, null, 2)}</pre>
-                                </div>
-                              </TableCell>
-                            </TableRow>
-                          )}
                           {cwAlerts.length > 0 && (
                             <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
                               <TableCell className="px-6 py-4 text-slate-600 font-medium">Alerts</TableCell>
@@ -570,6 +568,57 @@ export default function Dashboard() {
                                       <span className="font-bold uppercase">{alert.severity}</span>: {alert.message}
                                     </div>
                                   ))}
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                          {/* Show raw data when no LLM analysis is available */}
+                          {!llmOutput && cwResults.patterns && (
+                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Patterns</TableCell>
+                              <TableCell className="px-6 py-4">
+                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
+                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.patterns, null, 2)}</pre>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                          {!llmOutput && cwResults.anomalies && (
+                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Anomalies</TableCell>
+                              <TableCell className="px-6 py-4">
+                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
+                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.anomalies, null, 2)}</pre>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                          {!llmOutput && cwResults.timeline && (
+                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Timeline</TableCell>
+                              <TableCell className="px-6 py-4">
+                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
+                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.timeline, null, 2)}</pre>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                          {!llmOutput && cwResults.log_groups && (
+                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Log Group Details</TableCell>
+                              <TableCell className="px-6 py-4">
+                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
+                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.log_groups, null, 2)}</pre>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )}
+                          {!llmOutput && cwResults.summary && (
+                            <TableRow className="hover:bg-slate-50 transition-colors border-b border-slate-200">
+                              <TableCell className="px-6 py-4 text-slate-600 font-medium">Summary</TableCell>
+                              <TableCell className="px-6 py-4">
+                                <div className="bg-slate-50 rounded p-3 text-xs font-mono overflow-auto max-h-48">
+                                  <pre className="whitespace-pre-wrap break-words">{JSON.stringify(cwResults.summary, null, 2)}</pre>
                                 </div>
                               </TableCell>
                             </TableRow>
@@ -656,6 +705,57 @@ export default function Dashboard() {
                           })}
                         </TableBody>
                       </Table>
+                    </div>
+                  </div>
+                );
+              }
+
+              if (isReact) {
+                const finalAnswer = selectedRun?.output?.final_answer || '';
+                const userQuery = selectedRun?.output?.user_query || '';
+                const model = selectedRun?.output?.model || '';
+                const provider = selectedRun?.output?.provider || '';
+                const toolCalls = selectedRun?.output?.tool_calls || [];
+                return (
+                  <div>
+                    <div className="flex items-center justify-between mb-6">
+                      <h3 className="text-xl font-bold text-slate-900">Agent Response</h3>
+                      <span className="px-3 py-1 bg-violet-100 text-violet-700 rounded-full text-xs font-medium uppercase">{provider} / {model}</span>
+                    </div>
+                    <div className="space-y-4">
+                      {userQuery && (
+                        <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
+                          <div className="px-4 py-3 bg-slate-50 border-b border-slate-200">
+                            <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Query</p>
+                          </div>
+                          <div className="px-4 py-3">
+                            <p className="text-sm text-slate-700">{userQuery}</p>
+                          </div>
+                        </div>
+                      )}
+                      <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
+                        <div className="px-4 py-3 bg-slate-50 border-b border-slate-200">
+                          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Final Answer</p>
+                        </div>
+                        <div className="px-4 py-4">
+                          <pre className="text-sm text-slate-900 whitespace-pre-wrap break-words font-sans">{finalAnswer || '(no answer)'}</pre>
+                        </div>
+                      </div>
+                      {toolCalls.length > 0 && (
+                        <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
+                          <div className="px-4 py-3 bg-slate-50 border-b border-slate-200">
+                            <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Tool Calls ({toolCalls.length})</p>
+                          </div>
+                          <div className="px-4 py-3 space-y-2">
+                            {toolCalls.map((tc, i) => (
+                              <div key={i} className="flex items-center gap-2 text-xs">
+                                <span className="px-2 py-0.5 bg-slate-100 rounded font-mono text-slate-700 border border-slate-200">{tc.name || tc.tool || `Tool ${i + 1}`}</span>
+                                {tc.error && <span className="text-red-600">Error: {tc.error}</span>}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
                 );

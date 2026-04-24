@@ -91,7 +91,7 @@ class VisualWorkflowExecutor:
     def _build_node_result(value: Dict[str, Any]) -> Dict[str, Any]:
         """Extract relevant fields from a node execution result."""
         node_result = {}
-        for field in ('status', 'output', 'trigger_time'):
+        for field in ('status', 'output', 'trigger_time', 'model'):
             if field in value:
                 node_result[field] = value[field]
         
@@ -621,6 +621,27 @@ class VisualWorkflowExecutor:
             'stream_callback': stream_callback,
         }
 
+        # ------------------------------------------------------------------
+        # Cross-node data: collect results from upstream CloudWatch nodes so
+        # the agent can reason about pre-computed analysis.
+        # ------------------------------------------------------------------
+        cw_results = {}
+        for key, value in context.items():
+            if isinstance(value, dict) and value.get('analysis_type'):
+                cw_results[key] = {
+                    'analysis_type': value.get('analysis_type'),
+                    'output': value.get('output'),
+                    'log_groups_analyzed': value.get('log_groups_analyzed'),
+                    'time_range': value.get('time_range'),
+                    'alerts': value.get('alerts'),
+                }
+        if cw_results:
+            strategy_context['cloudwatch_context'] = cw_results
+            logger.info(
+                "Agent node: injecting %d upstream CloudWatch result(s) into context",
+                len(cw_results),
+            )
+
         try:
             react_strategy = ReactStrategy()
             result = await react_strategy.execute(workflow, strategy_context)
@@ -729,6 +750,9 @@ class VisualWorkflowExecutor:
 
     async def _execute_cloudwatch_node(self, node: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         """Execute CloudWatch Analyzer node by running log analysis."""
+        from app.core.aws_credentials import resolve_aws_credentials
+        from app.core.retry import with_retry
+
         node_data = node.get('data', {})
         log_groups = node_data.get('logGroups', [])
         analysis_type = node_data.get('analysisType', 'error-patterns')
@@ -752,33 +776,17 @@ class VisualWorkflowExecutor:
             }
 
         time_range_minutes = self._parse_time_range_minutes(time_range)
-        credentials: Dict[str, Any] = {}
 
-        # Prefer aws_profile from node config (e.g. test-dev refreshed via aws-azure-login).
-        # Fall back to DB-stored access keys if no profile is set.
-        if aws_profile:
-            credentials["aws_profile"] = aws_profile
-        else:
-            try:
-                from app.repositories import db_repository
-                for key_name in ("AWS CloudWatch", "cloudwatch", "AWS Bedrock", "bedrock", "aws bedrock", "aws"):
-                    mk = await db_repository.get_model_key(key_name, include_secrets=True)
-                    if mk and mk.get("access_key_id"):
-                        credentials["access_key_id"] = mk["access_key_id"]
-                        if mk.get("secret_access_key"):
-                            credentials["secret_access_key"] = mk["secret_access_key"]
-                        if mk.get("session_token"):
-                            credentials["session_token"] = mk["session_token"]
-                        if mk.get("region") and (not aws_region or aws_region == "us-east-1"):
-                            aws_region = mk["region"]
-                        break
-            except Exception as _cred_err:
-                logger.warning("Could not load AWS credentials from model_keys: %s", _cred_err)
+        # Use shared credential resolver instead of inline duplication.
+        credentials, aws_region = await resolve_aws_credentials(
+            aws_profile=aws_profile,
+            aws_region=aws_region,
+        )
 
-
-        try:
+        async def _run_analysis() -> Dict[str, Any]:
+            """Inner coroutine wrapped by with_retry for transient AWS errors."""
             if analysis_type == 'error-patterns':
-                result = await analyze_log_patterns(
+                return await analyze_log_patterns(
                     log_group_names=log_groups,
                     time_range_minutes=time_range_minutes,
                     pattern_types=["error", "warning"],
@@ -786,14 +794,14 @@ class VisualWorkflowExecutor:
                     credentials=credentials if credentials else None,
                 )
             elif analysis_type == 'activity-summary':
-                result = await watch_log_groups(
+                return await watch_log_groups(
                     log_group_names=log_groups,
                     time_range_minutes=time_range_minutes,
                     region=aws_region,
                     credentials=credentials if credentials else None,
                 )
             elif analysis_type == 'anomaly-detection':
-                result = await detect_anomalies(
+                return await detect_anomalies(
                     log_group_names=log_groups,
                     time_range_minutes=time_range_minutes,
                     sensitivity="medium",
@@ -801,7 +809,7 @@ class VisualWorkflowExecutor:
                     credentials=credentials if credentials else None,
                 )
             elif analysis_type == 'correlation':
-                result = await correlate_logs(
+                return await correlate_logs(
                     log_group_names=log_groups,
                     time_range_minutes=time_range_minutes,
                     region=aws_region,
@@ -812,6 +820,9 @@ class VisualWorkflowExecutor:
                     "status": "failed",
                     "error": f"Unknown analysis type: {analysis_type}"
                 }
+
+        try:
+            result = await with_retry(_run_analysis, max_retries=2)
 
             if isinstance(result, dict) and result.get('error'):
                 return {
@@ -825,14 +836,25 @@ class VisualWorkflowExecutor:
             if enable_alerts and isinstance(result, dict):
                 alerts = self._check_cloudwatch_alerts(result, analysis_type, error_threshold)
 
+            # Use the workflow's LLM to produce an agent-style analysis
+            llm_analysis, model_used = await self._analyze_cloudwatch_with_llm(
+                raw_result=result,
+                analysis_type=analysis_type,
+                log_groups=log_groups,
+                time_range=time_range,
+                alerts=alerts,
+                execution_id=context.get('execution_id'),
+            )
+
             return {
                 "status": "success",
-                "output": output_summary,
+                "output": llm_analysis or output_summary,
                 "analysis_type": analysis_type,
                 "log_groups_analyzed": log_groups,
                 "time_range": time_range,
                 "data": result,
                 "alerts": alerts if alerts else None,
+                "model": model_used,
             }
 
         except Exception as e:
@@ -841,6 +863,93 @@ class VisualWorkflowExecutor:
                 "status": "failed",
                 "error": str(e)
             }
+
+    async def _analyze_cloudwatch_with_llm(
+        self,
+        raw_result: Dict[str, Any],
+        analysis_type: str,
+        log_groups: List[str],
+        time_range: str,
+        alerts: list,
+        execution_id: str,
+    ) -> tuple:
+        """Use the workflow's LLM node to produce an agent-style analysis.
+
+        Returns:
+            Tuple of (analysis_text, model_name).  Both are ``None`` when
+            no LLM is available or the call fails (graceful fallback to
+            the static summary built by ``_build_cloudwatch_summary``).
+        """
+        try:
+            from app.workflow.strategies.react import ReactStrategy
+            from langchain_core.messages import SystemMessage, HumanMessage
+            import json
+
+            active = self.active_executions.get(execution_id, {})
+            workflow = active.get('workflow')
+            if not workflow:
+                return None, None
+
+            # Require an LLM node in the workflow
+            nodes = workflow.get('nodes', [])
+            if not any(n.get('type') == 'llm' for n in nodes):
+                logger.debug("CloudWatch LLM analysis skipped: no LLM node in workflow")
+                return None, None
+
+            strategy = ReactStrategy()
+            llm_config = await strategy._resolve_llm_config(workflow)
+            llm = strategy._build_llm(llm_config)
+
+            # Serialize raw data (truncate to stay within context limits)
+            data_str = json.dumps(raw_result, indent=2, default=str)
+            if len(data_str) > 15_000:
+                data_str = data_str[:15_000] + "\n... [truncated]"
+
+            alert_section = ""
+            if alerts:
+                alert_section = (
+                    "\n\nAlerts triggered:\n"
+                    + json.dumps(alerts, indent=2, default=str)
+                )
+
+            system_prompt = (
+                "You are an expert CloudWatch log analysis engineer for KYC Protect. "
+                "Analyze the provided log analysis results and give a clear, actionable summary. "
+                "Be concise but thorough. Focus on what matters for an on-call engineer."
+            )
+
+            human_prompt = (
+                f"Analyze these **{analysis_type}** results from CloudWatch log groups "
+                f"{log_groups} over the last **{time_range}**.\n\n"
+                f"Provide:\n"
+                f"1. A concise summary of findings\n"
+                f"2. Key patterns or anomalies identified\n"
+                f"3. Severity assessment\n"
+                f"4. Recommended next steps\n\n"
+                f"Raw analysis data:\n```json\n{data_str}\n```"
+                f"{alert_section}"
+            )
+
+            response = await asyncio.wait_for(
+                llm.ainvoke([
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=human_prompt),
+                ]),
+                timeout=60.0,
+            )
+
+            analysis = str(response.content) if response.content else None
+            model_name = llm_config.get('model')
+            if analysis:
+                logger.info(
+                    "CloudWatch LLM analysis complete (%d chars, model=%s)",
+                    len(analysis), model_name,
+                )
+            return analysis, model_name
+
+        except Exception as e:
+            logger.warning("CloudWatch LLM analysis failed (falling back to static): %s", e)
+            return None, None
 
     @staticmethod
     def _build_cloudwatch_summary(result: Dict[str, Any], analysis_type: str, log_groups: list) -> str:
@@ -869,10 +978,11 @@ class VisualWorkflowExecutor:
         elif analysis_type == 'anomaly-detection':
             anomaly_summary = result.get('summary', {})
             total = anomaly_summary.get('total_anomalies', 0)
+            critical = anomaly_summary.get('critical_severity', 0)
             high = anomaly_summary.get('high_severity', 0)
             medium = anomaly_summary.get('medium_severity', 0)
             low = anomaly_summary.get('low_severity', 0)
-            return f"Anomaly detection: {total} anomalies (high: {high}, medium: {medium}, low: {low})"
+            return f"Anomaly detection: {total} anomalies (critical: {critical}, high: {high}, medium: {medium}, low: {low})"
 
         elif analysis_type == 'correlation':
             summary = result.get('summary', {})
@@ -904,11 +1014,45 @@ class VisualWorkflowExecutor:
                         except (ValueError, TypeError):
                             pass
 
+            # Check unique error patterns — alert when a single pattern
+            # exceeds the threshold (indicates a repeated systematic issue).
+            for pattern_entry in result.get('unique_patterns', []):
+                for field in pattern_entry:
+                    if field.get('field') == 'occurrence_count':
+                        try:
+                            occ_count = float(field.get('value', 0))
+                            if occ_count > error_threshold:
+                                # Find the pattern text
+                                pattern_text = ""
+                                for f2 in pattern_entry:
+                                    if f2.get('field') == 'error_pattern':
+                                        pattern_text = (f2.get('value') or '')[:120]
+                                        break
+                                alerts.append({
+                                    "type": "repeated_error_pattern",
+                                    "message": (
+                                        f"Error pattern occurred {int(occ_count)} times "
+                                        f"(threshold {error_threshold}): {pattern_text}"
+                                    ),
+                                    "severity": "high" if occ_count > error_threshold * 3 else "medium",
+                                })
+                        except (ValueError, TypeError):
+                            pass
+
         elif analysis_type == 'anomaly-detection':
             for anomaly in result.get('anomalies', []):
+                z_info = ""
+                if anomaly.get('z_score'):
+                    z_info = f", z-score={anomaly['z_score']}"
+                deviation_info = ""
+                if anomaly.get('deviation_factor'):
+                    deviation_info = f" ({anomaly['deviation_factor']}x baseline)"
                 alerts.append({
                     "type": "anomaly_detected",
-                    "message": f"Anomaly at {anomaly.get('timestamp')}: {anomaly.get('current_count')} events ({anomaly.get('deviation_factor')}x baseline)",
+                    "message": (
+                        f"Anomaly at {anomaly.get('timestamp')}: "
+                        f"{anomaly.get('current_count')} events{deviation_info}{z_info}"
+                    ),
                     "severity": anomaly.get('severity', 'medium')
                 })
 
