@@ -20,8 +20,18 @@ const findNodeByType = (nodes, type) =>
 
 const agentConnectionRules = [
   { type: 'llm', message: 'Agent workflow must have an LLM node connected to the Agent.' },
-  { type: 'tool', message: 'Agent workflow must have at least one Tool connected to the Agent.' }
+  { type: 'tool', message: 'Agent workflow must have at least one Tool connected to the Agent.' },
+  { type: 'cloudwatchAnalyzer', message: 'Agent workflow must have at least one Tool connected to the Agent.' }
 ];
+
+// Check if agent has any tool connected (tool or cloudwatchAnalyzer)
+const hasToolConnection = (agentNodeId, nodes, edges) => {
+  return edges?.some(edge => {
+    if (edge.target !== agentNodeId) return false;
+    const sourceNode = nodes.find(n => n.id === edge.source);
+    return sourceNode?.type === 'tool' || sourceNode?.type === 'cloudwatchAnalyzer';
+  }) || false;
+};
 
 const validators = {
   minNodes: (nodes) => ({
@@ -37,6 +47,23 @@ const validators = {
     };
   },
 
+  orchestratorHasSql: (nodes) => {
+    const orchestratorNodes = nodes?.filter(node => node.type === 'orchestrator') || [];
+    const nodesWithoutSql = orchestratorNodes.filter(node => {
+      const data = node.data || {};
+      return !data.fileName && !data.fileContent;
+    });
+
+    if (nodesWithoutSql.length > 0) {
+      const labels = nodesWithoutSql.map(n => n.data?.label || 'Orchestrator').join(', ');
+      return {
+        isValid: false,
+        error: `SQL Orchestrator nodes must have an SQL file attached: ${labels}`
+      };
+    }
+    return { isValid: true, error: null };
+  },
+
   hasAgentNode: (nodes) => ({
     isValid: !!findNodeByType(nodes, 'agent'),
     error: 'Agent workflow must have an Agent AI node.'
@@ -45,12 +72,17 @@ const validators = {
   agentConnections: (nodes, edges) => {
     const agentNode = findNodeByType(nodes, 'agent');
     if (!agentNode) return { isValid: false, error: 'No agent node found.' };
-    
-    for (const rule of agentConnectionRules) {
-      if (!hasConnectionToType(agentNode.id, rule.type, nodes, edges)) {
-        return { isValid: false, error: rule.message };
-      }
+
+    // Check LLM connection
+    if (!hasConnectionToType(agentNode.id, 'llm', nodes, edges)) {
+      return { isValid: false, error: 'Agent workflow must have an LLM node connected to the Agent.' };
     }
+
+    // Check Tool connection (tool or cloudwatchAnalyzer)
+    if (!hasToolConnection(agentNode.id, nodes, edges)) {
+      return { isValid: false, error: 'Agent workflow must have at least one Tool connected to the Agent.' };
+    }
+
     return { isValid: true, error: null };
   }
 };
@@ -61,6 +93,10 @@ export const validateWorkflow = (workflowType, nodes, edges) => {
 
   const allConnectedResult = validators.allConnected(nodes, edges);
   if (!allConnectedResult.isValid) return allConnectedResult;
+
+  // Validate orchestrator nodes have SQL files
+  const orchestratorSqlResult = validators.orchestratorHasSql(nodes);
+  if (!orchestratorSqlResult.isValid) return orchestratorSqlResult;
 
   if (workflowType === 'agent') {
     const hasAgentResult = validators.hasAgentNode(nodes);
@@ -75,7 +111,7 @@ export const validateWorkflow = (workflowType, nodes, edges) => {
 
 export const isAgentWorkflowValid = (workflow) => {
   const { type, nodes, edges } = workflow;
-  
+
   if (type !== 'agent') return false;
   if (!validators.minNodes(nodes).isValid) return false;
   if (!validators.allConnected(nodes, edges).isValid) return false;

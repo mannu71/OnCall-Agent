@@ -1,12 +1,12 @@
 import React from 'react';
-import { Box, Paper, Typography, Grid, Card, CardContent } from '@mui/material';
-import { 
-  Construction as ConstructionIcon,
-  TrendingUp as TrendingUpIcon,
-  Schedule as ScheduleIcon,
-  CheckCircle as CheckCircleIcon,
-  Error as ErrorIcon
-} from '@mui/icons-material';
+import { Card, CardContent } from '@/components/ui/card';
+import {
+  Construction,
+  TrendingUp,
+  Calendar,
+  CheckCircle,
+  XCircle
+} from 'lucide-react';
 
 // Use Vite's environment check for development mode
 const DEV_MODE = import.meta.env.DEV;
@@ -15,135 +15,96 @@ function Analytics() {
   // Show under development message if not in dev mode
   if (!DEV_MODE) {
     return (
-      <Box 
-        sx={{ 
-          display: 'flex', 
-          flexDirection: 'column', 
-          alignItems: 'center', 
-          justifyContent: 'center', 
-          height: '100%',
-          p: 4,
-          textAlign: 'center'
-        }}
-      >
-        <ConstructionIcon sx={{ fontSize: 80, color: 'warning.main', mb: 2 }} />
-        <Typography variant="h4" gutterBottom fontWeight="bold">
-          Analytics
-        </Typography>
-        <Typography variant="h6" color="text.secondary" gutterBottom>
-          🚧 Under Development 🚧
-        </Typography>
-        <Paper 
-          elevation={0} 
-          sx={{ 
-            p: 3, 
-            mt: 2, 
-            maxWidth: 500, 
-            bgcolor: 'warning.light', 
-            borderRadius: 2,
-            border: '1px solid',
-            borderColor: 'warning.main'
-          }}
-        >
-          <Typography variant="body1" color="text.primary">
-            This feature is currently being developed. It will provide insights and analytics about your workflow runs and agent performance.
-          </Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
-            In the meantime, you can view workflow run history on the <strong>Dashboard</strong> page.
-          </Typography>
-        </Paper>
-      </Box>
+      <div className="flex flex-col items-center justify-center h-full p-8 text-center">
+        <Construction className="w-20 h-20 text-yellow-600 mb-4" />
+        <h1 className="text-4xl font-bold mb-2">Analytics</h1>
+        <h2 className="text-2xl text-muted-foreground mb-4">🚧 Under Development 🚧</h2>
+        <Card className="mt-4 max-w-lg bg-yellow-50 border-yellow-600">
+          <CardContent className="p-6">
+            <p className="text-base text-foreground mb-4">
+              This feature is currently being developed. It will provide insights and analytics about your workflow runs and agent performance.
+            </p>
+            <p className="text-sm text-muted-foreground">
+              In the meantime, you can view workflow run history on the <strong>Dashboard</strong> page.
+            </p>
+          </CardContent>
+        </Card>
+      </div>
     );
   }
 
   // Development mode - show analytics placeholder
   return (
-    <Box sx={{ p: 3 }}>
-      <Typography variant="h4" gutterBottom fontWeight="bold">
-        Analytics
-      </Typography>
-      <Typography variant="body1" color="text.secondary" sx={{ mb: 3 }}>
-        Workflow and agent performance metrics (Development Preview)
-      </Typography>
+    <div className="p-6">
+      <div className="mb-8">
+        <h1 className="text-4xl font-bold mb-2">Analytics</h1>
+        <p className="text-muted-foreground">Workflow and agent performance metrics (Development Preview)</p>
+      </div>
 
-      <Grid container spacing={3}>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
         {/* Summary Cards */}
-        <Grid item xs={12} sm={6} md={3}>
-          <Card>
-            <CardContent>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                <ScheduleIcon color="primary" />
-                <Typography variant="subtitle2" color="text.secondary">
-                  Total Runs
-                </Typography>
-              </Box>
-              <Typography variant="h4">--</Typography>
-            </CardContent>
-          </Card>
-        </Grid>
-        <Grid item xs={12} sm={6} md={3}>
-          <Card>
-            <CardContent>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                <CheckCircleIcon color="success" />
-                <Typography variant="subtitle2" color="text.secondary">
-                  Success Rate
-                </Typography>
-              </Box>
-              <Typography variant="h4">--%</Typography>
-            </CardContent>
-          </Card>
-        </Grid>
-        <Grid item xs={12} sm={6} md={3}>
-          <Card>
-            <CardContent>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                <ErrorIcon color="error" />
-                <Typography variant="subtitle2" color="text.secondary">
-                  Failed Runs
-                </Typography>
-              </Box>
-              <Typography variant="h4">--</Typography>
-            </CardContent>
-          </Card>
-        </Grid>
-        <Grid item xs={12} sm={6} md={3}>
-          <Card>
-            <CardContent>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                <TrendingUpIcon color="info" />
-                <Typography variant="subtitle2" color="text.secondary">
-                  Avg Duration
-                </Typography>
-              </Box>
-              <Typography variant="h4">--s</Typography>
-            </CardContent>
-          </Card>
-        </Grid>
+        <Card>
+          <CardContent className="pt-6">
+            <div className="flex items-center gap-2 mb-2">
+              <Calendar className="w-5 h-5 text-primary" />
+              <span className="text-sm text-muted-foreground">Total Runs</span>
+            </div>
+            <h4 className="text-4xl font-bold">--</h4>
+          </CardContent>
+        </Card>
+        
+        <Card>
+          <CardContent className="pt-6">
+            <div className="flex items-center gap-2 mb-2">
+              <CheckCircle className="w-5 h-5 text-green-600" />
+              <span className="text-sm text-muted-foreground">Success Rate</span>
+            </div>
+            <h4 className="text-4xl font-bold">--%</h4>
+          </CardContent>
+        </Card>
+        
+        <Card>
+          <CardContent className="pt-6">
+            <div className="flex items-center gap-2 mb-2">
+              <XCircle className="w-5 h-5 text-red-600" />
+              <span className="text-sm text-muted-foreground">Failed Runs</span>
+            </div>
+            <h4 className="text-4xl font-bold">--</h4>
+          </CardContent>
+        </Card>
+        
+        <Card>
+          <CardContent className="pt-6">
+            <div className="flex items-center gap-2 mb-2">
+              <TrendingUp className="w-5 h-5 text-blue-600" />
+              <span className="text-sm text-muted-foreground">Avg Duration</span>
+            </div>
+            <h4 className="text-4xl font-bold">--s</h4>
+          </CardContent>
+        </Card>
+      </div>
 
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-6">
         {/* Placeholder for charts */}
-        <Grid item xs={12} md={8}>
-          <Paper sx={{ p: 3, height: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <Box sx={{ textAlign: 'center' }}>
-              <TrendingUpIcon sx={{ fontSize: 48, color: 'text.disabled', mb: 1 }} />
-              <Typography variant="body1" color="text.secondary">
-                Workflow runs chart coming soon
-              </Typography>
-            </Box>
-          </Paper>
-        </Grid>
-        <Grid item xs={12} md={4}>
-          <Paper sx={{ p: 3, height: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <Box sx={{ textAlign: 'center' }}>
-              <CheckCircleIcon sx={{ fontSize: 48, color: 'text.disabled', mb: 1 }} />
-              <Typography variant="body1" color="text.secondary">
-                Success/failure breakdown coming soon
-              </Typography>
-            </Box>
-          </Paper>
-        </Grid>
-      </Grid>
-    </Box>
+        <Card className="lg:col-span-2">
+          <CardContent className="h-[300px] flex items-center justify-center">
+            <div className="text-center">
+              <TrendingUp className="w-12 h-12 text-muted-foreground mx-auto mb-2" />
+              <p className="text-muted-foreground">Workflow runs chart coming soon</p>
+            </div>
+          </CardContent>
+        </Card>
+        
+        <Card>
+          <CardContent className="h-[300px] flex items-center justify-center">
+            <div className="text-center">
+              <CheckCircle className="w-12 h-12 text-muted-foreground mx-auto mb-2" />
+              <p className="text-muted-foreground">Success/failure breakdown coming soon</p>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
   );
 }
 

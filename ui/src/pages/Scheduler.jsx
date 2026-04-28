@@ -1,73 +1,48 @@
-import React, { useState } from 'react';
-import { Button, Fab } from '@mui/material';
-import { Add as AddIcon } from '@mui/icons-material';
+import React, { useState, useCallback, memo } from 'react';
+import { Button } from '@/components/ui/button';
+import { Plus } from 'lucide-react';
 import { SchedulerProvider, useScheduler } from '../context/SchedulerContext';
 import ScheduleList from '../components/scheduler/ScheduleList';
 import AddScheduleDialog from '../components/scheduler/AddScheduleDialog';
 
-const SchedulerContent = () => {
+const SchedulerContent = memo(() => {
   const { addSchedule } = useScheduler();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
 
-  const handleAddSchedule = (scheduleData) => {
-    addSchedule(scheduleData);
-  };
+  const handleAddSchedule = useCallback(async (scheduleData) => {
+    // Add schedule to context (which handles the API call)
+    await addSchedule(scheduleData);
+    setAddDialogOpen(false);
+  }, [addSchedule]);
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      <div className="p-8">
-        <div className="max-w-7xl mx-auto">
-          {/* Header */}
-          <div className="mb-6 flex justify-between items-center">
-            <div>
-              <h1 className="text-3xl font-semibold text-gray-900 mb-2">
-                Scheduler Management
-              </h1>
-              <p className="text-gray-600">
-                Manage and organize your on-call schedules
-              </p>
-            </div>
-            
-            <Button
-              variant="contained"
-              startIcon={<AddIcon />}
-              onClick={() => setAddDialogOpen(true)}
-            >
-              Add Schedule
-            </Button>
-          </div>
-
-          {/* Schedule List */}
-          <ScheduleList />
-
-          {/* Floating Action Button for mobile */}
-          <Fab
-            color="primary"
-            aria-label="add"
-            onClick={() => setAddDialogOpen(true)}
-            sx={{
-              position: 'fixed',
-              bottom: 16,
-              right: 16,
-              display: { xs: 'flex', md: 'none' }
-            }}
-          >
-            <AddIcon />
-          </Fab>
-
-          {/* Add Schedule Dialog */}
-          <AddScheduleDialog
-            open={addDialogOpen}
-            onClose={() => setAddDialogOpen(false)}
-            onAdd={handleAddSchedule}
-          />
+    <div className="p-6">
+      <div className="flex justify-between items-center mb-6">
+        <div>
+          <h1 className="text-3xl font-bold tracking-tight">Schedule Management</h1>
+          <p className="text-muted-foreground mt-1">Automate and monitor your on-call routines</p>
         </div>
+
+        <Button onClick={() => setAddDialogOpen(true)}>
+          <Plus className="w-4 h-4 mr-2" />
+          Add Schedule
+        </Button>
       </div>
+
+      {/* Schedule List Component */}
+      <ScheduleList />
+
+      {/* Add Schedule Dialog */}
+      <AddScheduleDialog
+        open={addDialogOpen}
+        onClose={() => setAddDialogOpen(false)}
+        onAdd={handleAddSchedule}
+      />
     </div>
   );
-};
+});
 
-export default function Schedule() {
+export default function Scheduler() {
   return (
     <SchedulerProvider>
       <SchedulerContent />

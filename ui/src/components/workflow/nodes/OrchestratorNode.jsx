@@ -5,7 +5,14 @@ const OrchestratorNode = ({ data, id }) => {
   return (
     <div className="orchestrator-node">
 
-      {/* No left input handle */}
+      {/* Left Input Handle for Scheduler */}
+      <Handle 
+        type="target" 
+        position={Position.Left} 
+        id="orchestrator-input"
+        style={{ background: '#8b5cf6', top: '50%' }}
+        title="Scheduler Input"
+      />
 
       <div className="node-header">
         <span className="node-icon">🧩</span>
@@ -35,17 +42,6 @@ const OrchestratorNode = ({ data, id }) => {
             </div>
           )}
         </div>
-
-        {/* Variables */}
-        {data.vars && Object.keys(JSON.parse(data.vars || '{}')).length > 0 && (
-          <div className="vars-indicator">
-            <span className="vars-icon">⚙️</span>
-            <span className="vars-count">
-              {Object.keys(JSON.parse(data.vars)).length} variable
-              {Object.keys(JSON.parse(data.vars)).length !== 1 ? 's' : ''}
-            </span>
-          </div>
-        )}
       </div>
 
       {/* Status */}

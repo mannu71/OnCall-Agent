@@ -1,7 +1,9 @@
 // MCP Server Configuration Service
-// Manages loading and saving MCP server configurations via Electron file API
+// Manages loading and saving MCP server configurations via Agent API
 
-// Cache for config to reduce file reads
+import agentApiClient from './agentApiClient.js';
+
+// Cache for config to reduce API calls
 let configCache = null;
 let cacheTimestamp = 0;
 const CACHE_TTL_MS = 5000; // 5 second cache
@@ -15,8 +17,8 @@ export const invalidateCache = () => {
 };
 
 /**
- * Load MCP configuration from file via Electron API
- * Uses caching to prevent excessive file reads
+ * Load MCP configuration from Agent API
+ * Uses caching to prevent excessive API calls
  */
 export const loadMCPConfig = async () => {
     const now = Date.now();
@@ -25,38 +27,57 @@ export const loadMCPConfig = async () => {
     }
 
     try {
-        if (window.electronAPI?.loadMCPConfig) {
-            const config = await window.electronAPI.loadMCPConfig();
-            configCache = config || { servers: {}, inputs: [] };
-            cacheTimestamp = now;
-            return configCache;
-        }
-        console.warn('Electron API not available, using defaults');
-        return { servers: {}, inputs: [] };
+        // Try to use Agent API first
+        const config = await agentApiClient.getMCPConfig();
+        configCache = config || { servers: {}, inputs: [], inputValues: {} };
+        cacheTimestamp = now;
+        return configCache;
     } catch (error) {
-        console.error('Error loading MCP config:', error);
-        return { servers: {}, inputs: [] };
+        console.warn('Agent API not available, falling back to Electron API:', error.message);
+
+        // Fallback to Electron API if available (for desktop app)
+        if (globalThis.electronAPI?.loadMCPConfig) {
+            try {
+                const config = await globalThis.electronAPI.loadMCPConfig();
+                configCache = config || { servers: {}, inputs: [], inputValues: {} };
+                cacheTimestamp = now;
+                return configCache;
+            } catch (electronError) {
+                console.error('Error loading MCP config from Electron:', electronError);
+            }
+        }
+
+        return { servers: {}, inputs: [], inputValues: {} };
     }
 };
 
 /**
- * Save MCP configuration to file via Electron API
+ * Save MCP configuration via Agent API
  */
 export const saveMCPConfig = async (config) => {
     try {
-        if (window.electronAPI?.saveMCPConfig) {
-            const result = await window.electronAPI.saveMCPConfig(config);
-            if (result.success) {
-                // Update cache on successful save
-                configCache = config;
-                cacheTimestamp = Date.now();
-            }
-            return result.success;
-        }
-        console.error('Electron API not available');
-        return false;
+        // Try Agent API first
+        await agentApiClient.saveMCPConfig(config);
+        configCache = config;
+        cacheTimestamp = Date.now();
+        return true;
     } catch (error) {
-        console.error('Error saving MCP config:', error);
+        console.warn('Agent API not available, falling back to Electron API:', error.message);
+
+        // Fallback to Electron API
+        if (globalThis.electronAPI?.saveMCPConfig) {
+            try {
+                const result = await globalThis.electronAPI.saveMCPConfig(config);
+                if (result.success) {
+                    configCache = config;
+                    cacheTimestamp = Date.now();
+                    return true;
+                }
+            } catch (electronError) {
+                console.error('Error saving MCP config via Electron:', electronError);
+            }
+        }
+
         return false;
     }
 };
@@ -65,18 +86,37 @@ export const saveMCPConfig = async (config) => {
  * Get all MCP servers
  */
 export const getMCPServers = async () => {
-    const config = await loadMCPConfig();
-    return config.servers || {};
+    try {
+        // Try Agent API first
+        return await agentApiClient.getMCPServers();
+    } catch (error) {
+        console.warn('Agent API not available, falling back to loadMCPConfig:', error.message);
+        const config = await loadMCPConfig();
+        return config.servers || {};
+    }
 };
 
 /**
  * Add a new MCP server
  */
 export const addMCPServer = async (serverName, serverConfig) => {
-    const config = await loadMCPConfig();
-    config.servers[serverName] = serverConfig;
-    await saveMCPConfig(config);
-    return config;
+    try {
+        // Try Agent API first
+        await agentApiClient.createMCPServer({
+            name: serverName,
+            ...serverConfig
+        });
+        invalidateCache();
+        return await getMCPServers();
+    } catch (error) {
+        console.warn('Agent API not available, falling back to file-based save:', error.message);
+
+        // Fallback to file-based approach
+        const config = await loadMCPConfig();
+        config.servers[serverName] = serverConfig;
+        await saveMCPConfig(config);
+        return config.servers;
+    }
 };
 
 /**
@@ -85,31 +125,46 @@ export const addMCPServer = async (serverName, serverConfig) => {
 export const updateMCPServer = async (serverName, serverConfig, newServerName = null) => {
     // Invalidate cache first to ensure we get fresh data
     invalidateCache();
-    const config = await loadMCPConfig();
-    
+
     const actualNewName = newServerName || serverName;
-    
-    // If renaming, delete old and add new
-    if (newServerName && newServerName !== serverName) {
-        delete config.servers[serverName];
-        config.servers[newServerName] = serverConfig;
-    } else if (config.servers[serverName]) {
-        // Fully replace the server config (don't merge, to ensure args are properly updated)
-        config.servers[serverName] = serverConfig;
-    } else {
-        console.warn('updateMCPServer: server not found:', serverName);
-        return config;
-    }
-    
-    const success = await saveMCPConfig(config);
-    console.log('updateMCPServer:', serverName, '->', actualNewName, 'success:', success, 'config:', serverConfig);
-    
-    // Also update workflows that use this MCP server
-    if (success) {
+
+    try {
+        // Try Agent API first
+        await agentApiClient.updateMCPServer(serverName, {
+            name: newServerName || undefined,
+            ...serverConfig
+        });
+
+        // Also update workflows that use this MCP server
         await syncMCPServerToWorkflows(serverName, serverConfig, actualNewName);
+
+        invalidateCache();
+        return await getMCPServers();
+    } catch (error) {
+        console.warn('Agent API not available, falling back to file-based save:', error.message);
+
+        // Fallback to file-based approach
+        const config = await loadMCPConfig();
+
+        // If renaming, delete old and add new
+        if (newServerName && newServerName !== serverName) {
+            delete config.servers[serverName];
+            config.servers[newServerName] = serverConfig;
+        } else if (config.servers[serverName]) {
+            config.servers[serverName] = serverConfig;
+        } else {
+            console.warn('updateMCPServer: server not found:', serverName);
+            return config.servers;
+        }
+
+        const success = await saveMCPConfig(config);
+
+        if (success) {
+            await syncMCPServerToWorkflows(serverName, serverConfig, actualNewName);
+        }
+
+        return config.servers;
     }
-    
-    return config;
 };
 
 /**
@@ -117,44 +172,35 @@ export const updateMCPServer = async (serverName, serverConfig, newServerName = 
  */
 export const syncMCPServerToWorkflows = async (oldServerName, serverConfig, newServerName = null) => {
     const actualNewName = newServerName || oldServerName;
-    
+
     try {
-        if (!window.electronAPI?.loadWorkflows || !window.electronAPI?.saveWorkflows) {
-            console.warn('Electron API not available for workflow sync');
-            return false;
-        }
-        
-        const workflows = await window.electronAPI.loadWorkflows();
+        const workflows = await agentApiClient.listWorkflows();
         if (!workflows || !Array.isArray(workflows)) {
             return false;
         }
-        
-        let updated = false;
-        
+
         for (const workflow of workflows) {
             if (!workflow.nodes) continue;
-            
+
+            let workflowUpdated = false;
             for (const node of workflow.nodes) {
                 // Check if this node is a tool that uses the MCP server
-                if (node.type === 'tool' && 
-                    node.data?.toolType === 'mcp-server' && 
+                if (node.type === 'tool' &&
+                    node.data?.toolType === 'mcp-server' &&
                     node.data?.label === oldServerName) {
-                    
+
                     // Update the node's label and mcpConfig
                     node.data.label = actualNewName;
                     node.data.mcpConfig = { ...serverConfig };
-                    updated = true;
-                    console.log(`Synced MCP server "${oldServerName}" -> "${actualNewName}" in workflow "${workflow.name}"`);
+                    workflowUpdated = true;
                 }
             }
+
+            if (workflowUpdated) {
+                await agentApiClient.updateWorkflow(workflow.name, workflow);
+            }
         }
-        
-        if (updated) {
-            const result = await window.electronAPI.saveWorkflows(workflows);
-            console.log('Workflows synced with MCP server changes:', result);
-            return result?.success || result === true;
-        }
-        
+
         return true;
     } catch (error) {
         console.error('Error syncing MCP server to workflows:', error);
@@ -166,10 +212,20 @@ export const syncMCPServerToWorkflows = async (oldServerName, serverConfig, newS
  * Delete an MCP server
  */
 export const deleteMCPServer = async (serverName) => {
-    const config = await loadMCPConfig();
-    delete config.servers[serverName];
-    await saveMCPConfig(config);
-    return config;
+    try {
+        // Try Agent API first
+        await agentApiClient.deleteMCPServer(serverName);
+        invalidateCache();
+        return await getMCPServers();
+    } catch (error) {
+        console.warn('Agent API not available, falling back to file-based save:', error.message);
+
+        // Fallback to file-based approach
+        const config = await loadMCPConfig();
+        delete config.servers[serverName];
+        await saveMCPConfig(config);
+        return config.servers;
+    }
 };
 
 /**
@@ -204,27 +260,47 @@ export const convertServersToNodeItems = (servers) => {
  * Get input values (the actual values set by user)
  */
 export const getMCPInputValues = async () => {
-    const config = await loadMCPConfig();
-    return config.inputValues || {};
+    try {
+        // Try Agent API first
+        return await agentApiClient.getMCPInputValues();
+    } catch (error) {
+        console.warn('Agent API not available, falling back to loadMCPConfig:', error.message);
+        const config = await loadMCPConfig();
+        return config.inputValues || {};
+    }
 };
 
 /**
  * Set input values
  */
 export const setMCPInputValues = async (inputValues) => {
-    const config = await loadMCPConfig();
-    config.inputValues = inputValues;
-    await saveMCPConfig(config);
-    return config;
+    try {
+        // Try Agent API first
+        return await agentApiClient.setMCPInputValues(inputValues);
+    } catch (error) {
+        console.warn('Agent API not available, falling back to file-based save:', error.message);
+
+        const config = await loadMCPConfig();
+        config.inputValues = inputValues;
+        await saveMCPConfig(config);
+        return config.inputValues;
+    }
 };
 
 /**
  * Update a single input value
  */
 export const updateMCPInputValue = async (inputId, value) => {
-    const config = await loadMCPConfig();
-    config.inputValues = config.inputValues || {};
-    config.inputValues[inputId] = value;
-    await saveMCPConfig(config);
-    return config;
+    try {
+        // Try Agent API first
+        return await agentApiClient.updateMCPInputValue(inputId, value);
+    } catch (error) {
+        console.warn('Agent API not available, falling back to file-based save:', error.message);
+
+        const config = await loadMCPConfig();
+        config.inputValues = config.inputValues || {};
+        config.inputValues[inputId] = value;
+        await saveMCPConfig(config);
+        return config.inputValues;
+    }
 };

@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  # PostgreSQL with pgvector extension
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: kyc-agent-db
+    environment:
+      POSTGRES_USER: kycuser
+      POSTGRES_PASSWORD: kycpassword
+      POSTGRES_DB: kycagent
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U kycuser -d kycagent" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Agent API Service
+  agent-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ~/.aws:/root/.aws:ro
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - STORAGE_PATH=/app/data/storage
+      - WORKFLOW_DIR=/app/data/workflows
+      - LOGS_DIR=/app/data/logs
+      - SCHEDULER_TIMEZONE=UTC
+      - MAX_CONCURRENT_WORKFLOWS=5
+      - LOG_LEVEL=INFO
+      - AWS_SSL_VERIFY=false
+      - DATABASE_URL=postgresql://kycuser:kycpassword@postgres:5432/kycagent
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

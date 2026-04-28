@@ -1,5 +1,16 @@
 /* Node Styles */
-.agent-node, .llm-node, .database-node, .gmail-node, .teams-node, .tool-node, .memory-node, .chat-node, .output-node, .orchestrator-node {
+.agent-node,
+.llm-node,
+.database-node,
+.gmail-node,
+.teams-node,
+.tool-node,
+.memory-node,
+.chat-node,
+.output-node,
+.orchestrator-node,
+.scheduler-node,
+.cloudwatch-analyzer-node {
   padding: 12px;
   border-radius: 8px;
   border: 2px solid #ddd;
@@ -11,7 +22,18 @@
   position: relative;
 }
 
-.agent-node:hover, .llm-node:hover, .database-node:hover, .gmail-node:hover, .teams-node:hover, .tool-node:hover, .memory-node:hover, .chat-node:hover, .output-node:hover, .orchestrator-node:hover {
+.agent-node:hover,
+.llm-node:hover,
+.database-node:hover,
+.gmail-node:hover,
+.teams-node:hover,
+.tool-node:hover,
+.memory-node:hover,
+.chat-node:hover,
+.output-node:hover,
+.orchestrator-node:hover,
+.scheduler-node:hover,
+.cloudwatch-analyzer-node:hover {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
   transform: translateY(-1px);
 }
@@ -138,8 +160,13 @@
 }
 
 @keyframes llmSpin {
-  0% { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
+  0% {
+    transform: rotate(0deg);
+  }
+
+  100% {
+    transform: rotate(360deg);
+  }
 }
 
 .tool-node {
@@ -193,13 +220,25 @@
 }
 
 @keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 @keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+  }
 }
 
 .chat-node {
@@ -631,6 +670,30 @@
   width: calc(100% - 50px);
 }
 
+.config-field.checkbox-field {
+  margin-bottom: 16px;
+}
+
+.config-field.checkbox-field label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: 500;
+  margin-bottom: 0;
+}
+
+.config-field.checkbox-field input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.config-field.checkbox-field span {
+  color: #333;
+}
+
 .checkbox-group {
   display: flex;
   flex-direction: column;
@@ -737,6 +800,7 @@
     opacity: 0;
     transform: translateX(-50%) translateY(-10px);
   }
+
   to {
     opacity: 1;
     transform: translateX(-50%) translateY(0);
@@ -793,8 +857,13 @@
 }
 
 @keyframes spin {
-  0% { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
+  0% {
+    transform: rotate(0deg);
+  }
+
+  100% {
+    transform: rotate(360deg);
+  }
 }
 
 .processing-spinner {
@@ -806,10 +875,12 @@
     transform: scale(1);
     opacity: 1;
   }
+
   50% {
     transform: scale(1.1);
     opacity: 0.7;
   }
+
   100% {
     transform: scale(1);
     opacity: 1;
@@ -945,7 +1016,7 @@
 
 .output-node .node-icon {
   font-size: 18px;
-  filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3));
 }
 
 .output-node .header-text {
@@ -1319,10 +1390,179 @@
 }
 
 @keyframes pulse {
-  0%, 100% {
+
+  0%,
+  100% {
     opacity: 1;
   }
+
   50% {
     opacity: 0.5;
   }
+}
+
+/* Scheduler Node Styles */
+.scheduler-node {
+  border-color: #9c27b0;
+  background: linear-gradient(135deg, #f3e5f5 0%, #fff 100%);
+  min-width: 200px;
+}
+
+.scheduler-node .node-icon {
+  font-size: 20px;
+}
+
+.scheduler-node .node-title {
+  font-weight: 600;
+  color: #7b1fa2;
+  font-size: 14px;
+}
+
+.scheduler-enabled-status {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: rgba(76, 175, 80, 0.1);
+  border: 1px solid rgba(76, 175, 80, 0.3);
+  border-radius: 4px;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.scheduler-enabled-status .status-icon {
+  color: #388e3c;
+}
+
+.scheduler-enabled-status .status-text {
+  color: #388e3c;
+  font-weight: 500;
+}
+
+.scheduler-disabled-status {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: rgba(158, 158, 158, 0.1);
+  border: 1px solid rgba(158, 158, 158, 0.3);
+  border-radius: 4px;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.scheduler-disabled-status .status-icon {
+  color: #757575;
+}
+
+.scheduler-disabled-status .status-text {
+  color: #757575;
+  font-weight: 500;
+}
+
+.node-cron {
+  margin-top: 4px;
+  font-size: 10px;
+  color: #7b1fa2;
+  font-family: 'Courier New', monospace;
+  background: rgba(156, 39, 176, 0.1);
+  padding: 2px 6px;
+  border-radius: 3px;
+  display: inline-block;
+}
+
+/* CloudWatch Analyzer Node Styles */
+.cloudwatch-analyzer-node {
+  border-color: #1a237e;
+  background: linear-gradient(135deg, #e8eaf6 0%, #fff 100%);
+  min-width: 220px;
+}
+
+.cloudwatch-analyzer-node .node-icon {
+  font-size: 20px;
+}
+
+.cloudwatch-analyzer-node .node-title {
+  font-weight: 600;
+  color: #1a237e;
+  font-size: 14px;
+}
+
+.cloudwatch-analyzer-node .ready-status {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: rgba(26, 35, 126, 0.1);
+  border: 1px solid rgba(26, 35, 126, 0.3);
+  border-radius: 4px;
+  font-size: 11px;
+  color: #1a237e;
+}
+
+.cloudwatch-analyzer-node .processing-status {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: rgba(255, 152, 0, 0.1);
+  border: 1px solid rgba(255, 152, 0, 0.3);
+  border-radius: 4px;
+  font-size: 11px;
+  color: #e65100;
+}
+
+.cloudwatch-analyzer-node .error-status {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: rgba(244, 67, 54, 0.1);
+  border: 1px solid rgba(244, 67, 54, 0.3);
+  border-radius: 4px;
+  font-size: 11px;
+  color: #c62828;
+}
+
+.cloudwatch-analyzer-node .node-timestamp {
+  margin-top: 4px;
+  font-size: 10px;
+  color: #3949ab;
+  font-family: 'Courier New', monospace;
+  background: rgba(26, 35, 126, 0.08);
+  padding: 2px 6px;
+  border-radius: 3px;
+  display: inline-block;
+}
+
+/* Log Groups Configuration in Node */
+.log-groups-preview {
+  margin-top: 8px;
+  font-size: 10px;
+  color: #666;
+}
+
+.log-groups-preview .log-group-count {
+  font-weight: 500;
+  color: #1a237e;
+}
+
+.analysis-type-badge {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 2px 8px;
+  font-size: 10px;
+  border-radius: 12px;
+  background: rgba(26, 35, 126, 0.1);
+  color: #3949ab;
+  text-transform: capitalize;
+}
+
+.analysis-type-badge.error-patterns {
+  background: rgba(244, 67, 54, 0.1);
+  color: #c62828;
+}
+
+.analysis-type-badge.anomaly-detection {
+  background: rgba(255, 152, 0, 0.1);
+  color: #e65100;
+}
+
+.analysis-type-badge.correlation {
+  background: rgba(76, 175, 80, 0.1);
+  color: #2e7d32;
 }

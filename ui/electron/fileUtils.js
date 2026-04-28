@@ -1,6 +1,6 @@
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { app } from 'electron';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -115,7 +115,7 @@ function saveSchedulesToFile(schedules) {
     }
     
     if (!Array.isArray(schedules)) {
-      throw new Error('Schedules payload must be an array');
+      throw new TypeError('Schedules payload must be an array');
     }
     
     // Clean up trigger files for deleted schedules
@@ -163,7 +163,7 @@ function saveWorkflowsToFile(workflows) {
     }
     
     if (!Array.isArray(workflows)) {
-      throw new Error('Workflows payload must be an array');
+      throw new TypeError('Workflows payload must be an array');
     }
     
     console.log('fileUtils: Writing workflows to file:', workflowsPath);
@@ -206,7 +206,7 @@ function triggerWorkflow(workflowName) {
     if (!fs.existsSync(triggersDir)) {
       fs.mkdirSync(triggersDir, { recursive: true });
     }
-    const safeName = workflowName.replace(/\s+/g, '_');
+    const safeName = workflowName.replaceAll(/\s+/g, '_');
     const triggerPath = path.join(triggersDir, `${safeName}.flag`);
     fs.writeFileSync(triggerPath, Date.now().toString());
     return { success: true, path: triggerPath, workflow: workflowName };
@@ -219,11 +219,11 @@ function triggerWorkflow(workflowName) {
 // Run an agent workflow with a user query
 async function runAgentWorkflow(workflowName, userQuery, progressCallback = null) {
   try {
-    const { spawn } = await import('child_process');
+    const { spawn } = await import('node:child_process');
     
     return new Promise((resolve, reject) => {
-      // Run the agent using node
-      const agentPath = path.join(agentDir, 'src', 'agents', 'run.js');
+      // Run the agent using node (unified engine)
+      const agentPath = path.join(agentDir, 'src', 'agents', 'run-unified.js');
       
       console.log(`Running agent: node ${agentPath} "${workflowName}" "${userQuery?.slice(0, 50)}..."`);
       
@@ -261,10 +261,11 @@ async function runAgentWorkflow(workflowName, userQuery, progressCallback = null
               case 'mcp.connect.success':
                 progressCallback({ type: 'status', message: `Connected to ${log.server} (${log.toolCount} tools)` });
                 break;
-              case 'workflow.tools.discovered':
+              case 'workflow.tools.discovered': {
                 const totalTools = Object.values(log.toolsByServer || {}).reduce((sum, arr) => sum + arr.length, 0);
                 progressCallback({ type: 'status', message: `Discovered ${totalTools} tools` });
                 break;
+              }
               case 'workflow.compiled':
                 progressCallback({ type: 'status', message: 'Workflow compiled, starting...' });
                 break;
@@ -297,8 +298,8 @@ async function runAgentWorkflow(workflowName, userQuery, progressCallback = null
                 break;
             }
           }
-        } catch (e) {
-          // Not JSON, might be other output
+        } catch {
+          // Not JSON - line is plain text output, skip parsing
         }
       };
       
@@ -319,7 +320,7 @@ async function runAgentWorkflow(workflowName, userQuery, progressCallback = null
         console.log(`Agent exited with code ${code}`);
         if (code === 0) {
           // Extract the final answer from the output
-          const finalAnswerMatch = stdout.match(/🔥 FINAL ANSWER:\s*([\s\S]*)/);
+          const finalAnswerMatch = /🔥 FINAL ANSWER:\s*([\s\S]*)/.exec(stdout);
           let answer = finalAnswerMatch ? finalAnswerMatch[1].trim() : stdout;
           
           // Filter out JSON log lines from the answer
@@ -328,10 +329,7 @@ async function runAgentWorkflow(workflowName, userQuery, progressCallback = null
             .filter(line => {
               const trimmed = line.trim();
               // Skip lines that are JSON log objects
-              if (trimmed.startsWith('{"ts":') && trimmed.includes('"event":')) {
-                return false;
-              }
-              return true;
+              return !(trimmed.startsWith('{"ts":') && trimmed.includes('"event":'));
             })
             .join('\n')
             .trim();
@@ -387,7 +385,7 @@ function cleanupTriggers(currentSchedules) {
     
     // Get all current workflow names
     const activeWorkflows = new Set(
-      currentSchedules.map(sch => sch.workflow?.replace(/\s+/g, '_')).filter(Boolean)
+      currentSchedules.map(sch => sch.workflow?.replaceAll(/\s+/g, '_')).filter(Boolean)
     );
     
     // Read all trigger files

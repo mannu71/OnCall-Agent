@@ -47,14 +47,15 @@ coverage/
 output/
 agent/output/
 agent/logs/
-agent/data/config/triggers/*.flag
 scheduler/triggers/*.flag
 worker/output/
 
-# Configuration files with sensitive data
-agent/data/config/workflows.json
-agent/data/config/schedules.json
-agent/data/config/sql/
+# Ignore entire data directories
+agent/data/
+agent-api/data/
+
+# Hermes agent (submodule/reference)
+hermes-agent-main/
 
 # Temporary files
 tmp/

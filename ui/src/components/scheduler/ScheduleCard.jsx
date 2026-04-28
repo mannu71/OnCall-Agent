@@ -1,50 +1,32 @@
 import React, { useState } from 'react';
+import { Card, CardContent } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import {
-  Card,
-  CardContent,
-  Typography,
-  Chip,
-  IconButton,
-  Box,
-  Grid,
-  Menu,
-  MenuItem,
   Dialog,
-  DialogTitle,
   DialogContent,
-  DialogContentText,
-  DialogActions,
-  Button,
-  Tooltip
-} from '@mui/material';
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import {
-  MoreVert as MoreVertIcon,
-  Schedule as ScheduleIcon,
-  Event as EventIcon,
-  Edit as EditIcon,
-  Delete as DeleteIcon
-} from '@mui/icons-material';
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { MoreVertical, Calendar, Clock, Edit2, Trash2 } from 'lucide-react';
 
 const ScheduleCard = ({ schedule, onEdit, onDelete }) => {
-  const [anchorEl, setAnchorEl] = useState(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
-
-  const handleMenuOpen = (event) => {
-    setAnchorEl(event.currentTarget);
-  };
-
-  const handleMenuClose = () => {
-    setAnchorEl(null);
-  };
 
   const handleEdit = () => {
     onEdit(schedule);
-    handleMenuClose();
   };
 
   const handleDelete = () => {
     setDeleteDialogOpen(true);
-    handleMenuClose();
   };
 
   const confirmDelete = () => {
@@ -65,7 +47,7 @@ const ScheduleCard = ({ schedule, onEdit, onDelete }) => {
   const formatTime = (timeString) => {
     const [hours, minutes] = timeString.split(':');
     const date = new Date();
-    date.setHours(parseInt(hours), parseInt(minutes));
+    date.setHours(Number.parseInt(hours, 10), Number.parseInt(minutes, 10));
     return date.toLocaleTimeString('en-US', { 
       hour: 'numeric', 
       minute: '2-digit',
@@ -75,84 +57,78 @@ const ScheduleCard = ({ schedule, onEdit, onDelete }) => {
 
   return (
     <>
-      <Card sx={{ mb: 2, '&:hover': { boxShadow: 3 } }}>
-        <CardContent>
-          <Box display="flex" justifyContent="space-between" alignItems="flex-start">
-            <Box flex={1}>
-              <Typography variant="h6" gutterBottom>
+      <Card className="mb-4 hover:shadow-lg transition-shadow">
+        <CardContent className="pt-6">
+          <div className="flex justify-between items-start">
+            <div className="flex-1">
+              <h3 className="text-lg font-semibold mb-2">
                 {schedule.title}
-              </Typography>
+              </h3>
               
-              <Box display="flex" gap={1} mb={2} flexWrap="wrap" alignItems="center">
+              <div className="flex gap-2 mb-4 flex-wrap items-center">
                 {schedule.workflow && (
-                  <Chip
-                    label={schedule.workflow.charAt(0).toUpperCase() + schedule.workflow.slice(1)}
-                    color="primary"
-                    size="small"
-                  />
+                  <Badge variant="default">
+                    {schedule.workflow.charAt(0).toUpperCase() + schedule.workflow.slice(1)}
+                  </Badge>
                 )}
-              </Box>
+              </div>
 
-              <Grid container spacing={2} sx={{ mt: 1 }}>
-                <Grid item xs={12} sm={6}>
-                  <Box display="flex" alignItems="center" gap={1}>
-                    <EventIcon fontSize="small" color="action" />
-                    <Typography variant="body2">
-                      {formatDate(schedule.date)}
-                    </Typography>
-                  </Box>
-                </Grid>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-3">
+                <div className="flex items-center gap-2">
+                  <Calendar className="w-4 h-4 text-muted-foreground" />
+                  <span className="text-sm">
+                    {formatDate(schedule.date)}
+                  </span>
+                </div>
                 
-                <Grid item xs={12} sm={6}>
-                  <Box display="flex" alignItems="center" gap={1}>
-                    <ScheduleIcon fontSize="small" color="action" />
-                    <Typography variant="body2">
-                      {formatTime(schedule.startTime)}
-                    </Typography>
-                  </Box>
-                </Grid>
-              </Grid>
-            </Box>
+                <div className="flex items-center gap-2">
+                  <Clock className="w-4 h-4 text-muted-foreground" />
+                  <span className="text-sm">
+                    {formatTime(schedule.startTime)}
+                  </span>
+                </div>
+              </div>
+            </div>
 
-            <IconButton onClick={handleMenuOpen} size="small">
-              <MoreVertIcon />
-            </IconButton>
-          </Box>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon">
+                  <MoreVertical className="w-4 h-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={handleEdit}>
+                  <Edit2 className="w-4 h-4 mr-2" />
+                  Edit
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={handleDelete} className="text-red-600">
+                  <Trash2 className="w-4 h-4 mr-2" />
+                  Delete
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </CardContent>
       </Card>
 
-      <Menu
-        anchorEl={anchorEl}
-        open={Boolean(anchorEl)}
-        onClose={handleMenuClose}
-      >
-        <MenuItem onClick={handleEdit}>
-          <EditIcon fontSize="small" sx={{ mr: 1 }} />
-          Edit
-        </MenuItem>
-        <MenuItem onClick={handleDelete} sx={{ color: 'error.main' }}>
-          <DeleteIcon fontSize="small" sx={{ mr: 1 }} />
-          Delete
-        </MenuItem>
-      </Menu>
-
-      <Dialog
-        open={deleteDialogOpen}
-        onClose={() => setDeleteDialogOpen(false)}
-      >
-        <DialogTitle>Confirm Delete</DialogTitle>
+      <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
         <DialogContent>
-          <DialogContentText>
-            Are you sure you want to delete the schedule "{schedule.title}"? 
-            This action cannot be undone.
-          </DialogContentText>
+          <DialogHeader>
+            <DialogTitle>Confirm Delete</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete the schedule "{schedule.title}"? 
+              This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={confirmDelete}>
+              Delete
+            </Button>
+          </DialogFooter>
         </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setDeleteDialogOpen(false)}>Cancel</Button>
-          <Button onClick={confirmDelete} color="error" variant="contained">
-            Delete
-          </Button>
-        </DialogActions>
       </Dialog>
     </>
   );

@@ -1,29 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import {
-  Box,
-  Paper,
-  TextField,
-  IconButton,
-  Typography,
-  List,
-  ListItem,
-  ListItemButton,
-  ListItemIcon,
-  ListItemText,
-  CircularProgress,
-  Chip,
-  Alert
-} from '@mui/material';
-import {
-  Send as SendIcon,
-  SmartToy as AgentIcon,
-  Person as PersonIcon,
-  PlayArrow as PlayIcon,
-  Error as ErrorIcon,
-  Refresh as RefreshIcon,
-  Construction as ConstructionIcon
-} from '@mui/icons-material';
+import { Card, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Loader2, Send, Bot, User, Play, RefreshCw, XCircle, Construction } from 'lucide-react';
 import { isAgentWorkflowValid } from '../utils/workflowValidation.js';
+import agentApiClient from '../services/agentApiClient.js';
 
 // Use Vite's environment check for development mode
 const DEV_MODE = import.meta.env.DEV;
@@ -31,55 +14,12 @@ const DEV_MODE = import.meta.env.DEV;
 // Message types
 const MESSAGE_TYPES = {
   USER: 'user',
-  ASSISTANT: 'assistant',
+  AGENT: 'agent',
   SYSTEM: 'system'
 };
 
 function Chat() {
-  // Show under development message if not in dev mode
-  if (!DEV_MODE) {
-    return (
-      <Box 
-        sx={{ 
-          display: 'flex', 
-          flexDirection: 'column', 
-          alignItems: 'center', 
-          justifyContent: 'center', 
-          height: '100%',
-          p: 4,
-          textAlign: 'center'
-        }}
-      >
-        <ConstructionIcon sx={{ fontSize: 80, color: 'warning.main', mb: 2 }} />
-        <Typography variant="h4" gutterBottom fontWeight="bold">
-          Agent Chat
-        </Typography>
-        <Typography variant="h6" color="text.secondary" gutterBottom>
-          🚧 Under Development 🚧
-        </Typography>
-        <Paper 
-          elevation={0} 
-          sx={{ 
-            p: 3, 
-            mt: 2, 
-            maxWidth: 500, 
-            bgcolor: 'warning.light', 
-            borderRadius: 2,
-            border: '1px solid',
-            borderColor: 'warning.main'
-          }}
-        >
-          <Typography variant="body1" color="text.primary">
-            This feature is currently being developed. It will allow you to interact with your agents through a chat interface.
-          </Typography>
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
-            In the meantime, you can use the <strong>Workflow</strong> page to create and manage your agent workflows, and run them from the <strong>Dashboard</strong>.
-          </Typography>
-        </Paper>
-      </Box>
-    );
-  }
-
+  // Initialize all hooks first (before any returns)
   const [messages, setMessages] = useState([
     {
       id: 1,
@@ -97,13 +37,40 @@ function Chat() {
 
   // Load agent-type workflows
   useEffect(() => {
-    loadAgents();
+    if (DEV_MODE) {
+      loadAgents();
+    }
   }, []);
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
-    scrollToBottom();
+    if (DEV_MODE) {
+      scrollToBottom();
+    }
   }, [messages]);
+
+  // Show under development message if not in dev mode
+  if (!DEV_MODE) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full p-8 text-center">
+        <Construction className="w-20 h-20 text-yellow-500 mb-4" />
+        <h1 className="text-3xl font-bold mb-2">
+          Agent Chat
+        </h1>
+        <h2 className="text-xl text-muted-foreground mb-4">
+          🚧 Under Development 🚧
+        </h2>
+        <Card className="p-6 mt-4 max-w-lg bg-yellow-50 border-yellow-500 rounded-lg">
+          <p className="text-base text-foreground mb-4">
+            This feature is currently being developed. It will allow you to interact with your agents through a chat interface.
+          </p>
+          <p className="text-sm text-muted-foreground">
+            In the meantime, you can use the <strong>Workflow</strong> page to create and manage your agent workflows, and run them from the <strong>Dashboard</strong>.
+          </p>
+        </Card>
+      </div>
+    );
+  }
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -111,20 +78,22 @@ function Chat() {
 
   const loadAgents = async () => {
     try {
-      if (window.electronAPI?.loadWorkflows) {
-        const workflows = await window.electronAPI.loadWorkflows();
-        // Filter to only show valid agent workflows
-        const agentWorkflows = workflows.filter(wf => isAgentWorkflowValid(wf));
-        setAgents(agentWorkflows);
-      }
+      const workflows = await agentApiClient.listWorkflows();
+      // Filter to only show valid agent workflows
+      const agentWorkflows = workflows.filter(wf => isAgentWorkflowValid(wf));
+      setAgents(agentWorkflows);
     } catch (error) {
       console.error('Error loading agents:', error);
+      setAgents([]);
+      if (error.code === 'ERR_NETWORK' || error.message.includes('Network Error')) {
+        console.warn('Cannot connect to Agent API. Please start the API server at http://localhost:8000');
+      }
     }
   };
 
   const addMessage = (type, content, metadata = {}) => {
     const newMessage = {
-      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      id: `${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
       type,
       content,
       timestamp: new Date().toISOString(),
@@ -135,7 +104,7 @@ function Chat() {
   };
 
   const updateMessage = (messageId, updates) => {
-    setMessages(prev => prev.map(msg => 
+    setMessages(prev => prev.map(msg =>
       msg.id === messageId ? { ...msg, ...updates } : msg
     ));
   };
@@ -149,37 +118,37 @@ function Chat() {
   // Trigger the selected agent
   const triggerAgent = async (agent) => {
     if (!agent) return;
-    
+
     addMessage(MESSAGE_TYPES.USER, `Triggering agent: ${agent.name}`);
-    
+
     const thinkingId = addMessage(MESSAGE_TYPES.ASSISTANT, `Running "${agent.name}"...`, { isLoading: true });
     setIsLoading(true);
-    
+
     try {
       if (window.electronAPI?.triggerWorkflow) {
         const result = await window.electronAPI.triggerWorkflow(agent.name);
-        
+
         if (result?.success) {
-          updateMessage(thinkingId, { 
+          updateMessage(thinkingId, {
             content: `Agent "${agent.name}" triggered successfully!`,
-            isLoading: false 
+            isLoading: false
           });
         } else {
-          updateMessage(thinkingId, { 
+          updateMessage(thinkingId, {
             content: `Failed to trigger agent: ${result?.error || 'Unknown error'}`,
             isLoading: false,
             isError: true
           });
         }
       } else {
-        updateMessage(thinkingId, { 
+        updateMessage(thinkingId, {
           content: 'Agent execution is only available in the desktop app.',
           isLoading: false,
           isError: true
         });
       }
     } catch (error) {
-      updateMessage(thinkingId, { 
+      updateMessage(thinkingId, {
         content: `Error: ${error.message}`,
         isLoading: false,
         isError: true
@@ -191,12 +160,12 @@ function Chat() {
 
   const handleSendMessage = async () => {
     if (!inputValue.trim() || isLoading) return;
-    
+
     const userMessage = inputValue.trim();
     setInputValue('');
-    
+
     addMessage(MESSAGE_TYPES.USER, userMessage);
-    
+
     // If no agent selected, prompt user to select one
     if (!selectedAgent) {
       if (agents.length === 0) {
@@ -210,7 +179,7 @@ function Chat() {
       await askAgent(firstAgent, userMessage);
       return;
     }
-    
+
     // Send the question to the selected agent
     await askAgent(selectedAgent, userMessage);
   };
@@ -219,7 +188,7 @@ function Chat() {
   const askAgent = async (agent, question) => {
     const thinkingId = addMessage(MESSAGE_TYPES.ASSISTANT, `Starting agent...`, { isLoading: true, statusHistory: [] });
     setIsLoading(true);
-    
+
     // Subscribe to progress events
     let unsubscribe = null;
     if (window.electronAPI?.onAgentProgress) {
@@ -230,15 +199,15 @@ function Chat() {
             const statusHistory = [...(msg.statusHistory || [])];
             // Add new status to history (keep last 5)
             if (progress.message) {
-              statusHistory.push({ 
-                type: progress.type, 
-                message: progress.message, 
-                time: new Date().toLocaleTimeString() 
+              statusHistory.push({
+                type: progress.type,
+                message: progress.message,
+                time: new Date().toLocaleTimeString()
               });
               if (statusHistory.length > 8) statusHistory.shift();
             }
-            return { 
-              ...msg, 
+            return {
+              ...msg,
               content: progress.message || msg.content,
               currentStatus: progress,
               statusHistory
@@ -248,19 +217,19 @@ function Chat() {
         }));
       });
     }
-    
+
     try {
       if (window.electronAPI?.runAgent) {
         const result = await window.electronAPI.runAgent(agent.name, question);
-        
+
         if (result?.success) {
-          updateMessage(thinkingId, { 
+          updateMessage(thinkingId, {
             content: result.answer || 'Agent completed successfully.',
             isLoading: false,
             currentStatus: null
           });
         } else {
-          updateMessage(thinkingId, { 
+          updateMessage(thinkingId, {
             content: `Error: ${result?.error || 'Unknown error'}`,
             isLoading: false,
             isError: true,
@@ -268,14 +237,14 @@ function Chat() {
           });
         }
       } else {
-        updateMessage(thinkingId, { 
+        updateMessage(thinkingId, {
           content: 'Agent execution is only available in the desktop app.',
           isLoading: false,
           isError: true
         });
       }
     } catch (error) {
-      updateMessage(thinkingId, { 
+      updateMessage(thinkingId, {
         content: `Error: ${error.message}`,
         isLoading: false,
         isError: true
@@ -297,222 +266,188 @@ function Chat() {
   const renderMessage = (message) => {
     const isUser = message.type === MESSAGE_TYPES.USER;
     const isSystem = message.type === MESSAGE_TYPES.SYSTEM;
-    
+
     return (
-      <Box
+      <div
         key={message.id}
-        sx={{
-          display: 'flex',
-          justifyContent: isUser ? 'flex-end' : 'flex-start',
-          mb: 2
-        }}
+        className={`flex mb-4 ${isUser ? 'justify-end' : 'justify-start'}`}
       >
-        <Box
-          sx={{
-            display: 'flex',
-            flexDirection: isUser ? 'row-reverse' : 'row',
-            alignItems: 'flex-start',
-            maxWidth: '100%',
-            width: '100%',
-            gap: 1
-          }}
+        <div
+          className={`flex ${isUser ? 'flex-row-reverse' : 'flex-row'} items-start max-w-full w-full gap-2`}
         >
-          <Box
-            sx={{
-              width: 36,
-              height: 36,
-              borderRadius: '50%',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              bgcolor: isUser ? 'primary.main' : isSystem ? 'grey.500' : 'secondary.main',
-              color: 'white',
-              flexShrink: 0
-            }}
+          <div
+            className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 ${
+              isUser 
+                ? 'bg-primary text-primary-foreground' 
+                : isSystem 
+                ? 'bg-gray-500 text-white' 
+                : 'bg-secondary text-secondary-foreground'
+            }`}
           >
-            {isUser ? <PersonIcon fontSize="small" /> : <AgentIcon fontSize="small" />}
-          </Box>
-          
-          <Paper
-            elevation={1}
-            sx={{
-              py: 1,
-              px: 2,
-              bgcolor: isUser ? 'primary.light' : isSystem ? 'grey.100' : 'background.paper',
-              color: isUser ? 'primary.contrastText' : 'text.primary',
-              borderRadius: 2,
-              borderTopLeftRadius: isUser ? 16 : 4,
-              borderTopRightRadius: isUser ? 4 : 16
-            }}
+            {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+          </div>
+
+          <Card
+            className={`${
+              isUser 
+                ? 'bg-primary text-primary-foreground rounded-tl-2xl rounded-tr-sm' 
+                : isSystem 
+                ? 'bg-gray-100 text-gray-900 rounded-tl-sm rounded-tr-2xl' 
+                : 'bg-background rounded-tl-sm rounded-tr-2xl'
+            }`}
           >
-            <Typography 
-              variant="body1" 
-              sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
-            >
-              {message.content}
-            </Typography>
-            
-            {message.isLoading && (
-              <Box sx={{ mt: 1 }}>
-                {/* Show status history */}
-                {message.statusHistory && message.statusHistory.length > 0 && (
-                  <Box sx={{ mb: 1, maxHeight: 150, overflowY: 'auto' }}>
-                    {message.statusHistory.map((status, idx) => (
-                      <Typography 
-                        key={idx} 
-                        variant="caption" 
-                        sx={{ 
-                          display: 'block', 
-                          color: status.type === 'error' ? 'error.main' : 'text.secondary',
-                          fontSize: '0.7rem',
-                          opacity: 0.8,
-                          pl: 1,
-                          borderLeft: '2px solid',
-                          borderColor: status.type === 'tool' ? 'info.main' : 
-                                      status.type === 'thinking' ? 'warning.main' :
-                                      status.type === 'error' ? 'error.main' : 'grey.400',
-                          mb: 0.5
-                        }}
-                      >
-                        <span style={{ opacity: 0.6, marginRight: 4 }}>{status.time}</span>
-                        {status.message}
-                      </Typography>
-                    ))}
-                  </Box>
-                )}
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                  <CircularProgress size={16} />
-                  <Typography variant="caption" color="text.secondary">
-                    {message.currentStatus?.message || 'Processing...'}
-                  </Typography>
-                </Box>
-              </Box>
-            )}
-            
-            {message.isError && (
-              <Chip icon={<ErrorIcon />} label="Error" color="error" size="small" sx={{ mt: 1 }} />
-            )}
-            
-            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
-              {new Date(message.timestamp).toLocaleTimeString()}
-            </Typography>
-          </Paper>
-        </Box>
-      </Box>
+            <CardContent className="py-2 px-3">
+              <p className="whitespace-pre-wrap break-words text-sm">
+                {message.content}
+              </p>
+
+              {message.isLoading && (
+                <div className="mt-2">
+                  {/* Show status history */}
+                  {message.statusHistory && message.statusHistory.length > 0 && (
+                    <div className="mb-2 max-h-36 overflow-y-auto">
+                      {message.statusHistory.map((status, idx) => (
+                        <div
+                          key={idx}
+                          className={`text-xs opacity-80 pl-2 border-l-2 mb-1 ${
+                            status.type === 'tool' 
+                              ? 'border-blue-500 text-blue-600' 
+                              : status.type === 'thinking' 
+                              ? 'border-yellow-500 text-yellow-600' 
+                              : status.type === 'error' 
+                              ? 'border-red-500 text-red-600' 
+                              : 'border-gray-400 text-gray-600'
+                          }`}
+                        >
+                          <span className="opacity-60 mr-1">{status.time}</span>
+                          {status.message}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span className="text-xs text-muted-foreground">
+                      {message.currentStatus?.message || 'Processing...'}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {message.isError && (
+                <Badge variant="destructive" className="mt-2">
+                  <XCircle className="w-3 h-3 mr-1" />
+                  Error
+                </Badge>
+              )}
+
+              <p className="text-xs text-muted-foreground mt-2">
+                {new Date(message.timestamp).toLocaleTimeString()}
+              </p>
+            </CardContent>
+          </Card>
+        </div>
+      </div>
     );
   };
 
   return (
-    <Box sx={{ display: 'flex', height: '100vh', bgcolor: 'grey.50' }}>
+    <div className="flex h-screen bg-gray-50">
       {/* Sidebar - Agent List */}
-      <Paper 
-        elevation={0} 
-        sx={{ 
-          width: 280, 
-          borderRight: 1, 
-          borderColor: 'divider',
-          display: 'flex',
-          flexDirection: 'column'
-        }}
-      >
-        <Box sx={{ p: 2, borderBottom: 1, borderColor: 'divider' }}>
-          <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <Typography variant="h6" fontWeight="bold">Agents</Typography>
-            <IconButton size="small" onClick={loadAgents} title="Refresh">
-              <RefreshIcon fontSize="small" />
-            </IconButton>
-          </Box>
-          <Typography variant="body2" color="text.secondary">
+      <Card className="w-[280px] border-r rounded-none flex flex-col">
+        <div className="p-4 h-20 border-b flex flex-col justify-center">
+          <div className="flex items-center justify-between">
+            <h2 className="font-bold text-base">Agents</h2>
+            <Button size="icon" variant="ghost" onClick={loadAgents} title="Refresh">
+              <RefreshCw className="w-4 h-4" />
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
             Click to trigger an agent
-          </Typography>
-        </Box>
-        
-        <List sx={{ flexGrow: 1, overflow: 'auto' }}>
+          </p>
+        </div>
+
+        <div className="flex-grow overflow-auto">
           {agents.length === 0 ? (
-            <Box sx={{ p: 2 }}>
-              <Alert severity="info" sx={{ fontSize: '0.875rem' }}>
-                No agents found. Create a workflow with type "Agent" and ensure the Agent AI node has both an LLM and at least one Tool connected.
+            <div className="p-4">
+              <Alert>
+                <AlertDescription className="text-sm">
+                  No agents found. Create a workflow with type "Agent" and ensure the Agent AI node has both an LLM and at least one Tool connected.
+                </AlertDescription>
               </Alert>
-            </Box>
+            </div>
           ) : (
             agents.map((agent) => (
-              <ListItem key={agent.id} disablePadding secondaryAction={
-                <IconButton 
-                  edge="end" 
+              <div key={agent.id} className="relative">
+                <Button
+                  variant="ghost"
+                  className={`w-full justify-start px-4 py-6 rounded-none border-b ${
+                    selectedAgent?.id === agent.id ? 'bg-accent' : ''
+                  }`}
+                  onClick={() => handleSelectAgent(agent)}
+                  disabled={isLoading}
+                >
+                  <Bot className={`w-5 h-5 mr-3 ${selectedAgent?.id === agent.id ? 'text-primary' : 'text-muted-foreground'}`} />
+                  <div className="flex-1 text-left">
+                    <div className="font-medium">{agent.name}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {selectedAgent?.id === agent.id ? 'Selected' : 'Click to select'}
+                    </div>
+                  </div>
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="absolute right-2 top-1/2 -translate-y-1/2"
                   onClick={(e) => { e.stopPropagation(); triggerAgent(agent); }}
                   disabled={isLoading}
                   title="Run agent"
                 >
-                  <PlayIcon color="primary" fontSize="small" />
-                </IconButton>
-              }>
-                <ListItemButton 
-                  onClick={() => handleSelectAgent(agent)}
-                  disabled={isLoading}
-                  selected={selectedAgent?.id === agent.id}
-                >
-                  <ListItemIcon>
-                    <AgentIcon color={selectedAgent?.id === agent.id ? 'primary' : 'action'} />
-                  </ListItemIcon>
-                  <ListItemText 
-                    primary={agent.name}
-                    secondary={selectedAgent?.id === agent.id ? 'Selected' : 'Click to select'}
-                  />
-                </ListItemButton>
-              </ListItem>
+                  <Play className="w-4 h-4 text-primary" />
+                </Button>
+              </div>
             ))
           )}
-        </List>
-      </Paper>
-      
+        </div>
+      </Card>
+
       {/* Main Chat Area */}
-      <Box sx={{ flexGrow: 1, display: 'flex', flexDirection: 'column' }}>
-        <Paper 
-          elevation={0} 
-          sx={{ p: 2, borderBottom: 1, borderColor: 'divider', bgcolor: 'background.paper' }}
-        >
-          <Typography variant="h5" fontWeight="bold">Agent Chat</Typography>
-          <Typography variant="body2" color="text.secondary">
-            Select an agent from the sidebar, then run it with the play button or type "run"
-          </Typography>
-        </Paper>
-        
-        <Box sx={{ flexGrow: 1, overflow: 'auto', p: 2, bgcolor: 'grey.50' }}>
+      <div className="flex-grow flex flex-col">
+        <Card className="h-20 px-6 border-b rounded-none flex flex-col justify-center">
+          <h1 className="font-bold text-xl">Agent Chat</h1>
+          <p className="text-sm text-muted-foreground">
+            Interact with your agent workflows in real-time
+          </p>
+        </Card>
+
+        <div className="flex-grow overflow-auto p-4 bg-gray-50">
           {messages.map(renderMessage)}
           <div ref={messagesEndRef} />
-        </Box>
-        
-        <Paper elevation={2} sx={{ p: 2, borderTop: 1, borderColor: 'divider' }}>
-          <Box sx={{ display: 'flex', gap: 1 }}>
-            <TextField
+        </div>
+
+        <Card className="p-4 border-t rounded-none shadow-lg">
+          <div className="flex gap-2">
+            <Input
               ref={inputRef}
-              fullWidth
-              variant="outlined"
-              placeholder="Type 'run [agent name]' to trigger an agent..."
+              placeholder="Enter message"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               onKeyPress={handleKeyPress}
               disabled={isLoading}
-              size="small"
-              sx={{ '& .MuiOutlinedInput-root': { borderRadius: 3 } }}
+              className="flex-1 rounded-full"
             />
-            <IconButton 
-              color="primary" 
+            <Button
+              size="icon"
               onClick={handleSendMessage}
               disabled={!inputValue.trim() || isLoading}
-              sx={{ 
-                bgcolor: 'primary.main', 
-                color: 'white',
-                '&:hover': { bgcolor: 'primary.dark' },
-                '&:disabled': { bgcolor: 'grey.300' }
-              }}
+              className="rounded-full"
             >
-              {isLoading ? <CircularProgress size={24} color="inherit" /> : <SendIcon />}
-            </IconButton>
-          </Box>
-        </Paper>
-      </Box>
-    </Box>
+              {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
+            </Button>
+          </div>
+        </Card>
+      </div>
+    </div>
   );
 }
 

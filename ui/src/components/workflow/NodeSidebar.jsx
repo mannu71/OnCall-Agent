@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { getMCPServers, convertServersToNodeItems, invalidateCache as invalidateMCPCache } from '../../services/mcpService';
 import { getLLMs, convertLLMsToNodeItems, invalidateCache as invalidateLLMCache } from '../../services/llmService';
+import { localTimeToCron } from '../../utils/cronUtils';
 
 const NodeSidebar = () => {
   const [mcpServers, setMcpServers] = useState([]);
@@ -76,7 +77,30 @@ const NodeSidebar = () => {
           icon: '🤖',
           title: 'AI Agent',
           description: 'Intelligent autonomous agent',
-          data: { label: 'AI Agent', description: 'Tools Agent' }
+          data: {
+            label: 'AI Agent',
+            description: 'Tools Agent',
+            agentMode: 'single'  // 'single' or 'multi'
+          }
+        }
+      ]
+    },
+    {
+      title: 'Scheduling',
+      items: [
+        {
+          type: 'scheduler',
+          icon: '⏰',
+          title: 'Scheduler',
+          description: 'Trigger workflows on schedule',
+          data: {
+            label: 'Scheduler',
+            cronExpression: localTimeToCron('09:00', 'daily'), // Convert 9:00 AM local to UTC cron
+            startTime: '09:00', // Local time for display
+            recurrence: 'daily',
+            enabled: true,
+            status: 'Ready'
+          }
         }
       ]
     },
@@ -96,25 +120,45 @@ const NodeSidebar = () => {
       title: 'MCP Servers',
       items: isLoadingMCP
         ? [
-            {
-              type: 'tool',
-              icon: '⏳',
-              title: 'Loading...',
-              description: 'Loading MCP servers from config',
-              data: { label: 'Loading...', toolType: 'mcp-server', status: 'Loading' }
-            }
-          ]
+          {
+            type: 'tool',
+            icon: '⏳',
+            title: 'Loading...',
+            description: 'Loading MCP servers from config',
+            data: { label: 'Loading...', toolType: 'mcp-server', status: 'Loading' }
+          }
+        ]
         : mcpServers.length > 0
           ? mcpServers
           : [
-              {
-                type: 'tool',
-                icon: '❌',
-                title: 'No MCP Servers',
-                description: 'Add MCP servers in Settings',
-                data: { label: 'No Servers', toolType: 'mcp-server', status: 'Empty' }
-              }
-            ]
+            {
+              type: 'tool',
+              icon: '❌',
+              title: 'No MCP Servers',
+              description: 'Add MCP servers in Settings',
+              data: { label: 'No Servers', toolType: 'mcp-server', status: 'Empty' }
+            }
+          ]
+    },
+    {
+      title: 'Tools',
+      items: [
+        {
+          type: 'cloudwatchAnalyzer',
+          icon: '📊',
+          title: 'CloudWatch Log Analyzer',
+          description: 'Analyze multiple CloudWatch log groups',
+          data: {
+            label: 'Log Analyzer',
+            logGroups: [],
+            analysisType: 'error-patterns',
+            timeRange: '1h',
+            errorThreshold: 10,
+            enableAlerts: false,
+            status: 'Ready'
+          }
+        }
+      ]
     },
     {
       title: 'Memory',
@@ -129,28 +173,20 @@ const NodeSidebar = () => {
       ]
     },
     {
-      title: 'Language Models',
+      title: 'LLM Models',
       items: isLoadingLLM
         ? [
-            {
-              type: 'llm',
-              icon: '⏳',
-              title: 'Loading...',
-              description: 'Loading LLM configurations',
-              data: { label: 'Loading...', model: '', status: 'Loading' }
-            }
-          ]
+          {
+            type: 'llm',
+            icon: '⏳',
+            title: 'Loading...',
+            description: 'Loading LLM models',
+            data: { label: 'Loading...', model: '', status: 'Loading' }
+          }
+        ]
         : llmModels.length > 0
           ? llmModels
-          : [
-              {
-                type: 'llm',
-                icon: '❌',
-                title: 'No LLMs',
-                description: 'Add LLMs in Settings',
-                data: { label: 'No LLMs', model: '', status: 'Empty' }
-              }
-            ]
+          : []
     },
     {
       title: 'Communication',
@@ -179,7 +215,7 @@ const NodeSidebar = () => {
       <div style={{ fontSize: '12px', color: '#666', marginBottom: '20px' }}>
         Drag and drop components to build your AI workflow
       </div>
-      
+
       {getNodeCategories().map((category, categoryIndex) => (
         <div key={categoryIndex} className="sidebar-section">
           <div className="sidebar-section-title">{category.title}</div>
@@ -199,14 +235,14 @@ const NodeSidebar = () => {
           ))}
         </div>
       ))}
-      
-      <div style={{ 
-        marginTop: '30px', 
-        padding: '10px', 
-        background: '#e3f2fd', 
-        borderRadius: '6px', 
-        fontSize: '11px', 
-        color: '#1976d2' 
+
+      <div style={{
+        marginTop: '30px',
+        padding: '10px',
+        background: '#e3f2fd',
+        borderRadius: '6px',
+        fontSize: '11px',
+        color: '#1976d2'
       }}>
         💡 <strong>Tip:</strong> Connect Model (bottom left), Memory (bottom center), and Tool (bottom right) to Agents
       </div>

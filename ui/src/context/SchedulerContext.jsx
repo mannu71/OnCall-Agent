@@ -1,4 +1,8 @@
-import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
+import PropTypes from 'prop-types';
+import { agentApiClient } from '../services/agentApiClient';
+import { cronToLocalTime } from '../utils/cronUtils';
+import { getSchedulerNode, applyScheduleToWorkflow } from '../utils/workflowUtils';
 
 const SchedulerContext = createContext();
 
@@ -10,225 +14,175 @@ export const useScheduler = () => {
   return context;
 };
 
+const formatTime = (timeString) => {
+  if (!timeString) return '-';
+  try {
+    const [hours, minutes] = timeString.split(':');
+    const date = new Date(2024, 0, 15); // Fixed date to avoid DST issue
+    date.setHours(Number.parseInt(hours, 10), Number.parseInt(minutes, 10), 0, 0);
+    return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  } catch {
+    return timeString;
+  }
+};
+
+const fromApi = (wf) => {
+  let startTime;
+  let recurrence;
+  const schedulerNode = getSchedulerNode(wf);
+
+  if (schedulerNode?.data) {
+    startTime = schedulerNode.data.startTime || cronToLocalTime(schedulerNode.data.cronExpression);
+    recurrence = schedulerNode.data.recurrence;
+  } else if (wf.schedule) {
+    startTime = cronToLocalTime(wf.schedule);
+  }
+
+  return {
+    id: wf.name || wf.id,
+    title: wf.name,
+    name: wf.name,
+    description: wf.description || '',
+    workflow: wf.name,
+    schedule: wf.schedule,
+    enabled: wf.enabled ?? true,
+    startTime: startTime,
+    recurrence: recurrence || wf.recurrence || 'daily',
+    nodes: wf.nodes || [],
+    edges: wf.edges || [],
+    tasks: wf.tasks || [],
+    type: wf.type,
+    createdAt: wf.createdAt || wf.created_at || new Date().toISOString(),
+    updatedAt: wf.updatedAt || wf.updated_at || new Date().toISOString()
+  };
+};
+
 export const SchedulerProvider = ({ children }) => {
   const [schedules, setSchedules] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
-  const initialLoadDone = useRef(false);
-  const saveTimeoutRef = useRef(null);
+  const [error, setError] = useState(null);
 
-  const isElectron = Boolean(typeof window !== 'undefined' && window?.electronAPI);
+  const loadSchedules = useCallback(async (silent = false) => {
+    try {
+      if (!silent) setIsLoading(true);
+      setError(null);
+      const apiWorkflows = await agentApiClient.listWorkflows();
+      const normalized = Array.isArray(apiWorkflows) ? apiWorkflows.map(fromApi) : [];
+      setSchedules(normalized);
+    } catch (err) {
+      console.error('Failed to load schedules:', err);
+      if (!silent) setError('Failed to connect to agent-api');
+    } finally {
+      if (!silent) setIsLoading(false);
+    }
+  }, []);
 
-  // Helper: parse simple cron (m h * * *) into HH:MM (converts UTC cron to local time for display)
-  const parseCronTime = (cron) => {
-    if (!cron || typeof cron !== 'string') return undefined;
-    const parts = cron.trim().split(/\s+/);
-    if (parts.length < 2) return undefined;
-    const [min, hour] = parts;
-    if (isNaN(parseInt(hour)) || isNaN(parseInt(min))) return undefined;
-    
-    // Convert UTC time from cron to local time for display
-    const utcDate = new Date();
-    utcDate.setUTCHours(parseInt(hour), parseInt(min), 0, 0);
-    
-    const pad = (n) => n.toString().padStart(2, '0');
-    // Return local time
-    return `${pad(utcDate.getHours())}:${pad(utcDate.getMinutes())}`;
-  };
-
-  // Transform from workflow file object to internal schedule shape
-  const fromWorkflow = (wf) => {
-    // Use a stable ID based on name hash to prevent regeneration on reload
-    const stableId = wf.id || `${wf.name}-${wf.name.split('').reduce((a, b) => ((a << 5) - a) + b.charCodeAt(0), 0)}`;
-    return {
-      id: stableId,
-      title: wf.name,
-      name: wf.name,
-      workflow: wf.workflow || wf.name,
-      schedule: wf.schedule,
-      enabled: wf.enabled ?? true,
-      // Derive display time if cron fits pattern
-      startTime: parseCronTime(wf.schedule),
-      // Preserve date from saved data
-      date: wf.date,
-      createdAt: wf.createdAt || new Date().toISOString(),
-      updatedAt: wf.updatedAt || new Date().toISOString()
-    };
-  };
-
-  // Transform internal schedule back to workflow file object
-  const toWorkflow = (sch) => {
-    return {
-      id: sch.id,
-      name: sch.title || sch.name || 'untitled',
-      workflow: sch.workflow || 'daily',
-      date: sch.date,
-      createdAt: sch.createdAt,
-      updatedAt: sch.updatedAt,
-      schedule: sch.schedule || (() => {
-        // If we have startTime and type, synthesize cron in UTC
-        if (sch.startTime) {
-          const [hour, minute] = sch.startTime.split(':');
-          // startTime is in local time, convert to UTC for cron
-          const localDate = new Date();
-          localDate.setHours(parseInt(hour) || 0, parseInt(minute) || 0, 0, 0);
-          const utcH = localDate.getUTCHours().toString();
-          const utcM = localDate.getUTCMinutes().toString();
-          if ((sch.workflow === 'weekly') && sch.date) {
-            // Use day-of-week from date (in UTC)
-            const dow = new Date(sch.date).getUTCDay(); // 0-6
-            return `${utcM} ${utcH} * * ${dow}`;
-          }
-          // Daily / default
-          return `${utcM} ${utcH} * * *`;
-        }
-        return '*/5 * * * *'; // Fallback every 5 minutes
-      })(),
-      enabled: sch.enabled ?? true
-    };
-  };
-
-  // Load schedules on mount
   useEffect(() => {
-    const loadSchedules = async () => {
-      try {
-        console.log('Loading schedules, isElectron:', isElectron);
-        setIsLoading(true);
-        let savedSchedules = [];
-        
-        if (isElectron) {
-          // Use Electron file operations
-          try {
-            console.log('Using Electron API to load schedules');
-            savedSchedules = await window.electronAPI.loadSchedules();
-            console.log('Loaded schedules from Electron:', savedSchedules);
-          } catch (error) {
-            console.error('Electron load failed:', error);
-            savedSchedules = [];
-          }
-        } else {
-          // Use localStorage for web
-          console.log('Using localStorage to load schedules');
-          const data = localStorage.getItem('oncall-schedules');
-          savedSchedules = data ? JSON.parse(data) : [];
-          console.log('Loaded schedules from localStorage:', savedSchedules);
-        }
-        
-        const validSchedules = Array.isArray(savedSchedules) ? savedSchedules : [];
-        // Detect workflow format: objects with name & schedule keys
-        const normalized = validSchedules.map(obj => {
-          if (obj && 'name' in obj && 'schedule' in obj && !('title' in obj)) {
-            return fromWorkflow(obj);
-          }
-            // Already internal shape
-          return obj;
-        });
-        console.log('Setting schedules (normalized):', normalized);
-        setSchedules(normalized);
-        initialLoadDone.current = true;
-      } catch (error) {
-        console.error('Error loading schedules:', error);
-        setSchedules([]);
-        initialLoadDone.current = true;
-      } finally {
-        setIsLoading(false);
-      }
+    // Initial Load
+    loadSchedules(false);
+
+    // Background polling every 30 seconds (increased from 15s to reduce load)
+    const interval = setInterval(() => loadSchedules(true), 30000);
+
+    const handleVisibilityChange = () => {
+      if (!document.hidden) loadSchedules(true);
     };
 
-    loadSchedules();
-    
-    // Cleanup on unmount
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
-      if (saveTimeoutRef.current) {
-        clearTimeout(saveTimeoutRef.current);
-      }
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [isElectron]);
+  }, [loadSchedules]);
 
-  // Save schedules with debouncing to prevent excessive writes
-  useEffect(() => {
-    if (isLoading || !initialLoadDone.current) {
-      return; // Don't save during initial load
+  const addSchedule = useCallback(async (schedule) => {
+    try {
+      setIsLoading(true);
+      const existingWorkflow = await agentApiClient.getWorkflow(schedule.workflow);
+      const payload = applyScheduleToWorkflow(existingWorkflow, schedule);
+      await agentApiClient.updateWorkflow(schedule.workflow, payload);
+      await loadSchedules(true);
+    } catch (err) {
+      setError('Failed to create schedule');
+      throw err;
+    } finally {
+      setIsLoading(false);
     }
-    
-    // Clear any pending save
-    if (saveTimeoutRef.current) {
-      clearTimeout(saveTimeoutRef.current);
+  }, [loadSchedules]);
+
+  const updateSchedule = useCallback(async (name, updatedSchedule) => {
+    try {
+      setIsLoading(true);
+      const existingWorkflow = await agentApiClient.getWorkflow(name);
+      const payload = applyScheduleToWorkflow(existingWorkflow, updatedSchedule);
+      await agentApiClient.updateWorkflow(name, payload);
+      await loadSchedules(true);
+    } catch (err) {
+      setError('Failed to update schedule');
+      throw err;
+    } finally {
+      setIsLoading(false);
     }
-    
-    // Debounce saves by 500ms
-    saveTimeoutRef.current = setTimeout(async () => {
-      try {
-        console.log('saveSchedules called, isElectron:', isElectron, 'schedules count:', schedules.length);
-        const workflowPayload = schedules.map(toWorkflow);
-        if (isElectron) {
-          // Use Electron file operations only; pass workflow format
-          const result = await window.electronAPI.saveSchedules(workflowPayload);
-          console.log('Save result:', result);
-          if (!result.success) {
-            console.error('Failed to save schedules to file:', result.error);
-          }
-        } else {
-          // Use localStorage for web in workflow format for consistency
-          localStorage.setItem('oncall-schedules', JSON.stringify(workflowPayload));
-          console.log('Saved to localStorage');
-        }
-      } catch (error) {
-        console.error('Error saving schedules:', error);
-      }
-    }, 500);
-  }, [schedules, isLoading, isElectron]);
+  }, [loadSchedules]);
 
-  const addSchedule = useCallback((schedule) => {
-    const newSchedule = {
-      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      ...schedule,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-    setSchedules(prev => [...prev, newSchedule]);
+  const deleteSchedule = useCallback(async (name) => {
+    try {
+      setIsLoading(true);
+      await agentApiClient.deleteWorkflow(name);
+      await loadSchedules(true);
+    } catch (err) {
+      setError('Failed to delete schedule');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  }, [loadSchedules]);
+
+  const triggerWorkflow = useCallback(async (name) => {
+    return await agentApiClient.executeWorkflow(name, true);
   }, []);
 
-  const updateSchedule = useCallback((id, updatedSchedule) => {
-    setSchedules(prev => prev.map(schedule => 
-      schedule.id === id 
-        ? { ...schedule, ...updatedSchedule, updatedAt: new Date().toISOString() }
-        : schedule
-    ));
-  }, []);
-
-  const deleteSchedule = useCallback((id) => {
-    console.log('deleteSchedule called with id:', id);
-    setSchedules(prev => {
-      const filtered = prev.filter(schedule => schedule.id !== id);
-      console.log('Schedules after delete:', filtered);
-      return filtered;
-    });
-  }, []);
-
-  const getSchedule = useCallback((id) => {
-    return schedules.find(schedule => schedule.id === id);
+  const getSchedule = useCallback((idOrName) => {
+    return schedules.find(s => s.name === idOrName || s.id === idOrName);
   }, [schedules]);
 
-  const getSchedulesByDate = useCallback((date) => {
-    const targetDate = new Date(date).toDateString();
-    return schedules.filter(schedule => 
-      new Date(schedule.date).toDateString() === targetDate
-    );
-  }, [schedules]);
+  const getFreshSchedule = useCallback(async (name) => {
+    const raw = await agentApiClient.getWorkflow(name);
+    return fromApi(raw);
+  }, []);
 
   const value = useMemo(() => ({
     schedules,
     isLoading,
+    error,
     addSchedule,
     updateSchedule,
     deleteSchedule,
     getSchedule,
-    getSchedulesByDate
-  }), [schedules, isLoading, addSchedule, updateSchedule, deleteSchedule, getSchedule, getSchedulesByDate]);
+    getFreshSchedule,
+    triggerWorkflow,
+    loadSchedules,
+    formatTime
+  }), [
+    schedules,
+    isLoading,
+    error,
+    addSchedule,
+    updateSchedule,
+    deleteSchedule,
+    getSchedule,
+    getFreshSchedule,
+    triggerWorkflow,
+    loadSchedules
+  ]);
 
   return (
     <SchedulerContext.Provider value={value}>
       {children}
     </SchedulerContext.Provider>
   );
+};
+
+SchedulerProvider.propTypes = {
+  children: PropTypes.node.isRequired,
 };
