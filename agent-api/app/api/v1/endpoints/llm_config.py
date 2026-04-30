@@ -85,7 +85,10 @@ async def discover_provider_models(request: DiscoverModelsRequest):
         return next((v for k, v in ICON_MAP.items() if k in model_lower), "🤖")
 
     try:
-        if provider == "AWS Bedrock":
+        # Normalize provider name for comparison (case-insensitive)
+        provider_lower = provider.lower()
+        
+        if provider_lower == "bedrock" or provider_lower == "aws bedrock":
             bedrock_region = region or "us-east-1"
             kwargs = {"region_name": bedrock_region}
             if access_key_id and secret_access_key:
@@ -125,7 +128,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
             logger.info("Discovered %d Bedrock models in %s", len(discovered), bedrock_region)
             return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
 
-        elif provider == "OpenAI":
+        elif provider_lower == "openai":
             if not api_key:
                 raise HTTPException(status_code=400, detail="No API key configured for OpenAI")
             async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as client:
@@ -155,7 +158,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
             logger.info("Discovered %d OpenAI models", len(discovered))
             return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
 
-        elif provider == "Anthropic":
+        elif provider_lower == "anthropic":
             if not api_key:
                 raise HTTPException(status_code=400, detail="No API key configured for Anthropic")
             async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as client:
@@ -188,7 +191,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
             logger.info("Discovered %d Anthropic models", len(discovered))
             return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
 
-        elif provider == "Google":
+        elif provider_lower == "google":
             if not api_key:
                 raise HTTPException(status_code=400, detail="No API key configured for Google")
             async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as client:
@@ -217,7 +220,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
             logger.info("Discovered %d Google models", len(discovered))
             return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
 
-        elif provider == "Groq":
+        elif provider_lower == "groq":
             if not api_key:
                 raise HTTPException(status_code=400, detail="No API key configured for Groq")
             async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as client:
@@ -247,7 +250,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
             logger.info("Discovered %d Groq models", len(discovered))
             return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
 
-        elif provider == "Azure OpenAI":
+        elif provider_lower == "azure openai":
             if not api_key:
                 raise HTTPException(status_code=400, detail="No API key configured for Azure OpenAI")
             if not endpoint:
@@ -280,7 +283,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
             logger.info("Discovered %d Azure OpenAI models", len(discovered))
             return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
 
-        elif provider == "Ollama":
+        elif provider_lower == "ollama":
             ollama_url = endpoint or "http://localhost:11434"
             async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as client:
                 resp = await client.get(f"{ollama_url}/api/tags")

@@ -39,7 +39,7 @@ import {
 } from 'lucide-react';
 import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer, getMCPInputValues, updateMCPInputValue, invalidateCache } from '../services/mcpService';
 import { getLLMs, addLLM, updateLLM, deleteLLM, discoverModels, addDiscoveredModels, bulkDeleteLLMs } from '../services/llmService';
-import { getModelKeys, upsertModelKey, deleteModelKey } from '../services/modelKeyService';
+import { getModelKeys, upsertModelKey, deleteModelKey, getProviderSchemas } from '../services/modelKeyService';
 import agentApiClient from '../services/agentApiClient';
 import { testLLMConnection as testLLMConnectionAPI } from '../services/apiClient';
 
@@ -138,6 +138,9 @@ const parseEnvVars = (envString) => {
 };
 
 const Settings = () => {
+    // Debug: Verify new code is loaded
+    console.log('Settings component loaded - VERSION 2.0 - Fixed provider fields - Timestamp:', new Date().toISOString());
+    
     const [servers, setServers] = useState({});
     const [openDialog, setOpenDialog] = useState(false);
     const [editingServer, setEditingServer] = useState(null);
@@ -208,6 +211,7 @@ const Settings = () => {
 
     // Model Keys state
     const [modelKeys, setModelKeys] = useState([]);
+    const [providerSchemas, setProviderSchemas] = useState([]);
     const [openModelKeyDialog, setOpenModelKeyDialog] = useState(false);
     const [editingModelKeyProvider, setEditingModelKeyProvider] = useState(null);
     const [modelKeyFormData, setModelKeyFormData] = useState({
@@ -225,37 +229,45 @@ const Settings = () => {
     const originalMaskedValues = useRef({});
 
     const MODEL_KEY_PROVIDERS = [
-        { value: 'OpenAI', label: 'OpenAI', icon: '🧠', fields: ['api_key'] },
-        { value: 'Anthropic', label: 'Anthropic', icon: '🤖', fields: ['api_key'] },
-        { value: 'Google', label: 'Google AI', icon: '✨', fields: ['api_key'] },
-        { value: 'Groq', label: 'Groq', icon: '⚡', fields: ['api_key'] },
-        { value: 'Azure OpenAI', label: 'Azure OpenAI', icon: '☁️', fields: ['api_key', 'endpoint'] },
-        { value: 'AWS Bedrock', label: 'AWS Bedrock', icon: '🌩️', fields: ['access_key_id', 'secret_access_key', 'session_token', 'region'] },
-        { value: 'Ollama', label: 'Ollama', icon: '🦙', fields: ['endpoint'] },
-        { value: 'Custom', label: 'Custom', icon: '🔧', fields: ['api_key', 'secret_key', 'endpoint'] },
+        { value: 'openai', label: 'OpenAI', icon: '🧠', fields: ['api_key'] },
+        { value: 'anthropic', label: 'Anthropic', icon: '🤖', fields: ['api_key'] },
+        { value: 'google', label: 'Google AI', icon: '✨', fields: ['api_key'] },
+        { value: 'groq', label: 'Groq', icon: '⚡', fields: ['api_key'] },
+        { value: 'azure openai', label: 'Azure OpenAI', icon: '☁️', fields: ['api_key', 'endpoint'] },
+        { value: 'bedrock', label: 'AWS Bedrock', icon: '🌩️', fields: ['access_key_id', 'secret_access_key', 'session_token', 'region'] },
+        { value: 'ollama', label: 'Ollama', icon: '🦙', fields: ['endpoint'] },
+        { value: 'custom', label: 'Custom', icon: '🔧', fields: ['api_key', 'secret_key', 'endpoint'] },
     ];
 
     const emptyModelKeyForm = (provider) => {
+        // Default to 'openai' if no provider specified
+        const selectedProvider = provider || 'openai';
+        
+        // Only initialize fields that are relevant for this provider
+        const providerConfig = MODEL_KEY_PROVIDERS.find(p => p.value === selectedProvider);
         const base = {
-            provider: provider || 'OpenAI',
-            api_key: '',
-            secret_key: '',
-            endpoint: '',
-            region: '',
-            access_key_id: '',
-            secret_access_key: '',
-            session_token: '',
+            provider: selectedProvider,
             description: '',
         };
-        if (provider === 'Azure OpenAI') base.endpoint = 'https://your-resource.openai.azure.com';
-        if (provider === 'Ollama') base.endpoint = 'http://localhost:11434';
-        if (provider === 'AWS Bedrock') base.region = 'us-east-1';
+        
+        // Only add fields that are configured for this provider
+        if (providerConfig) {
+            providerConfig.fields.forEach(field => {
+                base[field] = '';
+            });
+        }
+        
+        // Set default values for specific providers
+        if (selectedProvider === 'azure openai' && base.endpoint !== undefined) base.endpoint = 'https://your-resource.openai.azure.com';
+        if (selectedProvider === 'ollama' && base.endpoint !== undefined) base.endpoint = 'http://localhost:11434';
+        if (selectedProvider === 'bedrock' && base.region !== undefined) base.region = 'us-east-1';
+        
         return base;
     };
 
     const discoverableProviders = (() => {
         const providers = [];
-        const supportedForDiscovery = ['OpenAI', 'Anthropic', 'Google', 'Groq', 'Azure OpenAI', 'Ollama', 'AWS Bedrock'];
+        const supportedForDiscovery = ['openai', 'anthropic', 'google', 'groq', 'azure openai', 'ollama', 'bedrock'];
         for (const mk of modelKeys) {
             if (!supportedForDiscovery.includes(mk.provider)) continue;
             const hasCreds = mk.has_api_key || mk.has_secret_key || mk.has_access_credentials || mk.endpoint;
@@ -280,6 +292,7 @@ const Settings = () => {
         loadCertificates();
         checkApiHealth();
         loadModelKeys();
+        loadProviderSchemas();
     }, []);
 
     const loadServers = async () => {
@@ -345,21 +358,34 @@ const Settings = () => {
         }
     };
 
+    const loadProviderSchemas = async () => {
+        try {
+            const schemas = await getProviderSchemas();
+            setProviderSchemas(schemas);
+        } catch (error) {
+            console.error('Failed to load provider schemas:', error);
+            setProviderSchemas([]);
+        }
+    };
+
     const handleOpenModelKeyDialog = (provider = null) => {
         if (provider) {
             const existing = modelKeys.find(k => k.provider === provider);
+            const providerConfig = MODEL_KEY_PROVIDERS.find(p => p.value === provider);
             setEditingModelKeyProvider(provider);
+            
+            // Only include fields that are configured for this provider
             const formData = {
                 provider,
-                api_key: existing?.api_key || '',
-                secret_key: existing?.secret_key || '',
-                endpoint: existing?.endpoint || '',
-                region: existing?.region || '',
-                access_key_id: existing?.access_key_id || '',
-                secret_access_key: existing?.secret_access_key || '',
-                session_token: existing?.session_token || '',
                 description: existing?.description || '',
             };
+            
+            if (providerConfig) {
+                providerConfig.fields.forEach(field => {
+                    formData[field] = existing?.[field] || '';
+                });
+            }
+            
             setModelKeyFormData(formData);
             originalMaskedValues.current = { ...formData };
         } else {
@@ -379,23 +405,66 @@ const Settings = () => {
         try {
             const providerConfig = MODEL_KEY_PROVIDERS.find(p => p.value === modelKeyFormData.provider);
             const data = { provider: modelKeyFormData.provider };
+            
+            console.log('=== DEBUG: handleSaveModelKey ===');
+            console.log('Provider:', modelKeyFormData.provider);
+            console.log('Provider config:', providerConfig);
+            console.log('Form data before filtering:', modelKeyFormData);
+            
+            // Only include fields that are configured for this provider
             if (providerConfig) {
-                providerConfig.fields.forEach(field => {
+                const validFields = providerConfig.fields;
+                console.log('Valid fields for this provider:', validFields);
+                
+                validFields.forEach(field => {
                     const value = modelKeyFormData[field];
-                    if (value && value !== originalMaskedValues.current[field]) {
+                    console.log(`Checking field '${field}':`, value);
+                    // Include the field if it has a value and either:
+                    // 1. It's different from the masked value (for edits), or
+                    // 2. We're creating a new entry (no original masked value)
+                    if (value && (value !== originalMaskedValues.current[field] || !editingModelKeyProvider)) {
                         data[field] = value;
+                        console.log(`  -> Including field '${field}'`);
+                    } else {
+                        console.log(`  -> Skipping field '${field}' (empty or unchanged)`);
                     }
                 });
             }
-            if (modelKeyFormData.description) data.description = modelKeyFormData.description;
-            if (modelKeyFormData.region && modelKeyFormData.provider === 'AWS Bedrock') data.region = modelKeyFormData.region;
+            
+            // Add description if provided
+            if (modelKeyFormData.description) {
+                data.description = modelKeyFormData.description;
+            }
+            
+            console.log('Final data to send:', data);
+            console.log('=== END DEBUG ===');
+            
             await upsertModelKey(data);
             setSaveMessage(`Saved keys for ${modelKeyFormData.provider}`);
             await loadModelKeys();
             handleCloseModelKeyDialog();
         } catch (error) {
             console.error('Error saving model key:', error);
-            alert('Failed to save: ' + error.message);
+            
+            // Try to parse validation error from API
+            let errorMessage = 'Failed to save: ' + error.message;
+            try {
+                // Check if error response contains validation details
+                const response = await error.response?.json();
+                if (response?.detail) {
+                    const detail = response.detail;
+                    if (detail.errors && Array.isArray(detail.errors)) {
+                        errorMessage = 'Validation failed:\n' + 
+                            detail.errors.map(e => `• ${e.field}: ${e.message}`).join('\n');
+                    } else if (typeof detail === 'string') {
+                        errorMessage = detail;
+                    }
+                }
+            } catch (parseError) {
+                // Use original error message
+            }
+            
+            alert(errorMessage);
         }
         setTimeout(() => setSaveMessage(''), 3000);
     };
@@ -1172,24 +1241,32 @@ const Settings = () => {
                             </Button>
                         </div>
                         <p className="text-sm text-muted-foreground mb-4">
-                            Centralized API key and secret key management for all model providers
+                            Centralized API key and credential management for all model providers
                         </p>
                         <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-                            {MODEL_KEY_PROVIDERS.map((provider) => {
-                                const existing = modelKeys.find(k => k.provider === provider.value);
+                            {providerSchemas.map((schema) => {
+                                const existing = modelKeys.find(k => k.provider.toLowerCase() === schema.provider.toLowerCase());
+                                const configuredFields = existing?.configured_fields || [];
+                                
                                 return (
-                                    <div key={provider.value} className="border rounded-lg p-4">
+                                    <div key={schema.provider} className="border rounded-lg p-4">
                                         <div className="flex items-start justify-between mb-2">
                                             <div className="flex items-center gap-2">
-                                                <span className="text-xl">{provider.icon}</span>
-                                                <span className="font-medium text-sm">{provider.label}</span>
+                                                <span className="text-xl">
+                                                    {schema.provider === 'openai' && '🧠'}
+                                                    {schema.provider === 'anthropic' && '🤖'}
+                                                    {schema.provider === 'groq' && '⚡'}
+                                                    {schema.provider === 'bedrock' && '🌩️'}
+                                                    {schema.provider === 'cloudwatch' && '☁️'}
+                                                </span>
+                                                <span className="font-medium text-sm">{schema.display_name}</span>
                                             </div>
                                             <div className="flex gap-1">
                                                 <Button
                                                     size="icon"
                                                     variant="ghost"
                                                     className="h-7 w-7"
-                                                    onClick={() => handleOpenModelKeyDialog(provider.value)}
+                                                    onClick={() => handleOpenModelKeyDialog(schema.provider)}
                                                     title="Edit"
                                                 >
                                                     <Edit2 className="w-3.5 h-3.5" />
@@ -1199,7 +1276,7 @@ const Settings = () => {
                                                         size="icon"
                                                         variant="ghost"
                                                         className="h-7 w-7 text-red-600 hover:text-red-700"
-                                                        onClick={() => handleDeleteModelKey(provider.value)}
+                                                        onClick={() => handleDeleteModelKey(schema.provider)}
                                                         title="Delete"
                                                     >
                                                         <Trash2 className="w-3.5 h-3.5" />
@@ -1207,50 +1284,68 @@ const Settings = () => {
                                                 )}
                                             </div>
                                         </div>
-                                        <div className="flex flex-wrap gap-1 mb-1">
-                                            {existing ? (
-                                                <>
-                                                    {existing.has_api_key && (
-                                                        <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200 gap-1 text-xs">
-                                                            <Key className="w-3 h-3" /> API Key
-                                                        </Badge>
-                                                    )}
-                                                    {existing.has_secret_key && (
-                                                        <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200 gap-1 text-xs">
-                                                            <Shield className="w-3 h-3" /> Secret
-                                                        </Badge>
-                                                    )}
-                                                    {existing.has_aws_credentials && (
-                                                        <Badge variant="outline" className="bg-orange-50 text-orange-700 border-orange-200 gap-1 text-xs">
-                                                            <Cloud className="w-3 h-3" /> AWS
-                                                        </Badge>
-                                                    )}
-                                                    {existing.endpoint && (
-                                                        <Badge variant="outline" className="bg-purple-50 text-purple-700 border-purple-200 gap-1 text-xs">
-                                                            Endpoint
-                                                        </Badge>
-                                                    )}
-                                                </>
+                                        
+                                        {/* Authentication Type Badge */}
+                                        <div className="mb-2">
+                                            {schema.auth_type === 'api_key' && (
+                                                <Badge variant="outline" className="text-xs">
+                                                    <Key className="w-3 h-3 mr-1" /> API Key Auth
+                                                </Badge>
+                                            )}
+                                            {schema.auth_type === 'aws_iam' && (
+                                                <Badge variant="outline" className="text-xs">
+                                                    <Cloud className="w-3 h-3 mr-1" /> AWS IAM Auth
+                                                </Badge>
+                                            )}
+                                            {schema.auth_type === 'api_key_or_aws_iam' && (
+                                                <Badge variant="outline" className="text-xs">
+                                                    <Key className="w-3 h-3 mr-1" /> Dual Auth
+                                                </Badge>
+                                            )}
+                                        </div>
+                                        
+                                        {/* Configured Fields */}
+                                        <div className="flex flex-wrap gap-1 mb-2">
+                                            {existing && configuredFields.length > 0 ? (
+                                                configuredFields.map(field => (
+                                                    <Badge 
+                                                        key={field} 
+                                                        variant="outline" 
+                                                        className="bg-green-50 text-green-700 border-green-200 text-xs"
+                                                    >
+                                                        {field.replace(/_/g, ' ')}
+                                                    </Badge>
+                                                ))
                                             ) : (
                                                 <Badge variant="outline" className="text-muted-foreground text-xs">
                                                     Not configured
                                                 </Badge>
                                             )}
                                         </div>
+                                        
+                                        {/* Additional Info */}
                                         {existing?.endpoint && (
-                                            <p className="text-xs text-muted-foreground font-mono truncate" title={existing.endpoint}>
+                                            <p className="text-xs text-muted-foreground font-mono truncate mb-1" title={existing.endpoint}>
                                                 {existing.endpoint}
                                             </p>
                                         )}
                                         {existing?.region && (
-                                            <p className="text-xs text-muted-foreground">Region: {existing.region}</p>
+                                            <p className="text-xs text-muted-foreground mb-1">
+                                                Region: {existing.region}
+                                            </p>
                                         )}
+                                        
+                                        {/* Description */}
+                                        <p className="text-xs text-muted-foreground line-clamp-2">
+                                            {schema.description}
+                                        </p>
+                                        
                                         {!existing && (
                                             <Button
                                                 variant="outline"
                                                 size="sm"
                                                 className="mt-2 w-full text-xs h-7"
-                                                onClick={() => handleOpenModelKeyDialog(provider.value)}
+                                                onClick={() => handleOpenModelKeyDialog(schema.provider)}
                                             >
                                                 <Plus className="w-3 h-3 mr-1" /> Configure
                                             </Button>
@@ -1834,7 +1929,7 @@ const Settings = () => {
                                                         value={modelKeyFormData.api_key}
                                                         onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, api_key: e.target.value })}
                                                         type={showModelKeyFields.api_key ? 'text' : 'password'}
-                                                        placeholder={modelKeyFormData.provider === 'OpenAI' ? 'sk-...' : modelKeyFormData.provider === 'Anthropic' ? 'sk-ant-...' : 'Enter API key'}
+                                                        placeholder={modelKeyFormData.provider === 'openai' ? 'sk-...' : modelKeyFormData.provider === 'anthropic' ? 'sk-ant-...' : 'Enter API key'}
                                                         className="pr-10"
                                                     />
                                                     <Button
@@ -1886,13 +1981,13 @@ const Settings = () => {
                                         return (
                                             <div key={field} className="space-y-2">
                                                 <Label htmlFor="mk-endpoint">
-                                                    {modelKeyFormData.provider === 'Ollama' ? 'Base URL' : 'Endpoint URL'}
+                                                    {modelKeyFormData.provider === 'ollama' ? 'Base URL' : 'Endpoint URL'}
                                                 </Label>
                                                 <Input
                                                     id="mk-endpoint"
                                                     value={modelKeyFormData.endpoint}
                                                     onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, endpoint: e.target.value })}
-                                                    placeholder={modelKeyFormData.provider === 'Ollama' ? 'http://localhost:11434' : 'https://...'}
+                                                    placeholder={modelKeyFormData.provider === 'ollama' ? 'http://localhost:11434' : 'https://...'}
                                                 />
                                             </div>
                                         );

@@ -95,3 +95,29 @@ export const deleteModelKey = async (provider) => {
     throw error;
   }
 };
+
+export const getProviderSchemas = async () => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/model-keys/schemas`);
+    if (!response.ok) throw new Error('Failed to fetch provider schemas');
+    const data = await response.json();
+    return data.schemas || [];
+  } catch (error) {
+    console.error('Error fetching provider schemas:', error);
+    return [];
+  }
+};
+
+export const getProviderSchema = async (provider) => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/model-keys/schemas/${encodeURIComponent(provider)}`);
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to fetch provider schema');
+    }
+    return await response.json();
+  } catch (error) {
+    console.error('Error fetching provider schema:', error);
+    throw error;
+  }
+};

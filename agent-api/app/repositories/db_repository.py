@@ -14,6 +14,8 @@ from app.models.db_models import (
     ModelKeyModel,
 )
 from app.core.redact import redact
+from app.services.credential_transformer import CredentialTransformer
+from app.services.provider_schema_registry import ProviderSchema
 
 logger = logging.getLogger(__name__)
 
@@ -693,17 +695,28 @@ class DatabaseRepository:
             return self._model_key_to_dict(k, include_secrets) if k else None
 
     async def create_model_key(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new model key with field name normalization.
+        
+        Args:
+            data: Model key data with potentially aws_* prefixed field names
+            
+        Returns:
+            Created model key data
+        """
         async with AsyncSessionLocal() as session:
+            # Normalize field names using CredentialTransformer
+            normalized_data = CredentialTransformer.normalize_input(data)
+            
             key = ModelKeyModel(
-                provider=data["provider"],
-                api_key=data.get("api_key"),
-                secret_key=data.get("secret_key"),
-                endpoint=data.get("endpoint"),
-                region=data.get("region"),
-                access_key_id=data.get("access_key_id"),
-                secret_access_key=data.get("secret_access_key"),
-                session_token=data.get("session_token"),
-                description=data.get("description"),
+                provider=normalized_data["provider"],
+                api_key=normalized_data.get("api_key"),
+                secret_key=normalized_data.get("secret_key"),
+                endpoint=normalized_data.get("endpoint"),
+                region=normalized_data.get("region"),
+                access_key_id=normalized_data.get("access_key_id"),
+                secret_access_key=normalized_data.get("secret_access_key"),
+                session_token=normalized_data.get("session_token"),
+                description=normalized_data.get("description"),
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
             )
@@ -713,6 +726,15 @@ class DatabaseRepository:
             return self._model_key_to_dict(key, include_secrets=True)
 
     async def update_model_key(self, provider: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update an existing model key with field name normalization.
+        
+        Args:
+            provider: Provider identifier
+            data: Updated model key data with potentially aws_* prefixed field names
+            
+        Returns:
+            Updated model key data or None if not found
+        """
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(ModelKeyModel).where(ModelKeyModel.provider == provider)
@@ -720,40 +742,59 @@ class DatabaseRepository:
             key = result.scalar_one_or_none()
             if not key:
                 return None
-            for field in ("api_key", "secret_key", "endpoint", "region",
-                         "access_key_id", "secret_access_key",
-                         "session_token", "description"):
-                if field in data:
-                    setattr(key, field, data[field])
+            
+            # Normalize field names using CredentialTransformer
+            normalized_data = CredentialTransformer.normalize_input(data)
+            
+            # Update fields from normalized data
+            for field_name in ["api_key", "secret_key", "endpoint", "region", 
+                              "access_key_id", "secret_access_key", "session_token", "description"]:
+                if field_name in normalized_data:
+                    setattr(key, field_name, normalized_data[field_name])
+            
             key.updated_at = datetime.now(timezone.utc)
             await session.commit()
             await session.refresh(key)
             return self._model_key_to_dict(key, include_secrets=True)
 
     async def upsert_model_key(self, provider: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Insert or update a model key with field name normalization.
+        
+        Args:
+            provider: Provider identifier
+            data: Model key data with potentially aws_* prefixed field names
+            
+        Returns:
+            Upserted model key data
+        """
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(ModelKeyModel).where(ModelKeyModel.provider == provider)
             )
             key = result.scalar_one_or_none()
+            
+            # Normalize field names using CredentialTransformer
+            normalized_data = CredentialTransformer.normalize_input(data)
+            
             if key:
-                for field in ("api_key", "secret_key", "endpoint", "region",
-                             "access_key_id", "secret_access_key",
-                             "session_token", "description"):
-                    if field in data:
-                        setattr(key, field, data[field])
+                # Update existing key
+                for field_name in ["api_key", "secret_key", "endpoint", "region", 
+                                  "access_key_id", "secret_access_key", "session_token", "description"]:
+                    if field_name in normalized_data:
+                        setattr(key, field_name, normalized_data[field_name])
                 key.updated_at = datetime.now(timezone.utc)
             else:
+                # Create new key
                 key = ModelKeyModel(
                     provider=provider,
-                    api_key=data.get("api_key"),
-                    secret_key=data.get("secret_key"),
-                    endpoint=data.get("endpoint"),
-                    region=data.get("region"),
-                    access_key_id=data.get("access_key_id"),
-                    secret_access_key=data.get("secret_access_key"),
-                    session_token=data.get("session_token"),
-                    description=data.get("description"),
+                    api_key=normalized_data.get("api_key"),
+                    secret_key=normalized_data.get("secret_key"),
+                    endpoint=normalized_data.get("endpoint"),
+                    region=normalized_data.get("region"),
+                    access_key_id=normalized_data.get("access_key_id"),
+                    secret_access_key=normalized_data.get("secret_access_key"),
+                    session_token=normalized_data.get("session_token"),
+                    description=normalized_data.get("description"),
                     created_at=datetime.now(timezone.utc),
                     updated_at=datetime.now(timezone.utc),
                 )
@@ -778,7 +819,22 @@ class DatabaseRepository:
             )
             return result.scalar_one_or_none() is not None
 
-    def _model_key_to_dict(self, key: ModelKeyModel, include_secrets: bool = False) -> Dict[str, Any]:
+    def _model_key_to_dict(
+        self, 
+        key: ModelKeyModel, 
+        include_secrets: bool = False,
+        schema: Optional[ProviderSchema] = None
+    ) -> Dict[str, Any]:
+        """Convert model key to dictionary with optional schema information.
+        
+        Args:
+            key: ModelKeyModel instance
+            include_secrets: If True, include actual secret values; if False, mask them
+            schema: Optional ProviderSchema to include in response
+            
+        Returns:
+            Dictionary representation with provider info, credential flags, and optional schema
+        """
         d = {
             "provider": key.provider,
             "has_api_key": bool(key.api_key),
@@ -788,12 +844,40 @@ class DatabaseRepository:
             "region": key.region,
             "description": key.description,
         }
+        
+        # Add configured_fields list showing which fields have values
+        configured_fields = []
+        if key.api_key:
+            configured_fields.append("api_key")
+        if key.secret_key:
+            configured_fields.append("secret_key")
+        if key.access_key_id:
+            configured_fields.append("access_key_id")
+        if key.secret_access_key:
+            configured_fields.append("secret_access_key")
+        if key.session_token:
+            configured_fields.append("session_token")
+        if key.endpoint:
+            configured_fields.append("endpoint")
+        if key.region:
+            configured_fields.append("region")
+        if key.description:
+            configured_fields.append("description")
+        
+        d["configured_fields"] = configured_fields
+        
+        # Include schema if provided
+        if schema:
+            d["schema"] = schema.model_dump()
+        
+        # Include actual secret values if requested
         if include_secrets:
             d["api_key"] = key.api_key
             d["secret_key"] = key.secret_key
             d["access_key_id"] = key.access_key_id
             d["secret_access_key"] = key.secret_access_key
             d["session_token"] = key.session_token
+        
         return d
 
 
