@@ -43,6 +43,55 @@ class Settings(BaseSettings):
     scheduler_timezone: str = "UTC"
     max_concurrent_workflows: int = 5
     
+    # Hermes integration feature flags
+    # Context compression settings
+    context_compression_enabled: bool = Field(
+        default=True,
+        description="Enable intelligent context compression for long conversations"
+    )
+    context_threshold_percent: float = Field(
+        default=0.50,
+        description="Token usage threshold (as fraction of context length) to trigger compression"
+    )
+    context_protect_first_n: int = Field(
+        default=3,
+        description="Number of initial messages (system prompt + first exchange) to protect from compression"
+    )
+    
+    # Rate limit tracking settings
+    rate_limit_tracking_enabled: bool = Field(
+        default=True,
+        description="Enable tracking of API rate limits from response headers"
+    )
+    rate_limit_warning_threshold: float = Field(
+        default=0.80,
+        description="Usage percentage threshold to trigger rate limit warnings"
+    )
+    
+    # Auxiliary client settings (for side tasks like summarization)
+    auxiliary_provider: str = Field(
+        default="auto",
+        description="Provider for auxiliary LLM tasks (auto, openrouter, anthropic, openai)"
+    )
+    auxiliary_model: str = Field(
+        default="",
+        description="Model to use for auxiliary tasks (empty = auto-select)"
+    )
+    auxiliary_base_url: str = Field(
+        default="",
+        description="Custom base URL for auxiliary provider"
+    )
+    
+    # Skills and trajectories directories
+    skills_dir: str = Field(
+        default="data/skills",
+        description="Directory containing skill SKILL.md files"
+    )
+    trajectories_dir: str = Field(
+        default="data/trajectories",
+        description="Directory for storing conversation trajectories"
+    )
+    
     @property
     def async_database_url(self) -> str:
         """Get async database URL for asyncpg."""

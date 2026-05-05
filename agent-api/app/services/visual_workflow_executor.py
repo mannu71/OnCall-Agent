@@ -17,6 +17,7 @@ from app.mcp.tools.watch_tools import (
     correlate_logs,
 )
 from app.core.redact import redact
+from app.core.error_classifier import ClassifiedError
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +39,13 @@ class _AgentStreamCallback:
             {"token": token, "node_id": self._node_id},
         )
 
-    async def on_tool_call(self, tool_name: str, args: dict) -> None:
+    async def on_tool_call(self, tool_name: str, args: dict, preview: str = None) -> None:
+        event_data = {"tool": tool_name, "args": args, "node_id": self._node_id}
+        if preview:
+            event_data["preview"] = preview
         await self._executor._publish_event(
             self._execution_id, "tool_call",
-            {"tool": tool_name, "args": args, "node_id": self._node_id},
+            event_data,
         )
 
     async def on_tool_result(self, tool_name: str, result: str) -> None:
@@ -50,16 +54,27 @@ class _AgentStreamCallback:
             {"tool": tool_name, "result": redact(result)[:2000], "node_id": self._node_id},
         )
 
-    async def on_error(self, error: str) -> None:
+    async def on_error(self, error: str, classified: "ClassifiedError" = None) -> None:
+        event_data = {"error": redact(error), "node_id": self._node_id}
+        if classified:
+            event_data["classified"] = {
+                "reason": classified.reason.value,
+                "retryable": classified.retryable,
+                "should_compress": classified.should_compress,
+                "should_fallback": classified.should_fallback,
+            }
         await self._executor._publish_event(
             self._execution_id, "agent_error",
-            {"error": redact(error), "node_id": self._node_id},
+            event_data,
         )
 
-    async def on_complete(self, output: str) -> None:
+    async def on_complete(self, output: str, metadata: dict = None) -> None:
+        event_data = {"output": redact(output)[:500], "node_id": self._node_id}
+        if metadata:
+            event_data["metadata"] = metadata
         await self._executor._publish_event(
             self._execution_id, "agent_complete",
-            {"output": redact(output)[:500], "node_id": self._node_id},
+            event_data,
         )
 
 
@@ -91,9 +106,17 @@ class VisualWorkflowExecutor:
     def _build_node_result(value: Dict[str, Any]) -> Dict[str, Any]:
         """Extract relevant fields from a node execution result."""
         node_result = {}
-        for field in ('status', 'output', 'trigger_time', 'model'):
+        for field in ('status', 'output', 'trigger_time', 'model', 'provider', 'duration', 'recall_hits'):
             if field in value:
                 node_result[field] = value[field]
+        
+        # Extract token usage if available
+        if 'token_usage' in value:
+            node_result['token_usage'] = value['token_usage']
+        
+        # Extract metadata if available
+        if 'metadata' in value:
+            node_result['metadata'] = value['metadata']
         
         if 'queries_executed' in value:
             node_result['queries_executed'] = value['queries_executed']
@@ -109,6 +132,14 @@ class VisualWorkflowExecutor:
             node_result['data'] = value.get('data', {})
             if value.get('alerts'):
                 node_result['alerts'] = value['alerts']
+        
+        # Extract agent-specific fields
+        if 'final_answer' in value:
+            node_result['final_answer'] = value['final_answer']
+        if 'message_count' in value:
+            node_result['message_count'] = value['message_count']
+        if 'tool_calls' in value:
+            node_result['tool_calls'] = value['tool_calls']
         
         return node_result
     
@@ -837,7 +868,7 @@ class VisualWorkflowExecutor:
                 alerts = self._check_cloudwatch_alerts(result, analysis_type, error_threshold)
 
             # Use the workflow's LLM to produce an agent-style analysis
-            llm_analysis, model_used = await self._analyze_cloudwatch_with_llm(
+            llm_analysis, model_used, token_usage = await self._analyze_cloudwatch_with_llm(
                 raw_result=result,
                 analysis_type=analysis_type,
                 log_groups=log_groups,
@@ -855,6 +886,7 @@ class VisualWorkflowExecutor:
                 "data": result,
                 "alerts": alerts if alerts else None,
                 "model": model_used,
+                "token_usage": token_usage,
             }
 
         except Exception as e:
@@ -876,7 +908,7 @@ class VisualWorkflowExecutor:
         """Use the workflow's LLM node to produce an agent-style analysis.
 
         Returns:
-            Tuple of (analysis_text, model_name).  Both are ``None`` when
+            Tuple of (analysis_text, model_name, token_usage).  All are ``None`` when
             no LLM is available or the call fails (graceful fallback to
             the static summary built by ``_build_cloudwatch_summary``).
         """
@@ -888,13 +920,13 @@ class VisualWorkflowExecutor:
             active = self.active_executions.get(execution_id, {})
             workflow = active.get('workflow')
             if not workflow:
-                return None, None
+                return None, None, None
 
             # Require an LLM node in the workflow
             nodes = workflow.get('nodes', [])
             if not any(n.get('type') == 'llm' for n in nodes):
                 logger.debug("CloudWatch LLM analysis skipped: no LLM node in workflow")
-                return None, None
+                return None, None, None
 
             strategy = ReactStrategy()
             llm_config = await strategy._resolve_llm_config(workflow)
@@ -940,16 +972,119 @@ class VisualWorkflowExecutor:
 
             analysis = str(response.content) if response.content else None
             model_name = llm_config.get('model')
+            
+            # Extract token usage from response metadata
+            token_usage = None
+            try:
+                # Log the full response object structure for debugging
+                logger.info(f"CloudWatch: response type: {type(response)}")
+                logger.info(f"CloudWatch: response attributes: {dir(response)}")
+                
+                # Check for usage_metadata attribute (LangChain standard)
+                if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                    usage_meta = response.usage_metadata
+                    logger.info(f"CloudWatch: found usage_metadata: {usage_meta}")
+                    
+                    # usage_metadata can be either a dict or an object with attributes
+                    if isinstance(usage_meta, dict):
+                        prompt_tokens = usage_meta.get('input_tokens', 0) or usage_meta.get('prompt_tokens', 0)
+                        completion_tokens = usage_meta.get('output_tokens', 0) or usage_meta.get('completion_tokens', 0)
+                        total_tokens = usage_meta.get('total_tokens', 0)
+                    else:
+                        prompt_tokens = getattr(usage_meta, 'input_tokens', 0) or getattr(usage_meta, 'prompt_tokens', 0)
+                        completion_tokens = getattr(usage_meta, 'output_tokens', 0) or getattr(usage_meta, 'completion_tokens', 0)
+                        total_tokens = getattr(usage_meta, 'total_tokens', 0)
+                    
+                    if not total_tokens and (prompt_tokens or completion_tokens):
+                        total_tokens = prompt_tokens + completion_tokens
+                    
+                    if total_tokens > 0:
+                        token_usage = {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens,
+                        }
+                        logger.info(
+                            "CloudWatch: extracted token usage from usage_metadata - prompt=%d, completion=%d, total=%d",
+                            prompt_tokens, completion_tokens, total_tokens
+                        )
+                
+                # Fallback: check response_metadata
+                if not token_usage and hasattr(response, 'response_metadata'):
+                    resp_meta = response.response_metadata
+                    logger.info(f"CloudWatch: response_metadata keys: {list(resp_meta.keys())}")
+                    logger.info(f"CloudWatch: full response_metadata: {resp_meta}")
+                    
+                    # AWS Bedrock Converse API returns usage directly in response_metadata
+                    # Check for usage at top level first (Bedrock Converse format)
+                    if 'usage' in resp_meta:
+                        usage_meta = resp_meta['usage']
+                        prompt_tokens = usage_meta.get("inputTokens", 0)
+                        completion_tokens = usage_meta.get("outputTokens", 0)
+                        total_tokens = usage_meta.get("totalTokens", 0)
+                        
+                        if not total_tokens and (prompt_tokens or completion_tokens):
+                            total_tokens = prompt_tokens + completion_tokens
+                        
+                        if total_tokens > 0:
+                            token_usage = {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": total_tokens,
+                            }
+                            logger.info(
+                                "CloudWatch: extracted token usage (Bedrock format) - prompt=%d, completion=%d, total=%d",
+                                prompt_tokens, completion_tokens, total_tokens
+                            )
+                    else:
+                        # Fallback: try other provider formats
+                        usage_meta = (
+                            resp_meta.get('token_usage') or
+                            resp_meta.get('usage_metadata')
+                        )
+                        
+                        if usage_meta:
+                            # Handle different provider formats
+                            prompt_tokens = (
+                                usage_meta.get("input_tokens") or 
+                                usage_meta.get("prompt_tokens") or 
+                                usage_meta.get("inputTokens") or 
+                                0
+                            )
+                            completion_tokens = (
+                                usage_meta.get("output_tokens") or 
+                                usage_meta.get("completion_tokens") or 
+                                usage_meta.get("outputTokens") or 
+                                0
+                            )
+                            total_tokens = usage_meta.get("total_tokens") or usage_meta.get("totalTokens") or 0
+                            
+                            if not total_tokens and (prompt_tokens or completion_tokens):
+                                total_tokens = prompt_tokens + completion_tokens
+                            
+                            if total_tokens > 0:
+                                token_usage = {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "total_tokens": total_tokens,
+                                }
+                                logger.info(
+                                    "CloudWatch: extracted token usage (generic format) - prompt=%d, completion=%d, total=%d",
+                                    prompt_tokens, completion_tokens, total_tokens
+                                )
+            except Exception as e:
+                logger.warning("CloudWatch: failed to extract token usage: %s", e)
+            
             if analysis:
                 logger.info(
-                    "CloudWatch LLM analysis complete (%d chars, model=%s)",
-                    len(analysis), model_name,
+                    "CloudWatch LLM analysis complete (%d chars, model=%s, tokens=%s)",
+                    len(analysis), model_name, token_usage.get("total_tokens") if token_usage else "N/A",
                 )
-            return analysis, model_name
+            return analysis, model_name, token_usage
 
         except Exception as e:
             logger.warning("CloudWatch LLM analysis failed (falling back to static): %s", e)
-            return None, None
+            return None, None, None
 
     @staticmethod
     def _build_cloudwatch_summary(result: Dict[str, Any], analysis_type: str, log_groups: list) -> str:

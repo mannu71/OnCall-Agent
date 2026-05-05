@@ -416,31 +416,54 @@ export default function Dashboard() {
               const alertsCount = selectedRun?.output?.alerts?.length || 0;
 
               if (isCloudWatch) {
+                const tokenUsage = selectedRun?.output?.token_usage || selectedRun?.output?.metadata?.token_usage;
                 return (
-                  <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
-                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Execution ID</p>
-                      <p className="mt-2 text-4xl font-bold text-slate-900">{selectedRun?.execution_id || selectedRun?.id}</p>
+                  <>
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+                      <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                        <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Execution ID</p>
+                        <p className="mt-2 text-4xl font-bold text-slate-900">{selectedRun?.execution_id || selectedRun?.id}</p>
+                      </div>
+                      <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                        <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Duration</p>
+                        <p className="mt-2 text-4xl font-bold text-slate-900">{duration}<span className="text-xl ml-1 text-slate-400">s</span></p>
+                      </div>
+                      <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                        <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Log Groups</p>
+                        <p className="mt-2 text-4xl font-bold text-blue-700">{logGroupsAnalyzed}</p>
+                      </div>
+                      <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                        <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Alerts</p>
+                        <p className="mt-2 text-4xl font-bold text-emerald-600">{alertsCount}</p>
+                      </div>
                     </div>
-                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
-                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Duration</p>
-                      <p className="mt-2 text-4xl font-bold text-slate-900">{duration}<span className="text-xl ml-1 text-slate-400">s</span></p>
-                    </div>
-                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
-                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Log Groups</p>
-                      <p className="mt-2 text-4xl font-bold text-blue-700">{logGroupsAnalyzed}</p>
-                    </div>
-                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
-                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Alerts</p>
-                      <p className="mt-2 text-4xl font-bold text-emerald-600">{alertsCount}</p>
-                    </div>
-                  </div>
+                    {/* Token Usage for CloudWatch workflows */}
+                    {tokenUsage && (
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-6">
+                        <div className="bg-purple-50 p-6 rounded-lg border border-purple-200 hover:shadow-md transition-shadow">
+                          <p className="text-sm font-semibold text-purple-600 uppercase tracking-wider">Total Tokens</p>
+                          <p className="mt-2 text-4xl font-bold text-purple-700">{tokenUsage.total_tokens?.toLocaleString() || 0}</p>
+                        </div>
+                        <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                          <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Prompt Tokens</p>
+                          <p className="mt-2 text-4xl font-bold text-slate-700">{tokenUsage.prompt_tokens?.toLocaleString() || 0}</p>
+                        </div>
+                        <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                          <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Completion Tokens</p>
+                          <p className="mt-2 text-4xl font-bold text-slate-700">{tokenUsage.completion_tokens?.toLocaleString() || 0}</p>
+                        </div>
+                      </div>
+                    )}
+                  </>
                 );
               }
 
               if (isReact) {
                 const msgCount = selectedRun?.output?.message_count || 0;
                 const toolCalls = selectedRun?.output?.tool_calls?.length || 0;
+                const tokenUsage = selectedRun?.output?.token_usage || selectedRun?.output?.metadata?.token_usage;
+                const recallHits = selectedRun?.output?.recall_hits || 0;
+                
                 return (
                   <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
                     <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
@@ -459,29 +482,76 @@ export default function Dashboard() {
                       <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Tool Calls</p>
                       <p className="mt-2 text-4xl font-bold text-emerald-600">{toolCalls}</p>
                     </div>
+                    {tokenUsage && (
+                      <>
+                        <div className="bg-purple-50 p-6 rounded-lg border border-purple-200 hover:shadow-md transition-shadow">
+                          <p className="text-sm font-semibold text-purple-600 uppercase tracking-wider">Total Tokens</p>
+                          <p className="mt-2 text-4xl font-bold text-purple-700">{tokenUsage.total_tokens?.toLocaleString() || 0}</p>
+                        </div>
+                        <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                          <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Prompt Tokens</p>
+                          <p className="mt-2 text-4xl font-bold text-slate-700">{tokenUsage.prompt_tokens?.toLocaleString() || 0}</p>
+                        </div>
+                        <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                          <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Completion Tokens</p>
+                          <p className="mt-2 text-4xl font-bold text-slate-700">{tokenUsage.completion_tokens?.toLocaleString() || 0}</p>
+                        </div>
+                      </>
+                    )}
+                    {recallHits > 0 && (
+                      <div className="bg-indigo-50 p-6 rounded-lg border border-indigo-200 hover:shadow-md transition-shadow">
+                        <p className="text-sm font-semibold text-indigo-600 uppercase tracking-wider">Memory Recalls</p>
+                        <p className="mt-2 text-4xl font-bold text-indigo-700">{recallHits}</p>
+                      </div>
+                    )}
                   </div>
                 );
               }
 
               return (
-                <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-                  <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
-                    <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Execution ID</p>
-                    <p className="mt-2 text-4xl font-bold text-slate-900">{selectedRun?.execution_id || selectedRun?.id}</p>
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Execution ID</p>
+                      <p className="mt-2 text-4xl font-bold text-slate-900">{selectedRun?.execution_id || selectedRun?.id}</p>
+                    </div>
+                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Duration</p>
+                      <p className="mt-2 text-4xl font-bold text-slate-900">{duration}<span className="text-xl ml-1 text-slate-400">s</span></p>
+                    </div>
+                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Queries</p>
+                      <p className="mt-2 text-4xl font-bold text-blue-700">{queriesExecuted}</p>
+                    </div>
+                    <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                      <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Failures</p>
+                      <p className="mt-2 text-4xl font-bold text-emerald-600">{failures}</p>
+                    </div>
                   </div>
-                  <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
-                    <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Duration</p>
-                    <p className="mt-2 text-4xl font-bold text-slate-900">{duration}<span className="text-xl ml-1 text-slate-400">s</span></p>
-                  </div>
-                  <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
-                    <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Queries</p>
-                    <p className="mt-2 text-4xl font-bold text-blue-700">{queriesExecuted}</p>
-                  </div>
-                  <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
-                    <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Failures</p>
-                    <p className="mt-2 text-4xl font-bold text-emerald-600">{failures}</p>
-                  </div>
-                </div>
+                  {/* Token Usage for Orchestrator workflows */}
+                  {(() => {
+                    const tokenUsage = selectedRun?.output?.token_usage || selectedRun?.output?.metadata?.token_usage;
+                    if (tokenUsage) {
+                      return (
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-6">
+                          <div className="bg-purple-50 p-6 rounded-lg border border-purple-200 hover:shadow-md transition-shadow">
+                            <p className="text-sm font-semibold text-purple-600 uppercase tracking-wider">Total Tokens</p>
+                            <p className="mt-2 text-4xl font-bold text-purple-700">{tokenUsage.total_tokens?.toLocaleString() || 0}</p>
+                          </div>
+                          <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                            <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Prompt Tokens</p>
+                            <p className="mt-2 text-4xl font-bold text-slate-700">{tokenUsage.prompt_tokens?.toLocaleString() || 0}</p>
+                          </div>
+                          <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
+                            <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">Completion Tokens</p>
+                            <p className="mt-2 text-4xl font-bold text-slate-700">{tokenUsage.completion_tokens?.toLocaleString() || 0}</p>
+                          </div>
+                        </div>
+                      );
+                    }
+                    return null;
+                  })()}
+                </>
               );
             })()}
 

@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS llm_configs (
     base_url VARCHAR(500),
     temperature FLOAT DEFAULT 0.7,
     max_tokens INTEGER DEFAULT 4096,
-    region VARCHAR(50) DEFAULT 'us-east-1',
+    region VARCHAR(50) DEFAULT 'eu-west-1',
     icon VARCHAR(10),
     description TEXT,
     aws_profile VARCHAR(100),
@@ -197,3 +197,39 @@ ALTER TABLE executions ADD COLUMN IF NOT EXISTS trajectory JSONB;
 
 -- Index for filtering agent-created entries
 CREATE INDEX IF NOT EXISTS known_issues_source_idx ON known_issues(source);
+
+-- Trajectories table for storing conversation records
+CREATE TABLE IF NOT EXISTS trajectories (
+    id SERIAL PRIMARY KEY,
+    trajectory_id VARCHAR(255) NOT NULL UNIQUE,
+    execution_id VARCHAR(255),
+    model VARCHAR(255),
+    messages JSONB NOT NULL,
+    tool_calls JSONB,
+    completed BOOLEAN DEFAULT FALSE,
+    metadata JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Context references table for tracking injected content
+CREATE TABLE IF NOT EXISTS context_references (
+    id SERIAL PRIMARY KEY,
+    execution_id VARCHAR(255),
+    reference_type VARCHAR(50) NOT NULL,
+    target VARCHAR(1000) NOT NULL,
+    tokens_injected INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Context length cache table for persistent model metadata
+CREATE TABLE IF NOT EXISTS context_length_cache (
+    model_provider_key VARCHAR(255) PRIMARY KEY,
+    context_length INTEGER NOT NULL,
+    discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
+CREATE INDEX IF NOT EXISTS trajectories_execution_id_idx ON trajectories(execution_id);
+CREATE INDEX IF NOT EXISTS trajectories_created_at_idx ON trajectories(created_at DESC);
+CREATE INDEX IF NOT EXISTS context_references_execution_id_idx ON context_references(execution_id);
+CREATE INDEX IF NOT EXISTS context_references_created_at_idx ON context_references(created_at DESC);

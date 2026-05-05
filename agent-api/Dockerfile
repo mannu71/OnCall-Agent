@@ -1,6 +1,4 @@
-# Stage 1: Node (only if really needed)
-FROM node:20-slim AS node-base
-
+# Dockerfile for Agent API
 # Stage 2: Python app
 FROM python:3.12-slim
 

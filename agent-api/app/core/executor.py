@@ -1,6 +1,5 @@
 """Task executor for running workflow tasks."""
 import asyncio
-import subprocess
 import sys
 import io
 import traceback
@@ -67,7 +66,6 @@ class TaskExecutor:
                 task.command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                shell=True
             )
             
             # Wait for completion with timeout

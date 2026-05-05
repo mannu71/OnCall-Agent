@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import PropTypes from 'prop-types';
 import { localTimeToCron, cronToLocalTime } from '../../utils/cronUtils';
 import { agentApiClient } from '../../services/agentApiClient';
+import AgentAdvancedConfig from './AgentAdvancedConfig';
 
 const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
   const [config, setConfig] = useState(node?.data || {});
@@ -151,6 +152,12 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                 rows={4}
               />
             </div>
+            
+            {/* Advanced CloudWatch Workflow Features */}
+            <AgentAdvancedConfig 
+              config={config} 
+              onConfigChange={handleConfigChange}
+            />
           </>
         );
 

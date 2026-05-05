@@ -22,7 +22,9 @@ def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
         output = {
             'queries_executed': orchestrator_output.get('queries_executed', 0),
             'failures': orchestrator_output.get('failures', 0),
-            'results': orchestrator_output.get('results', [])
+            'results': orchestrator_output.get('results', []),
+            'token_usage': orchestrator_output.get('token_usage'),
+            'metadata': orchestrator_output.get('metadata'),
         }
         if orchestrator_output.get('error'):
             output['error'] = orchestrator_output['error']
@@ -41,6 +43,8 @@ def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
                 'results': cloudwatch_output.get('data', {}),
                 'output': cloudwatch_output.get('output'),
                 'model': cloudwatch_output.get('model'),
+                'token_usage': cloudwatch_output.get('token_usage'),
+                'metadata': cloudwatch_output.get('metadata'),
             }
             if cloudwatch_output.get('alerts'):
                 output['alerts'] = cloudwatch_output['alerts']
@@ -60,6 +64,9 @@ def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
                 'tool_calls': react_output.get('tool_calls', []),
                 'model': react_output.get('model'),
                 'provider': react_output.get('provider'),
+                'token_usage': react_output.get('token_usage'),
+                'metadata': react_output.get('metadata'),
+                'recall_hits': react_output.get('recall_hits', 0),
             }
 
     return execution

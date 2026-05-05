@@ -170,3 +170,39 @@ class AlertModel(Base):
     created_at = Column(DateTime(timezone=True))
     resolved_at = Column(DateTime(timezone=True))
     resolved_by = Column(String(255))
+
+
+class TrajectoryModel(Base):
+    """Conversation trajectory storage for Hermes Agent integration."""
+    __tablename__ = "trajectories"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trajectory_id = Column(String(255), unique=True, nullable=False)
+    execution_id = Column(String(255), index=True)
+    model = Column(String(255))
+    messages = Column(JSON, nullable=False)
+    tool_calls = Column(JSON)
+    completed = Column(Boolean, default=False)
+    trajectory_metadata = Column(JSON)  # Renamed from 'metadata' to avoid SQLAlchemy reserved word
+    created_at = Column(DateTime(timezone=True))
+
+
+class ContextReferenceModel(Base):
+    """Context reference tracking for Hermes Agent integration."""
+    __tablename__ = "context_references"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    execution_id = Column(String(255), index=True)
+    reference_type = Column(String(50), nullable=False)
+    target = Column(String(1000), nullable=False)
+    tokens_injected = Column(Integer)
+    created_at = Column(DateTime(timezone=True))
+
+
+class ContextLengthCacheModel(Base):
+    """Cached context lengths for models - Hermes Agent integration."""
+    __tablename__ = "context_length_cache"
+
+    model_provider_key = Column(String(255), primary_key=True)
+    context_length = Column(Integer, nullable=False)
+    discovered_at = Column(DateTime(timezone=True))

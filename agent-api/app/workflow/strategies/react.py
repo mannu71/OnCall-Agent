@@ -23,13 +23,14 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional
 
 from app.workflow.strategies.base import BaseStrategy
 from app.repositories.db_repository import db_repository
 from app.core.retry import with_retry
 from app.core.error_classifier import ClassifiedError, classify_error
 from app.core.redact import redact
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -157,12 +158,8 @@ def _collect_failed_tools(result: Dict[str, Any]) -> List[str]:
     return list(seen)
 
 
-class StreamCallback(Protocol):
-    async def on_llm_token(self, token: str) -> None: ...
-    async def on_tool_call(self, tool_name: str, args: dict) -> None: ...
-    async def on_tool_result(self, tool_name: str, result: str) -> None: ...
-    async def on_error(self, error: str) -> None: ...
-    async def on_complete(self, output: str) -> None: ...
+# Import canonical StreamCallback Protocol from streaming module
+from app.core.streaming.callbacks import StreamCallback, build_tool_preview
 
 
 class ReactStrategy(BaseStrategy):
@@ -174,6 +171,69 @@ class ReactStrategy(BaseStrategy):
     - "What's causing high CPU usage?"
     - "Investigate database connection issues"
     """
+
+    def __init__(self):
+        """Initialize ReactStrategy with optional context compression support.
+        
+        When context_compression_enabled is True in Settings, initializes a
+        ContextCompressor instance for handling context overflow errors.
+        
+        Requirements: 16.1, 16.4, 16.7
+        """
+        super().__init__()
+        
+        # Initialize ContextCompressor if enabled
+        self._context_compressor = None
+        if settings.context_compression_enabled:
+            try:
+                from app.core.context_compression import ContextCompressor
+                
+                # Initialize with settings from config
+                # Note: model will be set dynamically during execution
+                # For now, we'll initialize with a placeholder and reinitialize
+                # when we have the actual model from llm_config
+                self._context_compressor = None  # Will be initialized on first use
+                
+                logger.debug(
+                    "ReactStrategy: Context compression enabled "
+                    f"(threshold={settings.context_threshold_percent}, "
+                    f"protect_first_n={settings.context_protect_first_n})"
+                )
+            except ImportError as e:
+                logger.warning(
+                    f"ReactStrategy: Context compression enabled but ContextCompressor "
+                    f"not available: {e}"
+                )
+                self._context_compressor = None
+        
+        # Initialize rate limit tracking
+        self._rate_limit_state = None
+        if settings.rate_limit_tracking_enabled:
+            logger.debug(
+                "ReactStrategy: Rate limit tracking enabled "
+                f"(warning_threshold={settings.rate_limit_warning_threshold})"
+            )
+        
+        # Initialize MemoryManager with BuiltinMemoryProvider
+        # Requirement 16.7: Integrate Memory Manager for cross-session recall
+        self._memory_manager = None
+        try:
+            from app.core.memory.manager import MemoryManager
+            from app.core.memory.builtin import BuiltinMemoryProvider
+            from app.services.knowledge_base import knowledge_base
+            
+            self._memory_manager = MemoryManager()
+            builtin_provider = BuiltinMemoryProvider(knowledge_base)
+            self._memory_manager.add_provider(builtin_provider, is_builtin=True)
+            
+            logger.debug(
+                "ReactStrategy: Memory Manager initialized with BuiltinMemoryProvider"
+            )
+        except ImportError as e:
+            logger.warning(
+                f"ReactStrategy: Memory Manager initialization failed: {e}"
+            )
+            self._memory_manager = None
 
     def can_handle(self, workflow: Dict[str, Any]) -> bool:
         """
@@ -252,27 +312,113 @@ class ReactStrategy(BaseStrategy):
 
             # ------------------------------------------------------------------
             # Pre-execution recall: inject relevant past knowledge into the query.
+            # Uses MemoryManager to prefetch from all registered providers.
             # Failures here must never block the agent run.
+            # Requirement 16.7: Use Memory Manager for cross-session recall
             # ------------------------------------------------------------------
             recall_hits: int = 0
             augmented_query = user_query
-            try:
-                from app.services.knowledge_base import knowledge_base as _kb
-                _issues = await _kb.search_known_issues(user_query, limit=3, threshold=0.65)
-                _patterns = await _kb.search_similar_patterns(user_query, limit=3, threshold=0.65)
-                recall_hits = len(_issues) + len(_patterns)
-                recall_block = _build_recall_context(_issues, _patterns)
-                if recall_block:
-                    augmented_query = f"{recall_block}\n\n---\n\n{user_query}"
-                    logger_instance.debug(
-                        "ReactStrategy: prepended %d recall item(s) to query",
-                        recall_hits,
+            
+            if self._memory_manager and self._memory_manager.has_providers():
+                try:
+                    # Use MemoryManager to prefetch from all providers
+                    recall_block = await self._memory_manager.prefetch_all(
+                        query=user_query,
+                        session_id=execution_id or ""
+                    )
+                    
+                    if recall_block:
+                        # Count approximate recall hits (rough estimate)
+                        recall_hits = recall_block.count("similarity:")
+                        augmented_query = f"{recall_block}\n\n---\n\n{user_query}"
+                        logger_instance.debug(
+                            "ReactStrategy: prepended memory context to query",
+                            extra={"execution_id": execution_id, "recall_hits": recall_hits},
+                        )
+                except Exception as _recall_err:
+                    logger_instance.warning(
+                        "ReactStrategy: Memory prefetch failed (non-fatal): %s",
+                        redact(str(_recall_err)),
                         extra={"execution_id": execution_id},
                     )
-            except Exception as _recall_err:
+            else:
+                # Fallback to direct KB access if MemoryManager not available
+                try:
+                    from app.services.knowledge_base import knowledge_base as _kb
+                    _issues = await _kb.search_known_issues(user_query, limit=3, threshold=0.65)
+                    _patterns = await _kb.search_similar_patterns(user_query, limit=3, threshold=0.65)
+                    recall_hits = len(_issues) + len(_patterns)
+                    recall_block = _build_recall_context(_issues, _patterns)
+                    if recall_block:
+                        augmented_query = f"{recall_block}\n\n---\n\n{user_query}"
+                        logger_instance.debug(
+                            "ReactStrategy: prepended %d recall item(s) to query (fallback)",
+                            recall_hits,
+                            extra={"execution_id": execution_id},
+                        )
+                except Exception as _recall_err:
+                    logger_instance.warning(
+                        "ReactStrategy: KB recall failed (non-fatal): %s",
+                        redact(str(_recall_err)),
+                        extra={"execution_id": execution_id},
+                    )
+
+            # ------------------------------------------------------------------
+            # Context references preprocessing: expand @file, @folder, @url, @diff, @staged, @git
+            # Failures here must never block the agent run.
+            # Requirement 16.8: Use Context_Reference_System to preprocess user queries
+            # ------------------------------------------------------------------
+            try:
+                from app.core.context_references import preprocess_context_references_async
+                from app.core.model_metadata import get_model_context_length
+                
+                # Get context length for token limit enforcement
+                model = llm_config.get("model", "gpt-4")
+                base_url = llm_config.get("base_url", "")
+                provider = llm_config.get("provider", "")
+                
+                context_length = await get_model_context_length(
+                    model=model,
+                    base_url=base_url,
+                    provider=provider,
+                )
+                
+                # Preprocess context references
+                ref_result = await preprocess_context_references_async(
+                    augmented_query,
+                    cwd=context.get("cwd", "."),
+                    context_length=context_length,
+                    allowed_root=context.get("allowed_root"),
+                )
+                
+                # Log warnings (non-fatal)
+                if ref_result.warnings:
+                    for warning in ref_result.warnings:
+                        logger_instance.warning(
+                            "ReactStrategy: Context reference warning: %s",
+                            warning,
+                            extra={"execution_id": execution_id},
+                        )
+                
+                # Update augmented_query if references were expanded
+                if ref_result.expanded and not ref_result.blocked:
+                    augmented_query = ref_result.message
+                    logger_instance.info(
+                        "ReactStrategy: expanded %d context reference(s) (%d tokens injected)",
+                        len(ref_result.references),
+                        ref_result.injected_tokens,
+                        extra={"execution_id": execution_id},
+                    )
+                elif ref_result.blocked:
+                    logger_instance.warning(
+                        "ReactStrategy: context reference expansion blocked (hard limit exceeded)",
+                        extra={"execution_id": execution_id},
+                    )
+                    
+            except Exception as _ref_err:
                 logger_instance.warning(
-                    "ReactStrategy: KB recall failed (non-fatal): %s",
-                    redact(str(_recall_err)),
+                    "ReactStrategy: Context reference preprocessing failed (non-fatal): %s",
+                    redact(str(_ref_err)),
                     extra={"execution_id": execution_id},
                 )
 
@@ -315,7 +461,36 @@ class ReactStrategy(BaseStrategy):
             cw_context = context.get("cloudwatch_context")
             if cw_context:
                 import json
-                cw_summary = json.dumps(cw_context, indent=2, default=str)
+                
+                # Truncate large output fields to prevent context overflow
+                truncated_context = {}
+                MAX_OUTPUT_CHARS = 10_000  # Limit each output to 10k chars
+                
+                for key, value in cw_context.items():
+                    truncated_value = value.copy()
+                    if 'output' in truncated_value and isinstance(truncated_value['output'], str):
+                        output = truncated_value['output']
+                        if len(output) > MAX_OUTPUT_CHARS:
+                            truncated_value['output'] = output[:MAX_OUTPUT_CHARS] + "\n\n... [truncated for context limits]"
+                            logger_instance.warning(
+                                "ReactStrategy: truncated CloudWatch output from %d to %d chars",
+                                len(output), MAX_OUTPUT_CHARS,
+                                extra={"execution_id": execution_id},
+                            )
+                    truncated_context[key] = truncated_value
+                
+                cw_summary = json.dumps(truncated_context, indent=2, default=str)
+                
+                # Additional safety check: if the JSON is still too large, truncate it
+                MAX_TOTAL_CHARS = 50_000  # Limit total CloudWatch context to 50k chars (~12.5k tokens)
+                if len(cw_summary) > MAX_TOTAL_CHARS:
+                    cw_summary = cw_summary[:MAX_TOTAL_CHARS] + "\n... [truncated for context limits]"
+                    logger_instance.warning(
+                        "ReactStrategy: truncated total CloudWatch context to %d chars",
+                        MAX_TOTAL_CHARS,
+                        extra={"execution_id": execution_id},
+                    )
+                
                 augmented_query = (
                     f"[Pre-computed CloudWatch Analysis]\n{cw_summary}"
                     f"\n\n---\n\n{augmented_query}"
@@ -331,7 +506,7 @@ class ReactStrategy(BaseStrategy):
             agent = self._build_agent(llm, tools, agent_config, has_cloudwatch=bool(cloudwatch_config))
 
             result = await self._execute_agent(
-                agent, augmented_query, logger_instance, execution_id, stream_callback
+                agent, augmented_query, logger_instance, execution_id, stream_callback, llm_config
             )
 
             # ------------------------------------------------------------------
@@ -341,6 +516,38 @@ class ReactStrategy(BaseStrategy):
             await self._auto_learn(
                 user_query, result, execution_id, execution_start, recall_hits, logger_instance
             )
+
+            # ------------------------------------------------------------------
+            # Trajectory storage: save execution trajectory for replay/debugging.
+            # Failures here must never break result delivery.
+            # ------------------------------------------------------------------
+            await self._save_trajectory(
+                execution_id, result, llm_config, logger_instance
+            )
+
+            # ------------------------------------------------------------------
+            # Memory sync: persist completed turn to all memory providers.
+            # Failures here must never break result delivery.
+            # Requirement 16.7: Sync completed turns to all providers
+            # ------------------------------------------------------------------
+            if self._memory_manager and self._memory_manager.has_providers():
+                try:
+                    final_answer = result.get("final_answer") or ""
+                    await self._memory_manager.sync_all(
+                        user_content=user_query,
+                        assistant_content=final_answer,
+                        session_id=execution_id or ""
+                    )
+                    logger_instance.debug(
+                        "ReactStrategy: synced turn to memory providers",
+                        extra={"execution_id": execution_id},
+                    )
+                except Exception as _sync_err:
+                    logger_instance.warning(
+                        "ReactStrategy: Memory sync failed (non-fatal): %s",
+                        redact(str(_sync_err)),
+                        extra={"execution_id": execution_id},
+                    )
 
             if mcp_manager:
                 await mcp_manager.disconnect_all()
@@ -353,7 +560,12 @@ class ReactStrategy(BaseStrategy):
                 },
             )
 
-            return {
+            # Calculate execution duration
+            execution_end = datetime.now(timezone.utc)
+            duration_seconds = (execution_end - execution_start).total_seconds()
+
+            # Build final result with metadata
+            final_result = {
                 "type": "react",
                 "user_query": user_query,
                 "final_answer": result.get("final_answer"),
@@ -362,7 +574,19 @@ class ReactStrategy(BaseStrategy):
                 "tool_calls": result.get("tool_calls", []),
                 "model": llm_config.get("model", "unknown"),
                 "provider": llm_config.get("provider", "unknown"),
+                "duration": duration_seconds,
+                "recall_hits": recall_hits,
             }
+
+            # Add execution metadata if available
+            if result.get("metadata"):
+                final_result["metadata"] = result["metadata"]
+                
+                # Also add token usage at top level for easier access
+                if "token_usage" in result["metadata"]:
+                    final_result["token_usage"] = result["metadata"]["token_usage"]
+
+            return final_result
 
         except Exception as error:
             logger_instance.error(
@@ -437,6 +661,65 @@ class ReactStrategy(BaseStrategy):
             logger_instance.warning(
                 "ReactStrategy: _auto_learn failed (non-fatal): %s",
                 redact(str(_learn_err)),
+                extra={"execution_id": execution_id},
+            )
+
+    async def _save_trajectory(
+        self,
+        execution_id: Optional[str],
+        result: Dict[str, Any],
+        llm_config: Dict[str, Any],
+        logger_instance: Any,
+    ) -> None:
+        """Save execution trajectory for replay and debugging.
+
+        Called after every successful agent run. Any failure here is caught
+        and logged as a warning — it must never propagate to the caller.
+        
+        Requirements: 16.6
+        
+        Args:
+            execution_id: Execution identifier
+            result: Agent execution result with messages and tool calls
+            llm_config: LLM configuration with model and provider info
+            logger_instance: Logger for execution-scoped logging
+        """
+        try:
+            from app.services.trajectory_service import trajectory_service
+
+            # Extract data from result
+            messages = result.get("messages", [])
+            tool_calls = result.get("tool_calls", [])
+            model = llm_config.get("model", "unknown")
+            provider = llm_config.get("provider", "unknown")
+            
+            # Build metadata
+            metadata = {
+                "provider": provider,
+                "execution_id": execution_id or "unknown",
+            }
+            
+            # Save trajectory
+            trajectory_id = await trajectory_service.save_trajectory(
+                execution_id=execution_id or "unknown",
+                messages=messages,
+                model=model,
+                completed=True,
+                metadata=metadata,
+                tool_calls=tool_calls,
+            )
+            
+            logger_instance.info(
+                "ReactStrategy: saved trajectory %s for execution %s",
+                trajectory_id,
+                execution_id,
+                extra={"execution_id": execution_id, "trajectory_id": trajectory_id},
+            )
+
+        except Exception as _traj_err:
+            logger_instance.warning(
+                "ReactStrategy: _save_trajectory failed (non-fatal): %s",
+                redact(str(_traj_err)),
                 extra={"execution_id": execution_id},
             )
 
@@ -610,8 +893,8 @@ class ReactStrategy(BaseStrategy):
         nodes = workflow.get("nodes", [])
         edges = workflow.get("edges", [])
 
-        agent_ids = {n["id"] for n in nodes if n.get("type") == "agent"}
-        target_ids = {n["id"] for n in nodes if n.get("type") == target_type}
+        agent_ids = {n.get("id") for n in nodes if n.get("type") == "agent" and n.get("id")}
+        target_ids = {n.get("id") for n in nodes if n.get("type") == target_type and n.get("id")}
 
         if not agent_ids or not target_ids:
             return []
@@ -768,6 +1051,7 @@ class ReactStrategy(BaseStrategy):
             List of LangChain-compatible tool objects.
         """
         from app.workflow.mcp.mcp_langchain_adapter import build_langchain_tools
+        from app.core.tool_registry import registry
 
         for tool_config in tools_config:
             server_name = tool_config["name"]
@@ -809,12 +1093,73 @@ class ReactStrategy(BaseStrategy):
 
         # Convert all live MCP connections to LangChain tools
         langchain_tools = build_langchain_tools(mcp_manager)
+        
+        # Register tools in the Tool Registry
+        for tool in langchain_tools:
+            # Get emoji based on tool name patterns
+            emoji = self._get_tool_emoji(tool.name)
+            
+            # Build OpenAI-compatible schema
+            schema = {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.args_schema.schema() if tool.args_schema else {}
+                }
+            }
+            
+            # Register in global registry
+            registry.register(
+                name=tool.name,
+                schema=schema,
+                handler=tool._arun,
+                emoji=emoji,
+                availability_check=lambda: mcp_manager.is_connected(tool.server_id) if hasattr(tool, 'server_id') else True
+            )
+        
         logger.info(
-            "ReactStrategy: built %d LangChain tools",
+            "ReactStrategy: built %d LangChain tools and registered in Tool Registry",
             len(langchain_tools),
             extra={"execution_id": execution_id},
         )
         return langchain_tools
+    
+    def _get_tool_emoji(self, tool_name: str) -> str:
+        """Get emoji for tool based on name patterns.
+        
+        Args:
+            tool_name: Name of the tool
+            
+        Returns:
+            Emoji string
+        """
+        tool_lower = tool_name.lower()
+        
+        # File operations
+        if any(x in tool_lower for x in ['read', 'write', 'file', 'edit']):
+            return "📁"
+        # Search operations
+        elif any(x in tool_lower for x in ['search', 'find', 'grep', 'query']):
+            return "🔍"
+        # Web operations
+        elif any(x in tool_lower for x in ['web', 'http', 'fetch', 'url']):
+            return "🌐"
+        # Database operations
+        elif any(x in tool_lower for x in ['db', 'database', 'sql', 'query']):
+            return "💾"
+        # Execution operations
+        elif any(x in tool_lower for x in ['exec', 'run', 'execute', 'command', 'shell']):
+            return "🚀"
+        # Configuration operations
+        elif any(x in tool_lower for x in ['config', 'settings', 'env']):
+            return "⚙️"
+        # Analysis operations
+        elif any(x in tool_lower for x in ['analyze', 'metrics', 'stats', 'monitor']):
+            return "📊"
+        # Default
+        else:
+            return "⚡"
 
     # ------------------------------------------------------------------
     # LLM factory
@@ -1088,6 +1433,8 @@ class ReactStrategy(BaseStrategy):
 
         Returns:
             Compiled LangGraph agent (CompiledGraph).
+            
+        Requirements: 16.7
         """
         from langgraph.prebuilt import create_react_agent
 
@@ -1105,19 +1452,36 @@ class ReactStrategy(BaseStrategy):
             "to record the resolution so future investigations can benefit from it.",
         ]
 
+        # Integrate memory system prompts from all registered providers
+        # Requirement 16.7: Integrate memory system prompts into agent
+        if self._memory_manager and self._memory_manager.has_providers():
+            try:
+                memory_prompt = self._memory_manager.build_system_prompt()
+                if memory_prompt:
+                    system_parts.append(f"\n{memory_prompt}")
+                    logger.debug(
+                        "ReactStrategy: added memory system prompts from %d provider(s)",
+                        len(self._memory_manager.get_provider_names())
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"ReactStrategy: failed to build memory system prompt (non-fatal): {e}"
+                )
+
         # CloudWatch-specific instructions when CW nodes are connected.
         if has_cloudwatch:
             system_parts.append(
-                "\nYou also have access to CloudWatch log analysis tools. "
-                "Use them to investigate log patterns, detect anomalies, and correlate "
-                "events across services. When analysing logs:\n"
-                "- Start with cloudwatch_analyze_patterns to identify error trends.\n"
-                "- Use cloudwatch_detect_anomalies to compare current activity against baselines.\n"
-                "- Use cloudwatch_correlate_logs with a correlation or trace ID to trace requests across services.\n"
-                "- Use cloudwatch_search_logs for custom Insights queries when you need specific data.\n"
-                "- Use cloudwatch_watch_logs to retrieve raw log events for detailed inspection.\n"
-                "- Look for error spikes, unusual patterns, and cross-service correlations.\n"
-                "- If pre-computed CloudWatch analysis is provided, review it before making additional queries."
+                "\nYou have access to CloudWatch log analysis tools. Follow these rules:\n"
+                "1. START with high-level analysis (patterns, anomalies) before diving into raw logs\n"
+                "2. Use cloudwatch_analyze_patterns to identify error trends and spikes\n"
+                "3. Use cloudwatch_detect_anomalies to compare current vs baseline activity\n"
+                "4. Use cloudwatch_correlate_logs with correlation/trace IDs to trace requests\n"
+                "5. Use cloudwatch_search_logs for custom Insights queries (always include 'limit' in query)\n"
+                "6. Use cloudwatch_watch_logs ONLY as a last resort for raw log inspection\n"
+                "7. NEVER request time ranges > 1 hour without specific justification\n"
+                "8. STOP after finding the first likely root cause - do not exhaustively scan\n"
+                "9. If pre-computed CloudWatch analysis is provided, review it BEFORE making queries\n"
+                "10. All tool responses are size-limited - if truncated, refine your query"
             )
 
         if instructions:
@@ -1151,6 +1515,272 @@ class ReactStrategy(BaseStrategy):
         return agent
 
     # ------------------------------------------------------------------
+    # Rate limit tracking
+    # ------------------------------------------------------------------
+
+    def _capture_rate_limits(
+        self,
+        message: Any,
+        provider: str,
+        logger_instance: Any,
+        execution_id: Optional[str] = None,
+    ) -> None:
+        """Capture rate limit headers from LLM response message.
+        
+        Extracts rate limit information from the response_metadata of an
+        AIMessage and updates the internal rate limit state. Logs warnings
+        when any bucket exceeds the configured threshold.
+        
+        Args:
+            message: LangChain AIMessage with response_metadata
+            provider: Provider name (e.g., "anthropic", "openai")
+            logger_instance: Logger for execution-scoped logging
+            execution_id: Execution ID for logging
+        
+        Requirements: 16.4
+        """
+        if not settings.rate_limit_tracking_enabled:
+            return
+        
+        try:
+            from app.core.rate_limit_tracker import parse_rate_limit_headers, format_rate_limit_compact
+            
+            # Extract headers from response_metadata
+            response_metadata = getattr(message, "response_metadata", {})
+            if not response_metadata:
+                return
+            
+            # Headers may be nested under different keys depending on provider
+            headers = response_metadata.get("headers", {})
+            if not headers:
+                # Some providers put headers directly in response_metadata
+                headers = response_metadata
+            
+            # Parse rate limit headers
+            rate_limit_state = parse_rate_limit_headers(headers, provider=provider)
+            
+            if rate_limit_state and rate_limit_state.has_data:
+                self._rate_limit_state = rate_limit_state
+                
+                # Update global rate limit state for API endpoint access
+                # Requirement 5.5: Expose rate limit state via /usage/rate-limits endpoint
+                try:
+                    from app.api.v1.endpoints.usage import update_rate_limit_state
+                    update_rate_limit_state(rate_limit_state)
+                except ImportError:
+                    # Endpoint module not available (e.g., in tests)
+                    pass
+                
+                # Log compact summary
+                compact_summary = format_rate_limit_compact(rate_limit_state)
+                logger_instance.debug(
+                    f"ReactStrategy: Rate limits updated - {compact_summary}",
+                    extra={"execution_id": execution_id}
+                )
+                
+                # Check for warnings (any bucket >= threshold)
+                threshold = settings.rate_limit_warning_threshold
+                warnings = []
+                
+                if rate_limit_state.requests_min.limit > 0 and rate_limit_state.requests_min.usage_pct >= threshold:
+                    warnings.append(
+                        f"Requests/min at {rate_limit_state.requests_min.usage_pct * 100:.0f}% "
+                        f"({rate_limit_state.requests_min.remaining} remaining)"
+                    )
+                
+                if rate_limit_state.requests_hour.limit > 0 and rate_limit_state.requests_hour.usage_pct >= threshold:
+                    warnings.append(
+                        f"Requests/hour at {rate_limit_state.requests_hour.usage_pct * 100:.0f}% "
+                        f"({rate_limit_state.requests_hour.remaining} remaining)"
+                    )
+                
+                if rate_limit_state.tokens_min.limit > 0 and rate_limit_state.tokens_min.usage_pct >= threshold:
+                    warnings.append(
+                        f"Tokens/min at {rate_limit_state.tokens_min.usage_pct * 100:.0f}% "
+                        f"({rate_limit_state.tokens_min.remaining} remaining)"
+                    )
+                
+                if rate_limit_state.tokens_hour.limit > 0 and rate_limit_state.tokens_hour.usage_pct >= threshold:
+                    warnings.append(
+                        f"Tokens/hour at {rate_limit_state.tokens_hour.usage_pct * 100:.0f}% "
+                        f"({rate_limit_state.tokens_hour.remaining} remaining)"
+                    )
+                
+                # Log warnings if any bucket is approaching limits
+                if warnings:
+                    logger_instance.warning(
+                        f"ReactStrategy: Rate limit warning - {'; '.join(warnings)}",
+                        extra={
+                            "execution_id": execution_id,
+                            "provider": provider,
+                            "rate_limit_warnings": warnings,
+                        }
+                    )
+        
+        except Exception as e:
+            # Rate limit tracking failures should never break execution
+            logger_instance.debug(
+                f"ReactStrategy: Failed to capture rate limits (non-fatal): {e}",
+                extra={"execution_id": execution_id}
+            )
+
+    # ------------------------------------------------------------------
+    # Agent execution
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Context overflow handling
+    # ------------------------------------------------------------------
+
+    async def _on_context_overflow(
+        self,
+        input_state: Dict[str, Any],
+        llm_config: Dict[str, Any],
+        logger_instance: Any,
+        execution_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Handle context overflow by compressing the message history.
+        
+        This callback is invoked by the retry system when a context overflow
+        error is detected. It uses the ContextCompressor to intelligently
+        compress the conversation history while preserving critical information.
+        
+        If context compression is disabled or fails, falls back to the basic
+        _compact_input_state() method.
+        
+        Args:
+            input_state: The LangGraph input state with messages
+            llm_config: LLM configuration containing model info
+            logger_instance: Logger for execution-scoped logging
+            execution_id: Execution ID for logging
+        
+        Returns:
+            Updated input_state with compressed messages
+        
+        Requirements: 16.1
+        """
+        from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+        
+        logger_instance.info(
+            "ReactStrategy: Context overflow detected, attempting compression",
+            extra={"execution_id": execution_id}
+        )
+        
+        # Try to use ContextCompressor if available
+        if self._context_compressor is not None or settings.context_compression_enabled:
+            try:
+                from app.core.context_compression import ContextCompressor
+                from app.core.model_metadata import estimate_messages_tokens_rough
+                
+                # Initialize or reinitialize compressor with current model
+                model = llm_config.get("model", "gpt-4")
+                base_url = llm_config.get("base_url", "")
+                provider = llm_config.get("provider", "")
+                
+                if self._context_compressor is None:
+                    self._context_compressor = ContextCompressor(
+                        model=model,
+                        threshold_percent=settings.context_threshold_percent,
+                        protect_first_n=settings.context_protect_first_n,
+                        base_url=base_url,
+                        provider=provider,
+                    )
+                    logger_instance.debug(
+                        f"ReactStrategy: Initialized ContextCompressor for model {model}",
+                        extra={"execution_id": execution_id}
+                    )
+                
+                # Convert LangChain messages to dict format for compression
+                messages = input_state.get("messages", [])
+                dict_messages = []
+                
+                for msg in messages:
+                    if isinstance(msg, HumanMessage):
+                        dict_messages.append({"role": "user", "content": str(msg.content)})
+                    elif isinstance(msg, AIMessage):
+                        msg_dict = {"role": "assistant", "content": str(msg.content) if msg.content else ""}
+                        if hasattr(msg, "tool_calls") and msg.tool_calls:
+                            msg_dict["tool_calls"] = [
+                                {
+                                    "id": tc.get("id"),
+                                    "name": tc.get("name"),
+                                    "function": {"name": tc.get("name"), "arguments": tc.get("args", {})},
+                                }
+                                for tc in msg.tool_calls
+                            ]
+                        dict_messages.append(msg_dict)
+                    elif isinstance(msg, ToolMessage):
+                        dict_messages.append({
+                            "role": "tool",
+                            "tool_call_id": getattr(msg, "tool_call_id", ""),
+                            "content": str(msg.content),
+                        })
+                    elif isinstance(msg, SystemMessage):
+                        dict_messages.append({"role": "system", "content": str(msg.content)})
+                
+                # Estimate current token count
+                current_tokens = estimate_messages_tokens_rough(dict_messages)
+                
+                logger_instance.info(
+                    f"ReactStrategy: Compressing {len(dict_messages)} messages "
+                    f"(~{current_tokens} tokens)",
+                    extra={"execution_id": execution_id}
+                )
+                
+                # Compress using async method for LLM-based summarization
+                compressed_messages = await self._context_compressor.compress_async(
+                    dict_messages,
+                    current_tokens=current_tokens,
+                )
+                
+                # Convert back to LangChain message format
+                langchain_messages = []
+                for msg in compressed_messages:
+                    role = msg.get("role")
+                    content = msg.get("content", "")
+                    
+                    if role == "user":
+                        langchain_messages.append(HumanMessage(content=content))
+                    elif role == "assistant":
+                        tool_calls = msg.get("tool_calls")
+                        if tool_calls:
+                            langchain_messages.append(AIMessage(content=content, tool_calls=tool_calls))
+                        else:
+                            langchain_messages.append(AIMessage(content=content))
+                    elif role == "tool":
+                        langchain_messages.append(ToolMessage(
+                            content=content,
+                            tool_call_id=msg.get("tool_call_id", ""),
+                        ))
+                    elif role == "system":
+                        langchain_messages.append(SystemMessage(content=content))
+                
+                compressed_tokens = estimate_messages_tokens_rough(compressed_messages)
+                logger_instance.info(
+                    f"ReactStrategy: Compression complete - "
+                    f"{len(dict_messages)} -> {len(compressed_messages)} messages, "
+                    f"~{current_tokens} -> ~{compressed_tokens} tokens",
+                    extra={"execution_id": execution_id}
+                )
+                
+                return {"messages": langchain_messages}
+                
+            except Exception as e:
+                logger_instance.warning(
+                    f"ReactStrategy: ContextCompressor failed, falling back to basic compaction: {e}",
+                    extra={"execution_id": execution_id},
+                    exc_info=True
+                )
+                # Fall through to basic compaction
+        
+        # Fallback to basic compaction
+        logger_instance.info(
+            "ReactStrategy: Using basic compaction (ContextCompressor not available)",
+            extra={"execution_id": execution_id}
+        )
+        return _compact_input_state(input_state)
+
+    # ------------------------------------------------------------------
     # Agent execution
     # ------------------------------------------------------------------
 
@@ -1161,6 +1791,7 @@ class ReactStrategy(BaseStrategy):
         logger_instance: Any,
         execution_id: Optional[str] = None,
         stream_callback: Optional[StreamCallback] = None,
+        llm_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Execute the LangGraph ReAct agent with the user's query.
@@ -1170,7 +1801,8 @@ class ReactStrategy(BaseStrategy):
         ``agent.ainvoke()`` otherwise.
 
         The outer call is wrapped with ``with_retry`` so transient LLM errors
-        (rate-limit, 502/503) are automatically retried up to 3 times.
+        (rate-limit, 502/503) are automatically retried with intelligent
+        error classification and recovery strategies.
 
         Args:
             agent: Compiled LangGraph agent graph.
@@ -1178,12 +1810,15 @@ class ReactStrategy(BaseStrategy):
             logger_instance: Logger for execution-scoped logging.
             execution_id: Execution ID for logging.
             stream_callback: Optional streaming callback protocol.
+            llm_config: Optional LLM configuration for context compression.
 
         Returns:
             Dict with:
               - final_answer: str — the last AI response
               - messages: list — all messages in the conversation
               - tool_calls: list — summary of tools invoked
+        
+        Requirements: 16.2, 16.3
         """
         from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
@@ -1191,35 +1826,149 @@ class ReactStrategy(BaseStrategy):
 
         input_state = {"messages": [HumanMessage(content=user_query)]}
 
+        # Define compression callback for context overflow errors
+        async def compression_callback() -> None:
+            """Callback invoked by retry system on context overflow.
+            
+            Compresses the conversation history using ContextCompressor
+            or falls back to basic compaction if compression is unavailable.
+            
+            Requirements: 16.1, 16.2
+            """
+            nonlocal input_state
+            
+            logger_instance.info(
+                "ReactStrategy: compression callback invoked by retry system",
+                extra={"execution_id": execution_id}
+            )
+            
+            if llm_config:
+                new_state = await self._on_context_overflow(
+                    input_state, llm_config, logger_instance, execution_id
+                )
+                input_state.clear()
+                input_state.update(new_state)
+            else:
+                logger_instance.warning(
+                    "ReactStrategy: llm_config not available, using basic compaction",
+                    extra={"execution_id": execution_id}
+                )
+                new_state = _compact_input_state(input_state)
+                input_state.clear()
+                input_state.update(new_state)
+        
+        # Define fallback callback for auth/billing errors
+        async def fallback_callback(classified: ClassifiedError) -> None:
+            """Callback invoked by retry system for auth/billing errors.
+            
+            Logs the error and provides guidance for recovery. In the future,
+            this could trigger automatic provider rotation or credential refresh.
+            
+            Requirements: 16.3
+            """
+            logger_instance.error(
+                f"ReactStrategy: fallback callback invoked - {classified.reason.value}",
+                extra={
+                    "execution_id": execution_id,
+                    "error_reason": classified.reason.value,
+                    "status_code": classified.status_code,
+                    "should_rotate_credential": classified.should_rotate_credential,
+                    "error_msg": classified.message,  # Use error_msg instead of error_message
+                }
+            )
+            
+            # Log recovery guidance
+            if classified.should_rotate_credential:
+                logger_instance.warning(
+                    "ReactStrategy: credential rotation recommended - "
+                    "check API key validity and billing status",
+                    extra={"execution_id": execution_id}
+                )
+            
+            # Notify stream callback if available
+            if stream_callback:
+                try:
+                    await stream_callback.on_error(
+                        f"API Error: {classified.reason.value} - {classified.message}",
+                        classified
+                    )
+                except Exception as e:
+                    logger_instance.warning(
+                        f"ReactStrategy: stream callback error notification failed: {e}",
+                        extra={"execution_id": execution_id}
+                    )
+        
+        # Define retry callback for logging
+        async def retry_callback(attempt: int, classified: ClassifiedError) -> None:
+            """Callback invoked before each retry attempt.
+            
+            Logs retry information with classified error details for debugging
+            and monitoring.
+            
+            Requirements: 16.3
+            """
+            logger_instance.warning(
+                f"ReactStrategy: retry attempt {attempt} after {classified.reason.value}",
+                extra={
+                    "execution_id": execution_id,
+                    "attempt": attempt,
+                    "error_reason": classified.reason.value,
+                    "status_code": classified.status_code,
+                    "retryable": classified.retryable,
+                    "should_compress": classified.should_compress,
+                    "should_fallback": classified.should_fallback,
+                }
+            )
+
+        # Execute with retry and intelligent error handling
         try:
             if stream_callback is not None:
                 result_state = await with_retry(
                     self._execute_agent_stream,
-                    agent, input_state, stream_callback, logger_instance, execution_id,
+                    agent, input_state, stream_callback, logger_instance, execution_id, llm_config,
                     max_retries=3,
+                    on_retry=retry_callback,
+                    on_context_overflow=compression_callback,
+                    on_fallback=fallback_callback,
                 )
             else:
                 result_state = await with_retry(
                     self._invoke_agent, agent, input_state,
                     max_retries=3,
+                    on_retry=retry_callback,
+                    on_context_overflow=compression_callback,
+                    on_fallback=fallback_callback,
                 )
         except Exception as exc:
-            # On context overflow, compact the input and retry once.
+            # Classify error for enhanced error reporting
             classified = classify_error(exc)
-            if classified.should_compress:
-                logger_instance.warning(
-                    "ReactStrategy: context overflow detected — compacting and retrying",
-                    extra={"execution_id": execution_id},
-                )
-                input_state = _compact_input_state(input_state)
-                if stream_callback is not None:
-                    result_state = await self._execute_agent_stream(
-                        agent, input_state, stream_callback, logger_instance, execution_id
+            
+            # Build extra dict carefully to avoid LogRecord attribute conflicts
+            extra_data = {
+                "execution_id": execution_id,
+                "error_reason": classified.reason.value,
+                "status_code": classified.status_code,
+                "retryable": classified.retryable,
+                "error_msg": classified.message,  # Use error_msg instead of error_message to be safe
+            }
+            
+            logger_instance.error(
+                f"ReactStrategy: agent execution failed after retries - {classified.reason.value}",
+                extra=extra_data,
+                exc_info=True
+            )
+            
+            # Notify stream callback with classified error
+            if stream_callback:
+                try:
+                    await stream_callback.on_error(
+                        f"Execution failed: {classified.reason.value} - {classified.message}",
+                        classified
                     )
-                else:
-                    result_state = await self._invoke_agent(agent, input_state)
-            else:
-                raise
+                except Exception:
+                    pass
+            
+            raise
 
         messages = result_state.get("messages", [])
         serialized_messages = []
@@ -1251,6 +2000,11 @@ class ReactStrategy(BaseStrategy):
                 serialized_messages.append(entry)
                 if content:
                     final_answer = content
+                
+                # Capture rate limits from this AI message
+                if llm_config:
+                    provider = llm_config.get("provider", "unknown")
+                    self._capture_rate_limits(msg, provider, logger_instance, execution_id)
 
             elif isinstance(msg, ToolMessage):
                 serialized_messages.append({
@@ -1268,10 +2022,76 @@ class ReactStrategy(BaseStrategy):
             len(tool_calls_summary),
         )
 
+        # Extract token usage metadata from result_state if available
+        # LangGraph may include usage_metadata in the response
+        usage_metadata = {}
+        if hasattr(result_state, 'usage_metadata'):
+            usage_metadata = result_state.usage_metadata
+        elif isinstance(result_state, dict) and 'usage_metadata' in result_state:
+            usage_metadata = result_state['usage_metadata']
+        
+        # Try to extract from the last AI message if not in result_state
+        if not usage_metadata:
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage):
+                    if hasattr(msg, 'usage_metadata') and msg.usage_metadata:
+                        usage_metadata = msg.usage_metadata
+                        break
+                    elif hasattr(msg, 'response_metadata') and msg.response_metadata:
+                        # Some providers put usage in response_metadata
+                        resp_meta = msg.response_metadata
+                        if 'usage' in resp_meta:
+                            usage_metadata = resp_meta['usage']
+                        elif 'token_usage' in resp_meta:
+                            usage_metadata = resp_meta['token_usage']
+                        break
+        
+        # Build execution metadata
+        execution_metadata = {
+            "message_count": len(serialized_messages),
+            "tool_call_count": len(tool_calls_summary),
+        }
+        
+        # Add token usage if available
+        if usage_metadata:
+            execution_metadata["token_usage"] = {
+                "prompt_tokens": usage_metadata.get("input_tokens") or usage_metadata.get("prompt_tokens", 0),
+                "completion_tokens": usage_metadata.get("output_tokens") or usage_metadata.get("completion_tokens", 0),
+                "total_tokens": usage_metadata.get("total_tokens", 0),
+            }
+            # Calculate total if not provided
+            if not execution_metadata["token_usage"]["total_tokens"]:
+                execution_metadata["token_usage"]["total_tokens"] = (
+                    execution_metadata["token_usage"]["prompt_tokens"] +
+                    execution_metadata["token_usage"]["completion_tokens"]
+                )
+            
+            logger_instance.info(
+                "ReactStrategy: token usage - prompt: %d, completion: %d, total: %d",
+                execution_metadata["token_usage"]["prompt_tokens"],
+                execution_metadata["token_usage"]["completion_tokens"],
+                execution_metadata["token_usage"]["total_tokens"],
+                extra={"execution_id": execution_id}
+            )
+
+        # Notify stream callback of completion with metadata
+        if stream_callback:
+            try:
+                await stream_callback.on_complete(
+                    final_answer or "Agent completed",
+                    metadata=execution_metadata
+                )
+            except Exception as e:
+                logger_instance.warning(
+                    f"ReactStrategy: stream callback completion notification failed: {e}",
+                    extra={"execution_id": execution_id}
+                )
+
         return {
             "final_answer": final_answer,
             "messages": serialized_messages,
             "tool_calls": tool_calls_summary,
+            "metadata": execution_metadata,
         }
 
     @staticmethod
@@ -1293,8 +2113,18 @@ class ReactStrategy(BaseStrategy):
         stream_callback: StreamCallback,
         logger_instance: Any,
         execution_id: Optional[str] = None,
+        llm_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Streaming invocation using ``agent.astream_events()`` (v2)."""
+        """Streaming invocation using ``agent.astream_events()`` (v2).
+        
+        Args:
+            agent: Compiled LangGraph agent graph
+            input_state: Input state with messages
+            stream_callback: Streaming callback protocol
+            logger_instance: Logger for execution-scoped logging
+            execution_id: Execution ID for logging
+            llm_config: Optional LLM configuration for rate limit tracking
+        """
         current_tool_name: str = ""
         accumulated_state: Dict[str, Any] = {"messages": []}
         msg_map: Dict[str, Any] = {}
@@ -1336,6 +2166,11 @@ class ReactStrategy(BaseStrategy):
                     output = data.get("output")
                     if output and hasattr(output, "id"):
                         msg_map[output.id] = output
+                        
+                        # Capture rate limits from the completed message
+                        if llm_config:
+                            provider = llm_config.get("provider", "unknown")
+                            self._capture_rate_limits(output, provider, logger_instance, execution_id)
 
                 elif kind == "on_tool_start":
                     tool_input = data.get("input", {})
