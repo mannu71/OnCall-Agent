@@ -6,13 +6,12 @@ A desktop application for automating database monitoring workflows using MCP (Mo
 
 ```
 kyc-protect-oncall-agent/
-├── agent/                    # Backend agent for workflow execution
-│   ├── data/config/          # Configuration files
-│   │   ├── mcp-servers.json  # MCP server configurations
-│   │   ├── workflows.json    # Workflow definitions
-│   │   ├── schedules.json    # Schedule configurations
-│   │   └── sql/              # SQL workflow files
-│   └── src/                  # Agent source code
+├── agent-api/                # FastAPI backend engine & DB orchestrator
+│   ├── app/                  # Application source code
+│   ├── tests/                # Test suite
+│   ├── docker-compose.yml    # Docker services (API + PostgreSQL)
+│   └── Dockerfile            # Backend container definition
+├── hermes-agent-main/        # Core AI agent engine (Python)
 ├── ui/                       # Electron + React frontend
 │   ├── electron/             # Electron main process
 │   ├── src/                  # React frontend source
@@ -24,33 +23,32 @@ kyc-protect-oncall-agent/
 
 ### Prerequisites
 
+- **Docker** and **Docker Compose**
 - **Node.js** v18 or higher
 - **npm** v9 or higher
+- **Python** 3.12+ (for running agent-api locally without Docker)
 
-### Installation
+### 1. Start the Backend API & Database
+
+The backend services run in Docker containers (FastAPI + PostgreSQL with pgvector).
 
 ```bash
-# Clone the repository
-git clone https://dev.azure.com/creditsafe/Compliance/_git/kyc-protect-oncall-agent
-cd kyc-protect-oncall-agent
-
-# Install agent dependencies
-cd agent
-npm install
-
-# Install UI dependencies
-cd ../ui
-npm install
+cd agent-api
+# Build and start the containers in the background
+docker-compose up -d --build
 ```
 
-### Run in Development Mode
+The API will be available at `http://localhost:8000` (Swagger UI at `/docs`).
+
+### 2. Start the Frontend UI
 
 ```bash
 cd ui
+npm install
 npm run dev
 ```
 
-This starts both Vite dev server and Electron with hot-reload.
+This starts both the Vite dev server and Electron with hot-reload.
 
 ## How to Build EXE
 
@@ -118,38 +116,37 @@ This creates:
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           USER RUNS AGENT                                    │
-│  node src/agents/run-unified.js "OnCall" "Why did profiles fail today?"     │
+│  API Call -> POST /api/v1/workflows/OnCall/execute                           │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  1️⃣  run-unified.js                                                         │
+│  1️⃣  FastAPI Endpoint (agent-api)                                            │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │ • Loads workflows.json → finds "OnCall" workflow                     │   │
-│  │ • Loads llm-config.json → merges API keys                           │   │
-│  │ • Calls buildDynamicWorkflow(agentJSON)                             │   │
+│  │ • Loads workflows from DB → finds "OnCall" workflow                  │   │
+│  │ • Loads LLM config → gets API keys                                   │   │
+│  │ • Initializes Python ReActStrategy & LangGraph                       │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  2️⃣  build-mcp-config.js                                                    │
+│  2️⃣  MCP Configuration (mcp_config.py)                                       │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │ • Reads tool nodes from workflow JSON                                │   │
-│  │ • Resolves ${input:ado_org} from mcp-servers.json                   │   │
-│  │ • Resolves ${env:AWS_PROFILE} from environment                      │   │
-│  │ • Returns MCP server configs                                         │   │
+│  │ • Reads tool nodes from workflow definition                          │   │
+│  │ • Resolves credentials from secrets manager / environment           │   │
+│  │ • Returns MCP server connection parameters                           │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  3️⃣  multiserver-mcp-client.js                                              │
+│  3️⃣  MCP Client Manager (mcp_client.py)                                      │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │ • Spawns MCP server processes (postgres, ado, cloudwatch)           │   │
-│  │ • Connects with 15s timeout                                          │   │
+│  │ • Connects via stdio/sse with timeouts                               │   │
 │  │ • Discovers tools from each server                                   │   │
-│  │ • Sets up circuit breakers per server                                │   │
+│  │ • Sets up circuit breakers and rate limits                           │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 │  Output:                                                                    │
@@ -159,22 +156,21 @@ This creates:
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  4️⃣  llm-loader.js                                                          │
+│  4️⃣  LLM Loader (llm.py)                                                     │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │ • Reads LLM config from workflow (provider, model, apiKey)          │   │
-│  │ • Validates model exists                                             │   │
-│  │ • Clamps temperature to 0-1                                          │   │
-│  │ • Creates ChatOpenAI/ChatAnthropic/etc instance                     │   │
+│  │ • Initializes ChatOpenAI/ChatAnthropic/etc using LangChain           │   │
+│  │ • Configures context lengths and system prompts                      │   │
+│  │ • Sets up token tracking and callbacks                               │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  5️⃣  generic-multi-step-workflow.js - SETUP                                 │
+│  5️⃣  LangGraph Orchestrator (workflow.py)                                    │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │ • Creates LangChain tools from MCP tools                            │   │
-│  │ • Binds tools to LLM (llm.bindTools())                              │   │
-│  │ • Builds system prompt with available tools                         │   │
+│  │ • Binds tools to LLM (llm.bind_tools())                             │   │
+│  │ • Builds dynamic system prompt                                       │   │
 │  │ • Compiles StateGraph (ReAct loop)                                  │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
