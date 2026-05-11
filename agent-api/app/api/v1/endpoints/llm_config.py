@@ -370,7 +370,10 @@ def mask_api_key(api_key: str) -> str:
 
 
 @router.post("/discover", response_model=Dict[str, Any])
-async def discover_bedrock_models(request: Optional[AWSDiscoverRequest] = None):
+async def discover_bedrock_models(
+    request: Optional[AWSDiscoverRequest] = None,
+    llm_repo: LLMConfigRepository = Depends(get_llm_config_repo),
+):
     """Discover available AWS Bedrock models without saving.
 
     Calls the Bedrock ListFoundationModels API and returns the list
@@ -467,7 +470,10 @@ class AddDiscoveredModelsRequest(BaseModel):
 
 
 @router.post("/discover/add", response_model=Dict[str, Any])
-async def add_discovered_models(request: AddDiscoveredModelsRequest):
+async def add_discovered_models(
+    request: AddDiscoveredModelsRequest,
+    llm_repo: LLMConfigRepository = Depends(get_llm_config_repo),
+):
     """Save selected discovered models to the database."""
     added = []
     skipped = []
@@ -501,7 +507,9 @@ async def add_discovered_models(request: AddDiscoveredModelsRequest):
 
 
 @router.get("", response_model=Dict[str, Any])
-async def get_llm_config():
+async def get_llm_config(
+    llm_repo: LLMConfigRepository = Depends(get_llm_config_repo),
+):
     configs = await llm_repo.list_all()
     masked_llms = {}
     for name, cfg in configs.items():
@@ -517,7 +525,10 @@ async def get_llm_config():
 
 
 @router.get("/{llm_name}", response_model=Dict[str, Any])
-async def get_llm_by_name(llm_name: str):
+async def get_llm_by_name(
+    llm_name: str,
+    llm_repo: LLMConfigRepository = Depends(get_llm_config_repo),
+):
     cfg = await llm_repo.get_by_name(llm_name)
     if not cfg:
         raise HTTPException(
@@ -534,7 +545,10 @@ async def get_llm_by_name(llm_name: str):
 
 
 @router.post("", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
-async def create_llm_config(llm_data: LLMConfigCreate):
+async def create_llm_config(
+    llm_data: LLMConfigCreate,
+    llm_repo: LLMConfigRepository = Depends(get_llm_config_repo),
+):
     if await llm_repo.exists(llm_data.name):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -546,7 +560,11 @@ async def create_llm_config(llm_data: LLMConfigCreate):
 
 
 @router.put("/{llm_name}", response_model=Dict[str, Any])
-async def update_llm_config(llm_name: str, llm_update: LLMConfigUpdate):
+async def update_llm_config(
+    llm_name: str,
+    llm_update: LLMConfigUpdate,
+    llm_repo: LLMConfigRepository = Depends(get_llm_config_repo),
+):
     update_data = llm_update.model_dump(exclude_unset=True)
     new_name = update_data.get("name") or llm_name
     if new_name != llm_name and await llm_repo.exists(new_name):
@@ -565,7 +583,10 @@ async def update_llm_config(llm_name: str, llm_update: LLMConfigUpdate):
 
 
 @router.delete("/{llm_name}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_llm_config(llm_name: str):
+async def delete_llm_config(
+    llm_name: str,
+    llm_repo: LLMConfigRepository = Depends(get_llm_config_repo),
+):
     deleted = await llm_repo.delete(llm_name)
     if not deleted:
         raise HTTPException(
@@ -581,7 +602,10 @@ class BulkDeleteRequest(BaseModel):
 
 
 @router.post("/bulk-delete", response_model=Dict[str, Any])
-async def bulk_delete_llm_configs(request: BulkDeleteRequest):
+async def bulk_delete_llm_configs(
+    request: BulkDeleteRequest,
+    llm_repo: LLMConfigRepository = Depends(get_llm_config_repo),
+):
     """Delete multiple LLM configurations by name."""
     deleted = []
     not_found = []
@@ -613,7 +637,12 @@ class LLMTestRequest(BaseModel):
 
 
 @router.post("/{llm_name}/test", response_model=Dict[str, Any])
-async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] = None):
+async def test_llm_connection(
+    llm_name: str,
+    request: Optional[LLMTestRequest] = None,
+    llm_repo: LLMConfigRepository = Depends(get_llm_config_repo),
+    key_repo: ModelKeyRepository = Depends(get_model_key_repo),
+):
     import httpx
 
     cfg = await llm_repo.get_by_name(llm_name)
