@@ -9,12 +9,13 @@ import { AppSidebar } from './components/sidebar/AppSidebar';
 import Dashboard from './pages/Dashboard';
 import Scheduler from './pages/Scheduler';
 import Settings from './pages/Settings';
+import Releases from './pages/Releases';
 import LogWatchConfig from './components/logwatch/LogWatchConfig';
+import ErrorBoundary from './components/releases/ErrorBoundary';
 import './App.css';
 
 // Lazy load heavy components
 const Workflow = lazy(() => import('./pages/workflow'));
-const Analytics = lazy(() => import('./pages/Analytics'));
 const Chat = lazy(() => import('./pages/Chat'));
 
 // Use HashRouter for Electron, BrowserRouter for web
@@ -52,22 +53,24 @@ const AppRoutes = () => {
       <AppSidebar />
       <SidebarInset>
         <main className="w-full max-w-full min-h-screen overflow-x-hidden">
-          <Suspense fallback={<LoadingFallback />}>
-            <Routes>
-              <Route path="/" element={<Dashboard />} />
-              <Route path="/dashboard" element={<Dashboard />} />
-              <Route path="/scheduler" element={<Scheduler />} />
-              <Route path="/log-watch" element={<LogWatchConfig />} />
-              {isDevelopment && <Route path="/chat" element={<Chat />} />}
-              <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
-              <Route path="/workflow" element={<Workflow />} />
-              <Route path="/alerts" element={<PlaceholderPage title="Alerts" />} />
-              {isDevelopment && <Route path="/analytics" element={<Analytics />} />}
-              <Route path="/emergency" element={<PlaceholderPage title="Emergency Contact" />} />
-              <Route path="/settings" element={<Settings />} />
-              <Route path="*" element={<Dashboard />} />
-            </Routes>
-          </Suspense>
+          <ErrorBoundary>
+            <Suspense fallback={<LoadingFallback />}>
+              <Routes>
+                <Route path="/" element={<Dashboard />} />
+                <Route path="/dashboard" element={<Dashboard />} />
+                <Route path="/scheduler" element={<Scheduler />} />
+                <Route path="/log-watch" element={<LogWatchConfig />} />
+                {isDevelopment && <Route path="/chat" element={<Chat />} />}
+                <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
+                <Route path="/workflow" element={<Workflow />} />
+                <Route path="/releases" element={<Releases />} />
+                <Route path="/alerts" element={<PlaceholderPage title="Alerts" />} />
+                <Route path="/emergency" element={<PlaceholderPage title="Emergency Contact" />} />
+                <Route path="/settings" element={<Settings />} />
+                <Route path="*" element={<Dashboard />} />
+              </Routes>
+            </Suspense>
+          </ErrorBoundary>
         </main>
       </SidebarInset>
     </SidebarProvider>

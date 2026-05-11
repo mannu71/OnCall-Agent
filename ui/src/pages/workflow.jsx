@@ -25,7 +25,7 @@ function Workflow() {
     triggerWorkflow,
     formatTime
   } = useScheduler();
-  const { isWorkflowRunning } = useWorkflowStatus();
+  const { isWorkflowRunning, markWorkflowPending, refreshNow } = useWorkflowStatus();
 
   const [showDialog, setShowDialog] = useState(false);
   const [showWorkflowEditor, setShowWorkflowEditor] = useState(false);
@@ -71,8 +71,12 @@ function Workflow() {
     }
 
     try {
+      // Mark as pending immediately (optimistic update)
+      markWorkflowPending(workflow.name);
       await triggerWorkflow(workflow.name);
       showMessage(`Workflow '${workflow.name}' started`, 'success');
+      // Immediately refresh active workflow list so Live Monitor appears
+      setTimeout(refreshNow, 500);
     } catch (error) {
       showMessage(`Failed to start workflow: ${error.message}`, 'error');
     }

@@ -45,3 +45,35 @@ class StorageException(AppException):
 class ConfigurationException(AppException):
     """Exception raised for configuration errors."""
     pass
+
+
+# Azure Release Management Exceptions
+
+class ReleaseManagementException(AppException):
+    """Base exception for Azure Release Management errors."""
+    pass
+
+
+class AzureDevOpsException(ReleaseManagementException):
+    """Exception raised for Azure DevOps API errors."""
+    pass
+
+
+class AzureWikiException(ReleaseManagementException):
+    """Exception raised for Azure Wiki API errors."""
+    pass
+
+
+class GitOperationException(ReleaseManagementException):
+    """Exception raised for Git operation errors."""
+    pass
+
+
+class ConflictResolutionException(ReleaseManagementException):
+    """Exception raised for conflict resolution errors."""
+    pass
+
+
+class CredentialException(ReleaseManagementException):
+    """Exception raised for credential-related errors."""
+    pass

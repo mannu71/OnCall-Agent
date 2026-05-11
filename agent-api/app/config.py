@@ -43,7 +43,6 @@ class Settings(BaseSettings):
     scheduler_timezone: str = "UTC"
     max_concurrent_workflows: int = 5
     
-    # Hermes integration feature flags
     # Context compression settings
     context_compression_enabled: bool = Field(
         default=True,
@@ -90,6 +89,34 @@ class Settings(BaseSettings):
     trajectories_dir: str = Field(
         default="data/trajectories",
         description="Directory for storing conversation trajectories"
+    )
+    
+    # Agent execution settings
+    agent_recursion_limit: int = Field(
+        default=50,
+        description="Maximum recursion depth for LangGraph agent execution (default: 50, LangGraph default: 25)"
+    )
+    agent_timeout_seconds: int = Field(
+        default=300,
+        description="Timeout in seconds for agent execution (default: 300 = 5 minutes)"
+    )
+    
+    # Embedding settings
+    embedding_provider: str = Field(
+        default="bedrock",
+        description="Provider for embedding generation (bedrock, openai, azure, cohere)"
+    )
+    embedding_model: str = Field(
+        default="amazon.titan-embed-text-v1",
+        description="Model ID for embedding generation"
+    )
+    embedding_region: str = Field(
+        default="us-east-1",
+        description="AWS region for Bedrock embeddings (only used for bedrock provider)"
+    )
+    embedding_dimensions: int = Field(
+        default=1536,
+        description="Embedding vector dimensions (1536 for Titan v1, 1024 for Titan v2, varies by model)"
     )
     
     @property

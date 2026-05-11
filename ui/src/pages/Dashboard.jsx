@@ -409,6 +409,10 @@ export default function Dashboard() {
               const isCloudWatch = selectedRun?.output?.analysis_type;
               const isReact = selectedRun?.output?.type === 'react';
 
+              // Check for React agent node in results (for workflows with multiple node types)
+              const reactAgentNode = selectedRun?.results ? 
+                Object.entries(selectedRun.results).find(([key, value]) => value?.type === 'react')?.[1] : null;
+
               const queriesExecuted = orchestrator?.queries_executed || selectedRun?.output?.queries_executed || 0;
               const failures = orchestrator?.failures || selectedRun?.output?.failures || 0;
               const duration = selectedRun?.duration ? selectedRun.duration.toFixed(2) : 'N/A';
@@ -416,7 +420,8 @@ export default function Dashboard() {
               const alertsCount = selectedRun?.output?.alerts?.length || 0;
 
               if (isCloudWatch) {
-                const tokenUsage = selectedRun?.output?.token_usage || selectedRun?.output?.metadata?.token_usage;
+                // Prioritize React agent token usage if present, otherwise use CloudWatch token usage
+                const tokenUsage = reactAgentNode?.token_usage || selectedRun?.output?.token_usage || selectedRun?.output?.metadata?.token_usage;
                 return (
                   <>
                     <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
@@ -439,7 +444,20 @@ export default function Dashboard() {
                     </div>
                     {/* Token Usage for CloudWatch workflows */}
                     {tokenUsage && (
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-6">
+                      <>
+                        {reactAgentNode && (
+                          <div className="col-span-full">
+                            <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 flex items-center gap-2">
+                              <svg className="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                              </svg>
+                              <span className="text-sm text-blue-800 font-medium">
+                                Showing React Agent token usage (this workflow includes both CloudWatch analysis and AI agent investigation)
+                              </span>
+                            </div>
+                          </div>
+                        )}
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-6">
                         <div className="bg-purple-50 p-6 rounded-lg border border-purple-200 hover:shadow-md transition-shadow">
                           <p className="text-sm font-semibold text-purple-600 uppercase tracking-wider">Total Tokens</p>
                           <p className="mt-2 text-4xl font-bold text-purple-700">{tokenUsage.total_tokens?.toLocaleString() || 0}</p>
@@ -453,6 +471,7 @@ export default function Dashboard() {
                           <p className="mt-2 text-4xl font-bold text-slate-700">{tokenUsage.completion_tokens?.toLocaleString() || 0}</p>
                         </div>
                       </div>
+                      </>
                     )}
                   </>
                 );

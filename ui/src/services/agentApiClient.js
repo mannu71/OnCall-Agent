@@ -277,6 +277,109 @@ export const agentApiClient = {
         });
         return response.data;
     },
+
+    // ==================== Azure Release Management ====================
+
+    /**
+     * Search for work items by tags or PBI numbers
+     */
+    async searchWorkItems(organization, project, criteria) {
+        const response = await client.post('/api/v1/releases/work-items/search', {
+            organization,
+            project,
+            ...criteria
+        });
+        return response.data;
+    },
+
+    /**
+     * Get commits for a specific work item
+     */
+    async getCommitsForWorkItem(organization, project, workItemId) {
+        const response = await client.get(`/api/v1/releases/work-items/${workItemId}/commits`, {
+            params: { organization, project }
+        });
+        return response.data;
+    },
+
+    /**
+     * Create a new release
+     */
+    async createRelease(releaseData) {
+        const response = await client.post('/api/v1/releases', releaseData);
+        return response.data;
+    },
+
+    /**
+     * Get release history
+     */
+    async getReleases(limit = 20, offset = 0, organization = null, project = null) {
+        const params = { limit, offset };
+        if (organization) params.organization = organization;
+        if (project) params.project = project;
+        
+        const response = await client.get('/api/v1/releases', { params });
+        return response.data;
+    },
+
+    /**
+     * Get release details
+     */
+    async getReleaseDetails(organization, project, releaseName) {
+        const response = await client.get(`/api/v1/releases/${encodeURIComponent(organization)}/${encodeURIComponent(project)}/${encodeURIComponent(releaseName)}`);
+        return response.data;
+    },
+
+    /**
+     * Resolve a merge conflict
+     */
+    async resolveConflict(releaseId, conflictData) {
+        const response = await client.post(`/api/v1/releases/${releaseId}/conflicts/resolve`, conflictData);
+        return response.data;
+    },
+
+    /**
+     * Abort the current cherry-pick / merge operation for a release
+     */
+    async abortRelease(releaseId) {
+        const response = await client.post(`/api/v1/releases/${releaseId}/conflicts/abort`);
+        return response.data;
+    },
+
+    /**
+     * Save Azure DevOps PAT (global, no per-org key needed)
+     */
+    async saveAzureDevOpsCredentials(pat) {
+        const response = await client.post('/api/v1/releases/settings/azure-devops', { pat });
+        return response.data;
+    },
+
+    /**
+     * Test Azure DevOps connection
+     */
+    async testAzureDevOpsConnection(organization, project) {
+        const response = await client.post('/api/v1/releases/settings/azure-devops/test', {
+            organization,
+            project
+        });
+        return response.data;
+    },
+
+    /**
+     * Get configured Azure DevOps organizations
+     */
+    async getAzureDevOpsOrganizations() {
+        const response = await client.get('/api/v1/releases/settings/azure-devops');
+        return response.data;
+    },
+
+    /**
+     * Delete (clear) the stored Azure DevOps PAT
+     */
+    async deleteAzureDevOpsCredentials() {
+        const response = await client.delete('/api/v1/releases/settings/azure-devops/_default');
+        return response.data;
+    },
 };
 
 export default agentApiClient;

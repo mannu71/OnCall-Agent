@@ -46,5 +46,9 @@ sqlalchemy>=2.0.0
 # Async file operations
 aiofiles==23.2.1
 
+
+# Encryption
+cryptography>=42.0.0
+
 # Property-based testing
 hypothesis>=6.152.0

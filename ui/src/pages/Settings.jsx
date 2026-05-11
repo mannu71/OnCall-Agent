@@ -42,6 +42,7 @@ import { getLLMs, addLLM, updateLLM, deleteLLM, discoverModels, addDiscoveredMod
 import { getModelKeys, upsertModelKey, deleteModelKey, getProviderSchemas } from '../services/modelKeyService';
 import agentApiClient from '../services/agentApiClient';
 import { testLLMConnection as testLLMConnectionAPI } from '../services/apiClient';
+import AzureDevOpsSettings from '../components/releases/AzureDevOpsSettings';
 
 // Icon options for MCP Servers
 const MCP_SERVER_ICONS = [
@@ -173,9 +174,7 @@ const Settings = () => {
         endpoint: '',
         baseUrl: '',
         temperature: 0,
-        access_key_id: '',
-        secret_access_key: '',
-        session_token: '',
+        useForEmbeddings: false,
     });
 
     const [openAWSDialog, setOpenAWSDialog] = useState(false);
@@ -705,7 +704,8 @@ const Settings = () => {
                 icon: llm.icon || '🧠',
                 endpoint: llm.endpoint || '',
                 baseUrl: llm.baseUrl || '',
-                temperature: llm.temperature ?? 0
+                temperature: llm.temperature ?? 0,
+                useForEmbeddings: llm.useForEmbeddings || llm.use_for_embeddings || false,
             });
         } else {
             setEditingLLM(null);
@@ -716,7 +716,8 @@ const Settings = () => {
                 icon: '🧠',
                 endpoint: '',
                 baseUrl: '',
-                temperature: 0
+                temperature: 0,
+                useForEmbeddings: false,
             });
         }
         setOpenLLMDialog(true);
@@ -736,12 +737,12 @@ const Settings = () => {
                 ...(!isReasoningModel(llmFormData.model) && { temperature: llmFormData.temperature }),
                 ...(llmFormData.endpoint && { endpoint: llmFormData.endpoint }),
                 ...(llmFormData.baseUrl && { baseUrl: llmFormData.baseUrl }),
-                ...(llmFormData.access_key_id && { access_key_id: llmFormData.access_key_id }),
-                ...(llmFormData.secret_access_key && { secret_access_key: llmFormData.secret_access_key }),
-                ...(llmFormData.session_token && { session_token: llmFormData.session_token }),
+                useForEmbeddings: llmFormData.useForEmbeddings || false,
             };
 
             const llmName = llmFormData.model;
+
+            console.log('Saving LLM config:', { name: llmName, config: llmConfig });
 
             if (editingLLM) {
                 await updateLLM(editingLLM, llmConfig, llmName);
@@ -756,7 +757,8 @@ const Settings = () => {
             setTimeout(() => setSaveMessage(''), 3000);
         } catch (error) {
             console.error('Error saving LLM:', error);
-            alert('Failed to save LLM configuration');
+            const errorMessage = error.message || 'Failed to save LLM configuration';
+            alert(`Failed to save LLM configuration: ${errorMessage}`);
         }
     };
 
@@ -1230,6 +1232,11 @@ const Settings = () => {
                     </CardContent>
                 </Card>
 
+                {/* Azure DevOps Settings Section */}
+                <div className="mb-6">
+                    <AzureDevOpsSettings />
+                </div>
+
                 {/* Model Keys Section */}
                 <Card className="mb-6">
                     <CardContent className="pt-6">
@@ -1655,45 +1662,43 @@ const Settings = () => {
                                 </div>
                             )}
 
-                            {/* AWS Credentials Section */}
-                            {(llmFormData.provider === 'AWS Bedrock' || llmFormData.provider === 'Bedrock' || llmFormData.provider === 'bedrock') && (
-                                <div className="p-4 bg-muted rounded-lg flex flex-col gap-3">
-                                    <div className="flex items-center gap-2">
-                                        <Key className="w-4 h-4 text-primary" />
-                                        <h4 className="text-sm font-medium">AWS Credentials</h4>
-                                    </div>
-                                    <div className="space-y-2">
-                                        <Label htmlFor="llm-aws-access-key">Access Key ID</Label>
-                                        <Input
-                                            id="llm-aws-access-key"
-                                            type="password"
-                                            placeholder="AKIA..."
-                                            value={llmFormData.access_key_id}
-                                            onChange={(e) => setLLMFormData({ ...llmFormData, access_key_id: e.target.value })}
-                                        />
-                                    </div>
-                                    <div className="space-y-2">
-                                        <Label htmlFor="llm-aws-secret-key">Secret Access Key</Label>
-                                        <Input
-                                            id="llm-aws-secret-key"
-                                            type="password"
-                                            placeholder="Secret key"
-                                            value={llmFormData.secret_access_key}
-                                            onChange={(e) => setLLMFormData({ ...llmFormData, secret_access_key: e.target.value })}
-                                        />
-                                    </div>
-                                    <div className="space-y-2">
-                                        <Label htmlFor="llm-aws-session-token">Session Token <span className="text-muted-foreground">(optional)</span></Label>
-                                        <Input
-                                            id="llm-aws-session-token"
-                                            type="password"
-                                            placeholder="For temporary credentials"
-                                            value={llmFormData.session_token}
-                                            onChange={(e) => setLLMFormData({ ...llmFormData, session_token: e.target.value })}
-                                        />
-                                    </div>
-                                    <p className="text-xs text-muted-foreground">Credentials are stored in the database and used automatically when running workflows.</p>
+                            {/* Use for Embeddings Checkbox */}
+                            <div className="flex items-start space-x-3 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                                <input
+                                    type="checkbox"
+                                    id="llm-use-for-embeddings"
+                                    checked={llmFormData.useForEmbeddings || false}
+                                    onChange={(e) => setLLMFormData({ 
+                                        ...llmFormData, 
+                                        useForEmbeddings: e.target.checked 
+                                    })}
+                                    className="mt-1 h-4 w-4 rounded border-gray-300"
+                                />
+                                <div className="flex-1">
+                                    <Label htmlFor="llm-use-for-embeddings" className="cursor-pointer font-medium">
+                                        Use for Embeddings
+                                    </Label>
+                                    <p className="text-sm text-muted-foreground mt-1">
+                                        Use this model for generating embeddings in knowledge base operations. 
+                                        Only one LLM can be active for embeddings at a time.
+                                    </p>
                                 </div>
+                            </div>
+
+                            {/* Note about credentials */}
+                            {(llmFormData.provider === 'AWS Bedrock' || llmFormData.provider === 'Bedrock' || llmFormData.provider === 'bedrock' || 
+                              llmFormData.provider === 'OpenAI' || llmFormData.provider === 'Anthropic' || 
+                              llmFormData.provider === 'Google' || llmFormData.provider === 'Groq' || 
+                              llmFormData.provider === 'Azure OpenAI') && (
+                                <Alert className="flex items-start gap-2">
+                                    <Key className="w-4 h-4 mt-0.5" />
+                                    <div>
+                                        <p className="text-sm">
+                                            <strong>API Credentials:</strong> Configure {llmFormData.provider} credentials in the <strong>Model Keys</strong> section below. 
+                                            Credentials are shared across all LLMs using the same provider.
+                                        </p>
+                                    </div>
+                                </Alert>
                             )}
                         </div>
                         <DialogFooter className="mt-6">

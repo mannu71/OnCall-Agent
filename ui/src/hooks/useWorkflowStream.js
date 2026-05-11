@@ -39,7 +39,10 @@ export function useWorkflowStream(workflowName, enabled = true) {
                 setError(null);
             };
 
-            const handleLlmToken = (event) => {
+            // Backend emits canonical event names via "event: <type>" SSE prefix
+            // agent_* events use named SSE events; workflow/node events use unnamed (onmessage)
+
+            const handleAgentToken = (event) => {
                 try {
                     const data = JSON.parse(event.data);
                     const nodeId = data.data?.node_id || 'default';
@@ -52,15 +55,15 @@ export function useWorkflowStream(workflowName, enabled = true) {
 
                     setEvents(prev => [...prev, {
                         ...data,
-                        event_type: 'llm_token',
+                        event_type: 'agent_token',
                         timestamp: data.timestamp || new Date().toISOString()
                     }]);
                 } catch (err) {
-                    console.error('[SSE] Failed to parse llm_token event:', err);
+                    console.error('[SSE] Failed to parse agent_token event:', err);
                 }
             };
 
-            const handleToolCall = (event) => {
+            const handleAgentToolCall = (event) => {
                 try {
                     const data = JSON.parse(event.data);
                     setAgentToolCalls(prev => [...prev, {
@@ -73,15 +76,15 @@ export function useWorkflowStream(workflowName, enabled = true) {
 
                     setEvents(prev => [...prev, {
                         ...data,
-                        event_type: 'tool_call',
+                        event_type: 'agent_tool_call',
                         timestamp: data.timestamp || new Date().toISOString()
                     }]);
                 } catch (err) {
-                    console.error('[SSE] Failed to parse tool_call event:', err);
+                    console.error('[SSE] Failed to parse agent_tool_call event:', err);
                 }
             };
 
-            const handleToolResult = (event) => {
+            const handleAgentToolResult = (event) => {
                 try {
                     const data = JSON.parse(event.data);
                     setAgentToolCalls(prev => [...prev, {
@@ -94,11 +97,11 @@ export function useWorkflowStream(workflowName, enabled = true) {
 
                     setEvents(prev => [...prev, {
                         ...data,
-                        event_type: 'tool_result',
+                        event_type: 'agent_tool_result',
                         timestamp: data.timestamp || new Date().toISOString()
                     }]);
                 } catch (err) {
-                    console.error('[SSE] Failed to parse tool_result event:', err);
+                    console.error('[SSE] Failed to parse agent_tool_result event:', err);
                 }
             };
 
@@ -128,15 +131,22 @@ export function useWorkflowStream(workflowName, enabled = true) {
                 }
             };
 
-            eventSource.addEventListener('llm_token', handleLlmToken);
-            eventSource.addEventListener('tool_call', handleToolCall);
-            eventSource.addEventListener('tool_result', handleToolResult);
+            // Register named SSE event listeners (canonical agent_* names from backend)
+            eventSource.addEventListener('agent_token', handleAgentToken);
+            eventSource.addEventListener('agent_tool_call', handleAgentToolCall);
+            eventSource.addEventListener('agent_tool_result', handleAgentToolResult);
             eventSource.addEventListener('agent_error', handleAgentError);
             eventSource.addEventListener('agent_complete', handleAgentComplete);
 
+            // onmessage fires for unnamed SSE messages (workflow/node level events)
+            // Agent-level events (agent_*) are sent as named events and handled above
             eventSource.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
+                    const eventType = data.event_type || data.data?.event_type;
+
+                    // Skip agent events here — they're handled by named listeners above
+                    if (eventType && eventType.startsWith('agent_')) return;
 
                     setEvents(prev => [...prev, {
                         ...data,
@@ -152,8 +162,9 @@ export function useWorkflowStream(workflowName, enabled = true) {
                         setError(data.error || 'Unknown error');
                     }
 
-                    const eventType = data.event_type || data.data?.event_type;
-                    if (eventType === 'workflow_completed') {
+                    if (eventType === 'workflow_started') {
+                        setStatus('running');
+                    } else if (eventType === 'workflow_completed') {
                         setStatus('completed');
                     } else if (eventType === 'workflow_failed') {
                         setStatus('failed');

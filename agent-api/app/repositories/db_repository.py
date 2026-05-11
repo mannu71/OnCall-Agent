@@ -342,6 +342,15 @@ class DatabaseRepository:
             Created configuration dict
         """
         async with AsyncSessionLocal() as session:
+            # Handle both camelCase and snake_case for use_for_embeddings
+            use_for_embeddings = config_data.get("use_for_embeddings") or config_data.get("useForEmbeddings", False)
+            
+            # If this LLM is marked for embeddings, unmark all others
+            if use_for_embeddings:
+                await session.execute(
+                    update(LLMConfigModel).values(use_for_embeddings=False)
+                )
+            
             config = LLMConfigModel(
                 name=config_data["name"],
                 provider=config_data["provider"],
@@ -354,6 +363,7 @@ class DatabaseRepository:
                 icon=config_data.get("icon"),
                 description=config_data.get("description"),
                 aws_profile=config_data.get("aws_profile"),
+                use_for_embeddings=use_for_embeddings,
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
             )
@@ -373,6 +383,15 @@ class DatabaseRepository:
             Updated configuration dict or None if not found
         """
         async with AsyncSessionLocal() as session:
+            # Handle both camelCase and snake_case for use_for_embeddings
+            use_for_embeddings = config_data.get("use_for_embeddings") or config_data.get("useForEmbeddings")
+            
+            # If this LLM is being marked for embeddings, unmark all others first
+            if use_for_embeddings:
+                await session.execute(
+                    update(LLMConfigModel).values(use_for_embeddings=False)
+                )
+            
             result = await session.execute(
                 select(LLMConfigModel).where(LLMConfigModel.name == name)
             )
@@ -393,6 +412,8 @@ class DatabaseRepository:
                 "icon": "icon",
                 "description": "description",
                 "aws_profile": "aws_profile",
+                "use_for_embeddings": "use_for_embeddings",
+                "useForEmbeddings": "use_for_embeddings",  # Handle camelCase
             }
             for json_key, col_name in field_map.items():
                 if json_key in config_data:
@@ -517,6 +538,8 @@ class DatabaseRepository:
             "icon": config.icon,
             "description": config.description,
             "aws_profile": config.aws_profile,
+            "use_for_embeddings": config.use_for_embeddings or False,
+            "useForEmbeddings": config.use_for_embeddings or False,
         }
         return d
 

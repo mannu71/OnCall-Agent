@@ -93,7 +93,7 @@ def _compact_input_state(input_state: Dict[str, Any]) -> Dict[str, Any]:
     """Reduce the token footprint of a LangGraph input state by pruning stale
     tool results from the middle of the conversation history.
 
-    Strategy (mirrors hermes context_compressor logic):
+    Strategy:
     - Always keep the first message (the original human query).
     - Always keep the last 4 messages (recent reasoning and answer).
     - Replace ToolMessage entries in the middle with a single HumanMessage
@@ -514,7 +514,7 @@ class ReactStrategy(BaseStrategy):
             # Failures here must never break result delivery.
             # ------------------------------------------------------------------
             await self._auto_learn(
-                user_query, result, execution_id, execution_start, recall_hits, logger_instance
+                user_query, result, execution_id, execution_start, recall_hits, logger_instance, llm
             )
 
             # ------------------------------------------------------------------
@@ -613,6 +613,7 @@ class ReactStrategy(BaseStrategy):
         execution_start: "datetime",
         recall_hits: int,
         logger_instance: Any,
+        llm: Any,  # LangChain BaseChatModel
     ) -> None:
         """Persist what this execution found to the knowledge base.
 
@@ -636,17 +637,26 @@ class ReactStrategy(BaseStrategy):
             )
 
             if final_answer and _RESOLUTION_RE.search(final_answer):
+                # Extract structured issue details using LLM
+                details = await self._extract_issue_details(
+                    user_query, final_answer, llm, logger_instance
+                )
+                
                 await _kb.add_known_issue(
-                    title=user_query[:120],
-                    description=final_answer[:1000],
-                    symptoms=[user_query],
-                    solution=final_answer[:2000],
-                    category="agent_discovered",
+                    title=details.get("title", user_query[:120]),
+                    description=details.get("description", final_answer[:1000]),
+                    symptoms=details.get("symptoms", [user_query]),
+                    solution=details.get("solution", final_answer[:2000]),
+                    category=details.get("category", "agent_discovered"),
                     source="agent",
                 )
                 logger_instance.info(
-                    "ReactStrategy: resolution detected — seeded KnownIssueModel",
-                    extra={"execution_id": execution_id},
+                    "ReactStrategy: resolution detected — seeded KnownIssueModel with structured details",
+                    extra={
+                        "execution_id": execution_id,
+                        "title": details.get("title"),
+                        "category": details.get("category"),
+                    },
                 )
 
             failed_tools = _collect_failed_tools(result)
@@ -663,6 +673,119 @@ class ReactStrategy(BaseStrategy):
                 redact(str(_learn_err)),
                 extra={"execution_id": execution_id},
             )
+
+    async def _extract_issue_details(
+        self,
+        user_query: str,
+        final_answer: str,
+        llm: Any,
+        logger_instance: Any,
+    ) -> Dict[str, Any]:
+        """Extract structured issue details from user query and agent resolution using LLM.
+        
+        This method replaces the old _generate_title approach by extracting a complete
+        structured JSON object representing the known issue, including title, description,
+        symptoms, solution, and category.
+        
+        Args:
+            user_query: The original user query (may contain instructions)
+            final_answer: The agent's resolution/answer
+            llm: LangChain BaseChatModel instance
+            logger_instance: Logger for warnings
+            
+        Returns:
+            Dict with keys: title, description, symptoms (list), solution, category.
+            Falls back to basic extraction from raw text on any error.
+        """
+        try:
+            import json
+            from langchain_core.messages import SystemMessage, HumanMessage
+            
+            extraction_messages = [
+                SystemMessage(
+                    content=(
+                        "You are a technical documentation assistant that extracts structured issue information. "
+                        "Analyze the user query and agent resolution, then output a raw JSON object (no markdown, no code blocks) with these fields:\n"
+                        "- title: A concise, descriptive title (max 10 words) focusing on the core issue or finding\n"
+                        "- description: A clear, objective description of the underlying issue (2-3 sentences)\n"
+                        "- symptoms: A JSON array of strings representing actual symptoms observed (strip out user instructions like 'Investigate...' or 'Check...')\n"
+                        "- solution: Step-by-step or descriptive resolution based on the agent's findings\n"
+                        "- category: A single category string (e.g., 'database', 'networking', 'application', 'configuration', 'performance', 'security')\n\n"
+                        "Output ONLY the JSON object, nothing else."
+                    )
+                ),
+                HumanMessage(
+                    content=f"User Query:\n{user_query[:500]}\n\nAgent Resolution:\n{final_answer[:1500]}"
+                )
+            ]
+            
+            response = await llm.ainvoke(extraction_messages)
+            response_text = str(response.content).strip()
+            
+            # Try to extract JSON from response (handle markdown code blocks if present)
+            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+            if json_match:
+                json_text = json_match.group(1)
+            else:
+                # Assume the entire response is JSON
+                json_text = response_text
+            
+            # Parse JSON
+            parsed = json.loads(json_text)
+            
+            # Validate and normalize the structure
+            result = {
+                "title": str(parsed.get("title", ""))[:120] or user_query[:120],
+                "description": str(parsed.get("description", ""))[:1000] or final_answer[:1000],
+                "symptoms": parsed.get("symptoms", [user_query]) if isinstance(parsed.get("symptoms"), list) else [user_query],
+                "solution": str(parsed.get("solution", ""))[:2000] or final_answer[:2000],
+                "category": str(parsed.get("category", "agent_discovered")),
+            }
+            
+            logger_instance.debug(
+                "ReactStrategy: successfully extracted structured issue details",
+                extra={"title": result["title"], "category": result["category"]},
+            )
+            
+            return result
+            
+        except json.JSONDecodeError as e:
+            logger_instance.warning(
+                "Failed to parse JSON from LLM response, falling back to basic extraction: %s",
+                redact(str(e))
+            )
+            return self._fallback_issue_extraction(user_query, final_answer)
+        except Exception as e:
+            logger_instance.warning(
+                "Failed to extract issue details with LLM, falling back to basic extraction: %s",
+                redact(str(e))
+            )
+            return self._fallback_issue_extraction(user_query, final_answer)
+    
+    def _fallback_issue_extraction(
+        self,
+        user_query: str,
+        final_answer: str,
+    ) -> Dict[str, Any]:
+        """Fallback extraction using the original simple truncation logic.
+        
+        This ensures that if LLM-based extraction fails, we still get a valid
+        known issue entry using the same logic as before.
+        
+        Args:
+            user_query: The original user query
+            final_answer: The agent's resolution/answer
+            
+        Returns:
+            Dict with basic issue details extracted from raw text
+        """
+        return {
+            "title": user_query[:120],
+            "description": final_answer[:1000],
+            "symptoms": [user_query],
+            "solution": final_answer[:2000],
+            "category": "agent_discovered",
+        }
 
     async def _save_trajectory(
         self,
@@ -1968,6 +2091,15 @@ class ReactStrategy(BaseStrategy):
                 except Exception:
                     pass
             
+            # For non-retryable auth errors (like ExpiredTokenException), 
+            # immediately re-raise without any post-processing to avoid wasting tokens
+            if classified.reason == FailoverReason.AUTH_PERMANENT and not classified.retryable:
+                logger_instance.warning(
+                    "ReactStrategy: Skipping post-processing due to non-retryable auth error",
+                    extra={"execution_id": execution_id}
+                )
+                raise
+            
             raise
 
         messages = result_state.get("messages", [])
@@ -2096,14 +2228,19 @@ class ReactStrategy(BaseStrategy):
 
     @staticmethod
     async def _invoke_agent(agent: Any, input_state: Dict[str, Any]) -> Dict[str, Any]:
-        """Non-streaming invocation with timeout."""
+        """Non-streaming invocation with timeout and recursion limit."""
+        from app.config import settings
+        
         try:
             result_state = await asyncio.wait_for(
-                agent.ainvoke(input_state),
-                timeout=300.0,
+                agent.ainvoke(
+                    input_state,
+                    config={"recursion_limit": settings.agent_recursion_limit}
+                ),
+                timeout=settings.agent_timeout_seconds,
             )
         except asyncio.TimeoutError:
-            raise RuntimeError("ReAct agent timed out after 300 seconds.")
+            raise RuntimeError(f"ReAct agent timed out after {settings.agent_timeout_seconds} seconds.")
         return result_state
 
     async def _execute_agent_stream(
@@ -2125,12 +2262,18 @@ class ReactStrategy(BaseStrategy):
             execution_id: Execution ID for logging
             llm_config: Optional LLM configuration for rate limit tracking
         """
+        from app.config import settings
+        
         current_tool_name: str = ""
         accumulated_state: Dict[str, Any] = {"messages": []}
         msg_map: Dict[str, Any] = {}
 
         try:
-            async for event in agent.astream_events(input_state, version="v2"):
+            async for event in agent.astream_events(
+                input_state,
+                version="v2",
+                config={"recursion_limit": settings.agent_recursion_limit}
+            ):
                 kind = event.get("event", "")
                 data = event.get("data", {})
                 name = event.get("name", "")

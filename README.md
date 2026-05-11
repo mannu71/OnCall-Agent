@@ -11,7 +11,6 @@ kyc-protect-oncall-agent/
 │   ├── tests/                # Test suite
 │   ├── docker-compose.yml    # Docker services (API + PostgreSQL)
 │   └── Dockerfile            # Backend container definition
-├── hermes-agent-main/        # Core AI agent engine (Python)
 ├── ui/                       # Electron + React frontend
 │   ├── electron/             # Electron main process
 │   ├── src/                  # React frontend source

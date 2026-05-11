@@ -111,9 +111,10 @@ export const WorkflowStatusProvider = ({ children }) => {
     clearWorkflowPending,
     subscribeToWorkflow,
     unsubscribeFromWorkflow,
+    refreshNow: checkRunningWorkflows,
     count: allRunningWorkflows.length,
     lastCheck
-  }), [allRunningWorkflows, isWorkflowRunning, markWorkflowPending, clearWorkflowPending, subscribeToWorkflow, unsubscribeFromWorkflow, lastCheck]);
+  }), [allRunningWorkflows, isWorkflowRunning, markWorkflowPending, clearWorkflowPending, subscribeToWorkflow, unsubscribeFromWorkflow, checkRunningWorkflows, lastCheck]);
 
   return (
     <WorkflowStatusContext.Provider value={value}>

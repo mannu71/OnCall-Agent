@@ -1,5 +1,7 @@
 """Error handling middleware for FastAPI."""
 import logging
+import uuid
+from datetime import datetime
 from fastapi import Request, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -12,7 +14,33 @@ from app.core.exceptions import (
     WorkflowException,
     ExecutionException,
     StorageException,
-    ConfigurationException
+    ConfigurationException,
+    ReleaseManagementException,
+    AzureDevOpsException,
+    AzureWikiException,
+    GitOperationException,
+    ConflictResolutionException,
+    CredentialException
+)
+from app.services.azure_devops_client import (
+    AzureDevOpsError,
+    AzureDevOpsConnectionError,
+    AzureDevOpsAuthenticationError,
+    AzureDevOpsNotFoundError,
+    AzureDevOpsRateLimitError
+)
+from app.services.azure_wiki_client import (
+    AzureWikiError,
+    AzureWikiConnectionError,
+    AzureWikiAuthenticationError,
+    AzureWikiNotFoundError,
+    AzureWikiConflictError
+)
+from app.services.release_manager import (
+    ReleaseManagerError,
+    ReleaseValidationError,
+    ReleaseCreationError,
+    ReleaseCredentialsError
 )
 
 logger = logging.getLogger(__name__)
@@ -127,12 +155,151 @@ def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
+def azure_devops_exception_handler(request: Request, exc: AzureDevOpsError) -> JSONResponse:
+    """Handle Azure DevOps API exceptions.
+    
+    Args:
+        request: FastAPI request
+        exc: Azure DevOps exception
+        
+    Returns:
+        JSON error response
+        
+    Requirements: 12.3, 12.4
+    """
+    # Map exception types to HTTP status codes
+    status_code_map = {
+        AzureDevOpsAuthenticationError: status.HTTP_401_UNAUTHORIZED,
+        AzureDevOpsNotFoundError: status.HTTP_404_NOT_FOUND,
+        AzureDevOpsRateLimitError: status.HTTP_429_TOO_MANY_REQUESTS,
+        AzureDevOpsConnectionError: status.HTTP_502_BAD_GATEWAY,
+        AzureDevOpsError: status.HTTP_500_INTERNAL_SERVER_ERROR,
+    }
+    
+    status_code = status_code_map.get(type(exc), status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    logger.error(
+        f"Azure DevOps error on {request.url.path}: {exc.__class__.__name__}: {str(exc)}",
+        extra={
+            "error_type": exc.__class__.__name__,
+            "path": request.url.path,
+            "status_code": status_code
+        }
+    )
+    
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": exc.__class__.__name__,
+            "message": str(exc),
+            "details": {"service": "Azure DevOps"},
+            "timestamp": datetime.utcnow().isoformat(),
+            "request_id": str(uuid.uuid4())
+        }
+    )
+
+
+def azure_wiki_exception_handler(request: Request, exc: AzureWikiError) -> JSONResponse:
+    """Handle Azure Wiki API exceptions.
+    
+    Args:
+        request: FastAPI request
+        exc: Azure Wiki exception
+        
+    Returns:
+        JSON error response
+        
+    Requirements: 12.3, 12.4
+    """
+    # Map exception types to HTTP status codes
+    status_code_map = {
+        AzureWikiAuthenticationError: status.HTTP_401_UNAUTHORIZED,
+        AzureWikiNotFoundError: status.HTTP_404_NOT_FOUND,
+        AzureWikiConflictError: status.HTTP_409_CONFLICT,
+        AzureWikiConnectionError: status.HTTP_502_BAD_GATEWAY,
+        AzureWikiError: status.HTTP_500_INTERNAL_SERVER_ERROR,
+    }
+    
+    status_code = status_code_map.get(type(exc), status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    logger.error(
+        f"Azure Wiki error on {request.url.path}: {exc.__class__.__name__}: {str(exc)}",
+        extra={
+            "error_type": exc.__class__.__name__,
+            "path": request.url.path,
+            "status_code": status_code
+        }
+    )
+    
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": exc.__class__.__name__,
+            "message": str(exc),
+            "details": {"service": "Azure Wiki"},
+            "timestamp": datetime.utcnow().isoformat(),
+            "request_id": str(uuid.uuid4())
+        }
+    )
+
+
+def release_manager_exception_handler(request: Request, exc: ReleaseManagerError) -> JSONResponse:
+    """Handle release manager exceptions.
+    
+    Args:
+        request: FastAPI request
+        exc: Release manager exception
+        
+    Returns:
+        JSON error response
+        
+    Requirements: 12.3, 12.4
+    """
+    # Map exception types to HTTP status codes
+    status_code_map = {
+        ReleaseValidationError: status.HTTP_400_BAD_REQUEST,
+        ReleaseCredentialsError: status.HTTP_401_UNAUTHORIZED,
+        ReleaseCreationError: status.HTTP_500_INTERNAL_SERVER_ERROR,
+        ReleaseManagerError: status.HTTP_500_INTERNAL_SERVER_ERROR,
+    }
+    
+    status_code = status_code_map.get(type(exc), status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    logger.error(
+        f"Release manager error on {request.url.path}: {exc.__class__.__name__}: {str(exc)}",
+        extra={
+            "error_type": exc.__class__.__name__,
+            "path": request.url.path,
+            "status_code": status_code
+        }
+    )
+    
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": exc.__class__.__name__,
+            "message": str(exc),
+            "details": {"service": "Release Manager"},
+            "timestamp": datetime.utcnow().isoformat(),
+            "request_id": str(uuid.uuid4())
+        }
+    )
+
+
 def register_exception_handlers(app):
     """Register all exception handlers with the FastAPI app.
     
     Args:
         app: FastAPI application instance
+        
+    Requirements: 12.3, 12.4
     """
+    # Register Azure Release Management exception handlers
+    app.add_exception_handler(AzureDevOpsError, azure_devops_exception_handler)
+    app.add_exception_handler(AzureWikiError, azure_wiki_exception_handler)
+    app.add_exception_handler(ReleaseManagerError, release_manager_exception_handler)
+    
+    # Register general application exception handlers
     app.add_exception_handler(AppException, app_exception_handler)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)

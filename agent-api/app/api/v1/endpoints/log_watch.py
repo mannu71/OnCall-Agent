@@ -4,10 +4,11 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel, Field
-from app.repositories import db_repository
 
+from app.api.deps import get_model_key_repo
+from app.infrastructure.persistence import ModelKeyRepository
 from app.mcp.tools.watch_tools import (
     watch_log_groups,
     analyze_log_patterns,
@@ -35,6 +36,8 @@ router = APIRouter(prefix="/log-watch", tags=["Log Watch Analyzer"])
 async def _resolve_aws_credentials(
     request_credentials: Optional[Any],
     region: str,
+    *,
+    repo: ModelKeyRepository,
 ) -> tuple[Optional[Dict[str, Any]], str]:
     """Return (credentials_dict, region) from request body or DB fallback."""
     if request_credentials:
@@ -43,7 +46,7 @@ async def _resolve_aws_credentials(
     # Fall back to credentials stored in the model_keys table
     try:
         for key_name in ("AWS CloudWatch", "cloudwatch", "AWS Bedrock", "bedrock", "aws bedrock", "aws"):
-            mk = await db_repository.get_model_key(key_name, include_secrets=True)
+            mk = await repo.get_by_provider(key_name, include_secrets=True)
             if mk and mk.get("access_key_id"):
                 creds: Dict[str, Any] = {
                     "access_key_id": mk["access_key_id"],

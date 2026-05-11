@@ -106,7 +106,7 @@ class VisualWorkflowExecutor:
     def _build_node_result(value: Dict[str, Any]) -> Dict[str, Any]:
         """Extract relevant fields from a node execution result."""
         node_result = {}
-        for field in ('status', 'output', 'trigger_time', 'model', 'provider', 'duration', 'recall_hits'):
+        for field in ('status', 'output', 'trigger_time', 'model', 'provider', 'duration', 'recall_hits', 'type'):
             if field in value:
                 node_result[field] = value[field]
         
@@ -117,6 +117,9 @@ class VisualWorkflowExecutor:
         # Extract metadata if available
         if 'metadata' in value:
             node_result['metadata'] = value['metadata']
+            # Also extract token_usage from metadata if not at top level
+            if 'token_usage' not in node_result and 'token_usage' in value['metadata']:
+                node_result['token_usage'] = value['metadata']['token_usage']
         
         if 'queries_executed' in value:
             node_result['queries_executed'] = value['queries_executed']
@@ -140,6 +143,10 @@ class VisualWorkflowExecutor:
             node_result['message_count'] = value['message_count']
         if 'tool_calls' in value:
             node_result['tool_calls'] = value['tool_calls']
+        if 'user_query' in value:
+            node_result['user_query'] = value['user_query']
+        if 'messages' in value:
+            node_result['messages'] = value['messages']
         
         return node_result
     
@@ -418,11 +425,32 @@ class VisualWorkflowExecutor:
                     if isinstance(node_result, dict) and node_result.get("messages"):
                         trajectory.extend(node_result["messages"])
 
+            # Map result fields → DB column names expected by ExecutionRepository.save()
+            # result dict uses: start_time, end_time, duration (secs), results
+            # DB repo expects: started_at (datetime), completed_at (datetime), duration_ms (int), output
+            duration_secs = result.get("duration", 0) or 0
+
+            def _parse_dt(ts: Optional[str]):
+                """Parse ISO timestamp string to datetime; return None if invalid."""
+                if not ts:
+                    return None
+                try:
+                    if ts.endswith('Z'):
+                        ts = ts[:-1] + '+00:00'
+                    return datetime.fromisoformat(ts)
+                except (ValueError, TypeError):
+                    return datetime.now(timezone.utc)
+
             await execution_repo.save({
-                **result,
                 "workflow_name": workflow.get('name'),
                 "workflow_id": workflow.get('id'),
-                "events": self.active_executions[execution_id].get('events', []),
+                "status": result.get("status", "failed"),
+                "started_at": _parse_dt(result.get("start_time")),
+                "completed_at": _parse_dt(result.get("end_time")),
+                "duration_ms": int(duration_secs * 1000),
+                "output": node_results,          # the sanitized node results dict
+                "error": result.get("error"),
+                "logs": self.active_executions[execution_id].get('events', []),
                 "trajectory": trajectory or None,
             })
         except Exception as e:
@@ -679,6 +707,7 @@ class VisualWorkflowExecutor:
 
             return {
                 'status': 'success',
+                'type': result.get('type'),  # Preserve type field for React identification
                 'output': result.get('final_answer', 'Agent completed (no answer returned).'),
                 'final_answer': result.get('final_answer'),
                 'messages': result.get('messages', []),
@@ -686,6 +715,11 @@ class VisualWorkflowExecutor:
                 'tool_calls': result.get('tool_calls', []),
                 'model': result.get('model'),
                 'provider': result.get('provider'),
+                'token_usage': result.get('token_usage'),  # Preserve token usage
+                'metadata': result.get('metadata'),  # Preserve metadata
+                'recall_hits': result.get('recall_hits', 0),  # Preserve recall hits
+                'duration': result.get('duration'),  # Preserve duration
+                'user_query': result.get('user_query'),  # Preserve user query
                 'agent_data': node_data,
             }
 
@@ -694,6 +728,20 @@ class VisualWorkflowExecutor:
                 "Agent node execution failed: %s (node_id=%s, execution_id=%s)",
                 e, node_id, execution_id,
             )
+            
+            # Check if this is a fatal auth error that should stop the workflow
+            from app.core.error_classifier import classify_error, FailoverReason
+            classified = classify_error(e)
+            
+            # For non-retryable auth errors (like ExpiredTokenException),
+            # propagate the exception to stop the workflow immediately
+            if classified.reason == FailoverReason.AUTH_PERMANENT and not classified.retryable:
+                logger.warning(
+                    "Agent node: propagating fatal auth error to stop workflow",
+                    extra={"execution_id": execution_id, "node_id": node_id}
+                )
+                raise
+            
             return {
                 'status': 'failed',
                 'error': str(e),
@@ -891,6 +939,20 @@ class VisualWorkflowExecutor:
 
         except Exception as e:
             logger.error(f"CloudWatch Analyzer execution failed: {e}")
+            
+            # Check if this is a fatal auth error that should stop the workflow
+            from app.core.error_classifier import classify_error, FailoverReason
+            classified = classify_error(e)
+            
+            # For non-retryable auth errors (like ExpiredTokenException),
+            # propagate the exception to stop the workflow immediately
+            if classified.reason == FailoverReason.AUTH_PERMANENT and not classified.retryable:
+                logger.warning(
+                    "CloudWatch node: propagating fatal auth error to stop workflow",
+                    extra={"execution_id": context.get('execution_id')}
+                )
+                raise
+            
             return {
                 "status": "failed",
                 "error": str(e)
@@ -1083,6 +1145,19 @@ class VisualWorkflowExecutor:
             return analysis, model_name, token_usage
 
         except Exception as e:
+            # Check if this is a fatal auth error that should stop the workflow
+            from app.core.error_classifier import classify_error, FailoverReason
+            classified = classify_error(e)
+            
+            # For non-retryable auth errors (like ExpiredTokenException),
+            # propagate the exception to stop the workflow immediately
+            if classified.reason == FailoverReason.AUTH_PERMANENT and not classified.retryable:
+                logger.warning(
+                    "CloudWatch LLM analysis: propagating fatal auth error to stop workflow",
+                    extra={"execution_id": execution_id}
+                )
+                raise
+            
             logger.warning("CloudWatch LLM analysis failed (falling back to static): %s", e)
             return None, None, None
 

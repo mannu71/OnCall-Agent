@@ -19,19 +19,25 @@ const ExecutionLog = ({ events, maxHeight = 400 }) => {
         switch (eventType) {
             case 'workflow_started':
             case 'node_started':
+            case 'node_start':
                 return <Play className="w-3.5 h-3.5 text-blue-500" />;
             case 'workflow_completed':
             case 'node_completed':
+            case 'node_done':
             case 'agent_complete':
                 return <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />;
             case 'workflow_failed':
             case 'node_failed':
+            case 'node_error':
             case 'agent_error':
                 return <XCircle className="w-3.5 h-3.5 text-red-500" />;
             case 'tool_call':
             case 'tool_result':
+            case 'agent_tool_call':
+            case 'agent_tool_result':
                 return <Wrench className="w-3.5 h-3.5 text-purple-500" />;
             case 'llm_token':
+            case 'agent_token':
                 return <MessageSquare className="w-3.5 h-3.5 text-cyan-500" />;
             default:
                 return <AlertCircle className="w-3.5 h-3.5 text-gray-500" />;
@@ -60,48 +66,67 @@ const ExecutionLog = ({ events, maxHeight = 400 }) => {
 
         switch (eventType) {
             case 'workflow_started':
-                return `Workflow started: ${data.workflow_name || 'Unknown'}`;
+                return `Starting workflow: ${data.workflow_name || 'Unknown'}`;
             
             case 'workflow_completed':
-                const duration = data.duration ? ` (${data.duration.toFixed(2)}s)` : '';
-                return `Workflow completed successfully${duration}`;
+                const duration = data.duration ? ` in ${data.duration.toFixed(2)}s` : '';
+                const nodesExecuted = data.nodes_executed ? ` (${data.nodes_executed} nodes)` : '';
+                return `Workflow completed successfully${duration}${nodesExecuted}`;
             
             case 'workflow_failed':
                 return `Workflow failed: ${data.error || 'Unknown error'}`;
             
+            // Handle both internal (node_started) and canonical (node_start) event types
             case 'node_started':
-                return `Node started: ${data.node_id || data.node_name || 'Unknown'}`;
+            case 'node_start':
+                const startLabel = data.label || data.nodeType || data.node_type || 'Node';
+                return `Starting: ${startLabel}`;
             
             case 'node_completed':
-                return `Node completed: ${data.node_id || data.node_name || 'Unknown'}`;
+            case 'node_done':
+                const doneLabel = data.label || data.nodeType || data.node_type || 'Node';
+                const doneStatus = data.status || 'completed';
+                const nodeDuration = data.duration ? ` (${data.duration.toFixed(2)}s)` : '';
+                const doneOutput = data.output ? ` - ${String(data.output).substring(0, 80)}` : '';
+                return `${doneLabel} ${doneStatus}${nodeDuration}${doneOutput}`;
             
             case 'node_failed':
-                return `Node failed: ${data.node_id || data.node_name || 'Unknown'} - ${data.error || 'Unknown error'}`;
+            case 'node_error':
+                const failedLabel = data.label || data.nodeType || data.node_type || 'Node';
+                const errorMsg = data.error || 'Unknown error';
+                const failDuration = data.duration ? ` (${data.duration.toFixed(2)}s)` : '';
+                return `${failedLabel} failed${failDuration}: ${errorMsg}`;
             
             case 'tool_call':
+            case 'agent_tool_call':
                 const toolName = data.tool_name || data.tool || 'Unknown tool';
-                const argsPreview = data.args ? ` with ${Object.keys(data.args).length} parameter(s)` : '';
+                const argsCount = data.args ? Object.keys(data.args).length : 0;
+                const argsPreview = argsCount > 0 ? ` (${argsCount} parameter${argsCount !== 1 ? 's' : ''})` : '';
                 return `Calling tool: ${toolName}${argsPreview}`;
             
             case 'tool_result':
+            case 'agent_tool_result':
                 const resultTool = data.tool_name || data.tool || 'Tool';
                 const resultPreview = data.result ? String(data.result).substring(0, 100) : 'completed';
-                return `${resultTool} returned: ${resultPreview}${String(data.result || '').length > 100 ? '...' : ''}`;
+                const truncated = String(data.result || '').length > 100 ? '...' : '';
+                return `${resultTool} completed: ${resultPreview}${truncated}`;
             
             case 'agent_complete':
                 const msgCount = data.metadata?.message_count || data.message_count || 0;
                 const toolCount = data.metadata?.tool_call_count || data.tool_call_count || 0;
-                return `Agent completed (${msgCount} messages, ${toolCount} tool calls)`;
+                const agentDuration = data.duration ? ` in ${data.duration.toFixed(2)}s` : '';
+                return `Agent completed${agentDuration} (${msgCount} message${msgCount !== 1 ? 's' : ''}, ${toolCount} tool call${toolCount !== 1 ? 's' : ''})`;
             
             case 'agent_error':
                 return `Agent error: ${data.error || 'Unknown error'}`;
             
+            case 'agent_token':
             case 'llm_token':
                 // Skip token events in the log - they're shown in Agent Output section
                 return null;
             
             case 'connected':
-                return `Connected to execution: ${data.execution_id || ''}`;
+                return `Connected to workflow execution`;
             
             case 'keepalive':
                 // Skip keepalive events
@@ -151,7 +176,10 @@ const ExecutionLog = ({ events, maxHeight = 400 }) => {
     const visibleEvents = events.filter(event => {
         const eventType = event.event_type || event.type;
         const message = formatEventMessage(event);
-        return message !== null && eventType !== 'keepalive' && eventType !== 'llm_token';
+        return message !== null && 
+               eventType !== 'keepalive' && 
+               eventType !== 'llm_token' && 
+               eventType !== 'agent_token';
     });
 
     return (

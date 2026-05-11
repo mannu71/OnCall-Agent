@@ -147,6 +147,86 @@ async def list_workflows(
     return await workflow_repo.list_all()
 
 
+# ============================================================================
+# Workflow Metadata & Schema Endpoints (must be before /{workflow_name})
+# ============================================================================
+
+@router.post("/validate")
+async def validate_workflow(workflow: dict):
+    """Validate a workflow definition.
+    
+    Validates:
+    - Node types and configurations
+    - Edge connections
+    - Required fields
+    
+    Returns validation result with errors if any.
+    """
+    from app.workflow.workflow_translator import workflow_translator, WorkflowValidationError
+    
+    try:
+        # Attempt to translate (validates in the process)
+        engine_workflow = workflow_translator.translate(workflow)
+        
+        return {
+            "valid": True,
+            "workflow": engine_workflow,
+            "errors": []
+        }
+    except WorkflowValidationError as e:
+        return {
+            "valid": False,
+            "errors": [{"type": "validation", "message": str(e)}]
+        }
+    except Exception as e:
+        return {
+            "valid": False,
+            "errors": [{"type": "error", "message": f"Validation failed: {str(e)}"}]
+        }
+
+
+@router.get("/node-types")
+async def get_node_types():
+    """Get all available node types with their schemas.
+    
+    Returns list of node types with metadata and form schemas.
+    """
+    from app.workflow.node_config_generator import node_config_generator
+    
+    return {
+        "node_types": node_config_generator.get_all_node_types()
+    }
+
+
+@router.get("/node-schema/{node_type}")
+async def get_node_schema(node_type: str):
+    """Get form schema for a specific node type.
+    
+    Returns JSON Schema-based form configuration that can be used
+    with react-jsonschema-form or similar libraries.
+    """
+    from app.workflow.node_config_generator import node_config_generator
+    
+    return node_config_generator.get_node_schema(node_type)
+
+
+@router.get("/skills")
+async def get_available_skills():
+    """Get all available skills with their schemas.
+    
+    Returns dict mapping skill names to form configurations.
+    """
+    from app.workflow.node_config_generator import node_config_generator
+    
+    return {
+        "skills": node_config_generator.get_skill_schemas()
+    }
+
+
+# ============================================================================
+# Workflow CRUD Endpoints
+# ============================================================================
+
 @router.get("/{workflow_name}", response_model=WorkflowResponse)
 async def get_workflow(
     workflow_name: str,
@@ -393,16 +473,16 @@ async def stream_workflow_execution(
     
     Monitors an existing execution. Does NOT start a new one.
     
-    Event types emitted:
+    All events are normalized to the canonical schema defined in
+    app.workflow.event_schema before being sent to the client.
+    
+    Event types emitted (canonical format):
     - workflow_started, workflow_completed, workflow_failed
-    - node_started, node_completed, node_failed
-    - llm_token:   real-time LLM output token
-    - tool_call:   agent invoking a tool
-    - tool_result: tool execution result
-    - agent_error: error from agent execution
-    - agent_complete: agent finished
-    - keepalive:   connection keep-alive
+    - node_start, node_update, node_done, node_error (React Flow compatible)
+    - agent_token, agent_tool_call, agent_tool_result, agent_error, agent_complete
+    - keepalive, error
     """
+    from app.workflow.event_adapter import event_adapter
     
     async def event_generator():
         exec_id = visual_executor._is_workflow_running(workflow_name)
@@ -417,22 +497,28 @@ async def stream_workflow_execution(
             
             while True:
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=60.0)
+                    # Get internal event from queue
+                    internal_event = await asyncio.wait_for(queue.get(), timeout=60.0)
                     
-                    event_type = event.event_type
-                    event_data = event.dict()
+                    # Normalize to canonical schema
+                    canonical_event = event_adapter.normalize(internal_event.dict())
                     
-                    if event_type in ("llm_token", "tool_call", "tool_result", "agent_error", "agent_complete"):
-                        yield f"event: {event_type}\ndata: {json.dumps(event_data)}\n\n"
-                    else:
-                        yield f"data: {json.dumps(event_data)}\n\n"
+                    # Send as SSE
+                    yield canonical_event.to_sse()
                     
-                    if event_type in ("workflow_completed", "workflow_failed"):
+                    # Break on workflow completion
+                    if canonical_event.event_type in ("workflow_completed", "workflow_failed"):
                         break
+                        
                 except asyncio.TimeoutError:
+                    # Check if execution still exists
                     if exec_id not in visual_executor.active_executions:
                         break
-                    yield f"data: {json.dumps({'event': 'keepalive'})}\n\n"
+                    # Send keepalive
+                    from app.workflow.event_schema import KeepaliveEvent
+                    keepalive = KeepaliveEvent()
+                    yield keepalive.to_sse()
+                    
         finally:
             visual_executor.unsubscribe_from_events(exec_id, queue)
     
@@ -447,3 +533,4 @@ async def get_workflow_executions(
 ):
     """Get execution history for a workflow."""
     return await execution_repo.list_by_workflow(workflow_name, limit=limit)
+

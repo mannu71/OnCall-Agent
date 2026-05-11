@@ -819,6 +819,17 @@ def _classify_boto_error(error: Exception) -> ClassifiedError:
                 retryable=True,
                 original_error=error,
             )
+        # Handle ExpiredTokenException - credentials expired, cannot proceed
+        if error_code == "ExpiredTokenException" or "ExpiredToken" in str(error):
+            return ClassifiedError(
+                reason=FailoverReason.AUTH_PERMANENT,
+                status_code=status_code,
+                message=error_body.get("error_message", "AWS credentials expired. Please refresh your AWS credentials and try again."),
+                error_context=error_body,
+                retryable=False,
+                should_fallback=False,  # Don't fallback, credentials need to be refreshed
+                original_error=error,
+            )
         if error_code in ("InvalidClientTokenId", "UnrecognizedClientException"):
             return ClassifiedError(
                 reason=FailoverReason.AUTH_PERMANENT,

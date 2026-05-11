@@ -24,52 +24,181 @@ logger = logging.getLogger(__name__)
 
 
 class EmbeddingService:
-    """Service for generating embeddings using AWS Bedrock."""
+    """Service for generating embeddings using configurable providers."""
     
-    def __init__(self, region: str = "us-east-1"):
+    def __init__(
+        self,
+        provider: str = None,
+        model: str = None,
+        region: str = None,
+        api_key: str = None,
+        base_url: str = None,
+        access_key_id: str = None,
+        secret_access_key: str = None,
+        session_token: str = None,
+    ):
         """Initialize embedding service.
         
         Args:
-            region: AWS region for Bedrock
+            provider: Embedding provider (bedrock, openai, azure, cohere). Defaults to settings.
+            model: Model ID for embeddings. Defaults to settings.
+            region: AWS region for Bedrock. Defaults to settings.
+            api_key: API key for non-AWS providers
+            base_url: Custom base URL for API providers
+            access_key_id: AWS access key ID for Bedrock
+            secret_access_key: AWS secret access key for Bedrock
+            session_token: AWS session token for Bedrock (optional)
         """
-        self.region = region
+        from app.config import settings
+        
+        self.provider = (provider or settings.embedding_provider).lower()
+        self.model = model or settings.embedding_model
+        self.region = region or settings.embedding_region
+        self.api_key = api_key
+        self.base_url = base_url
+        self.access_key_id = access_key_id
+        self.secret_access_key = secret_access_key
+        self.session_token = session_token
         self._client = None
+        
+        logger.info(
+            "EmbeddingService initialized: provider=%s, model=%s, region=%s",
+            self.provider, self.model, self.region
+        )
     
     @property
     def client(self):
-        """Get Bedrock client (lazy initialization)."""
+        """Get embedding client (lazy initialization based on provider)."""
         if self._client is None:
-            import boto3
-            self._client = boto3.client('bedrock-runtime', region_name=self.region)
+            if self.provider == "bedrock":
+                import boto3
+                import os
+                from botocore.config import Config
+                
+                # Respect AWS_SSL_VERIFY environment variable
+                ssl_verify = os.environ.get("AWS_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
+                
+                # Build boto3 client kwargs
+                kwargs = {"region_name": self.region}
+                
+                # Use explicit credentials if provided (from Model Keys)
+                if self.access_key_id and self.secret_access_key:
+                    kwargs["aws_access_key_id"] = self.access_key_id
+                    kwargs["aws_secret_access_key"] = self.secret_access_key
+                    if self.session_token:
+                        kwargs["aws_session_token"] = self.session_token
+                    logger.info("Using explicit AWS credentials from Model Keys for embeddings")
+                else:
+                    logger.info("Using default AWS credential chain for embeddings")
+                
+                if ssl_verify:
+                    self._client = boto3.client('bedrock-runtime', **kwargs)
+                else:
+                    kwargs["verify"] = False
+                    kwargs["config"] = Config(retries={"max_attempts": 3})
+                    self._client = boto3.client('bedrock-runtime', **kwargs)
+                    
+            elif self.provider == "openai":
+                from openai import AsyncOpenAI
+                self._client = AsyncOpenAI(
+                    api_key=self.api_key,
+                    base_url=self.base_url
+                )
+            elif self.provider == "azure":
+                from openai import AsyncAzureOpenAI
+                self._client = AsyncAzureOpenAI(
+                    api_key=self.api_key,
+                    azure_endpoint=self.base_url,
+                    api_version="2024-02-01"
+                )
+            elif self.provider == "cohere":
+                import cohere
+                self._client = cohere.AsyncClient(api_key=self.api_key)
+            else:
+                raise ValueError(f"Unsupported embedding provider: {self.provider}")
+                
         return self._client
     
     async def generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding for text using Amazon Titan.
+        """Generate embedding for text using configured provider.
         
         Args:
             text: Text to embed
             
         Returns:
-            Embedding vector (1536 dimensions for Titan)
+            Embedding vector
         """
         import asyncio
+        from botocore.exceptions import ClientError
         
         # Truncate text if too long
         max_tokens = 8000
         if len(text) > max_tokens:
             text = text[:max_tokens]
         
-        # Call Bedrock API
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: self.client.invoke_model(
-                modelId='amazon.titan-embed-text-v1',
-                body=json.dumps({'inputText': text})
-            )
-        )
-        
-        result = json.loads(response['body'].read())
-        return result.get('embedding', [])
+        # Provider-specific embedding generation with retry on credential expiration
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                if self.provider == "bedrock":
+                    # AWS Bedrock
+                    response = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.client.invoke_model(
+                            modelId=self.model,
+                            body=json.dumps({'inputText': text})
+                        )
+                    )
+                    result = json.loads(response['body'].read())
+                    return result.get('embedding', [])
+                    
+                elif self.provider == "openai":
+                    # OpenAI
+                    response = await self.client.embeddings.create(
+                        model=self.model,
+                        input=text
+                    )
+                    return response.data[0].embedding
+                    
+                elif self.provider == "azure":
+                    # Azure OpenAI
+                    response = await self.client.embeddings.create(
+                        model=self.model,
+                        input=text
+                    )
+                    return response.data[0].embedding
+                    
+                elif self.provider == "cohere":
+                    # Cohere
+                    response = await self.client.embed(
+                        texts=[text],
+                        model=self.model,
+                        input_type="search_document"
+                    )
+                    return response.embeddings[0]
+                    
+                else:
+                    raise ValueError(f"Unsupported provider: {self.provider}")
+                    
+            except ClientError as e:
+                # Handle AWS credential expiration
+                error_code = e.response.get('Error', {}).get('Code', '')
+                
+                if error_code == 'ExpiredTokenException' and attempt < max_retries - 1:
+                    logger.warning(
+                        "EmbeddingService: AWS token expired, refreshing client (attempt %d/%d)",
+                        attempt + 1, max_retries
+                    )
+                    self._client = None  # Force client recreation with fresh credentials
+                    continue
+                    
+                raise
+            except Exception as e:
+                # For non-AWS providers, don't retry
+                if self.provider != "bedrock":
+                    raise
+                # For AWS, only retry on credential errors
+                raise
     
     async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings for multiple texts.
@@ -96,7 +225,107 @@ class KnowledgeBaseService:
         Args:
             embedding_service: Embedding service for vector generation
         """
-        self.embedding_service = embedding_service or EmbeddingService()
+        self._embedding_service = embedding_service
+    
+    async def _get_embedding_service(self) -> EmbeddingService:
+        """Get or create embedding service based on LLM config marked for embeddings.
+        
+        Returns:
+            EmbeddingService instance
+        """
+        if self._embedding_service is not None:
+            return self._embedding_service
+        
+        # Try to find an LLM marked for embeddings
+        try:
+            from app.repositories.db_repository import db_repository
+            llm_configs = await db_repository.list_llm_configs()
+            
+            for name, config in llm_configs.items():
+                if config.get('use_for_embeddings'):
+                    # Found an LLM marked for embeddings
+                    logger.info(
+                        "Using LLM '%s' (%s/%s) for embeddings",
+                        name, config.get('provider'), config.get('model')
+                    )
+                    
+                    # Normalize provider name for embedding service
+                    provider = config.get('provider', '').lower().replace(' ', '_')
+                    # Map common variations to standard names
+                    provider_map = {
+                        'aws_bedrock': 'bedrock',
+                        'bedrock': 'bedrock',
+                        'aws': 'bedrock',
+                        'openai': 'openai',
+                        'anthropic': 'openai',  # Anthropic uses OpenAI-compatible API
+                        'azure_openai': 'azure',
+                        'azure': 'azure',
+                        'cohere': 'cohere',
+                    }
+                    normalized_provider = provider_map.get(provider, provider)
+                    
+                    # Get credentials from model_keys
+                    api_key = None
+                    access_key_id = None
+                    secret_access_key = None
+                    session_token = None
+                    
+                    # For Bedrock, get AWS credentials from Model Keys (same as workflow LLMs)
+                    if normalized_provider == 'bedrock':
+                        try:
+                            # Try multiple key names for Bedrock
+                            for bedrock_key in ("AWS Bedrock", "bedrock", "aws bedrock", "aws"):
+                                mk = await db_repository.get_model_key(bedrock_key, include_secrets=True)
+                                if mk:
+                                    if mk.get("access_key_id"):
+                                        access_key_id = mk["access_key_id"]
+                                    if mk.get("secret_access_key"):
+                                        secret_access_key = mk["secret_access_key"]
+                                    if mk.get("session_token"):
+                                        session_token = mk["session_token"]
+                                    if mk.get("region") and (not config.get("region") or config.get("region") == "us-east-1"):
+                                        config["region"] = mk["region"]
+                                    logger.info(
+                                        "Using AWS credentials from Model Key '%s' for embeddings",
+                                        bedrock_key
+                                    )
+                                    break
+                        except Exception as e:
+                            logger.warning("Could not look up Model Key for Bedrock: %s", e)
+                    
+                    # For other providers, get API key
+                    elif normalized_provider not in ('ollama',):
+                        try:
+                            # Use original provider name for model_key lookup
+                            mk = await db_repository.get_model_key(config.get('provider'), include_secrets=True)
+                            if mk:
+                                api_key = mk.get('api_key')
+                        except Exception:
+                            pass
+                    
+                    self._embedding_service = EmbeddingService(
+                        provider=normalized_provider,
+                        model=config.get('model'),
+                        region=config.get('region'),
+                        api_key=api_key,
+                        base_url=config.get('base_url') or config.get('endpoint'),
+                        access_key_id=access_key_id,
+                        secret_access_key=secret_access_key,
+                        session_token=session_token,
+                    )
+                    return self._embedding_service
+        except Exception as e:
+            logger.warning("Failed to load LLM config for embeddings: %s", e)
+        
+        # Fall back to default settings
+        logger.info("Using default embedding configuration from settings")
+        self._embedding_service = EmbeddingService()
+        return self._embedding_service
+    
+    @property
+    async def embedding_service(self) -> EmbeddingService:
+        """Get embedding service (async property)."""
+        return await self._get_embedding_service()
     
     # ============================================
     # LOG PATTERN OPERATIONS
@@ -123,7 +352,8 @@ class KnowledgeBaseService:
             Created pattern
         """
         # Generate embedding for pattern
-        embedding = await self.embedding_service.generate_embedding(f"{name} {pattern} {description or ''}")
+        embedding_svc = await self._get_embedding_service()
+        embedding = await embedding_svc.generate_embedding(f"{name} {pattern} {description or ''}")
         
         async with AsyncSessionLocal() as session:
             pattern_model = LogPatternModel(
@@ -164,30 +394,27 @@ class KnowledgeBaseService:
             List of similar patterns with similarity scores
         """
         # Generate embedding for query
-        query_embedding = await self.embedding_service.generate_embedding(query)
+        embedding_svc = await self._get_embedding_service()
+        query_embedding = await embedding_svc.generate_embedding(query)
         
         async with AsyncSessionLocal() as session:
             # Use pgvector cosine similarity search
             # Note: This requires the pgvector extension
             from sqlalchemy import text
             
+            # Convert embedding list to pgvector format string
+            embedding_str = '[' + ','.join(str(x) for x in query_embedding) + ']'
+            
             query_str = """
                 SELECT id, name, pattern, pattern_type, severity, description,
-                       1 - (embedding <=> :embedding::vector) as similarity
+                       1 - (embedding <=> $1::vector) as similarity
                 FROM log_patterns
-                WHERE 1 - (embedding <=> :embedding::vector) > :threshold
+                WHERE 1 - (embedding <=> $1::vector) > $2
                 ORDER BY similarity DESC
-                LIMIT :limit
+                LIMIT $3
             """
             
-            result = await session.execute(
-                text(query_str),
-                {
-                    "embedding": str(query_embedding),
-                    "threshold": threshold,
-                    "limit": limit
-                }
-            )
+            result = await session.execute(text(query_str), (embedding_str, threshold, limit))
             
             patterns = []
             for row in result:
@@ -265,7 +492,8 @@ class KnowledgeBaseService:
         """
         # Generate embedding from combined text
         combined_text = f"{title} {description} {' '.join(symptoms)}"
-        embedding = await self.embedding_service.generate_embedding(combined_text)
+        embedding_svc = await self._get_embedding_service()
+        embedding = await embedding_svc.generate_embedding(combined_text)
         
         async with AsyncSessionLocal() as session:
             issue_model = KnownIssueModel(
@@ -313,7 +541,8 @@ class KnowledgeBaseService:
             Dict with id, title, category, source, and whether it was created or updated.
         """
         combined_text = f"{title} {' '.join(symptoms)} {solution}"
-        embedding = await self.embedding_service.generate_embedding(combined_text)
+        embedding_svc = await self._get_embedding_service()
+        embedding = await embedding_svc.generate_embedding(combined_text)
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
@@ -392,7 +621,8 @@ class KnowledgeBaseService:
 
             # Regenerate embedding to reflect updated solution content.
             combined_text = f"{existing.title} {' '.join(existing.symptoms or [])} {new_solution}"
-            existing.embedding = await self.embedding_service.generate_embedding(combined_text)
+            embedding_svc = await self._get_embedding_service()
+            existing.embedding = await embedding_svc.generate_embedding(combined_text)
 
             await session.commit()
             await session.refresh(existing)
@@ -422,33 +652,36 @@ class KnowledgeBaseService:
         Returns:
             List of matching known issues
         """
-        query_embedding = await self.embedding_service.generate_embedding(query)
+        embedding_svc = await self._get_embedding_service()
+        query_embedding = await embedding_svc.generate_embedding(query)
         
         async with AsyncSessionLocal() as session:
             from sqlalchemy import text
             
-            category_filter = ""
-            params = {
-                "embedding": str(query_embedding),
-                "threshold": threshold,
-                "limit": limit
-            }
+            # Convert embedding list to pgvector format string
+            embedding_str = '[' + ','.join(str(x) for x in query_embedding) + ']'
             
             if category:
-                category_filter = "AND category = :category"
-                params["category"] = category
-            
-            query_str = f"""
-                SELECT id, title, description, symptoms, solution, category,
-                       1 - (embedding <=> :embedding::vector) as similarity
-                FROM known_issues
-                WHERE 1 - (embedding <=> :embedding::vector) > :threshold
-                {category_filter}
-                ORDER BY similarity DESC
-                LIMIT :limit
-            """
-            
-            result = await session.execute(text(query_str), params)
+                query_str = """
+                    SELECT id, title, description, symptoms, solution, category,
+                           1 - (embedding <=> $1::vector) as similarity
+                    FROM known_issues
+                    WHERE 1 - (embedding <=> $1::vector) > $2
+                    AND category = $3
+                    ORDER BY similarity DESC
+                    LIMIT $4
+                """
+                result = await session.execute(text(query_str), (embedding_str, threshold, category, limit))
+            else:
+                query_str = """
+                    SELECT id, title, description, symptoms, solution, category,
+                           1 - (embedding <=> $1::vector) as similarity
+                    FROM known_issues
+                    WHERE 1 - (embedding <=> $1::vector) > $2
+                    ORDER BY similarity DESC
+                    LIMIT $3
+                """
+                result = await session.execute(text(query_str), (embedding_str, threshold, limit))
             
             issues = []
             for row in result:
@@ -809,5 +1042,6 @@ class KnowledgeBaseService:
 
 
 # Singleton instances
-embedding_service = EmbeddingService()
+# Note: embedding_service will be lazily initialized based on LLM config marked for embeddings
+embedding_service = None
 knowledge_base = KnowledgeBaseService(embedding_service)

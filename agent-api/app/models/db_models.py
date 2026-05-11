@@ -57,6 +57,7 @@ class LLMConfigModel(Base):
     icon = Column(String(10))
     description = Column(Text)
     aws_profile = Column(String(100))
+    use_for_embeddings = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
 
@@ -104,7 +105,7 @@ class LogPatternModel(Base):
     pattern_type = Column(String(50), nullable=False)
     severity = Column(Integer, default=1)
     description = Column(Text)
-    embedding = Column(Vector(1536))
+    embedding = Column(Vector(1024))
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
 
@@ -120,7 +121,7 @@ class KnownIssueModel(Base):
     solution = Column(Text)
     category = Column(String(100))
     source = Column(String(50), default="manual")  # manual | agent | verified
-    embedding = Column(Vector(1536))
+    embedding = Column(Vector(1024))
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
 
@@ -173,7 +174,7 @@ class AlertModel(Base):
 
 
 class TrajectoryModel(Base):
-    """Conversation trajectory storage for Hermes Agent integration."""
+    """Conversation trajectory storage."""
     __tablename__ = "trajectories"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -188,7 +189,7 @@ class TrajectoryModel(Base):
 
 
 class ContextReferenceModel(Base):
-    """Context reference tracking for Hermes Agent integration."""
+    """Context reference tracking."""
     __tablename__ = "context_references"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -200,7 +201,7 @@ class ContextReferenceModel(Base):
 
 
 class ContextLengthCacheModel(Base):
-    """Cached context lengths for models - Hermes Agent integration."""
+    """Cached context lengths for models."""
     __tablename__ = "context_length_cache"
 
     model_provider_key = Column(String(255), primary_key=True)

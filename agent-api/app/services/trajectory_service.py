@@ -1,7 +1,6 @@
 """Trajectory service for storing and replaying conversation trajectories.
 
-This service implements the Hermes Agent trajectory storage pattern for
-debugging and analysis of agent executions.
+This service implements trajectory storage for debugging and analysis of agent executions.
 """
 import logging
 import uuid
@@ -250,8 +249,7 @@ class TrajectoryService:
     ) -> List[Dict[str, Any]]:
         """Convert reasoning scratchpad tags from 'thinking' to 'think'.
         
-        This follows the Hermes Agent pattern of normalizing reasoning tags
-        for consistency across different model providers.
+        This normalizes reasoning tags for consistency across different model providers.
         
         Args:
             messages: List of message dictionaries

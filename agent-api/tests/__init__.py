@@ -1,1 +1,1 @@
-# Test package
+"""Test utilities and fixtures."""

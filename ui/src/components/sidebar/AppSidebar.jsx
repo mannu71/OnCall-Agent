@@ -5,10 +5,10 @@ import {
   Workflow,
   Calendar,
   Settings,
-  BarChart3,
   MessageSquare,
   Eye,
-  ChevronLeft
+  ChevronLeft,
+  GitBranch
 } from 'lucide-react'
 
 import {
@@ -62,11 +62,10 @@ const navigationItems = [
     icon: Workflow,
   },
   {
-    id: 'analytics',
-    title: 'Analytics',
-    path: '/analytics',
-    icon: BarChart3,
-    devOnly: true,
+    id: 'releases',
+    title: 'Releases',
+    path: '/releases',
+    icon: GitBranch,
   },
   {
     id: 'settings',

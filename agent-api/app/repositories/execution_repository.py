@@ -162,6 +162,25 @@ class ExecutionRepository:
         """
         return await self.db.delete_all_executions()
     
+    async def delete_by_workflow(self, workflow_name: str) -> int:
+        """Delete all executions for a specific workflow.
+
+        Args:
+            workflow_name: Workflow name
+
+        Returns:
+            Number of executions deleted
+        """
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import delete as sa_delete
+        from app.models.db_models import ExecutionModel as ExecModel
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                sa_delete(ExecModel).where(ExecModel.workflow_name == workflow_name)
+            )
+            await session.commit()
+            return result.rowcount
+
     async def delete_by_workflow_and_id(self, workflow_name: str, execution_id: str) -> bool:
         """Delete an execution by workflow name and execution ID.
         

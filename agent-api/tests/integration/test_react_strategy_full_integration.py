@@ -1,4 +1,4 @@
-"""Comprehensive integration tests for ReactStrategy with all Hermes components.
+"""Comprehensive integration tests for ReactStrategy with all components.
 
 This module tests the full ReAct workflow with:
 - Context compression on overflow
@@ -665,7 +665,7 @@ class TestStreamingWithLargeResponses:
 
 
 class TestIntegratedComponents:
-    """Test integration of all Hermes components.
+    """Test integration of all components.
     
     **Validates: Requirements 16.1-16.10**
     """

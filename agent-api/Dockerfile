@@ -6,7 +6,8 @@ WORKDIR /app
 
 # Environment variables
 ENV AWS_DEFAULT_REGION=eu-west-1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
 # Install system dependencies + Node/npm from Debian repos (no external registry needed)
 RUN apt-get update && \
@@ -20,14 +21,15 @@ RUN apt-get update && \
     && npm config set strict-ssl false
 
 # Install Python dependencies
-COPY requirements.txt .
+COPY requirements.txt /app/
 RUN pip install --no-cache-dir \
     --trusted-host pypi.org \
     --trusted-host files.pythonhosted.org \
-    -r requirements.txt
+    -r /app/requirements.txt
 
-# Copy app
-COPY app/ ./app/
+# Copy application
+COPY app/ /app/app/
+COPY pyproject.toml /app/
 
 # Create required directories
 RUN mkdir -p /app/data/certs

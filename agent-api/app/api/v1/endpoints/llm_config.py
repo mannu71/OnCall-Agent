@@ -1,10 +1,11 @@
 """LLM Configuration API routes."""
 import logging
 from typing import Dict, Any, Optional
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel, Field
 
-from app.repositories.db_repository import db_repository
+from app.api.deps import get_llm_config_repo, get_model_key_repo
+from app.infrastructure.persistence import LLMConfigRepository, ModelKeyRepository
 from app.core.redact import redact
 
 router = APIRouter(prefix="/llm-config", tags=["llm-config"])
@@ -25,7 +26,11 @@ class DiscoverModelsRequest(BaseModel):
 
 
 @router.post("/discover/models", response_model=Dict[str, Any])
-async def discover_provider_models(request: DiscoverModelsRequest):
+async def discover_provider_models(
+    request: DiscoverModelsRequest,
+    llm_repo: LLMConfigRepository = Depends(get_llm_config_repo),
+    key_repo: ModelKeyRepository = Depends(get_model_key_repo),
+):
     """Discover available models for a configured provider.
 
     Looks up the provider's credentials from Model Keys and calls
@@ -40,7 +45,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
     ssl_verify = os.environ.get("AWS_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
 
     provider = request.provider
-    mk = await db_repository.get_model_key(provider, include_secrets=True)
+    mk = await key_repo.get_by_provider(provider, include_secrets=True)
     if not mk:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -115,7 +120,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 if not model_id:
                     continue
                 display_name = model_name or (model_id.split(".")[-1] if "." in model_id else model_id)
-                existing = await db_repository.get_llm_config(display_name)
+                existing = await llm_repo.get_by_name(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
@@ -145,7 +150,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 if not model_id:
                     continue
                 display_name = model_id
-                existing = await db_repository.get_llm_config(display_name)
+                existing = await llm_repo.get_by_name(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
@@ -178,7 +183,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 display_name = m.get("display_name", model_id)
                 if not model_id:
                     continue
-                existing = await db_repository.get_llm_config(display_name)
+                existing = await llm_repo.get_by_name(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
@@ -207,7 +212,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 display_name = m.get("displayName", model_id)
                 if not model_id:
                     continue
-                existing = await db_repository.get_llm_config(display_name)
+                existing = await llm_repo.get_by_name(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
@@ -237,7 +242,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 if not model_id:
                     continue
                 display_name = model_id
-                existing = await db_repository.get_llm_config(display_name)
+                existing = await llm_repo.get_by_name(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
@@ -269,7 +274,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 display_name = m.get("id", model_id)
                 if not model_id:
                     continue
-                existing = await db_repository.get_llm_config(display_name)
+                existing = await llm_repo.get_by_name(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
@@ -296,7 +301,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 if not model_id:
                     continue
                 display_name = model_id
-                existing = await db_repository.get_llm_config(display_name)
+                existing = await llm_repo.get_by_name(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
@@ -341,6 +346,7 @@ class LLMConfigCreate(BaseModel):
     region: Optional[str] = Field(None, description="AWS region")
     icon: Optional[str] = Field(None, description="Icon")
     description: Optional[str] = Field(None, description="Description")
+    useForEmbeddings: Optional[bool] = Field(False, description="Use this LLM for embeddings")
 
 
 class LLMConfigUpdate(BaseModel):
@@ -354,6 +360,7 @@ class LLMConfigUpdate(BaseModel):
     region: Optional[str] = Field(None, description="AWS region")
     icon: Optional[str] = Field(None, description="Icon")
     description: Optional[str] = Field(None, description="Description")
+    useForEmbeddings: Optional[bool] = Field(None, description="Use this LLM for embeddings")
 
 
 def mask_api_key(api_key: str) -> str:
@@ -434,7 +441,7 @@ async def discover_bedrock_models(request: Optional[AWSDiscoverRequest] = None):
 
         display_name = model_name or model_id.split(".")[-1] if "." in model_id else model_id
 
-        existing = await db_repository.get_llm_config(display_name)
+        existing = await llm_repo.get_by_name(display_name)
         discovered.append({
             "name": display_name,
             "model": model_id,
@@ -468,7 +475,7 @@ async def add_discovered_models(request: AddDiscoveredModelsRequest):
         name = model.get("name")
         if not name:
             continue
-        if await db_repository.llm_config_exists(name):
+        if await llm_repo.exists(name):
             skipped.append(name)
             continue
         config_data = {
@@ -480,7 +487,7 @@ async def add_discovered_models(request: AddDiscoveredModelsRequest):
             "temperature": 0.1,
             "max_tokens": 4096,
         }
-        await db_repository.create_llm_config({**config_data, "name": name})
+        await llm_repo.create({**config_data, "name": name})
         added.append(name)
 
     logger.info("Added %d discovered models, skipped %d existing", len(added), len(skipped))
@@ -495,7 +502,7 @@ async def add_discovered_models(request: AddDiscoveredModelsRequest):
 
 @router.get("", response_model=Dict[str, Any])
 async def get_llm_config():
-    configs = await db_repository.list_llm_configs()
+    configs = await llm_repo.list_all()
     masked_llms = {}
     for name, cfg in configs.items():
         masked = {**cfg}
@@ -511,7 +518,7 @@ async def get_llm_config():
 
 @router.get("/{llm_name}", response_model=Dict[str, Any])
 async def get_llm_by_name(llm_name: str):
-    cfg = await db_repository.get_llm_config(llm_name)
+    cfg = await llm_repo.get_by_name(llm_name)
     if not cfg:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -528,12 +535,12 @@ async def get_llm_by_name(llm_name: str):
 
 @router.post("", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
 async def create_llm_config(llm_data: LLMConfigCreate):
-    if await db_repository.llm_config_exists(llm_data.name):
+    if await llm_repo.exists(llm_data.name):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"LLM configuration '{llm_data.name}' already exists"
         )
-    created = await db_repository.create_llm_config(llm_data.model_dump())
+    created = await llm_repo.create(llm_data.model_dump())
     logger.info("Created LLM configuration: %s", llm_data.name)
     return {"name": llm_data.name, **created}
 
@@ -542,12 +549,12 @@ async def create_llm_config(llm_data: LLMConfigCreate):
 async def update_llm_config(llm_name: str, llm_update: LLMConfigUpdate):
     update_data = llm_update.model_dump(exclude_unset=True)
     new_name = update_data.get("name") or llm_name
-    if new_name != llm_name and await db_repository.llm_config_exists(new_name):
+    if new_name != llm_name and await llm_repo.exists(new_name):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"LLM configuration '{new_name}' already exists"
         )
-    updated = await db_repository.update_llm_config(llm_name, update_data)
+    updated = await llm_repo.update(llm_name, update_data)
     if not updated:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -559,7 +566,7 @@ async def update_llm_config(llm_name: str, llm_update: LLMConfigUpdate):
 
 @router.delete("/{llm_name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_llm_config(llm_name: str):
-    deleted = await db_repository.delete_llm_config(llm_name)
+    deleted = await llm_repo.delete(llm_name)
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -579,7 +586,7 @@ async def bulk_delete_llm_configs(request: BulkDeleteRequest):
     deleted = []
     not_found = []
     for name in request.names:
-        if await db_repository.delete_llm_config(name):
+        if await llm_repo.delete(name):
             deleted.append(name)
         else:
             not_found.append(name)
@@ -609,7 +616,7 @@ class LLMTestRequest(BaseModel):
 async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] = None):
     import httpx
 
-    cfg = await db_repository.get_llm_config(llm_name)
+    cfg = await llm_repo.get_by_name(llm_name)
     if not cfg:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -644,7 +651,7 @@ async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] =
     api_key = ""
 
     if not api_key and provider not in ("AWS Bedrock", "Bedrock", "bedrock", "Ollama"):
-        mk = await db_repository.get_model_key(provider, include_secrets=True)
+        mk = await key_repo.get_by_provider(provider, include_secrets=True)
         if mk:
             if mk.get("api_key") and not api_key:
                 api_key = mk["api_key"]
@@ -738,7 +745,7 @@ async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] =
                 secret_access_key = test_config.get("secret_access_key")
                 session_token = test_config.get("session_token")
 
-                mk = await db_repository.get_model_key("AWS Bedrock", include_secrets=True)
+                mk = await key_repo.get_by_provider("AWS Bedrock", include_secrets=True)
                 if mk:
                     if not access_key_id and mk.get("access_key_id"):
                         access_key_id = mk["access_key_id"]

@@ -1,10 +1,11 @@
 """Model Keys API routes - centralized provider API key management."""
 import logging
 from typing import Dict, Any, Optional, List
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel, Field
 
-from app.repositories.db_repository import db_repository
+from app.api.deps import get_model_key_repo
+from app.infrastructure.persistence import ModelKeyRepository
 from app.services.provider_schema_registry import (
     ProviderSchemaRegistry,
     ProviderSchema,
@@ -110,8 +111,8 @@ def get_configured_fields(data: Dict[str, Any]) -> List[str]:
 
 
 @router.get("", response_model=Dict[str, Any])
-async def list_model_keys():
-    keys = await db_repository.list_model_keys(include_secrets=True)
+async def list_model_keys(repo: ModelKeyRepository = Depends(get_model_key_repo)):
+    keys = await repo.list_all(include_secrets=True)
     
     # Enhance each key with schema and configured_fields
     enhanced_keys = []
@@ -173,8 +174,8 @@ async def get_provider_schema(provider: str):
 
 
 @router.get("/{provider}", response_model=Dict[str, Any])
-async def get_model_key(provider: str):
-    key = await db_repository.get_model_key(provider, include_secrets=True)
+async def get_model_key(provider: str, repo: ModelKeyRepository = Depends(get_model_key_repo)):
+    key = await repo.get_by_provider(provider, include_secrets=True)
     if not key:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -196,8 +197,8 @@ async def get_model_key(provider: str):
 
 
 @router.post("", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
-async def create_model_key(data: ModelKeyCreate):
-    if await db_repository.model_key_exists(data.provider):
+async def create_model_key(data: ModelKeyCreate, repo: ModelKeyRepository = Depends(get_model_key_repo)):
+    if await repo.exists(data.provider):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Model key for provider '{data.provider}' already exists"
@@ -232,7 +233,7 @@ async def create_model_key(data: ModelKeyCreate):
         )
     
     # Create the model key in database
-    result = await db_repository.create_model_key(input_dict)
+    result = await repo.create(normalized_data)
     logger.info("Created model key for provider: %s", data.provider)
     
     # Mask secrets and add schema information to response
@@ -250,9 +251,9 @@ async def create_model_key(data: ModelKeyCreate):
 
 
 @router.put("/{provider}", response_model=Dict[str, Any])
-async def update_model_key(provider: str, data: ModelKeyUpdate):
+async def update_model_key(provider: str, data: ModelKeyUpdate, repo: ModelKeyRepository = Depends(get_model_key_repo)):
     update_data = data.model_dump(exclude_unset=True)
-    if not await db_repository.model_key_exists(provider):
+    if not await repo.exists(provider):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Model key for provider '{provider}' not found"
@@ -262,7 +263,7 @@ async def update_model_key(provider: str, data: ModelKeyUpdate):
     normalized_update = CredentialTransformer.normalize_input(update_data)
     
     # Fetch existing credentials from database
-    existing_creds = await db_repository.get_model_key(provider, include_secrets=True)
+    existing_creds = await repo.get_by_provider(provider, include_secrets=True)
     if not existing_creds:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -298,7 +299,7 @@ async def update_model_key(provider: str, data: ModelKeyUpdate):
         )
     
     # Update the model key in database
-    result = await db_repository.update_model_key(provider, update_data)
+    result = await repo.update(provider, update_data)
     logger.info("Updated model key for provider: %s", provider)
     
     # Mask secrets and add schema information to response
@@ -316,7 +317,7 @@ async def update_model_key(provider: str, data: ModelKeyUpdate):
 
 
 @router.post("/upsert", response_model=Dict[str, Any])
-async def upsert_model_key(data: ModelKeyCreate):
+async def upsert_model_key(data: ModelKeyCreate, repo: ModelKeyRepository = Depends(get_model_key_repo)):
     # Normalize input data (handle aws_* prefixed fields)
     # Use exclude_none=True to exclude fields that weren't provided in the request
     input_dict = data.model_dump(exclude_none=True)
@@ -346,7 +347,7 @@ async def upsert_model_key(data: ModelKeyCreate):
         )
     
     # Upsert the model key in database
-    result = await db_repository.upsert_model_key(data.provider, input_dict)
+    result = await repo.upsert(data.provider, input_dict)
     logger.info("Upserted model key for provider: %s", data.provider)
     
     # Mask secrets and add schema information to response
@@ -364,8 +365,8 @@ async def upsert_model_key(data: ModelKeyCreate):
 
 
 @router.delete("/{provider}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_model_key(provider: str):
-    deleted = await db_repository.delete_model_key(provider)
+async def delete_model_key(provider: str, repo: ModelKeyRepository = Depends(get_model_key_repo)):
+    deleted = await repo.delete(provider)
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

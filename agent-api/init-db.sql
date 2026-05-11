@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS log_patterns (
     pattern_type VARCHAR(50) NOT NULL,
     severity INTEGER DEFAULT 1,
     description TEXT,
-    embedding vector(1536),
+    embedding vector(1024),  -- Updated to 1024 for Titan Embed Text v2
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -112,10 +112,10 @@ CREATE TABLE IF NOT EXISTS known_issues (
     id SERIAL PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
     description TEXT NOT NULL,
-    symptoms TEXT[],
+    symptoms JSON,  -- Changed from TEXT[] to JSON to match model
     solution TEXT,
     category VARCHAR(100),
-    embedding vector(1536),
+    embedding vector(1024),  -- Updated to 1024 for Titan Embed Text v2
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -194,6 +194,10 @@ ALTER TABLE known_issues ADD COLUMN IF NOT EXISTS source VARCHAR(50) DEFAULT 'ma
 
 -- Phase 3.1: full message trajectory on executions for analysis and training
 ALTER TABLE executions ADD COLUMN IF NOT EXISTS trajectory JSONB;
+
+-- Phase 3.2: use_for_embeddings flag on llm_configs for embedding model selection
+ALTER TABLE llm_configs ADD COLUMN IF NOT EXISTS use_for_embeddings BOOLEAN DEFAULT FALSE;
+COMMENT ON COLUMN llm_configs.use_for_embeddings IS 'Whether this LLM configuration should be used for generating embeddings';
 
 -- Index for filtering agent-created entries
 CREATE INDEX IF NOT EXISTS known_issues_source_idx ON known_issues(source);
