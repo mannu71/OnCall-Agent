@@ -9,15 +9,16 @@ import {
     CollapsibleContent,
     CollapsibleTrigger,
 } from '@/components/ui/collapsible';
-import { ChevronDown, ChevronUp, RefreshCw, Loader2, Wrench, Terminal } from 'lucide-react';
+import { ChevronDown, ChevronUp, RefreshCw, Loader2, Wrench, Terminal, DollarSign } from 'lucide-react';
 import { useWorkflowStream } from '../../hooks/useWorkflowStream';
 import StatusBadge from './StatusBadge';
 import ExecutionLog from './ExecutionLog';
+import HITLPanel from '../workflow/HITLPanel';
 
-const ExecutionMonitor = ({ workflowName, autoStart = false, onClose }) => {
+const ExecutionMonitor = ({ workflowName, executionId, autoStart = false, onClose }) => {
     const [expanded, setExpanded] = useState(true);
     const [agentExpanded, setAgentExpanded] = useState(true);
-    const { status, events, error, isConnected, clearEvents, agentTokens, agentToolCalls } = useWorkflowStream(
+    const { status, events, error, isConnected, clearEvents, agentTokens, agentToolCalls, totalCost } = useWorkflowStream(
         workflowName,
         autoStart
     );
@@ -53,6 +54,14 @@ const ExecutionMonitor = ({ workflowName, autoStart = false, onClose }) => {
                     </div>
 
                     <div className="flex items-center gap-2">
+                        {totalCost > 0 && (
+                            <span className="flex items-center gap-1 text-xs text-muted-foreground" title="Estimated LLM cost">
+                                <DollarSign className="w-3 h-3" />
+                                {totalCost < 0.001
+                                    ? `< $0.001`
+                                    : `$${totalCost.toFixed(4)}`}
+                            </span>
+                        )}
                         <span className={`text-xs ${connectionStatus.color}`}>
                             {connectionStatus.text}
                         </span>
@@ -137,6 +146,8 @@ const ExecutionMonitor = ({ workflowName, autoStart = false, onClose }) => {
                             </Collapsible>
                         )}
 
+                        <HITLPanel events={events} executionId={executionId} />
+
                         <h4 className="text-sm font-semibold mb-2">Execution Log</h4>
                         <ExecutionLog events={events} maxHeight={300} />
 
@@ -154,6 +165,7 @@ const ExecutionMonitor = ({ workflowName, autoStart = false, onClose }) => {
 
 ExecutionMonitor.propTypes = {
     workflowName: PropTypes.string.isRequired,
+    executionId: PropTypes.string,
     autoStart: PropTypes.bool,
     onClose: PropTypes.func,
 };

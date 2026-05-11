@@ -1,12 +1,36 @@
 """Execution history API routes."""
-from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, HTTPException, status, Query, Depends
+import asyncio
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, HTTPException, status, Query, Depends, Body
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from app.repositories import ExecutionRepository
 from app.api.deps import get_execution_repo
+from app.workflow.event_adapter import execution_event_stream
 
-
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/executions", tags=["executions"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HITL request / response models
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HITLApproveRequest(BaseModel):
+    request_id: str
+    approved: bool = True
+    reason: Optional[str] = None
+
+
+class HITLApproveResponse(BaseModel):
+    execution_id: str
+    request_id: str
+    approved: bool
+    message: str
 
 
 def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
@@ -214,3 +238,98 @@ async def delete_all_executions(
     """Delete all execution history."""
     deleted_count = await execution_repo.delete_all()
     return {"message": f"Deleted {deleted_count} executions", "deleted_count": deleted_count}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSE stream
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/{execution_id}/stream")
+async def stream_execution_events(execution_id: str):
+    """Stream live execution events as Server-Sent Events.
+
+    Returns:
+        SSE stream of WorkflowEvent objects. Closes after workflow_completed /
+        workflow_failed or after the 10-minute hard timeout.
+    """
+    from app.services.visual_workflow_executor import visual_executor
+
+    exec_data = visual_executor.get_execution_status(execution_id)
+    workflow_name = (exec_data or {}).get("workflow_name", execution_id)
+
+    return StreamingResponse(
+        execution_event_stream(execution_id, workflow_name),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HITL approve / reject
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/{execution_id}/approve", response_model=HITLApproveResponse)
+async def approve_hitl_request(
+    execution_id: str,
+    body: HITLApproveRequest = Body(...),
+):
+    """Resume a paused HITL execution.
+
+    When the execution engine emits a ``hitl_pause`` event the workflow is
+    suspended waiting for human approval.  POST here with ``approved=true``
+    (or false to reject) to resume.
+
+    The payload is placed on the execution's HITL queue so the running
+    LangGraph coroutine can pick it up and continue (or abort) the graph.
+    """
+    from app.services.visual_workflow_executor import visual_executor
+    from app.workflow.event_schema import hitl_approved, hitl_rejected
+
+    exec_data = visual_executor.get_execution_status(execution_id)
+    if exec_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active execution '{execution_id}' found",
+        )
+
+    hitl_queue: asyncio.Queue | None = exec_data.get("hitl_queue")
+    if hitl_queue is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Execution '{execution_id}' is not waiting for HITL approval",
+        )
+
+    decision = {
+        "request_id": body.request_id,
+        "approved": body.approved,
+        "reason": body.reason,
+    }
+    await hitl_queue.put(decision)
+
+    # Publish SSE event so the frontend updates immediately
+    event = (
+        hitl_approved(execution_id, body.request_id)
+        if body.approved
+        else hitl_rejected(execution_id, body.request_id, reason=body.reason or "")
+    )
+    await visual_executor._publish_event(execution_id, event.event_type, event.data)
+
+    logger.info(
+        "HITL %s for execution %s (request_id=%s)",
+        "approved" if body.approved else "rejected",
+        execution_id,
+        body.request_id,
+    )
+
+    return HITLApproveResponse(
+        execution_id=execution_id,
+        request_id=body.request_id,
+        approved=body.approved,
+        message="Decision recorded — execution will resume shortly."
+        if body.approved
+        else "Execution rejected — workflow will be stopped.",
+    )

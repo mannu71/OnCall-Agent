@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -328,10 +329,17 @@ class ReactStrategy(BaseStrategy):
 
             llm = self._build_llm(llm_config)
 
-            agent = self._build_agent(llm, tools, agent_config, has_cloudwatch=bool(cloudwatch_config))
+            checkpointer = await self._make_checkpointer()
+
+            agent = self._build_agent(
+                llm, tools, agent_config,
+                has_cloudwatch=bool(cloudwatch_config),
+                checkpointer=checkpointer,
+            )
 
             result = await self._execute_agent(
-                agent, augmented_query, logger_instance, execution_id, stream_callback
+                agent, augmented_query, logger_instance, execution_id,
+                stream_callback, thread_id=execution_id,
             )
 
             # ------------------------------------------------------------------
@@ -1064,6 +1072,65 @@ class ReactStrategy(BaseStrategy):
         ]
 
     # ------------------------------------------------------------------
+    # Checkpointer factory (AsyncPostgresSaver)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _make_checkpointer() -> Any:
+        """Create an AsyncPostgresSaver connected to the app database.
+
+        Returns None (gracefully) if the dependency is not installed or the
+        connection fails — the agent still runs without crash-safe state in
+        that case.
+        """
+        try:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+            from app.config import settings
+
+            # psycopg connection string (not +asyncpg variant)
+            db_url = settings.database_url
+            if "+asyncpg" in db_url:
+                db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
+
+            checkpointer = AsyncPostgresSaver.from_conn_string(db_url)
+            await checkpointer.setup()
+            return checkpointer
+        except Exception as exc:
+            logger.warning(
+                "ReactStrategy: AsyncPostgresSaver unavailable — running without checkpointer: %s",
+                exc,
+            )
+            return None
+
+    # ------------------------------------------------------------------
+    # HITL pause helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _emit_hitl_pause(execution_id: Optional[str], interrupt_data: Dict[str, Any]) -> None:
+        """Publish a hitl_pause SSE event into the execution's event queue."""
+        if not execution_id:
+            return
+        try:
+            from app.workflow.visual_executor import active_executions
+            from app.workflow.event_schema import WorkflowEvent, EventType
+
+            queue = active_executions.get(execution_id, {}).get("event_queue")
+            if queue is not None:
+                event = WorkflowEvent(
+                    event_type=EventType.HITL_PAUSE,
+                    data={
+                        "execution_id": execution_id,
+                        "request_id": interrupt_data.get("request_id", ""),
+                        "draft_answer": interrupt_data.get("draft_answer", ""),
+                        "message": interrupt_data.get("message", "Engineer approval required."),
+                    },
+                )
+                await queue.put(event.to_sse())
+        except Exception as exc:
+            logger.warning("ReactStrategy: could not emit hitl_pause event: %s", exc)
+
+    # ------------------------------------------------------------------
     # Agent construction (LangGraph)
     # ------------------------------------------------------------------
 
@@ -1073,6 +1140,7 @@ class ReactStrategy(BaseStrategy):
         tools: List[Any],
         agent_config: Dict[str, Any],
         has_cloudwatch: bool = False,
+        checkpointer: Any = None,
     ) -> Any:
         """
         Build a LangGraph ReAct agent graph.
@@ -1143,11 +1211,62 @@ class ReactStrategy(BaseStrategy):
             has_cloudwatch,
         )
 
-        agent = create_react_agent(
-            model=llm,
-            tools=all_tools,
-            prompt=system_prompt,
-        )
+        hitl_enabled = agent_config.get("hitl_enabled", False)
+
+        if hitl_enabled and checkpointer is not None:
+            # Build a custom outer graph that wraps the react agent with a
+            # HITL synthesis node.  The synthesis node calls interrupt() with
+            # the draft answer so an engineer can approve or reject before the
+            # result is returned to the caller.
+            from langchain_core.messages import AIMessage
+            from langgraph.graph import StateGraph, END
+            from langgraph.graph.message import add_messages
+            from langgraph.types import interrupt
+            from typing import Annotated  # already imported via __future__ + typing
+
+            inner_agent = create_react_agent(model=llm, tools=all_tools, prompt=system_prompt)
+
+            class _OuterState(Dict):  # type: ignore[misc]
+                pass
+
+            async def _run_inner(state: Dict[str, Any]) -> Dict[str, Any]:
+                result = await inner_agent.ainvoke({"messages": state.get("messages", [])})
+                return {"messages": result["messages"]}
+
+            def _hitl_synthesis(state: Dict[str, Any]) -> Dict[str, Any]:
+                msgs = state.get("messages", [])
+                draft = next(
+                    (m.content for m in reversed(msgs)
+                     if isinstance(m, AIMessage) and m.content and not getattr(m, "tool_calls", None)),
+                    "",
+                )
+                decision = interrupt({
+                    "request_id": str(uuid.uuid4()),
+                    "draft_answer": draft,
+                    "message": "Engineer approval required before delivering this investigation result.",
+                })
+                approved = (decision or {}).get("approved", False)
+                if not approved:
+                    rejection_note = (decision or {}).get("reason", "Rejected by engineer.")
+                    return {"messages": [AIMessage(content=f"[HITL Rejected] {rejection_note}")]}
+                return {}
+
+            builder: Any = StateGraph(dict)
+            builder.add_node("run_agent", _run_inner)
+            builder.add_node("hitl_synthesis", _hitl_synthesis)
+            builder.set_entry_point("run_agent")
+            builder.add_edge("run_agent", "hitl_synthesis")
+            builder.add_edge("hitl_synthesis", END)
+
+            agent = builder.compile(checkpointer=checkpointer)
+        else:
+            agent = create_react_agent(
+                model=llm,
+                tools=all_tools,
+                prompt=system_prompt,
+                checkpointer=checkpointer,
+            )
+
         return agent
 
     # ------------------------------------------------------------------
@@ -1161,6 +1280,7 @@ class ReactStrategy(BaseStrategy):
         logger_instance: Any,
         execution_id: Optional[str] = None,
         stream_callback: Optional[StreamCallback] = None,
+        thread_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute the LangGraph ReAct agent with the user's query.
@@ -1191,19 +1311,49 @@ class ReactStrategy(BaseStrategy):
 
         input_state = {"messages": [HumanMessage(content=user_query)]}
 
+        # Pass thread_id so the checkpointer can persist state across interrupts.
+        run_config: Dict[str, Any] = {}
+        if thread_id:
+            run_config = {"configurable": {"thread_id": thread_id}}
+
         try:
             if stream_callback is not None:
                 result_state = await with_retry(
                     self._execute_agent_stream,
                     agent, input_state, stream_callback, logger_instance, execution_id,
+                    run_config,
                     max_retries=3,
                 )
             else:
                 result_state = await with_retry(
-                    self._invoke_agent, agent, input_state,
+                    self._invoke_agent, agent, input_state, run_config,
                     max_retries=3,
                 )
         except Exception as exc:
+            # Handle LangGraph HITL interrupt — surface to caller as a structured pause.
+            try:
+                from langgraph.types import GraphInterrupt
+                if isinstance(exc, GraphInterrupt):
+                    interrupt_value = exc.args[0] if exc.args else {}
+                    logger_instance.info(
+                        "ReactStrategy: HITL interrupt raised — execution_id=%s request_id=%s",
+                        execution_id,
+                        (interrupt_value[0].value if interrupt_value else {}).get("request_id", "?"),
+                    )
+                    # Publish hitl_pause SSE event via the active_executions queue.
+                    _interrupt_data = interrupt_value[0].value if interrupt_value else {}
+                    await self._emit_hitl_pause(execution_id, _interrupt_data)
+                    # Return a sentinel result so the caller knows we paused.
+                    return {
+                        "final_answer": None,
+                        "messages": [],
+                        "tool_calls": [],
+                        "hitl_paused": True,
+                        "hitl_request": _interrupt_data,
+                    }
+            except ImportError:
+                pass
+
             # On context overflow, compact the input and retry once.
             classified = classify_error(exc)
             if classified.should_compress:
@@ -1214,10 +1364,11 @@ class ReactStrategy(BaseStrategy):
                 input_state = _compact_input_state(input_state)
                 if stream_callback is not None:
                     result_state = await self._execute_agent_stream(
-                        agent, input_state, stream_callback, logger_instance, execution_id
+                        agent, input_state, stream_callback, logger_instance, execution_id,
+                        run_config,
                     )
                 else:
-                    result_state = await self._invoke_agent(agent, input_state)
+                    result_state = await self._invoke_agent(agent, input_state, run_config)
             else:
                 raise
 
@@ -1275,11 +1426,15 @@ class ReactStrategy(BaseStrategy):
         }
 
     @staticmethod
-    async def _invoke_agent(agent: Any, input_state: Dict[str, Any]) -> Dict[str, Any]:
+    async def _invoke_agent(
+        agent: Any,
+        input_state: Dict[str, Any],
+        run_config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Non-streaming invocation with timeout."""
         try:
             result_state = await asyncio.wait_for(
-                agent.ainvoke(input_state),
+                agent.ainvoke(input_state, config=run_config or {}),
                 timeout=300.0,
             )
         except asyncio.TimeoutError:
@@ -1293,6 +1448,7 @@ class ReactStrategy(BaseStrategy):
         stream_callback: StreamCallback,
         logger_instance: Any,
         execution_id: Optional[str] = None,
+        run_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Streaming invocation using ``agent.astream_events()`` (v2)."""
         current_tool_name: str = ""
@@ -1300,7 +1456,7 @@ class ReactStrategy(BaseStrategy):
         msg_map: Dict[str, Any] = {}
 
         try:
-            async for event in agent.astream_events(input_state, version="v2"):
+            async for event in agent.astream_events(input_state, config=run_config or {}, version="v2"):
                 kind = event.get("event", "")
                 data = event.get("data", {})
                 name = event.get("name", "")

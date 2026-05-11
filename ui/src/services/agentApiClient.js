@@ -131,6 +131,29 @@ export const agentApiClient = {
     },
 
     /**
+     * Stream execution events by execution ID (SSE)
+     */
+    streamExecution(executionId) {
+        return new EventSource(`${AGENT_API_URL}/api/v1/executions/${encodeURIComponent(executionId)}/stream`);
+    },
+
+    /**
+     * Approve or reject a HITL pause request
+     * @param {string} executionId - The execution ID waiting for approval
+     * @param {string} requestId - The HITL request ID from the hitl_pause event
+     * @param {boolean} approved - true to approve, false to reject
+     * @param {string} [reason] - Optional rejection reason
+     */
+    async approveHITL(executionId, requestId, approved = true, reason = '') {
+        const response = await client.post(`/api/v1/executions/${encodeURIComponent(executionId)}/approve`, {
+            request_id: requestId,
+            approved,
+            reason,
+        });
+        return response.data;
+    },
+
+    /**
      * Clear in-memory data
      */
     async clearData(clearJobs = false) {

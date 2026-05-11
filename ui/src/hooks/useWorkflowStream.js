@@ -15,6 +15,10 @@ export function useWorkflowStream(workflowName, enabled = true) {
     const [isConnected, setIsConnected] = useState(false);
     const [agentTokens, setAgentTokens] = useState({});
     const [agentToolCalls, setAgentToolCalls] = useState([]);
+    // nodeStatuses: { [nodeId]: 'running' | 'completed' | 'failed' }
+    const [nodeStatuses, setNodeStatuses] = useState({});
+    // totalCost: cumulative USD cost from cost_update events
+    const [totalCost, setTotalCost] = useState(0);
     const eventSourceRef = useRef(null);
 
     const clearEvents = useCallback(() => {
@@ -23,6 +27,8 @@ export function useWorkflowStream(workflowName, enabled = true) {
         setStatus('idle');
         setAgentTokens({});
         setAgentToolCalls([]);
+        setNodeStatuses({});
+        setTotalCost(0);
     }, []);
 
     useEffect(() => {
@@ -128,11 +134,67 @@ export function useWorkflowStream(workflowName, enabled = true) {
                 }
             };
 
+            const handleNodeStarted = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    const nodeId = data.data?.node_id;
+                    if (nodeId) {
+                        setNodeStatuses(prev => ({ ...prev, [nodeId]: 'running' }));
+                    }
+                    setEvents(prev => [...prev, { ...data, event_type: 'node_started', timestamp: data.timestamp || new Date().toISOString() }]);
+                } catch (err) {
+                    console.error('[SSE] Failed to parse node_started event:', err);
+                }
+            };
+
+            const handleNodeCompleted = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    const nodeId = data.data?.node_id;
+                    if (nodeId) {
+                        setNodeStatuses(prev => ({ ...prev, [nodeId]: 'completed' }));
+                    }
+                    setEvents(prev => [...prev, { ...data, event_type: 'node_completed', timestamp: data.timestamp || new Date().toISOString() }]);
+                } catch (err) {
+                    console.error('[SSE] Failed to parse node_completed event:', err);
+                }
+            };
+
+            const handleNodeFailed = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    const nodeId = data.data?.node_id;
+                    if (nodeId) {
+                        setNodeStatuses(prev => ({ ...prev, [nodeId]: 'failed' }));
+                    }
+                    setEvents(prev => [...prev, { ...data, event_type: 'node_failed', timestamp: data.timestamp || new Date().toISOString() }]);
+                } catch (err) {
+                    console.error('[SSE] Failed to parse node_failed event:', err);
+                }
+            };
+
+            const handleCostUpdate = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    const delta = parseFloat(data.data?.cost_usd || data.data?.delta_usd || 0);
+                    if (delta > 0) {
+                        setTotalCost(prev => Math.round((prev + delta) * 1e6) / 1e6);
+                    }
+                    setEvents(prev => [...prev, { ...data, event_type: 'cost_update', timestamp: data.timestamp || new Date().toISOString() }]);
+                } catch (err) {
+                    console.error('[SSE] Failed to parse cost_update event:', err);
+                }
+            };
+
             eventSource.addEventListener('llm_token', handleLlmToken);
             eventSource.addEventListener('tool_call', handleToolCall);
             eventSource.addEventListener('tool_result', handleToolResult);
             eventSource.addEventListener('agent_error', handleAgentError);
             eventSource.addEventListener('agent_complete', handleAgentComplete);
+            eventSource.addEventListener('node_started', handleNodeStarted);
+            eventSource.addEventListener('node_completed', handleNodeCompleted);
+            eventSource.addEventListener('node_failed', handleNodeFailed);
+            eventSource.addEventListener('cost_update', handleCostUpdate);
 
             eventSource.onmessage = (event) => {
                 try {
@@ -197,7 +259,9 @@ export function useWorkflowStream(workflowName, enabled = true) {
         isConnected,
         clearEvents,
         agentTokens,
-        agentToolCalls
+        agentToolCalls,
+        nodeStatuses,
+        totalCost,
     };
 }
 
