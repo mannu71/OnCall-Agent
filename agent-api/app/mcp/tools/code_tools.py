@@ -43,21 +43,28 @@ async def search_code(
     repo: Optional[str] = None,
     limit: int = 5,
     language: Optional[str] = None,
+    bm25_weight: float = 0.3,
 ) -> List[Dict[str, Any]]:
-    """Semantic search across indexed code chunks.
+    """Hybrid BM25 + semantic search across indexed code chunks.
+
+    Combines pgvector cosine similarity with PostgreSQL tsvector BM25 rank
+    for better recall on keyword-heavy queries.
 
     Args:
         query: Natural language or code snippet to search for.
         repo: Optional repository name to restrict search.
         limit: Maximum results to return (max 20).
-        language: Optional filter ('python' | 'typescript').
+        language: Optional filter ('python' | 'typescript' | 'csharp' | ...).
+        bm25_weight: Weight for BM25 score (0–1); remainder goes to vector.
 
     Returns:
-        List of matching code chunks with similarity scores.
+        List of matching code chunks with hybrid scores.
     """
-    limit = min(limit, 20)
+    import re as _re
 
-    # Embed the query using Bedrock Titan
+    limit = min(limit, 20)
+    vec_weight = 1.0 - bm25_weight
+
     from app.services.code_indexer import _embed_text
     embedding = await _embed_text(query)
     if not embedding:
@@ -65,9 +72,19 @@ async def search_code(
 
     emb_str = f"[{','.join(str(v) for v in embedding)}]"
 
+    # Sanitize query into a simple AND tsquery
+    ts_terms = _re.sub(r"[^\w\s]", " ", query).split()
+    tsquery  = " & ".join(ts_terms) if ts_terms else "code"
+
     async with AsyncSessionLocal() as session:
-        conditions = ["1=1"]
-        params: Dict[str, Any] = {"embedding": emb_str, "limit": limit}
+        conditions = ["embedding IS NOT NULL"]
+        params: Dict[str, Any] = {
+            "embedding": emb_str,
+            "tsquery":   tsquery,
+            "limit":     limit,
+            "vec_w":     vec_weight,
+            "bm25_w":    bm25_weight,
+        }
 
         if repo:
             conditions.append("repo_name = :repo")
@@ -81,10 +98,16 @@ async def search_code(
             text(f"""
                 SELECT repo_name, file_path, name, chunk_type, signature,
                        docstring, line_start, line_end, language,
-                       1 - (embedding <=> :embedding::vector) AS similarity
+                       (
+                           :vec_w  * (1 - (embedding <=> :embedding::vector))
+                         + :bm25_w * COALESCE(
+                               ts_rank_cd(search_vector, to_tsquery('english', :tsquery)),
+                               0
+                           )
+                       ) AS score
                   FROM code_chunks
                  WHERE {where}
-                 ORDER BY embedding <=> :embedding::vector
+                 ORDER BY score DESC
                  LIMIT :limit
             """),
             params,
@@ -102,7 +125,7 @@ async def search_code(
             "line_start": r.line_start,
             "line_end":   r.line_end,
             "language":   r.language,
-            "similarity": round(float(r.similarity), 4),
+            "score":      round(float(r.score), 4),
         }
         for r in rows
     ]

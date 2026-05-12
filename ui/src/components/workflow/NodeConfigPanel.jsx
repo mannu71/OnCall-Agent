@@ -913,6 +913,11 @@ function CodeAnalyzerConfig({ config, handleConfigChange }) {
                 <option value="typescript">TypeScript</option>
                 <option value="react">React / JSX</option>
                 <option value="csharp">C# / .NET</option>
+                <option value="java">Java</option>
+                <option value="kotlin">Kotlin</option>
+                <option value="go">Go</option>
+                <option value="rust">Rust</option>
+                <option value="ruby">Ruby</option>
                 <option value="mixed">Mixed (Py + TS)</option>
               </select>
               <button

@@ -120,7 +120,19 @@ class CodeChunk:
     line_start: int  = 0
     line_end:   int  = 0
     entity_id:  str  = ""   # stable identity across renames
+    complexity: int  = 1   # approximate cyclomatic complexity
     embedding:  Optional[List[float]] = field(default=None, repr=False)
+
+
+@dataclass
+class LogPattern:
+    """A log call site extracted from source code."""
+    repo_name:        str
+    file_path:        str
+    function_name:    str
+    log_level:        str
+    message_template: str
+    line_number:      int
 
 
 @dataclass
@@ -202,6 +214,7 @@ def extract_python_chunks(source: str, file_path: str, repo_name: str) -> List[C
                 line_start=start,
                 line_end=end,
                 entity_id=compute_entity_id(repo_name, norm_sig),
+                complexity=_python_node_complexity(node),
             ))
         elif isinstance(node, ast.ClassDef):
             start, end = _get_source_lines(source, node)
@@ -217,6 +230,7 @@ def extract_python_chunks(source: str, file_path: str, repo_name: str) -> List[C
                 line_start=start,
                 line_end=end,
                 entity_id=compute_entity_id(repo_name, f"class:{node.name}"),
+                complexity=_python_node_complexity(node),
             ))
 
     return chunks
@@ -315,6 +329,92 @@ def extract_python_calls(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Complexity + log helpers (language-agnostic)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_COMPLEXITY_RE = re.compile(
+    r'\b(if|else\s+if|elif|else\s+when|for|foreach|while|do|case|catch|unless|guard)\b'
+    r'|&&|\|\||\?(?![:\s>])',
+    re.MULTILINE,
+)
+
+_LOG_CALL_RE = re.compile(
+    r'(?:logger|log|logging|LOG|self\.log|console)\s*[\.\[]\s*'
+    r'(?:info|debug|warning|warn|error|critical|fatal|exception|trace)\s*[\(\[]\s*'
+    r'f?["\']([^"\'\\]{5,200})',
+    re.MULTILINE | re.IGNORECASE,
+)
+
+_LOG_LEVEL_RE = re.compile(
+    r'\.(info|debug|warning|warn|error|critical|fatal|exception|trace)\s*[\(\[]',
+    re.IGNORECASE,
+)
+
+_TEST_FILE_PATTERNS = frozenset(["test_", "_test.", "spec_", "_spec.", ".test.", ".spec."])
+_TEST_DIR_PATTERNS  = frozenset(["test/", "tests/", "__tests__/", "spec/", "specs/"])
+
+
+def _compute_body_complexity(body: str) -> int:
+    """Approximate cyclomatic complexity from source text (language-agnostic)."""
+    return 1 + len(_COMPLEXITY_RE.findall(body))
+
+
+def _python_node_complexity(node: ast.AST) -> int:
+    """Count branch points in a Python AST node for cyclomatic complexity."""
+    branches = sum(
+        1 for n in ast.walk(node)
+        if isinstance(n, (
+            ast.If, ast.For, ast.While, ast.AsyncFor, ast.AsyncWith,
+            ast.ExceptHandler, ast.comprehension, ast.BoolOp,
+        ))
+    )
+    return 1 + branches
+
+
+def _is_test_file(relative_path: str) -> bool:
+    p = relative_path.lower().replace("\\", "/")
+    return (
+        any(pat in p for pat in _TEST_FILE_PATTERNS)
+        or any(p.startswith(d) or f"/{d}" in p for d in _TEST_DIR_PATTERNS)
+    )
+
+
+def _source_name_from_test(test_name: str) -> str:
+    """Heuristic: test_fetchUser → fetchUser, TestUserService → UserService."""
+    name = re.sub(r'^(?:test_|Test|spec_|Spec|it_|It|should_)', '', test_name)
+    name = re.sub(r'(?:_test|Test|_spec|Spec|_should\w*|_when\w*|_returns\w*|_raises\w*)$', '', name)
+    return name if name and name != test_name else ""
+
+
+def extract_log_patterns(
+    source: str,
+    file_path: str,
+    repo_name: str,
+    func_ranges: List[Tuple[int, int, str]],
+) -> List[LogPattern]:
+    """Extract log call sites from *source*, attributing each to its enclosing function."""
+    patterns: List[LogPattern] = []
+    for m in _LOG_CALL_RE.finditer(source):
+        lineno = source[:m.start()].count("\n") + 1
+        caller = ""
+        best_sz = 10 ** 9
+        for s, e, n in func_ranges:
+            if s <= lineno <= e and (e - s) < best_sz:
+                caller, best_sz = n, e - s
+        lm = _LOG_LEVEL_RE.search(m.group(0))
+        level = lm.group(1).lower() if lm else "unknown"
+        patterns.append(LogPattern(
+            repo_name=repo_name,
+            file_path=file_path,
+            function_name=caller,
+            log_level=level,
+            message_template=m.group(1)[:200],
+            line_number=lineno,
+        ))
+    return patterns
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TypeScript / TSX regex extraction (no full parser dependency)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -338,9 +438,14 @@ _TS_CALL_RE = re.compile(r"\b(\w{2,})\s*\(", re.MULTILINE)
 # Lazy init — falls back to regex if tree-sitter is not installed.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_TS_PARSER:  Any = None
-_TSX_PARSER: Any = None
-_CS_PARSER:  Any = None
+_TS_PARSER:   Any = None
+_TSX_PARSER:  Any = None
+_CS_PARSER:   Any = None
+_JAVA_PARSER: Any = None
+_GO_PARSER:   Any = None
+_RUST_PARSER: Any = None
+_RUBY_PARSER: Any = None
+_KT_PARSER:   Any = None
 
 _TS_DEF_QUERY = """
   (function_declaration        name: (identifier)           @name) @def
@@ -386,13 +491,106 @@ _CS_USING_QUERY = """
     [(qualified_name)(identifier)] @namespace)
 """
 
+# ── Java ──────────────────────────────────────────────────────────────────────
+_JAVA_DEF_QUERY = """
+  (method_declaration       name: (identifier) @name) @def
+  (constructor_declaration  name: (identifier) @name) @def
+  (class_declaration        name: (identifier) @name) @def
+  (interface_declaration    name: (identifier) @name) @def
+  (enum_declaration         name: (identifier) @name) @def
+  (record_declaration       name: (identifier) @name) @def
+"""
+_JAVA_CALL_QUERY = """
+  (method_invocation name: (identifier) @callee) @call
+"""
+_JAVA_IMPORT_QUERY = """
+  (import_declaration (scoped_identifier) @path)
+  (import_declaration (identifier) @path)
+"""
+
+# ── Go ────────────────────────────────────────────────────────────────────────
+_GO_DEF_QUERY = """
+  (function_declaration name: (identifier) @name) @def
+  (method_declaration   name: (field_identifier) @name) @def
+  (type_declaration (type_spec name: (type_identifier) @name)) @def
+"""
+_GO_CALL_QUERY = """
+  (call_expression function: (identifier) @callee) @call
+  (call_expression function: (selector_expression field: (field_identifier) @callee)) @call
+"""
+_GO_IMPORT_QUERY = """
+  (import_spec path: (interpreted_string_literal) @path)
+"""
+
+# ── Rust ──────────────────────────────────────────────────────────────────────
+_RUST_DEF_QUERY = """
+  (function_item name: (identifier) @name) @def
+  (struct_item   name: (type_identifier) @name) @def
+  (enum_item     name: (type_identifier) @name) @def
+  (trait_item    name: (type_identifier) @name) @def
+  (impl_item     type: (type_identifier) @name) @def
+"""
+_RUST_CALL_QUERY = """
+  (call_expression function: (identifier) @callee) @call
+  (call_expression function: (field_expression field: (field_identifier) @callee)) @call
+"""
+_RUST_IMPORT_QUERY = """
+  (use_declaration [(scoped_identifier)(identifier)] @path)
+"""
+
+# ── Ruby ──────────────────────────────────────────────────────────────────────
+_RUBY_DEF_QUERY = """
+  (method           name: (identifier) @name) @def
+  (singleton_method name: (identifier) @name) @def
+  (class            name: (constant) @name) @def
+  (module           name: (constant) @name) @def
+"""
+_RUBY_CALL_QUERY = """
+  (call method: (identifier) @callee) @call
+"""
+_RUBY_IMPORT_QUERY = """
+  (call method: (identifier) @_m
+        arguments: (argument_list (string (string_content) @path)))
+"""
+
+# ── Kotlin ────────────────────────────────────────────────────────────────────
+_KT_DEF_QUERY = """
+  (function_declaration (simple_identifier) @name) @def
+  (class_declaration    (type_identifier) @name) @def
+  (object_declaration   (type_identifier) @name) @def
+"""
+_KT_CALL_QUERY = """
+  (call_expression (simple_identifier) @callee) @call
+  (call_expression (navigation_expression (simple_identifier) @callee)) @call
+"""
+_KT_IMPORT_QUERY = """
+  (import_header [(identifier)(scoped_identifier)] @path)
+"""
+
+# ── Query router (parser_lang → (def_query, call_query)) ─────────────────────
+_LANG_QUERIES: Dict[str, Tuple[str, str]] = {
+    "typescript": (_TS_DEF_QUERY,   _TS_CALL_QUERY),
+    "tsx":        (_TS_DEF_QUERY,   _TS_CALL_QUERY),
+    "csharp":     (_CS_DEF_QUERY,   _CS_CALL_QUERY),
+    "java":       (_JAVA_DEF_QUERY, _JAVA_CALL_QUERY),
+    "go":         (_GO_DEF_QUERY,   _GO_CALL_QUERY),
+    "rust":       (_RUST_DEF_QUERY, _RUST_CALL_QUERY),
+    "ruby":       (_RUBY_DEF_QUERY, _RUBY_CALL_QUERY),
+    "kotlin":     (_KT_DEF_QUERY,   _KT_CALL_QUERY),
+}
+
+_CLASS_TYPE_KEYWORDS = frozenset(
+    ["class", "interface", "struct", "record", "enum", "trait", "module", "object"]
+)
+
 
 def _get_ts_parser(lang: str) -> Any:
-    """Return a cached tree-sitter Parser for *lang* ('typescript'|'tsx'|'csharp').
+    """Return a cached tree-sitter Parser for *lang*.
 
-    Returns None (never raises) if tree-sitter is not installed.
+    Returns None (never raises) if the grammar package is not installed.
     """
     global _TS_PARSER, _TSX_PARSER, _CS_PARSER
+    global _JAVA_PARSER, _GO_PARSER, _RUST_PARSER, _RUBY_PARSER, _KT_PARSER
     try:
         from tree_sitter import Parser, Language  # type: ignore[import]
         if lang == "typescript" and _TS_PARSER is None:
@@ -404,7 +602,27 @@ def _get_ts_parser(lang: str) -> Any:
         if lang == "csharp" and _CS_PARSER is None:
             import tree_sitter_c_sharp as _tsc  # type: ignore[import]
             _CS_PARSER = Parser(Language(_tsc.language_c_sharp()))
-        return {"typescript": _TS_PARSER, "tsx": _TSX_PARSER, "csharp": _CS_PARSER}[lang]
+        if lang == "java" and _JAVA_PARSER is None:
+            import tree_sitter_java as _tsj  # type: ignore[import]
+            _JAVA_PARSER = Parser(Language(_tsj.language_java()))
+        if lang == "go" and _GO_PARSER is None:
+            import tree_sitter_go as _tsg  # type: ignore[import]
+            _GO_PARSER = Parser(Language(_tsg.language_go()))
+        if lang == "rust" and _RUST_PARSER is None:
+            import tree_sitter_rust as _tsr  # type: ignore[import]
+            _RUST_PARSER = Parser(Language(_tsr.language_rust()))
+        if lang == "ruby" and _RUBY_PARSER is None:
+            import tree_sitter_ruby as _tsrb  # type: ignore[import]
+            _RUBY_PARSER = Parser(Language(_tsrb.language_ruby()))
+        if lang == "kotlin" and _KT_PARSER is None:
+            import tree_sitter_kotlin as _tsk  # type: ignore[import]
+            _KT_PARSER = Parser(Language(_tsk.language_kotlin()))
+        return {
+            "typescript": _TS_PARSER,  "tsx":    _TSX_PARSER,
+            "csharp":     _CS_PARSER,  "java":   _JAVA_PARSER,
+            "go":         _GO_PARSER,  "rust":   _RUST_PARSER,
+            "ruby":       _RUBY_PARSER,"kotlin": _KT_PARSER,
+        }.get(lang)
     except Exception:
         return None
 
@@ -430,9 +648,9 @@ def _extract_chunks_via_ts(
         lines = source.splitlines()
         lang  = parser.language
 
-        is_cs  = parser_lang == "csharp"
-        def_q  = lang.query(_CS_DEF_QUERY  if is_cs else _TS_DEF_QUERY)
-        call_q = lang.query(_CS_CALL_QUERY if is_cs else _TS_CALL_QUERY)
+        dq_str, cq_str = _LANG_QUERIES.get(parser_lang, (_TS_DEF_QUERY, _TS_CALL_QUERY))
+        def_q  = lang.query(dq_str)
+        call_q = lang.query(cq_str)
 
         chunks: List[CodeChunk] = []
         seen:   set             = set()
@@ -509,6 +727,42 @@ def _extract_chunks_via_ts(
             "tree-sitter extraction failed for %s (%s): %s", file_path, parser_lang, exc,
         )
         return [], []
+
+
+def _extract_imports_via_ts(
+    source: str,
+    file_path: str,
+    repo_name: str,
+    parser_lang: str,
+    import_query_str: str,
+) -> List[ImportEdge]:
+    """Generic tree-sitter import extractor; returns [] on any failure."""
+    parser = _get_ts_parser(parser_lang)
+    if parser is None:
+        return []
+    try:
+        tree = parser.parse(source.encode())
+        lang = parser.language
+        q    = lang.query(import_query_str)
+        path_nodes = q.captures(tree.root_node).get("path", [])
+        if not isinstance(path_nodes, list):
+            path_nodes = [path_nodes]
+        edges: List[ImportEdge] = []
+        for pn in path_nodes:
+            raw = pn.text.decode(errors="replace").strip().strip('"\'')
+            if not raw:
+                continue
+            edges.append(ImportEdge(
+                repo_name=repo_name,
+                file_path=file_path,
+                from_module=raw,
+                import_name=raw.split(".")[-1].split("/")[-1],
+                is_relative=raw.startswith("."),
+            ))
+        return edges
+    except Exception as exc:
+        logger.debug("tree-sitter import extraction failed for %s (%s): %s", file_path, parser_lang, exc)
+        return []
 
 
 def _extract_cs_imports_via_ts(
@@ -783,28 +1037,34 @@ class CodeIndexer:
         local_path: str,
         language: str = "python",
         progress_callback: Optional[Callable[[int, int], Awaitable[None]]] = None,
+        incremental: bool = False,
     ) -> List[CodeChunk]:
         """Index all source files in *local_path* and upsert to DB.
 
-        Phase 1 (synchronous, blocking):
-            - Walk files, extract chunks, embed, upsert to code_chunks
+        Phase 1 (fast, parallel):
+            - Walk files (optionally only git-changed files for incremental),
+              extract chunks, embed, upsert to code_chunks
             - Upsert raw call edges to code_calls
             - Upsert import edges to code_imports
+            - Index log patterns to code_log_patterns
             - Set enrichment_phase = 'raw' on all touched chunks
 
         Phase 2 (async, fire-and-forget via create_task):
             - Compute semantic edge weights
             - Write pre-reindex call-graph snapshot
+            - Resolve cross-file call edges
+            - Link test files to source files
             - Parse .github/CODEOWNERS into code_owners
             - Infer deployments from git tags as fallback
 
         Args:
             repo_name: Unique name for this repository.
             local_path: Absolute path to the local checkout.
-            language: 'python' | 'typescript' | 'mixed' | 'csharp' | 'dotnet' | 'react'
+            language: 'python' | 'typescript' | 'mixed' | 'csharp' | 'dotnet' |
+                      'react' | 'java' | 'kotlin' | 'go' | 'rust' | 'ruby'
             progress_callback: Optional async callable(files_done, total_files).
-                Called after each file is processed.  Failures are swallowed so
-                an SSE disconnect cannot abort indexing.
+            incremental: If True, only re-index files changed since the last
+                indexed commit (uses git diff HEAD~1).
 
         Returns:
             List of CodeChunk objects indexed during Phase 1.
@@ -822,9 +1082,23 @@ class CodeIndexer:
             extensions += [".cs"]
         if language == "react":
             extensions += [".jsx", ".tsx"]
+        if language == "java":
+            extensions += [".java"]
+        if language == "kotlin":
+            extensions += [".kt", ".kts"]
+        if language == "go":
+            extensions += [".go"]
+        if language == "rust":
+            extensions += [".rs"]
+        if language == "ruby":
+            extensions += [".rb"]
 
-        # ── Collect all files first so we know total_files ───────────────────
-        all_files: List[Tuple[Path, str]] = []  # (file_path, ext)
+        # ── Collect all files ────────────────────────────────────────────────
+        changed_set: Optional[set[str]] = None
+        if incremental:
+            changed_set = await self._get_changed_files(local_path)
+
+        all_files: List[Tuple[Path, str]] = []
         for ext in extensions:
             for fp in sorted(root.rglob(f"*{ext}")):
                 if self.jail_path:
@@ -836,67 +1110,99 @@ class CodeIndexer:
                 if fp.stat().st_size > _MAX_FILE_BYTES:
                     logger.debug("Skipping oversized file: %s", fp)
                     continue
+                if changed_set is not None:
+                    rel = str(fp.relative_to(root)).replace("\\", "/")
+                    if rel not in changed_set:
+                        continue
                 all_files.append((fp, fp.suffix))
 
         total_files = len(all_files)
-        all_chunks: List[CodeChunk]  = []
-        all_calls:  List[CallEdge]   = []
-        all_imports: List[ImportEdge] = []
+        all_chunks:   List[CodeChunk]   = []
+        all_calls:    List[CallEdge]    = []
+        all_imports:  List[ImportEdge]  = []
+        all_logs:     List[LogPattern]  = []
+        files_done_counter              = 0
+        sem = asyncio.Semaphore(8)
 
-        for files_done, (file_path, ext) in enumerate(all_files, start=1):
-            relative = str(file_path.relative_to(root))
-            try:
-                source = file_path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
+        async def _process_file(file_path: Path, ext: str) -> None:
+            nonlocal files_done_counter
+            async with sem:
+                relative = str(file_path.relative_to(root)).replace("\\", "/")
+                try:
+                    source = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: file_path.read_text(encoding="utf-8", errors="ignore")
+                    )
+                except OSError:
+                    return
+
+                # Extract chunks + calls + imports per language
+                if ext == ".py":
+                    chunks  = extract_python_chunks(source, relative, repo_name)
+                    calls   = extract_python_calls(source, relative, repo_name)
+                    imports = extract_python_imports(source, relative, repo_name)
+                elif ext == ".cs":
+                    chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "csharp", "csharp")
+                    if not chunks:
+                        chunks = extract_csharp_chunks(source, relative, repo_name)
+                        calls  = []
+                    imports = _extract_cs_imports_via_ts(source, relative, repo_name)
+                elif ext == ".jsx":
+                    chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "tsx", "react")
+                    if not chunks:
+                        chunks = extract_react_chunks(source, relative, repo_name)
+                        calls  = []
+                    imports = extract_typescript_imports(source, relative, repo_name)
+                elif ext == ".tsx":
+                    chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "tsx", "typescript")
+                    if not chunks:
+                        chunks = extract_typescript_chunks(source, relative, repo_name)
+                        calls  = []
+                    imports = extract_typescript_imports(source, relative, repo_name)
+                elif ext in {".ts"}:
+                    chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "typescript", "typescript")
+                    if not chunks:
+                        chunks = extract_typescript_chunks(source, relative, repo_name)
+                        calls  = []
+                    imports = extract_typescript_imports(source, relative, repo_name)
+                elif ext == ".java":
+                    chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "java", "java")
+                    imports = _extract_imports_via_ts(source, relative, repo_name, "java", _JAVA_IMPORT_QUERY)
+                elif ext in {".kt", ".kts"}:
+                    chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "kotlin", "kotlin")
+                    imports = _extract_imports_via_ts(source, relative, repo_name, "kotlin", _KT_IMPORT_QUERY)
+                elif ext == ".go":
+                    chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "go", "go")
+                    imports = _extract_imports_via_ts(source, relative, repo_name, "go", _GO_IMPORT_QUERY)
+                elif ext == ".rs":
+                    chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "rust", "rust")
+                    imports = _extract_imports_via_ts(source, relative, repo_name, "rust", _RUST_IMPORT_QUERY)
+                elif ext == ".rb":
+                    chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "ruby", "ruby")
+                    imports = _extract_imports_via_ts(source, relative, repo_name, "ruby", _RUBY_IMPORT_QUERY)
+                else:
+                    chunks, calls, imports = [], [], []
+
+                # Log patterns — build func_ranges from chunks
+                func_ranges = [(c.line_start, c.line_end, c.name) for c in chunks]
+                logs = extract_log_patterns(source, relative, repo_name, func_ranges)
+
+                all_chunks.extend(chunks)
+                all_calls.extend(calls)
+                all_imports.extend(imports)
+                all_logs.extend(logs)
+
+                files_done_counter += 1
                 if progress_callback:
                     try:
-                        await progress_callback(files_done, total_files)
+                        await progress_callback(files_done_counter, total_files)
                     except Exception:
                         pass
-                continue
 
-            if ext == ".py":
-                chunks  = extract_python_chunks(source, relative, repo_name)
-                calls   = extract_python_calls(source, relative, repo_name)
-                imports = extract_python_imports(source, relative, repo_name)
-            elif ext == ".cs":
-                chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "csharp", "csharp")
-                if not chunks:
-                    chunks = extract_csharp_chunks(source, relative, repo_name)
-                    calls  = []
-                imports = _extract_cs_imports_via_ts(source, relative, repo_name)
-            elif ext == ".jsx":
-                chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "tsx", "react")
-                if not chunks:
-                    chunks = extract_react_chunks(source, relative, repo_name)
-                    calls  = []
-                imports = extract_typescript_imports(source, relative, repo_name)
-            elif ext == ".tsx":
-                chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "tsx", "typescript")
-                if not chunks:
-                    chunks = extract_typescript_chunks(source, relative, repo_name)
-                    calls  = []
-                imports = extract_typescript_imports(source, relative, repo_name)
-            else:  # .ts
-                chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "typescript", "typescript")
-                if not chunks:
-                    chunks = extract_typescript_chunks(source, relative, repo_name)
-                    calls  = []
-                imports = extract_typescript_imports(source, relative, repo_name)
-
-            all_chunks.extend(chunks)
-            all_calls.extend(calls)
-            all_imports.extend(imports)
-
-            if progress_callback:
-                try:
-                    await progress_callback(files_done, total_files)
-                except Exception:
-                    pass  # SSE disconnect — indexing continues
+        await asyncio.gather(*[_process_file(fp, ext) for fp, ext in all_files])
 
         logger.info(
-            "CodeIndexer: extracted %d chunks, %d calls, %d imports from %s (%s)",
-            len(all_chunks), len(all_calls), len(all_imports), repo_name, language,
+            "CodeIndexer: extracted %d chunks, %d calls, %d imports, %d log patterns from %s (%s)",
+            len(all_chunks), len(all_calls), len(all_imports), len(all_logs), repo_name, language,
         )
 
         # ── Phase 1: embed + upsert synchronously ────────────────────────────
@@ -906,6 +1212,7 @@ class CodeIndexer:
         await self._upsert_chunks(all_chunks)
         await self._upsert_raw_calls(repo_name, all_calls)
         await self._upsert_imports(all_imports)
+        await self._index_log_patterns(all_logs)
 
         # ── Fire Phase 2 in background ───────────────────────────────────────
         asyncio.create_task(self._enrich_graph(repo_name, local_path))
@@ -924,19 +1231,15 @@ class CodeIndexer:
             return
 
         async with AsyncSessionLocal() as session:
-            # Ensure enrichment_phase column exists (idempotent)
-            await session.execute(text(
-                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS "
-                "enrichment_phase VARCHAR(10) DEFAULT 'raw'"
-            ))
-            await session.execute(text(
-                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS "
-                "entity_id VARCHAR(16)"
-            ))
-            await session.execute(text(
-                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS "
-                "predecessor_entity_id VARCHAR(16)"
-            ))
+            # Ensure all optional columns exist (idempotent)
+            for ddl in [
+                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS enrichment_phase VARCHAR(10) DEFAULT 'raw'",
+                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS entity_id VARCHAR(16)",
+                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS predecessor_entity_id VARCHAR(16)",
+                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS complexity INTEGER DEFAULT 1",
+                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS search_vector tsvector",
+            ]:
+                await session.execute(text(ddl))
 
             for chunk in chunks:
                 emb = (
@@ -948,11 +1251,14 @@ class CodeIndexer:
                         INSERT INTO code_chunks
                             (repo_name, file_path, name, chunk_type, signature, body,
                              docstring, language, line_start, line_end, embedding,
-                             entity_id, enrichment_phase, indexed_at)
+                             entity_id, enrichment_phase, complexity, search_vector,
+                             indexed_at)
                         VALUES
                             (:repo_name, :file_path, :name, :chunk_type, :signature, :body,
                              :docstring, :language, :line_start, :line_end,
-                             :embedding::vector, :entity_id, 'raw', NOW())
+                             :embedding::vector, :entity_id, 'raw', :complexity,
+                             to_tsvector('english', coalesce(:sig,'') || ' ' || coalesce(:name2,'') || ' ' || coalesce(:body2,'')),
+                             NOW())
                         ON CONFLICT (repo_name, file_path, name, chunk_type)
                         DO UPDATE SET
                             signature        = EXCLUDED.signature,
@@ -963,6 +1269,8 @@ class CodeIndexer:
                             embedding        = EXCLUDED.embedding,
                             entity_id        = EXCLUDED.entity_id,
                             enrichment_phase = 'raw',
+                            complexity       = EXCLUDED.complexity,
+                            search_vector    = EXCLUDED.search_vector,
                             indexed_at       = NOW()
                     """),
                     {
@@ -978,6 +1286,11 @@ class CodeIndexer:
                         "line_end":   chunk.line_end,
                         "embedding":  emb,
                         "entity_id":  chunk.entity_id or None,
+                        "complexity": chunk.complexity,
+                        # separate short params for tsvector to avoid 50k body
+                        "sig":        chunk.signature[:500],
+                        "name2":      chunk.name,
+                        "body2":      chunk.body[:2000],
                     },
                 )
             await session.commit()
@@ -1098,28 +1411,24 @@ class CodeIndexer:
     # ── Phase 2: async enrichment ─────────────────────────────────────────────
 
     async def _enrich_graph(self, repo_name: str, local_path: str) -> None:
-        """Background enrichment: edge weights, snapshot, CODEOWNERS, deployments."""
+        """Background enrichment: edge weights, snapshot, cross-file calls, test links, CODEOWNERS, deployments."""
         logger.info("CodeIndexer: starting graph enrichment for %s", repo_name)
         try:
             async with AsyncSessionLocal() as session:
-                # Take a pre-reindex snapshot BEFORE computing weights
                 await self._snapshot_graph(repo_name, session, trigger="pre_reindex")
                 await session.commit()
 
-            # Compute edge weights (may be top-N for large repos)
             await self._compute_edge_weights(repo_name)
+            await self._resolve_cross_file_calls(repo_name)
+            await self._link_test_files(repo_name)
 
-            # Parse CODEOWNERS if present
             codeowners_path = Path(local_path) / ".github" / "CODEOWNERS"
             if not codeowners_path.exists():
                 codeowners_path = Path(local_path) / "CODEOWNERS"
             if codeowners_path.exists():
                 await self._index_codeowners(repo_name, codeowners_path)
 
-            # Infer deployments from git tags (fallback; CI/CD should write directly)
             await self._infer_deployments_from_tags(repo_name, local_path)
-
-            # Mark enrichment complete
             await self._set_enrichment_phase(repo_name, "enriched")
 
             logger.info("CodeIndexer: enrichment complete for %s", repo_name)
@@ -1128,7 +1437,6 @@ class CodeIndexer:
                 "CodeIndexer: enrichment failed for %s — %s",
                 repo_name, exc, exc_info=True,
             )
-            # enrichment_phase stays 'raw' — tools still work with uniform weights
 
     async def _compute_edge_weights(self, repo_name: str) -> None:
         """Compute cosine-similarity edge weights for code_calls rows.
@@ -1492,3 +1800,131 @@ class CodeIndexer:
                  WHERE repo_name = :rn
             """), {"phase": phase, "rn": repo_name})
             await session.commit()
+
+    # ── New enrichment helpers ────────────────────────────────────────────────
+
+    async def _get_changed_files(self, local_path: str) -> set[str]:
+        """Return relative POSIX paths of files changed since the previous commit."""
+        def _run() -> set[str]:
+            try:
+                result = subprocess.run(
+                    ["git", "-C", local_path, "diff", "--name-only", "HEAD~1", "HEAD"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                return {
+                    line.strip()
+                    for line in result.stdout.splitlines()
+                    if line.strip()
+                }
+            except Exception:
+                return set()
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _run)
+
+    async def _resolve_cross_file_calls(self, repo_name: str) -> None:
+        """Populate callee_file in code_calls by joining imports + chunks."""
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("""
+                UPDATE code_calls cc
+                   SET callee_file = ch.file_path
+                  FROM code_chunks ch
+                 WHERE ch.repo_name = cc.caller_repo
+                   AND ch.name      = cc.callee_name
+                   AND cc.caller_repo = :rn
+                   AND (cc.callee_file IS NULL OR cc.callee_file = '')
+            """), {"rn": repo_name})
+            await session.commit()
+        logger.info("CodeIndexer: resolved cross-file calls for %s", repo_name)
+
+    async def _link_test_files(self, repo_name: str) -> None:
+        """Insert test→source edges into code_test_links."""
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS code_test_links (
+                    id           SERIAL PRIMARY KEY,
+                    repo_name    VARCHAR(255),
+                    test_file    VARCHAR(1000),
+                    source_file  VARCHAR(1000),
+                    test_name    VARCHAR(500),
+                    source_name  VARCHAR(500),
+                    indexed_at   TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (repo_name, test_file, test_name, source_name)
+                )
+            """))
+            # Match test chunks to source chunks by heuristic name proximity
+            rows = await session.execute(text("""
+                SELECT tc.file_path  AS test_file,
+                       tc.name       AS test_name,
+                       sc.file_path  AS source_file,
+                       sc.name       AS source_name
+                  FROM code_chunks tc
+                  JOIN code_chunks sc
+                    ON sc.repo_name = tc.repo_name
+                   AND sc.name = tc.name  -- exact name match after test prefix stripped
+                 WHERE tc.repo_name = :rn
+                   AND (
+                         tc.file_path LIKE '%test%'
+                      OR tc.file_path LIKE '%spec%'
+                      OR tc.file_path LIKE '%__tests__%'
+                   )
+                   AND NOT (
+                         sc.file_path LIKE '%test%'
+                      OR sc.file_path LIKE '%spec%'
+                      OR sc.file_path LIKE '%__tests__%'
+                   )
+            """), {"rn": repo_name})
+            links = rows.fetchall()
+            for lnk in links:
+                await session.execute(text("""
+                    INSERT INTO code_test_links
+                        (repo_name, test_file, source_file, test_name, source_name, indexed_at)
+                    VALUES (:rn, :tf, :sf, :tn, :sn, NOW())
+                    ON CONFLICT (repo_name, test_file, test_name, source_name) DO NOTHING
+                """), {
+                    "rn": repo_name,
+                    "tf": lnk.test_file,
+                    "sf": lnk.source_file,
+                    "tn": lnk.test_name,
+                    "sn": lnk.source_name,
+                })
+            await session.commit()
+        logger.info("CodeIndexer: linked %d test→source pairs for %s", len(links), repo_name)
+
+    async def _index_log_patterns(self, patterns: List[LogPattern]) -> None:
+        """Upsert log call-site patterns into code_log_patterns."""
+        if not patterns:
+            return
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS code_log_patterns (
+                    id               SERIAL PRIMARY KEY,
+                    repo_name        VARCHAR(255),
+                    file_path        VARCHAR(1000),
+                    function_name    VARCHAR(500),
+                    log_level        VARCHAR(20),
+                    message_template TEXT,
+                    line_number      INTEGER,
+                    indexed_at       TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (repo_name, file_path, line_number)
+                )
+            """))
+            for p in patterns:
+                await session.execute(text("""
+                    INSERT INTO code_log_patterns
+                        (repo_name, file_path, function_name, log_level,
+                         message_template, line_number, indexed_at)
+                    VALUES (:rn, :fp, :fn, :ll, :mt, :ln, NOW())
+                    ON CONFLICT (repo_name, file_path, line_number)
+                    DO UPDATE SET
+                        function_name    = EXCLUDED.function_name,
+                        log_level        = EXCLUDED.log_level,
+                        message_template = EXCLUDED.message_template,
+                        indexed_at       = NOW()
+                """), {
+                    "rn": p.repo_name, "fp": p.file_path,
+                    "fn": p.function_name, "ll": p.log_level,
+                    "mt": p.message_template, "ln": p.line_number,
+                })
+            await session.commit()
+        logger.info("CodeIndexer: indexed %d log patterns", len(patterns))
