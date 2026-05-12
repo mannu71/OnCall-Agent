@@ -18,7 +18,7 @@ import HITLPanel from '../workflow/HITLPanel';
 const ExecutionMonitor = ({ workflowName, executionId, autoStart = false, onClose }) => {
     const [expanded, setExpanded] = useState(true);
     const [agentExpanded, setAgentExpanded] = useState(true);
-    const { status, events, error, isConnected, clearEvents, agentTokens, agentToolCalls, totalCost } = useWorkflowStream(
+    const { status, events, error, isConnected, clearEvents, agentTokens, agentToolCalls, totalCost, agentCosts } = useWorkflowStream(
         workflowName,
         autoStart
     );
@@ -103,6 +103,13 @@ const ExecutionMonitor = ({ workflowName, executionId, autoStart = false, onClos
                                 <div className="flex items-center gap-2 cursor-pointer" onClick={() => setAgentExpanded(!agentExpanded)}>
                                     <Terminal className="w-4 h-4 text-blue-500" />
                                     <h4 className="text-sm font-semibold">Agent Output</h4>
+                                    {/* Per-agent cost badges */}
+                                    {Object.entries(agentCosts).map(([nodeId, cost]) => (
+                                        <span key={nodeId} className="flex items-center gap-0.5 text-xs text-muted-foreground ml-1" title={`${nodeId} cost`}>
+                                            <DollarSign className="w-3 h-3" />
+                                            {nodeId}: {cost < 0.001 ? '< $0.001' : `$${cost.toFixed(4)}`}
+                                        </span>
+                                    ))}
                                     {agentExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                                 </div>
                                 <CollapsibleContent>

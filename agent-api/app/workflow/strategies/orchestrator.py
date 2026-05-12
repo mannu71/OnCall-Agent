@@ -6,7 +6,8 @@ This strategy is used for scheduled reports and data queries where
 the steps are known in advance.
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
+import asyncio
 import logging
 import re
 
@@ -293,64 +294,161 @@ class OrchestratorStrategy(BaseStrategy):
         steps: List[Dict[str, Any]],
         mcp_manager: Any,
         variables: Dict[str, Any],
-        logger_instance: Any
+        logger_instance: Any,
     ) -> List[Dict[str, Any]]:
-        """
-        Execute workflow steps sequentially.
-        
-        Args:
-            steps: List of step definitions
-            mcp_manager: MCP client manager
-            variables: Variables for substitution
-            logger_instance: Logger instance
-            
+        """Execute workflow steps with automatic parallelism for independent steps.
+
+        Steps that declare no ``depends_on`` (or whose dependencies have all
+        already completed) are dispatched concurrently using ``asyncio.gather``.
+        Steps with unmet dependencies wait until every named predecessor has
+        finished.
+
+        Step definition keys:
+          name          – unique step identifier (required)
+          server        – MCP server name
+          tool          – tool name on that server
+          args          – argument dict (supports ``${var}`` substitution)
+          output        – variable name to store the result under
+          depends_on    – list[str] of step names that must complete first
+          continueOnError – bool, default False
+
         Returns:
-            List of step results
+            Ordered list of step result dicts (one per step, in completion order).
         """
-        results = []
-        step_variables = {**variables}
-        
-        for step in steps:
+        # Index steps by name for dependency resolution.
+        step_by_name: Dict[str, Dict[str, Any]] = {
+            s.get("name", f"__step_{i}"): s for i, s in enumerate(steps)
+        }
+        all_names: Set[str] = set(step_by_name)
+
+        completed: Set[str] = set()    # names of finished steps
+        failed: Set[str] = set()       # names of failed steps
+        results: List[Dict[str, Any]] = []
+
+        # Shared mutable variables — protected by asyncio cooperative scheduling
+        # (no threads, so no lock needed).
+        step_variables: Dict[str, Any] = {**variables}
+
+        async def _run_one(step: Dict[str, Any]) -> Dict[str, Any]:
+            """Execute a single step and return its result dict."""
             step_name = step.get("name", "unnamed")
             server_name = step.get("server", "")
             tool_name = step.get("tool", "")
             args = step.get("args", {})
-            
-            logger_instance.info(f"Executing step: {step_name}")
-            
+
+            logger_instance.info(
+                "OrchestratorStrategy: executing step '%s' (server=%s tool=%s)",
+                step_name, server_name, tool_name,
+            )
+
             try:
-                # Substitute variables in arguments
                 substituted_args = self._substitute_variables(args, step_variables)
-                
-                # Execute tool
-                result = await mcp_manager.execute_tool(
-                    server_name,
-                    tool_name,
-                    substituted_args
-                )
-                
-                # Store result for next steps
+                result = await mcp_manager.execute_tool(server_name, tool_name, substituted_args)
+
+                # Write output variable while still in the cooperative loop
+                # (no concurrent writes possible — gather yields between awaits).
                 if "output" in step:
                     step_variables[step["output"]] = result
-                
-                results.append({
-                    "step": step_name,
-                    "success": True,
-                    "result": result
-                })
-                
+
+                return {"step": step_name, "success": True, "result": result}
+
             except Exception as error:
-                logger_instance.error(f"Step failed: {step_name} - {str(error)}")
-                results.append({
-                    "step": step_name,
-                    "success": False,
-                    "error": str(error)
-                })
-                
-                # Stop on error unless configured to continue
-                if not step.get("continueOnError", False):
-                    raise
-        
+                logger_instance.error(
+                    "OrchestratorStrategy: step '%s' failed — %s", step_name, error
+                )
+                return {"step": step_name, "success": False, "error": str(error)}
+
+        # Wave-based parallel execution: in each wave dispatch all steps whose
+        # dependencies are satisfied.  Repeat until every step has been processed
+        # or a blocking failure halts execution.
+        pending: Set[str] = set(all_names)
+        max_waves = len(steps) + 1  # safety upper-bound
+
+        for _wave in range(max_waves):
+            if not pending:
+                break
+
+            # Identify steps that are ready in this wave.
+            ready: List[str] = []
+            for name in pending:
+                step = step_by_name[name]
+                deps: List[str] = step.get("depends_on") or []
+                # A step is ready when all its declared dependencies completed OK.
+                deps_ok = all(d in completed for d in deps)
+                deps_blocked = any(d in failed for d in deps)
+
+                if deps_blocked:
+                    # Dependency failed and step doesn't opt into continue-on-error
+                    if not step.get("continueOnError", False):
+                        logger_instance.warning(
+                            "OrchestratorStrategy: skipping step '%s' — dependency failed", name
+                        )
+                        failed.add(name)
+                        pending.discard(name)
+                        results.append({
+                            "step": name,
+                            "success": False,
+                            "error": "Skipped: dependency failed",
+                        })
+                    else:
+                        # Run anyway — treat missing dep output gracefully.
+                        ready.append(name)
+                elif deps_ok:
+                    ready.append(name)
+
+            if not ready:
+                # Either we're done, or there's a dependency cycle / all pending
+                # steps are blocked.  Log and break to avoid an infinite loop.
+                if pending:
+                    logger_instance.warning(
+                        "OrchestratorStrategy: %d step(s) could not be scheduled "
+                        "(possible cycle or unresolvable dependency): %s",
+                        len(pending), list(pending),
+                    )
+                    for name in list(pending):
+                        failed.add(name)
+                        pending.discard(name)
+                        results.append({
+                            "step": name,
+                            "success": False,
+                            "error": "Unschedulable: dependency cycle or unresolved dependency",
+                        })
+                break
+
+            logger_instance.info(
+                "OrchestratorStrategy: wave %d — dispatching %d step(s) in parallel: %s",
+                _wave + 1, len(ready), ready,
+            )
+
+            # Dispatch ready steps concurrently.
+            wave_results = await asyncio.gather(
+                *[_run_one(step_by_name[name]) for name in ready],
+                return_exceptions=False,
+            )
+
+            for name, res in zip(ready, wave_results):
+                pending.discard(name)
+                results.append(res)
+
+                if res.get("success"):
+                    completed.add(name)
+                else:
+                    failed.add(name)
+                    # Abort whole workflow on first hard failure (unless step opts out).
+                    step = step_by_name[name]
+                    if not step.get("continueOnError", False):
+                        # Drain remaining pending as skipped then re-raise.
+                        for rem in list(pending):
+                            results.append({
+                                "step": rem,
+                                "success": False,
+                                "error": "Skipped: preceding step failed",
+                            })
+                        raise RuntimeError(
+                            f"OrchestratorStrategy: step '{name}' failed — "
+                            f"{res.get('error', 'unknown error')}"
+                        )
+
         return results
     
     def _substitute_variables(

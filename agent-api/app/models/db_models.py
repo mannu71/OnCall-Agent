@@ -6,6 +6,34 @@ from pgvector.sqlalchemy import Vector
 # Import Base from database module
 from app.core.database import Base
 
+# ---------------------------------------------------------------------------
+# Migration note
+# ---------------------------------------------------------------------------
+# If upgrading an existing deployment, run the following SQL once:
+#
+#   ALTER TABLE known_issues RENAME TO knowledge_entries;
+#   CREATE INDEX IF NOT EXISTS ix_knowledge_entries_source
+#       ON knowledge_entries(source);
+#
+#   CREATE TABLE IF NOT EXISTS skills (
+#       id              SERIAL PRIMARY KEY,
+#       name            VARCHAR(255) UNIQUE NOT NULL,
+#       title           VARCHAR(255) NOT NULL,
+#       description     TEXT,
+#       trigger_patterns JSON,
+#       steps           JSON,
+#       workflow_name   VARCHAR(255),
+#       source          VARCHAR(50) DEFAULT 'distilled',
+#       status          VARCHAR(50) DEFAULT 'active',
+#       success_count   INTEGER DEFAULT 0,
+#       recall_count    INTEGER DEFAULT 0,
+#       last_used_at    TIMESTAMPTZ,
+#       promoted_from_id INTEGER,
+#       created_at      TIMESTAMPTZ,
+#       updated_at      TIMESTAMPTZ
+#   );
+# ---------------------------------------------------------------------------
+
 
 class WorkflowModel(Base):
     """Workflow database model."""
@@ -109,18 +137,72 @@ class LogPatternModel(Base):
     updated_at = Column(DateTime(timezone=True))
 
 
-class KnownIssueModel(Base):
-    """Known issue database model for RAG."""
-    __tablename__ = "known_issues"
+class KnowledgeEntryModel(Base):
+    """Knowledge entry — generic RAG store for resolutions, playbooks, and findings."""
+    __tablename__ = "knowledge_entries"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     title = Column(String(255), nullable=False)
     description = Column(Text, nullable=False)
-    symptoms = Column(JSON)  # Array of strings
-    solution = Column(Text)
-    category = Column(String(100))
-    source = Column(String(50), default="manual")  # manual | agent | verified
+    symptoms = Column(JSON)          # Array of symptom/trigger strings
+    solution = Column(Text)          # Resolution text
+    category = Column(String(100))   # Workflow domain or topic
+    source = Column(String(50), default="manual")  # manual | agent | verified | skill
     embedding = Column(Vector(1536))
+    created_at = Column(DateTime(timezone=True))
+    updated_at = Column(DateTime(timezone=True))
+
+
+# Backward-compat alias — remove once all import sites are updated
+KnownIssueModel = KnowledgeEntryModel
+
+
+class SkillModel(Base):
+    """Executable skill — a structured, reusable resolution procedure.
+
+    Skills are either distilled automatically from completed investigations
+    or authored manually.  The agent can call a skill by name via the
+    ``execute_skill`` tool, which runs the ``steps`` in order against the
+    live MCP tool set.
+    """
+    __tablename__ = "skills"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Identity
+    name  = Column(String(255), unique=True, nullable=False)  # slug: restart_api_pods
+    title = Column(String(255), nullable=False)               # human label
+
+    description = Column(Text)
+
+    # Matching — phrases / regex patterns that indicate this skill is relevant
+    trigger_patterns = Column(JSON)   # List[str]
+
+    # Execution — ordered list of step dicts:
+    #   [{order, description, tool, args_template, condition, on_failure}]
+    steps = Column(JSON, nullable=False, default=list)
+
+    # Optional: run a named workflow instead of individual steps
+    workflow_name = Column(String(255))
+
+    # Provenance
+    source = Column(String(50), default="distilled")
+    # distilled  — auto-generated from investigation
+    # manual     — written by an engineer
+    # promoted   — promoted from a knowledge_entry
+
+    # Lifecycle
+    status = Column(String(50), default="active")
+    # active | draft | archived
+
+    # Usage counters (updated by SkillService)
+    success_count = Column(Integer, default=0)
+    recall_count  = Column(Integer, default=0)
+    last_used_at  = Column(DateTime(timezone=True))
+
+    # Lineage — knowledge_entries.id this skill was promoted from (nullable)
+    promoted_from_id = Column(Integer)
+
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
 

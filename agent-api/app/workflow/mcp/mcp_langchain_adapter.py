@@ -71,6 +71,10 @@ class MCPToolWrapper(BaseTool):
 
     Delegates execution to the MCPClientManager which already holds the live
     stdio connection to the MCP server process.
+
+    The ``tool_timeout`` field limits how long a single tool call may block
+    before being cancelled.  Set to ``None`` to inherit the MCPClientManager
+    class-level ``TOOL_TIMEOUT`` default (60 s).
     """
 
     name: str
@@ -79,6 +83,7 @@ class MCPToolWrapper(BaseTool):
     tool_name: str
     mcp_manager: Any  # MCPClientManager — typed as Any to avoid circular imports
     args_schema: Optional[Type[BaseModel]] = None
+    tool_timeout: Optional[float] = None  # seconds; None = use manager default
 
     class Config:
         arbitrary_types_allowed = True
@@ -106,6 +111,7 @@ class MCPToolWrapper(BaseTool):
             server_id=self.server_id,
             tool_name=self.tool_name,
             arguments=kwargs,
+            tool_timeout=self.tool_timeout,
         )
 
         if result.get("isError"):
@@ -132,15 +138,20 @@ class MCPToolWrapper(BaseTool):
 def build_langchain_tools(
     mcp_manager: Any,
     server_tool_map: Optional[Dict[str, List[str]]] = None,
+    *,
+    tool_timeout: Optional[float] = None,
 ) -> List[BaseTool]:
     """
     Build a list of LangChain tools from all connected MCP servers.
 
     Args:
-        mcp_manager: Live MCPClientManager with active connections.
+        mcp_manager:     Live MCPClientManager with active connections.
         server_tool_map: Optional dict of {server_id: [tool_names]} to restrict
                          which tools are exposed to the agent. If None, all
                          discovered tools from all servers are included.
+        tool_timeout:    Per-call timeout in seconds forwarded to every
+                         ``MCPToolWrapper``.  When ``None`` each wrapper
+                         inherits the manager default.
 
     Returns:
         List of LangChain BaseTool-compatible instances, one per MCP tool.
@@ -186,6 +197,7 @@ def build_langchain_tools(
                 tool_name=tool_name,
                 mcp_manager=mcp_manager,
                 args_schema=args_schema,
+                tool_timeout=tool_timeout,
             )
             langchain_tools.append(tool)
 

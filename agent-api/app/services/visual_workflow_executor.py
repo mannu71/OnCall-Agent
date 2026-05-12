@@ -416,11 +416,13 @@ class VisualWorkflowExecutor:
         
         # Node type → executor mapping
         executors = {
-            'scheduler': self._execute_scheduler_node,
-            'orchestrator': self._execute_orchestrator_node,
-            'agent': self._execute_agent_node,
-            'tool': self._execute_tool_node,
+            'scheduler':          self._execute_scheduler_node,
+            'orchestrator':       self._execute_orchestrator_node,
+            'agent':              self._execute_agent_node,
+            'batchAgent':         self._execute_batch_agent_node,
+            'tool':               self._execute_tool_node,
             'cloudwatchAnalyzer': self._execute_cloudwatch_node,
+            'codeAnalyzer':       self._execute_code_analyzer_node,
         }
         
         try:
@@ -642,6 +644,50 @@ class VisualWorkflowExecutor:
                 len(cw_results),
             )
 
+        # ------------------------------------------------------------------
+        # Cross-node data: collect results from upstream Code Analyzer nodes
+        # so the agent can reason about pre-indexed code repositories.
+        # ------------------------------------------------------------------
+        code_results = {}
+        for key, value in context.items():
+            if isinstance(value, dict) and value.get('code_analysis_type'):
+                code_results[key] = {
+                    'code_analysis_type': value.get('code_analysis_type'),
+                    'repos_indexed':      value.get('repos_indexed'),
+                    'repos_config':       value.get('repos_config'),
+                    'pre_summary':        value.get('pre_summary'),
+                    'output':             value.get('output'),
+                }
+        if code_results:
+            strategy_context['code_analyzer_context'] = code_results
+            logger.info(
+                "Agent node: injecting %d upstream Code Analyzer result(s) into context",
+                len(code_results),
+            )
+
+        # ------------------------------------------------------------------
+        # Anomaly-code correlation: when both CW and Code Analyzer results are
+        # present, cross-reference anomaly messages with code chunk names and
+        # inject the correlation into strategy_context for the agent's initial
+        # context block.
+        # ------------------------------------------------------------------
+        if cw_results and code_results:
+            try:
+                log_group_to_repo = {}
+                for _, cv in code_results.items():
+                    for repo_cfg in (cv.get('repos_config') or []):
+                        for lg in (repo_cfg.get('logGroups') or []):
+                            log_group_to_repo[lg] = repo_cfg.get('name', '')
+                if log_group_to_repo:
+                    strategy_context['anomaly_code_correlation'] = \
+                        await self._correlate_anomalies_to_code(
+                            cw_results=cw_results,
+                            code_results=code_results,
+                            log_group_to_repo=log_group_to_repo,
+                        )
+            except Exception as _corr_exc:
+                logger.debug("Anomaly-code correlation skipped: %s", _corr_exc)
+
         try:
             react_strategy = ReactStrategy()
             result = await react_strategy.execute(workflow, strategy_context)
@@ -668,7 +714,108 @@ class VisualWorkflowExecutor:
                 'error': str(e),
                 'agent_data': node_data,
             }
-    
+
+    async def _execute_batch_agent_node(
+        self, node: Dict[str, Any], context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Execute a batchAgent node using BatchReactStrategy (map-reduce).
+
+        The node behaves like a regular agent node from the workflow editor's
+        perspective — same data shape, same edges — but internally decomposes
+        the query into N parallel sub-investigations and synthesises results.
+
+        Extra context keys forwarded to BatchReactStrategy:
+          ``batch_targets``     — explicit list of sub-investigation dicts
+          ``batch_concurrency`` — max parallel sub-agents (default 5)
+          ``batch_timeout``     — per-sub-agent timeout in seconds (default 180)
+        """
+        from app.workflow.strategies.batch_react import BatchReactStrategy
+
+        node_id      = node.get('id')
+        node_data    = node.get('data', {})
+        execution_id = context.get('execution_id')
+
+        active   = self.active_executions.get(execution_id, {})
+        workflow = active.get('workflow') or {
+            'name':  context.get('workflow_name', 'unknown'),
+            'nodes': [node],
+            'edges': [],
+        }
+
+        user_query = (
+            context.get('inputs', {}).get('user_query')
+            or context.get('inputs', {}).get('query')
+            or node_data.get('instructions')
+            or node_data.get('description')
+            or ''
+        )
+
+        if not user_query:
+            return {
+                'status': 'skipped',
+                'output': 'Batch agent node has no user_query or instructions configured.',
+                'agent_data': node_data,
+            }
+
+        if execution_id not in self.mcp_managers:
+            self.mcp_managers[execution_id] = MCPClientManager()
+
+        stream_callback = _AgentStreamCallback(self, execution_id, node_id)
+
+        strategy_context = {
+            'execution_id':     execution_id,
+            'user_query':       user_query,
+            'mcp_manager':      self.mcp_managers[execution_id],
+            'inputs':           context.get('inputs', {}),
+            'logger':           logger,
+            'stream_callback':  stream_callback,
+            # Pass through batch-specific overrides if the caller set them.
+            'batch_targets':    context.get('batch_targets'),
+            'batch_concurrency': context.get('batch_concurrency'),
+            'batch_timeout':    context.get('batch_timeout'),
+        }
+
+        # Forward upstream CloudWatch analysis (same as agent node).
+        cw_results = {
+            k: {
+                'analysis_type':       v.get('analysis_type'),
+                'output':              v.get('output'),
+                'log_groups_analyzed': v.get('log_groups_analyzed'),
+                'time_range':          v.get('time_range'),
+                'alerts':              v.get('alerts'),
+            }
+            for k, v in context.items()
+            if isinstance(v, dict) and v.get('analysis_type')
+        }
+        if cw_results:
+            strategy_context['cloudwatch_context'] = cw_results
+
+        try:
+            result = await BatchReactStrategy().execute(workflow, strategy_context)
+
+            return {
+                'status':        'success',
+                'output':        result.get('final_answer', 'Batch agent completed.'),
+                'final_answer':  result.get('final_answer'),
+                'sub_results':   result.get('sub_results', []),
+                'map_stats':     result.get('map_stats', {}),
+                'tool_calls':    result.get('tool_calls', []),
+                'model':         result.get('model'),
+                'provider':      result.get('provider'),
+                'agent_data':    node_data,
+            }
+
+        except Exception as e:
+            logger.error(
+                "Batch agent node execution failed: %s (node_id=%s, execution_id=%s)",
+                e, node_id, execution_id,
+            )
+            return {
+                'status':     'failed',
+                'error':      str(e),
+                'agent_data': node_data,
+            }
+
     async def _execute_tool_node(self, node: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         """Execute tool node by connecting to MCP server."""
         node_id = node.get('id')
@@ -863,6 +1010,328 @@ class VisualWorkflowExecutor:
                 "status": "failed",
                 "error": str(e)
             }
+
+    # ------------------------------------------------------------------
+    # Code Analyzer node
+    # ------------------------------------------------------------------
+
+    async def _execute_code_analyzer_node(
+        self,
+        node: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Execute a Code Analyzer node.
+
+        Phase 1 (fast, sync): index any un-indexed / stale repos, optionally
+        run a pre-execution semantic summary search.
+        Phase 2 (enrichment): fired in the background by CodeIndexer itself.
+
+        Returns a result dict with ``code_analysis_type`` discriminator so the
+        downstream agent node can pick it up from ``context``.
+        """
+        import os
+        import re as _re
+        from datetime import datetime, timezone
+
+        from app.core.security import check_path, PathJailError
+        from app.services.code_indexer import CodeIndexer
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import text as _text
+
+        node_data    = node.get('data', {})
+        execution_id = context.get('execution_id')
+        node_id      = node.get('id')
+        repos        = node_data.get('repos', [])
+        auto_index   = node_data.get('autoIndex', True)
+        stale_hours  = node_data.get('staleAfterHours', 24)
+        pre_summary  = node_data.get('preSummary', False)
+
+        REPOS_BASE_PATH = os.getenv('REPOS_BASE_PATH', '/tmp/indexed_repos')
+
+        if not repos:
+            return {
+                'status': 'failed',
+                'error': 'No repos configured for Code Analyzer node.',
+                'code_analysis_type': 'pre_summary',
+            }
+
+        # ── Security guards ────────────────────────────────────────────────
+        try:
+            # Lazy import to keep the import chain light until needed
+            from app.core.security import scan_injection, InjectionError  # type: ignore
+        except ImportError:
+            # scan_injection may not exist yet on older deployments — define no-op
+            def scan_injection(text: str) -> None:  # type: ignore
+                pass
+            class InjectionError(Exception):  # type: ignore
+                pass
+
+        for repo in repos:
+            try:
+                scan_injection(repo.get('name', ''))
+                scan_injection(repo.get('path', ''))
+            except InjectionError as exc:
+                return {
+                    'status': 'failed',
+                    'error': f'Injection detected in repo config: {exc}',
+                    'code_analysis_type': 'pre_summary',
+                }
+            try:
+                check_path(repo.get('path', ''), jail=REPOS_BASE_PATH)
+            except PathJailError as exc:
+                return {
+                    'status': 'failed',
+                    'error': f'Repo path outside allowed root ({REPOS_BASE_PATH}): {exc}',
+                    'code_analysis_type': 'pre_summary',
+                }
+
+        # ── Per-repo indexing ──────────────────────────────────────────────
+        repos_newly_indexed:   List[str] = []
+        repos_stale_reindexed: List[str] = []
+        repos_already_indexed: List[str] = []
+        cg_stale_warning: Optional[str] = None
+
+        indexer = CodeIndexer()
+        now = datetime.now(timezone.utc)
+
+        for repo in repos:
+            repo_name  = repo.get('name', '')
+            local_path = repo.get('path', '')
+            language   = repo.get('language', 'python')
+
+            if not repo_name or not local_path:
+                continue
+
+            # Try advisory lock to prevent concurrent indexing of the same repo
+            lock_key = abs(hash(repo_name)) % (2 ** 31)
+            acquired = False
+            try:
+                async with AsyncSessionLocal() as lock_session:
+                    result_lock = await lock_session.execute(
+                        _text('SELECT pg_try_advisory_lock(:key)'),
+                        {'key': lock_key},
+                    )
+                    acquired = bool(result_lock.scalar())
+
+                    if not acquired:
+                        logger.info(
+                            'codeAnalyzer: repo %r is being indexed by another process — skipping',
+                            repo_name,
+                        )
+                        repos_already_indexed.append(repo_name)
+                        continue
+
+                    # Check freshness
+                    fresh_result = await lock_session.execute(
+                        _text("""
+                            SELECT COUNT(*) AS cnt, MAX(indexed_at) AS last_indexed
+                              FROM code_chunks
+                             WHERE repo_name = :rn
+                        """),
+                        {'rn': repo_name},
+                    )
+                    row = fresh_result.one_or_none()
+                    chunk_count  = int(row.cnt) if row else 0
+                    last_indexed = row.last_indexed if row else None
+
+                    needs_index = (
+                        chunk_count == 0
+                        or (
+                            auto_index
+                            and last_indexed is not None
+                            and (now - last_indexed.replace(tzinfo=timezone.utc)).total_seconds()
+                                > stale_hours * 3600
+                        )
+                    )
+
+                    # Check call-graph staleness (warn if graph is older than chunks)
+                    cg_result = await lock_session.execute(
+                        _text("""
+                            SELECT MAX(indexed_at) AS cg_indexed
+                              FROM code_calls
+                             WHERE caller_repo = :rn
+                        """),
+                        {'rn': repo_name},
+                    )
+                    cg_row = cg_result.one_or_none()
+                    cg_stale_warning: Optional[str] = None
+                    if (
+                        last_indexed and cg_row and cg_row.cg_indexed
+                        and (last_indexed - cg_row.cg_indexed.replace(tzinfo=timezone.utc)).total_seconds()
+                            > 1800  # 30-minute grace period
+                    ):
+                        cg_stale_warning = (
+                            f'⚠️  Call graph for {repo_name} may be stale '
+                            f'(last updated {cg_row.cg_indexed.isoformat()}, '
+                            f'chunks updated {last_indexed.isoformat()}). '
+                            'Structural traces may reflect deleted or renamed functions. '
+                            'Verify with code_get_function.'
+                        )
+
+            except Exception as lock_exc:
+                logger.warning(
+                    'codeAnalyzer: advisory lock check failed for %s: %s',
+                    repo_name, lock_exc,
+                )
+                needs_index = chunk_count == 0
+
+            if not needs_index:
+                repos_already_indexed.append(repo_name)
+                continue
+
+            # Build a progress callback that publishes SSE events
+            async def _on_progress(done: int, total: int, _rn: str = repo_name) -> None:
+                try:
+                    await self._publish_event(execution_id, 'node_progress', {
+                        'message':      f'Indexing {_rn}: {done}/{total} files',
+                        'node_id':      node_id,
+                        'progress_pct': round(done / total * 100) if total else 0,
+                    })
+                except Exception:
+                    pass  # SSE disconnect — indexing continues
+
+            try:
+                await indexer.index_repo(
+                    repo_name=repo_name,
+                    local_path=local_path,
+                    language=language,
+                    progress_callback=_on_progress,
+                )
+                if chunk_count > 0:
+                    repos_stale_reindexed.append(repo_name)
+                else:
+                    repos_newly_indexed.append(repo_name)
+                logger.info('codeAnalyzer: indexed repo %s', repo_name)
+            except Exception as idx_exc:
+                logger.error(
+                    'codeAnalyzer: failed to index %s: %s', repo_name, idx_exc,
+                )
+
+        all_indexed = repos_newly_indexed + repos_stale_reindexed + repos_already_indexed
+        repos_config_with_lg = repos  # pass full config to agent so logGroupToRepo mapping is available
+
+        # ── Optional pre-execution summary ────────────────────────────────
+        pre_summary_results: Dict[str, Any] = {}
+        if pre_summary and all_indexed:
+            inputs = context.get('inputs', {})
+            search_query = (
+                inputs.get('service_name')
+                or inputs.get('error_signature')
+                or inputs.get('component')
+                or inputs.get('user_query', '')[:200]
+            )
+            if search_query:
+                from app.mcp.tools.code_tools import search_code as _search_code
+                for repo in repos:
+                    rn = repo.get('name', '')
+                    if rn not in all_indexed:
+                        continue
+                    try:
+                        hits = await _search_code(
+                            query=search_query, repo=rn, limit=5,
+                        )
+                        pre_summary_results[rn] = hits
+                    except Exception as se:
+                        logger.debug('codeAnalyzer pre-summary search failed for %s: %s', rn, se)
+
+        # ── Build output text ──────────────────────────────────────────────
+        parts: List[str] = []
+        if repos_newly_indexed:
+            parts.append(f'Newly indexed: {", ".join(repos_newly_indexed)}')
+        if repos_stale_reindexed:
+            parts.append(f'Re-indexed (stale): {", ".join(repos_stale_reindexed)}')
+        if repos_already_indexed:
+            parts.append(f'Already indexed: {", ".join(repos_already_indexed)}')
+        output_text = '; '.join(parts) or 'No repos indexed.'
+
+        if cg_stale_warning:
+            output_text += '\n' + cg_stale_warning
+
+        return {
+            'status':               'success',
+            'output':               output_text,
+            'code_analysis_type':   'pre_summary',
+            'repos_indexed':        all_indexed,
+            'repos_newly_indexed':  repos_newly_indexed,
+            'repos_stale_reindexed': repos_stale_reindexed,
+            'repos_already_indexed': repos_already_indexed,
+            'repos_config':         repos_config_with_lg,
+            'pre_summary':          pre_summary_results or None,
+        }
+
+    async def _correlate_anomalies_to_code(
+        self,
+        cw_results: Dict[str, Any],
+        code_results: Dict[str, Any],
+        log_group_to_repo: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        """Lightweight anomaly→code correlation.  No LLM — regex + exact match.
+
+        Extracts log groups and error/function names from CloudWatch anomaly
+        text, maps to repo names via ``log_group_to_repo``, then matches
+        against ``code_chunks.name``.
+
+        Returns a list of correlation dicts suitable for injection into the
+        agent's initial context block.
+        """
+        import re as _re
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import text as _text
+
+        _ENTITY_RE = _re.compile(
+            r'(?:ERROR|Exception|error|exception)\s+in\s+([\w\.]+)',
+            _re.IGNORECASE,
+        )
+
+        correlations: List[Dict[str, Any]] = []
+
+        for _key, cw_val in cw_results.items():
+            output_text = cw_val.get('output', '') or ''
+            log_groups  = cw_val.get('log_groups_analyzed') or []
+
+            for lg in log_groups:
+                repo_name = log_group_to_repo.get(lg)
+                if not repo_name:
+                    continue
+
+                # Extract function/class names from anomaly text
+                matches = _ENTITY_RE.findall(output_text)
+                for match in matches:
+                    func_name = match.split('.')[-1]  # "auth.service.authenticate_user" → "authenticate_user"
+                    if not func_name:
+                        continue
+                    # Exact-match lookup in code_chunks
+                    try:
+                        async with AsyncSessionLocal() as session:
+                            res = await session.execute(
+                                _text("""
+                                    SELECT name, file_path, line_start
+                                      FROM code_chunks
+                                     WHERE repo_name = :rn
+                                       AND name = :fn
+                                     LIMIT 1
+                                """),
+                                {'rn': repo_name, 'fn': func_name},
+                            )
+                            row = res.one_or_none()
+                        if row:
+                            correlations.append({
+                                'log_group':  lg,
+                                'repo':       repo_name,
+                                'anomaly_snippet': output_text[:200],
+                                'matched_function': row.name,
+                                'matched_file':     row.file_path,
+                                'matched_line':     row.line_start,
+                                'confidence':       'exact_name_match',
+                                'suggestion': (
+                                    f'code_trace_flow(entry_function="{row.name}", '
+                                    f'repo="{repo_name}")'
+                                ),
+                            })
+                    except Exception:
+                        pass
+
+        return correlations
 
     async def _analyze_cloudwatch_with_llm(
         self,
@@ -1062,6 +1531,52 @@ class VisualWorkflowExecutor:
         """Get status of an execution."""
         return self.active_executions.get(execution_id)
     
+    # ── Dynamic graph execution ───────────────────────────────────────────────
+
+    async def run_workflow_graph(
+        self,
+        workflow: Dict[str, Any],
+        inputs: Optional[Dict[str, Any]] = None,
+        registry: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Execute a workflow using the dynamic graph engine.
+
+        Unlike the BFS executor (which routes by node type at runtime),
+        WorkflowGraph instantiates nodes from the ``node_registry`` using the
+        node ``type`` field, wires successors from the edge list, then runs
+        the graph.  This enables arbitrary custom node logic without changing
+        the executor.
+
+        Args:
+            workflow: ReactFlow workflow dict (same schema as ``execute_workflow``).
+            inputs:   Optional initial shared state injected before the first node.
+            registry: NodeRegistry to use.  Defaults to ``default_registry``
+                      from ``app.engine``.
+
+        Returns:
+            The shared state dict after the graph terminates.
+        """
+        from app.engine.pocketflow import WorkflowGraph, default_registry
+
+        reg = registry or default_registry
+        shared: Dict[str, Any] = {"inputs": inputs or {}, "workflow": workflow}
+
+        try:
+            flow = WorkflowGraph.from_workflow_json(workflow, reg)
+        except (ValueError, KeyError) as exc:
+            logger.warning(
+                "run_workflow_graph: could not build WorkflowGraph: %s — "
+                "falling back to BFS executor",
+                exc,
+            )
+            return await self.execute_workflow(workflow, inputs)
+
+        workflow_name = workflow.get("name", "workflow")
+        logger.info("WorkflowGraph: running workflow '%s'", workflow_name)
+        result = await flow.run(shared)
+        logger.info("WorkflowGraph: workflow '%s' complete", workflow_name)
+        return result
+
     async def cleanup_execution(self, execution_id: str):
         """Clean up execution data and disconnect MCP clients."""
         if execution_id in self.mcp_managers:

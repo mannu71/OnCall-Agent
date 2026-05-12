@@ -198,6 +198,30 @@ export const nodeConfigurations = {
       text: `Last: ${new Date(data.lastAnalysis).toLocaleTimeString()}`,
       class: 'timestamp'
     } : null
+  },
+
+  codeAnalyzer: {
+    icon: '🔍',
+    title: 'Code Analyzer',
+    className: 'code-analyzer-node',
+    defaultLabel: 'Code Analyzer',
+    handles: [{ type: 'source', position: 'left', id: 'source-left' }],
+    getIcon: (data) => {
+      if (data?.processing) return '🔄';
+      if (data?.error) return '❌';
+      if (data?.lastIndexed) return '✅';
+      return '🔍';
+    },
+    getStatus: (data) => {
+      if (data?.processing) return { text: 'Indexing...', class: 'processing' };
+      if (data?.error) return { text: `Error: ${data.error.slice(0, 30)}...`, class: 'error' };
+      const c = data?.repos?.length || 0;
+      return { text: `${c} repo${c !== 1 ? 's' : ''} configured`, class: 'ready' };
+    },
+    getExtra: (data) => data?.lastIndexed ? {
+      text: `Last indexed: ${new Date(data.lastIndexed).toLocaleTimeString()}`,
+      class: 'timestamp'
+    } : null
   }
 };
 

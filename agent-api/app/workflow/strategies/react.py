@@ -52,10 +52,11 @@ _RECALL_MAX_CHARS = 3000
 def _build_recall_context(
     issues: List[Dict[str, Any]],
     patterns: List[Dict[str, Any]],
+    skills: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build a fenced recall block from KB search results.
 
-    Returns an empty string when both lists are empty so callers can do a
+    Returns an empty string when all lists are empty so callers can do a
     simple truth-check before prepending to the user query.
     """
     parts: List[str] = []
@@ -79,6 +80,20 @@ def _build_recall_context(
             f"  {(pattern.get('description') or '')[:200]}"
         )
 
+    # Matching skills — tell the agent it can call execute_skill to run them.
+    for skill in (skills or [])[:3]:
+        steps = skill.get("steps") or []
+        step_preview = "; ".join(
+            str(s.get("description") or s) for s in steps[:3]
+        )
+        if len(steps) > 3:
+            step_preview += f" … (+{len(steps) - 3} more steps)"
+        parts.append(
+            f"Executable Skill: {skill.get('title', skill.get('name', ''))}\n"
+            f"  Name (for execute_skill): {skill.get('name', '')}\n"
+            f"  Steps: {step_preview or '(see tool)'}"
+        )
+
     if not parts:
         return ""
 
@@ -93,7 +108,7 @@ def _compact_input_state(input_state: Dict[str, Any]) -> Dict[str, Any]:
     """Reduce the token footprint of a LangGraph input state by pruning stale
     tool results from the middle of the conversation history.
 
-    Strategy (mirrors hermes context_compressor logic):
+    Strategy:
     - Always keep the first message (the original human query).
     - Always keep the last 4 messages (recent reasoning and answer).
     - Replace ToolMessage entries in the middle with a single HumanMessage
@@ -250,6 +265,7 @@ class ReactStrategy(BaseStrategy):
             llm_config = await self._resolve_llm_config(workflow)
             tools_config = self._extract_tools_config(workflow)
             cloudwatch_config = self._extract_cloudwatch_config(workflow)
+            code_analyzer_config = self._extract_code_analyzer_config(workflow)
 
             # ------------------------------------------------------------------
             # Pre-execution recall: inject relevant past knowledge into the query.
@@ -261,13 +277,15 @@ class ReactStrategy(BaseStrategy):
                 from app.services.knowledge_base import knowledge_base as _kb
                 _issues = await _kb.search_known_issues(user_query, limit=3, threshold=0.65)
                 _patterns = await _kb.search_similar_patterns(user_query, limit=3, threshold=0.65)
-                recall_hits = len(_issues) + len(_patterns)
-                recall_block = _build_recall_context(_issues, _patterns)
+                _skills = await _kb.recall_skills_for_agent(user_query, limit=3)
+                recall_hits = len(_issues) + len(_patterns) + len(_skills)
+                recall_block = _build_recall_context(_issues, _patterns, _skills)
                 if recall_block:
                     augmented_query = f"{recall_block}\n\n---\n\n{user_query}"
                     logger_instance.debug(
-                        "ReactStrategy: prepended %d recall item(s) to query",
+                        "ReactStrategy: prepended %d recall item(s) (%d skills) to query",
                         recall_hits,
+                        len(_skills),
                         extra={"execution_id": execution_id},
                     )
             except Exception as _recall_err:
@@ -311,6 +329,29 @@ class ReactStrategy(BaseStrategy):
                     )
 
             # ------------------------------------------------------------------
+            # Code Analyzer tools: only injected when a codeAnalyzer node is
+            # connected to the agent node via workflow edges.
+            # ------------------------------------------------------------------
+            if code_analyzer_config:
+                try:
+                    from app.workflow.tools.code_analyzer_tools import build_code_analyzer_tools
+                    ca_tools = build_code_analyzer_tools(
+                        repos=code_analyzer_config.get("repos"),
+                    )
+                    tools.extend(ca_tools)
+                    logger_instance.info(
+                        "ReactStrategy: added %d Code Analyzer tools to agent",
+                        len(ca_tools),
+                        extra={"execution_id": execution_id},
+                    )
+                except Exception as _ca_err:
+                    logger_instance.warning(
+                        "ReactStrategy: failed to build Code Analyzer tools (non-fatal): %s",
+                        redact(str(_ca_err)),
+                        extra={"execution_id": execution_id},
+                    )
+
+            # ------------------------------------------------------------------
             # Cross-node data: inject upstream CloudWatch results into context.
             # ------------------------------------------------------------------
             cw_context = context.get("cloudwatch_context")
@@ -327,6 +368,33 @@ class ReactStrategy(BaseStrategy):
                     extra={"execution_id": execution_id},
                 )
 
+            # ------------------------------------------------------------------
+            # Cross-node data: inject upstream Code Analyzer results into context.
+            # ------------------------------------------------------------------
+            code_analyzer_context = context.get("code_analyzer_context")
+            if code_analyzer_context:
+                import json as _json
+                ca_summary = _json.dumps(code_analyzer_context, indent=2, default=str)
+                augmented_query = (
+                    f"[Pre-computed Code Analysis]\n{ca_summary}"
+                    f"\n\n---\n\n{augmented_query}"
+                )
+                logger_instance.info(
+                    "ReactStrategy: injected Code Analyzer context (%d chars) into query",
+                    len(ca_summary),
+                    extra={"execution_id": execution_id},
+                )
+
+            # Anomaly-code correlation from visual_workflow_executor
+            anomaly_correlation = context.get("anomaly_code_correlation")
+            if anomaly_correlation:
+                import json as _json2
+                corr_text = _json2.dumps(anomaly_correlation, indent=2, default=str)
+                augmented_query = (
+                    f"[Anomaly-Code Correlation]\n{corr_text}"
+                    f"\n\n---\n\n{augmented_query}"
+                )
+
             llm = self._build_llm(llm_config)
 
             checkpointer = await self._make_checkpointer()
@@ -334,13 +402,109 @@ class ReactStrategy(BaseStrategy):
             agent = self._build_agent(
                 llm, tools, agent_config,
                 has_cloudwatch=bool(cloudwatch_config),
+                has_code_analyzer=bool(code_analyzer_config),
                 checkpointer=checkpointer,
             )
 
-            result = await self._execute_agent(
-                agent, augmented_query, logger_instance, execution_id,
-                stream_callback, thread_id=execution_id,
+            # ------------------------------------------------------------------
+            # Supervisor retry loop
+            # Each pass: run agent → supervisor evaluates → route accordingly.
+            # supervisor_enabled defaults True; set to False on the agent node
+            # to bypass entirely (e.g. for quick ad-hoc queries).
+            # ------------------------------------------------------------------
+            from app.core.supervisor import (
+                InvestigationSupervisor,
+                SupervisorConfig,
+                SupervisorAction,
             )
+            supervisor_enabled = agent_config.get("supervisor_enabled", True)
+            supervisor = InvestigationSupervisor(SupervisorConfig()) if supervisor_enabled else None
+            supervisor_retry_count = 0
+            current_query = augmented_query
+            result: Dict[str, Any] = {}
+
+            while True:
+                result = await self._execute_agent(
+                    agent, current_query, logger_instance, execution_id,
+                    stream_callback, thread_id=execution_id,
+                )
+
+                # Derive confidence from auto-learn heuristic for supervisor input.
+                _final_answer = result.get("final_answer") or ""
+                _confidence = 0.90 if _RESOLUTION_RE.search(_final_answer) else 0.55
+
+                if supervisor is None:
+                    # Supervisor disabled — always pass.
+                    break
+
+                verdict = supervisor.evaluate(
+                    final_answer = _final_answer,
+                    tool_calls   = result.get("tool_calls", []),
+                    confidence   = _confidence,
+                    retry_count  = supervisor_retry_count,
+                )
+
+                logger_instance.info(
+                    "ReactStrategy: supervisor verdict=%s score=%.2f reason=%s",
+                    verdict.action.value, verdict.score, verdict.reason,
+                    extra={"execution_id": execution_id},
+                )
+
+                if verdict.action == SupervisorAction.PASS:
+                    break
+
+                if verdict.action == SupervisorAction.RETRY:
+                    supervisor_retry_count += 1
+                    # Prepend corrective guidance so the agent knows what to fix.
+                    current_query = (
+                        f"{verdict.retry_guidance}\n\n"
+                        f"---\n\nOriginal query:\n{augmented_query}"
+                    )
+                    logger_instance.info(
+                        "ReactStrategy: supervisor RETRY %d — rebuilding agent",
+                        supervisor_retry_count,
+                        extra={"execution_id": execution_id},
+                    )
+                    # Rebuild agent with same config for a clean retry.
+                    agent = self._build_agent(
+                        llm, tools, agent_config,
+                        has_cloudwatch=bool(cloudwatch_config),
+                        has_code_analyzer=bool(code_analyzer_config),
+                        checkpointer=checkpointer,
+                    )
+                    continue
+
+                if verdict.action == SupervisorAction.HITL:
+                    logger_instance.info(
+                        "ReactStrategy: supervisor → HITL (score=%.2f)",
+                        verdict.score,
+                        extra={"execution_id": execution_id},
+                    )
+                    await self._emit_hitl_pause(
+                        execution_id,
+                        {
+                            "request_id":   str(uuid.uuid4()),
+                            "draft_answer": _final_answer,
+                            "message":      (
+                                f"Supervisor quality score {verdict.score:.2f} — "
+                                f"engineer review requested. {verdict.reason}"
+                            ),
+                        },
+                    )
+                    break
+
+                if verdict.action == SupervisorAction.ESCALATE:
+                    logger_instance.warning(
+                        "ReactStrategy: supervisor → ESCALATE (score=%.2f)",
+                        verdict.score,
+                        extra={"execution_id": execution_id},
+                    )
+                    result["supervisor_escalated"] = True
+                    result["supervisor_reason"]    = verdict.reason
+                    break
+
+                # Unexpected action — pass through.
+                break
 
             # ------------------------------------------------------------------
             # Post-execution learning: persist what the agent found.
@@ -362,14 +526,16 @@ class ReactStrategy(BaseStrategy):
             )
 
             return {
-                "type": "react",
-                "user_query": user_query,
+                "type":         "react",
+                "user_query":   user_query,
                 "final_answer": result.get("final_answer"),
-                "messages": result.get("messages", []),
+                "messages":     result.get("messages", []),
                 "message_count": len(result.get("messages", [])),
-                "tool_calls": result.get("tool_calls", []),
-                "model": llm_config.get("model", "unknown"),
-                "provider": llm_config.get("provider", "unknown"),
+                "tool_calls":   result.get("tool_calls", []),
+                "model":        llm_config.get("model", "unknown"),
+                "provider":     llm_config.get("provider", "unknown"),
+                "supervisor_escalated": result.get("supervisor_escalated", False),
+                "supervisor_reason":    result.get("supervisor_reason"),
             }
 
         except Exception as error:
@@ -383,6 +549,11 @@ class ReactStrategy(BaseStrategy):
                     await mcp_manager.disconnect_all()
                 except Exception:
                     pass
+
+            # ── exec_fallback — return partial result instead of crashing ──
+            fallback = self._exec_fallback(error, user_query, execution_id, logger_instance)
+            if fallback is not None:
+                return fallback
             raise
 
     # ------------------------------------------------------------------
@@ -400,15 +571,22 @@ class ReactStrategy(BaseStrategy):
     ) -> None:
         """Persist what this execution found to the knowledge base.
 
-        Called after every successful agent run.  Any failure here is caught
-        and logged as a warning — it must never propagate to the caller.
+        Phase 1 — record_analysis (lightweight, always runs).
+        Phase 2 — AutoLearnService.learn() (closed learning loop):
+            • auto-approve gate (confidence threshold)
+            • KB upsert + pattern bump
+            • trajectory JSONL
+            • skill distillation via LLM when enough tool calls exist
+
+        Any failure in either phase is caught and logged as a warning —
+        it must never propagate to the caller.
         """
+        final_answer = result.get("final_answer") or ""
+        execution_end = datetime.now(timezone.utc)
+
+        # ── Phase 1: lightweight record_analysis ─────────────────────────
         try:
             from app.services.knowledge_base import knowledge_base as _kb
-
-            final_answer = result.get("final_answer") or ""
-            execution_end = datetime.now(timezone.utc)
-
             await _kb.record_analysis(
                 log_group=str(execution_id or "unknown"),
                 analysis_type="react_agent",
@@ -418,21 +596,63 @@ class ReactStrategy(BaseStrategy):
                 anomalies_found=0,
                 patterns_matched=recall_hits,
             )
+        except Exception as _rec_err:
+            logger_instance.warning(
+                "ReactStrategy: record_analysis failed (non-fatal): %s",
+                redact(str(_rec_err)),
+                extra={"execution_id": execution_id},
+            )
 
-            if final_answer and _RESOLUTION_RE.search(final_answer):
-                await _kb.add_known_issue(
-                    title=user_query[:120],
-                    description=final_answer[:1000],
-                    symptoms=[user_query],
-                    solution=final_answer[:2000],
-                    category="agent_discovered",
-                    source="agent",
-                )
-                logger_instance.info(
-                    "ReactStrategy: resolution detected — seeded KnownIssueModel",
-                    extra={"execution_id": execution_id},
-                )
+        # ── Phase 2: closed learning loop (AutoLearnService) ─────────────
+        try:
+            from app.core.auto_learn import AutoLearnService, AutoLearnConfig
 
+            _config = AutoLearnConfig()
+            _svc = AutoLearnService(_config)
+
+            # Derive a rough confidence score: high when a resolution keyword
+            # was found, moderate otherwise.  The AutoLearnService gate uses
+            # this to decide whether to auto-approve.
+            _has_resolution = bool(final_answer and _RESOLUTION_RE.search(final_answer))
+            _confidence = 0.90 if _has_resolution else 0.55
+
+            # Build the state dict AutoLearnService expects.
+            _learn_state = {
+                "execution_id": execution_id,
+                "user_query": user_query,
+                "final_answer": final_answer,
+                "tool_calls": result.get("tool_calls", []),
+                "confidence_score": _confidence,
+                "recall_hits": recall_hits,
+                "execution_start": execution_start.isoformat(),
+                "execution_end": execution_end.isoformat(),
+            }
+
+            _learn_result = await _svc.learn(
+                execution_id=str(execution_id or "unknown"),
+                state=_learn_state,
+            )
+
+            logger_instance.info(
+                "ReactStrategy: AutoLearnService completed — "
+                "kb=%s pattern=%s trajectory=%s skill=%s skipped=%s",
+                _learn_result.kb_upserted,
+                _learn_result.pattern_bumped,
+                _learn_result.trajectory_saved,
+                _learn_result.skill_distilled,
+                _learn_result.skipped_reason or "none",
+                extra={"execution_id": execution_id},
+            )
+
+        except Exception as _learn_err:
+            logger_instance.warning(
+                "ReactStrategy: AutoLearnService.learn failed (non-fatal): %s",
+                redact(str(_learn_err)),
+                extra={"execution_id": execution_id},
+            )
+
+        # ── Phase 3: log failed tools (diagnostic only) ──────────────────
+        try:
             failed_tools = _collect_failed_tools(result)
             if failed_tools:
                 logger_instance.debug(
@@ -440,13 +660,73 @@ class ReactStrategy(BaseStrategy):
                     failed_tools,
                     extra={"execution_id": execution_id},
                 )
+        except Exception:
+            pass
 
-        except Exception as _learn_err:
-            logger_instance.warning(
-                "ReactStrategy: _auto_learn failed (non-fatal): %s",
-                redact(str(_learn_err)),
-                extra={"execution_id": execution_id},
+    # ------------------------------------------------------------------
+    # Exec fallback — graceful degradation when all retries are exhausted
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _exec_fallback(
+        exc:             Exception,
+        user_query:      str,
+        execution_id:    Optional[str],
+        logger_instance: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a structured partial result when the agent fails unrecoverably.
+
+        Instead of propagating an exception to the caller, returns a well-formed
+        result dict that the UI can render as a degraded-mode response.
+
+        Returns ``None`` for exception types that should still propagate
+        (e.g. ``ValueError`` from bad config — those are programmer errors,
+        not runtime failures worth swallowing).
+        """
+        # Don't swallow configuration/validation errors — those should surface.
+        if isinstance(exc, (ValueError, TypeError, ImportError)):
+            return None
+
+        err_str = redact(str(exc))
+        logger_instance.warning(
+            "ReactStrategy: exec_fallback triggered — returning partial result. "
+            "error=%s execution_id=%s",
+            err_str, execution_id,
+        )
+
+        # Build a user-facing degraded answer.
+        if "timeout" in err_str.lower():
+            answer = (
+                "The investigation could not be completed within the time limit. "
+                "This may indicate the query requires too many tool calls or the "
+                "target services are slow to respond. Please try a more specific "
+                "query or retry during off-peak hours."
             )
+        elif "context" in err_str.lower() and "window" in err_str.lower():
+            answer = (
+                "The investigation accumulated more information than the model "
+                "context window can hold. Please narrow the query scope — for "
+                "example, target a specific service or shorter time window."
+            )
+        else:
+            answer = (
+                f"The investigation could not be completed due to an unexpected error. "
+                f"The on-call system recorded the failure for review. "
+                f"Error reference: {err_str[:200]}"
+            )
+
+        return {
+            "type":           "react",
+            "user_query":     user_query,
+            "final_answer":   answer,
+            "messages":       [],
+            "message_count":  0,
+            "tool_calls":     [],
+            "model":          "unknown",
+            "provider":       "unknown",
+            "fallback":       True,
+            "fallback_error": err_str,
+        }
 
     # ------------------------------------------------------------------
     # Validation
@@ -754,6 +1034,59 @@ class ReactStrategy(BaseStrategy):
             "aws_profile": merged_profile,
         }
 
+    def _extract_code_analyzer_config(
+        self, workflow: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Extract Code Analyzer config from codeAnalyzer nodes connected to the agent.
+
+        Merges repo lists from all connected ``codeAnalyzer`` nodes, deduplicating
+        by repo name.  First occurrence (BFS order) wins on name conflicts.
+
+        Returns:
+            Dict with ``repos`` list, or ``None`` if no codeAnalyzer node is connected.
+        """
+        nodes = workflow.get("nodes", [])
+        connected_ids = self._get_connected_node_ids(workflow, "codeAnalyzer")
+
+        if not connected_ids:
+            return None
+
+        ca_nodes = {n["id"]: n for n in nodes if n.get("type") == "codeAnalyzer"}
+
+        merged_repos: List[Dict[str, Any]] = []
+        seen_names: Dict[str, str] = {}  # name → first path (for conflict detection)
+
+        for ca_id in connected_ids:
+            if ca_id not in ca_nodes:
+                continue
+            ca_data = ca_nodes[ca_id].get("data", {})
+            for repo in ca_data.get("repos", []):
+                rname = repo.get("name", "")
+                rpath = repo.get("path", "")
+                if not rname:
+                    continue
+                if rname in seen_names:
+                    if seen_names[rname] != rpath:
+                        logger.warning(
+                            "ReactStrategy: duplicate repo name %r in codeAnalyzer nodes "
+                            "— first occurrence (path=%r) wins; ignoring path=%r",
+                            rname, seen_names[rname], rpath,
+                        )
+                    continue
+                seen_names[rname] = rpath
+                merged_repos.append(repo)
+
+        if not merged_repos:
+            return None
+
+        logger.info(
+            "ReactStrategy: %d codeAnalyzer node(s) connected to agent, repos=%s",
+            len(connected_ids),
+            [r.get("name") for r in merged_repos],
+        )
+
+        return {"repos": merged_repos}
+
     # ------------------------------------------------------------------
     # Tool setup (MCP → LangChain)
     # ------------------------------------------------------------------
@@ -1021,6 +1354,18 @@ class ReactStrategy(BaseStrategy):
             issue_id: int = PydanticField(description="The integer ID of the known issue to update.")
             new_solution: str = PydanticField(description="Replacement solution text.")
 
+        class ExecuteSkillInput(BaseModel):
+            skill_name: str = PydanticField(
+                description="Slug name of the skill to execute (as shown in the memory-context block)."
+            )
+            context: dict = PydanticField(
+                default_factory=dict,
+                description=(
+                    "Key-value pairs injected into the skill's args_template placeholders. "
+                    "For example: {\"log_group\": \"/aws/app\", \"threshold\": \"100\"}."
+                ),
+            )
+
         async def _save_playbook(title: str, symptoms: List[str], solution: str, category: str) -> str:
             try:
                 from app.services.knowledge_base import knowledge_base as _kb
@@ -1050,6 +1395,15 @@ class ReactStrategy(BaseStrategy):
             except Exception as exc:
                 return f"patch_playbook failed: {exc}"
 
+        async def _execute_skill(skill_name: str, context: dict) -> str:
+            """Run a named skill's steps against the live MCP tool set."""
+            try:
+                from app.core.skills import skill_service
+                exec_result = await skill_service.execute(skill_name, context=context)
+                return exec_result.to_agent_text()
+            except Exception as exc:
+                return f"execute_skill failed: {exc}"
+
         return [
             StructuredTool.from_function(
                 coroutine=_save_playbook,
@@ -1068,6 +1422,17 @@ class ReactStrategy(BaseStrategy):
                     "Use this when you have found a better resolution than what is already recorded."
                 ),
                 args_schema=PatchPlaybookInput,
+            ),
+            StructuredTool.from_function(
+                coroutine=_execute_skill,
+                name="execute_skill",
+                description=(
+                    "Execute a named, pre-built remediation skill by running its ordered steps "
+                    "against the live MCP tool set. Use this when the memory-context block "
+                    "shows a matching 'Executable Skill' and you want to apply it directly. "
+                    "Pass any required placeholder values in the 'context' dict."
+                ),
+                args_schema=ExecuteSkillInput,
             ),
         ]
 
@@ -1140,6 +1505,7 @@ class ReactStrategy(BaseStrategy):
         tools: List[Any],
         agent_config: Dict[str, Any],
         has_cloudwatch: bool = False,
+        has_code_analyzer: bool = False,
         checkpointer: Any = None,
     ) -> Any:
         """
@@ -1153,6 +1519,7 @@ class ReactStrategy(BaseStrategy):
             tools: List of LangChain BaseTool instances.
             agent_config: Agent node data with optional system prompt / instructions.
             has_cloudwatch: If True, add CloudWatch-specific instructions.
+            has_code_analyzer: If True, add code-analysis investigation instructions.
 
         Returns:
             Compiled LangGraph agent (CompiledGraph).
@@ -1171,6 +1538,9 @@ class ReactStrategy(BaseStrategy):
             "Present your findings clearly with specific data from the query results.",
             "When you resolve an issue or identify its root cause, use the save_playbook tool "
             "to record the resolution so future investigations can benefit from it.",
+            "If the memory-context block at the start of the query lists 'Executable Skill' entries "
+            "that match the current issue, prefer calling execute_skill with the skill's name before "
+            "running manual tool calls — this reuses proven remediation steps and is faster.",
         ]
 
         # CloudWatch-specific instructions when CW nodes are connected.
@@ -1186,6 +1556,42 @@ class ReactStrategy(BaseStrategy):
                 "- Use cloudwatch_watch_logs to retrieve raw log events for detailed inspection.\n"
                 "- Look for error spikes, unusual patterns, and cross-service correlations.\n"
                 "- If pre-computed CloudWatch analysis is provided, review it before making additional queries."
+            )
+
+        # Code Analyzer instructions when codeAnalyzer nodes are connected.
+        if has_code_analyzer:
+            system_parts.append(
+                "\nYou also have access to code analysis tools for investigating source repositories. "
+                "Use the following 5-tool investigation workflow:\n"
+                "  1. code_investigate     — primary entry for all investigations; "
+                "call this first to identify relevant functions and root-cause suspects.\n"
+                "  2. code_explain_flow    — when you need to understand how a specific "
+                "function or code path works in depth.\n"
+                "  3. code_analyze_change  — when the issue likely started after a recent "
+                "deploy or code change; traces diff + deployment timeline.\n"
+                "  4. code_get_runtime_evidence — when a stack trace or CloudWatch anomaly "
+                "is available; maps runtime frames directly to source functions with highest "
+                "confidence.\n"
+                "  5. code_finalize_incident — ALWAYS call this at investigation end to "
+                "record root cause, remediation steps, and persist findings for future use.\n\n"
+                "Investigation guidelines:\n"
+                "- Start with code_investigate for any code-related question.\n"
+                "- Use code_analyze_change when the error correlates with a deployment.\n"
+                "- Use code_get_runtime_evidence when a stack trace or CloudWatch anomaly is "
+                "available — it has the highest confidence.\n"
+                "- Always end every investigation with code_finalize_incident regardless of "
+                "outcome.\n"
+                "- Examine the 'evidence_grade' field in results: "
+                "speculative < inferred < correlated < runtime-confirmed < historically-confirmed. "
+                "Never conclude on 'speculative' alone — upgrade via code_get_runtime_evidence.\n"
+                "- If [Anomaly-Code Correlation] context is present, use the suggested "
+                "code_trace_flow call as your first code investigation step.\n"
+                "- The 'sub_tool_trace' in code_investigate responses shows individual "
+                "confidence scores — review them to identify weak evidence before concluding.\n"
+                "- remediation.grade is always 'suggestive' — present remediation steps as "
+                "options to consider, not guaranteed fixes.\n"
+                "- If [Pre-computed Code Analysis] context is present, review the pre-summary "
+                "before making additional tool calls."
             )
 
         if instructions:
@@ -1204,11 +1610,13 @@ class ReactStrategy(BaseStrategy):
         all_tools = list(tools) + playbook_tools
 
         logger.info(
-            "ReactStrategy: building LangGraph ReAct agent with %d tool(s) (%d playbook), mode=%s, cloudwatch=%s",
+            "ReactStrategy: building LangGraph ReAct agent with %d tool(s) (%d built-in), "
+            "mode=%s, cloudwatch=%s, code_analyzer=%s",
             len(all_tools),
             len(playbook_tools),
             agent_mode,
             has_cloudwatch,
+            has_code_analyzer,
         )
 
         hitl_enabled = agent_config.get("hitl_enabled", False)
@@ -1306,6 +1714,7 @@ class ReactStrategy(BaseStrategy):
               - tool_calls: list — summary of tools invoked
         """
         from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+        from app.core.telemetry import agent_span, get_current_trace_id
 
         logger_instance.info("ReactStrategy: invoking agent with query: %.100s", user_query)
 
@@ -1317,18 +1726,29 @@ class ReactStrategy(BaseStrategy):
             run_config = {"configurable": {"thread_id": thread_id}}
 
         try:
-            if stream_callback is not None:
-                result_state = await with_retry(
-                    self._execute_agent_stream,
-                    agent, input_state, stream_callback, logger_instance, execution_id,
-                    run_config,
-                    max_retries=3,
-                )
-            else:
-                result_state = await with_retry(
-                    self._invoke_agent, agent, input_state, run_config,
-                    max_retries=3,
-                )
+            async with agent_span("react_agent", execution_id=execution_id):
+                trace_id = get_current_trace_id()
+                if trace_id:
+                    # Store trace_id in the active execution for later persistence
+                    try:
+                        from app.services.visual_workflow_executor import visual_executor
+                        if execution_id and execution_id in visual_executor.active_executions:
+                            visual_executor.active_executions[execution_id]["trace_id"] = trace_id
+                    except Exception:
+                        pass
+
+                if stream_callback is not None:
+                    result_state = await with_retry(
+                        self._execute_agent_stream,
+                        agent, input_state, stream_callback, logger_instance, execution_id,
+                        run_config,
+                        max_retries=3,
+                    )
+                else:
+                    result_state = await with_retry(
+                        self._invoke_agent, agent, input_state, run_config,
+                        max_retries=3,
+                    )
         except Exception as exc:
             # Handle LangGraph HITL interrupt — surface to caller as a structured pause.
             try:
@@ -1354,14 +1774,36 @@ class ReactStrategy(BaseStrategy):
             except ImportError:
                 pass
 
-            # On context overflow, compact the input and retry once.
+            # On context overflow, use LLM-assisted compression then retry once.
             classified = classify_error(exc)
             if classified.should_compress:
                 logger_instance.warning(
-                    "ReactStrategy: context overflow detected — compacting and retrying",
+                    "ReactStrategy: context overflow detected — compressing and retrying",
                     extra={"execution_id": execution_id},
                 )
-                input_state = _compact_input_state(input_state)
+                from langchain_core.messages import BaseMessage as _BM
+                from app.core.context_compression import compress as _compress
+
+                existing_msgs = input_state.get("messages", [])
+                if isinstance(existing_msgs, list) and all(isinstance(m, _BM) for m in existing_msgs):
+                    # Attempt LLM-assisted compression; fall back to hard truncation if llm=None
+                    try:
+                        compressed = await _compress(existing_msgs, llm=None)
+                        input_state = {"messages": compressed}
+                        logger_instance.info(
+                            "ReactStrategy: compressed %d → %d messages via context_compression",
+                            len(existing_msgs), len(compressed),
+                            extra={"execution_id": execution_id},
+                        )
+                    except Exception as _ce:
+                        logger_instance.warning(
+                            "ReactStrategy: context_compression failed (%s), falling back to _compact",
+                            _ce,
+                        )
+                        input_state = _compact_input_state(input_state)
+                else:
+                    input_state = _compact_input_state(input_state)
+
                 if stream_callback is not None:
                     result_state = await self._execute_agent_stream(
                         agent, input_state, stream_callback, logger_instance, execution_id,
@@ -1451,9 +1893,21 @@ class ReactStrategy(BaseStrategy):
         run_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Streaming invocation using ``agent.astream_events()`` (v2)."""
+        from app.core.tool_guardrails import (
+            ToolCallGuardrailController,
+            toolguard_synthetic_result,
+            append_toolguard_guidance,
+        )
+
         current_tool_name: str = ""
+        current_tool_args: Dict[str, Any] = {}
         accumulated_state: Dict[str, Any] = {"messages": []}
         msg_map: Dict[str, Any] = {}
+
+        # ── Guardrail controller — one per streaming invocation (= one turn) ─
+        # Side-effect-free controller whose decisions (warn / block / halt)
+        # are acted on by this runtime code.
+        guardrail = ToolCallGuardrailController()
 
         try:
             async for event in agent.astream_events(input_state, config=run_config or {}, version="v2"):
@@ -1496,18 +1950,94 @@ class ReactStrategy(BaseStrategy):
                 elif kind == "on_tool_start":
                     tool_input = data.get("input", {})
                     tool_name = name or current_tool_name
+                    current_tool_name = tool_name
+                    current_tool_args = tool_input if isinstance(tool_input, dict) else {}
+
+                    # ── Guardrail pre-check ───────────────────────────────
+                    # before_call() is side-effect-free: it only reads state and
+                    # returns a decision.  We honour warn/block/halt by logging;
+                    # full blocking requires tool-wrapper interception which is
+                    # done at the MCPToolWrapper layer when guardrail is wired in.
+                    _gc_pre = guardrail.before_call(tool_name, current_tool_args)
+                    if _gc_pre.should_halt:
+                        logger_instance.warning(
+                            "ReactStrategy: guardrail HALT before tool '%s' — %s",
+                            tool_name, _gc_pre.message,
+                            extra={"execution_id": execution_id},
+                        )
+                        try:
+                            await stream_callback.on_error(
+                                f"[Guardrail HALT] {_gc_pre.message}"
+                            )
+                        except Exception:
+                            pass
+                    elif not _gc_pre.allows_execution:
+                        logger_instance.warning(
+                            "ReactStrategy: guardrail BLOCK for tool '%s' (count=%d) — %s",
+                            tool_name, _gc_pre.count, _gc_pre.message,
+                            extra={"execution_id": execution_id},
+                        )
+                    elif _gc_pre.action == "warn":
+                        logger_instance.info(
+                            "ReactStrategy: guardrail WARN for tool '%s' (count=%d) — %s",
+                            tool_name, _gc_pre.count, _gc_pre.message,
+                            extra={"execution_id": execution_id},
+                        )
+
                     try:
-                        await stream_callback.on_tool_call(tool_name, tool_input if isinstance(tool_input, dict) else {})
+                        await stream_callback.on_tool_call(tool_name, current_tool_args)
                     except Exception:
                         pass
 
                 elif kind == "on_tool_end":
                     tool_output = data.get("output", "")
                     tool_name = name or current_tool_name
+                    output_str = str(tool_output)
+
+                    # ── Guardrail post-check ──────────────────────────────
+                    from app.core.tool_guardrails import classify_tool_failure
+                    _is_failed, _fail_reason = classify_tool_failure(tool_name, output_str)
+                    _gc_post = guardrail.after_call(
+                        tool_name, current_tool_args, output_str, failed=_is_failed,
+                    )
+                    if _gc_post.action in ("warn", "block", "halt"):
+                        output_str = append_toolguard_guidance(output_str, _gc_post)
+                        logger_instance.warning(
+                            "ReactStrategy: guardrail %s after tool '%s' (count=%d) — %s",
+                            _gc_post.action.upper(), tool_name, _gc_post.count, _gc_post.message,
+                            extra={"execution_id": execution_id},
+                        )
+
                     try:
-                        await stream_callback.on_tool_result(tool_name, str(tool_output)[:2000])
+                        await stream_callback.on_tool_result(tool_name, output_str[:2000])
                     except Exception:
                         pass
+
+                    # ── /steer injection ──────────────────────────────────
+                    # Drain any engineer notes queued via POST /steer.
+                    # Injected as HumanMessages so the LLM sees them before
+                    # its next reasoning step (at tool boundary, as specified).
+                    if execution_id:
+                        try:
+                            from app.services.visual_workflow_executor import visual_executor
+                            from langchain_core.messages import HumanMessage as _HM
+                            steer_notes: list = (
+                                visual_executor.active_executions
+                                .get(execution_id, {})
+                                .get("steer_notes", [])
+                            )
+                            while steer_notes:
+                                note = steer_notes.pop(0)
+                                steer_msg = _HM(content=f"[Engineer Note] {note}")
+                                accumulated_state["messages"] = (
+                                    accumulated_state.get("messages", []) + [steer_msg]
+                                )
+                                logger_instance.info(
+                                    "ReactStrategy: injected steer note at tool boundary "
+                                    "(execution_id=%s)", execution_id,
+                                )
+                        except Exception:
+                            pass
 
                 elif kind == "on_chain_error":
                     err_str = str(data.get("error", ""))

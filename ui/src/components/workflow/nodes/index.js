@@ -13,6 +13,7 @@ const MemoryNode = (props) => React.createElement(NodeGenerator, { ...props, typ
 const ChatNode = (props) => React.createElement(NodeGenerator, { ...props, type: "chat" });
 const SchedulerNode = (props) => React.createElement(NodeGenerator, { ...props, type: "scheduler" });
 const CloudWatchAnalyzerNode = (props) => React.createElement(NodeGenerator, { ...props, type: "cloudwatchAnalyzer" });
+const CodeAnalyzerNode = (props) => React.createElement(NodeGenerator, { ...props, type: "codeAnalyzer" });
 
 export const nodeTypes = {
   agent: AgentNode,
@@ -26,6 +27,7 @@ export const nodeTypes = {
   orchestrator: OrchestratorNode,
   scheduler: SchedulerNode,
   cloudwatchAnalyzer: CloudWatchAnalyzerNode,
+  codeAnalyzer: CodeAnalyzerNode,
 };
 
-export { AgentNode, LLMNode, DatabaseNode, TeamsNode, ToolNode, MemoryNode, ChatNode, OutputNode, OrchestratorNode, SchedulerNode, CloudWatchAnalyzerNode };
+export { AgentNode, LLMNode, DatabaseNode, TeamsNode, ToolNode, MemoryNode, ChatNode, OutputNode, OrchestratorNode, SchedulerNode, CloudWatchAnalyzerNode, CodeAnalyzerNode };

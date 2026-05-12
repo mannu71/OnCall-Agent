@@ -33,6 +33,17 @@ class HITLApproveResponse(BaseModel):
     message: str
 
 
+class SteerRequest(BaseModel):
+    note: str
+    """Engineer note to inject into the running agent at the next tool boundary."""
+
+
+class SteerResponse(BaseModel):
+    execution_id: str
+    queued: bool
+    message: str
+
+
 def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
     """Extract the main workflow output from execution results."""
     results = execution.get('results') or {}
@@ -332,4 +343,61 @@ async def approve_hitl_request(
         message="Decision recorded — execution will resume shortly."
         if body.approved
         else "Execution rejected — workflow will be stopped.",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /steer — mid-run engineer note injection
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/{execution_id}/steer", response_model=SteerResponse)
+async def steer_execution(
+    execution_id: str,
+    body: SteerRequest = Body(...),
+):
+    """Inject an engineer note into a running execution at the next tool boundary.
+
+    Unlike the approve endpoint (which resumes a *paused* execution), steer
+    queues a note for a **running** execution.  The ReAct agent picks it up
+    as a HumanMessage at the next tool boundary without stopping or restarting
+    the investigation.
+
+    This is the in-context correction channel for running investigations.
+    """
+    from app.services.visual_workflow_executor import visual_executor
+
+    exec_data = visual_executor.get_execution_status(execution_id)
+    if exec_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active execution '{execution_id}' found",
+        )
+
+    if exec_data.get("status") != "running":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Execution '{execution_id}' is not currently running (status={exec_data.get('status')})",
+        )
+
+    # Append to the steer_notes list — consumed by ReactStrategy._execute_agent_stream
+    steer_notes: list = exec_data.setdefault("steer_notes", [])
+    steer_notes.append(body.note)
+
+    # Notify the frontend via SSE so the operator sees the note was registered.
+    await visual_executor._publish_event(
+        execution_id,
+        "steer_queued",
+        {"note": body.note[:500], "queue_depth": len(steer_notes)},
+    )
+
+    logger.info(
+        "Steer note queued for execution %s (queue_depth=%d)",
+        execution_id,
+        len(steer_notes),
+    )
+
+    return SteerResponse(
+        execution_id=execution_id,
+        queued=True,
+        message=f"Note queued — will be injected at the next tool boundary (queue depth: {len(steer_notes)}).",
     )

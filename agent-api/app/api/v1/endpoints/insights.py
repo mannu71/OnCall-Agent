@@ -25,7 +25,7 @@ from app.models.db_models import (
     AnalysisHistoryModel,
     BaselineMetricModel,
     ExecutionModel,
-    KnownIssueModel,
+    KnowledgeEntryModel,
     LogPatternModel,
 )
 
@@ -106,8 +106,8 @@ async def get_kb_insights(
     async with AsyncSessionLocal() as session:
         # Issue counts by source.
         source_counts_result = await session.execute(
-            select(KnownIssueModel.source, func.count(KnownIssueModel.id))
-            .group_by(KnownIssueModel.source)
+            select(KnowledgeEntryModel.source, func.count(KnowledgeEntryModel.id))
+            .group_by(KnowledgeEntryModel.source)
         )
         issue_by_source = {row[0] or "manual": row[1] for row in source_counts_result}
 
@@ -119,9 +119,9 @@ async def get_kb_insights(
 
         # Category breakdown.
         category_result = await session.execute(
-            select(KnownIssueModel.category, func.count(KnownIssueModel.id))
-            .group_by(KnownIssueModel.category)
-            .order_by(func.count(KnownIssueModel.id).desc())
+            select(KnowledgeEntryModel.category, func.count(KnowledgeEntryModel.id))
+            .group_by(KnowledgeEntryModel.category)
+            .order_by(func.count(KnowledgeEntryModel.id).desc())
             .limit(10)
         )
         top_categories = [
@@ -131,12 +131,12 @@ async def get_kb_insights(
 
         # Recent agent-written entries.
         recent_agent_result = await session.execute(
-            select(KnownIssueModel)
+            select(KnowledgeEntryModel)
             .where(
-                KnownIssueModel.source == "agent",
-                KnownIssueModel.created_at >= since,
+                KnowledgeEntryModel.source == "agent",
+                KnowledgeEntryModel.created_at >= since,
             )
-            .order_by(KnownIssueModel.created_at.desc())
+            .order_by(KnowledgeEntryModel.created_at.desc())
             .limit(limit)
         )
         recent_agent = [
@@ -255,7 +255,7 @@ async def _anomaly_trends(
 
 
 async def _resolution_rate(session: Any, since: datetime) -> Dict[str, Any]:
-    """Percentage of agent executions that produced an agent-written KnownIssueModel."""
+    """Percentage of agent executions that produced an agent-written knowledge entry."""
     total_result = await session.execute(
         select(func.count(ExecutionModel.id)).where(
             ExecutionModel.started_at >= since,
@@ -265,9 +265,9 @@ async def _resolution_rate(session: Any, since: datetime) -> Dict[str, Any]:
     total_executions = total_result.scalar() or 0
 
     agent_entries_result = await session.execute(
-        select(func.count(KnownIssueModel.id)).where(
-            KnownIssueModel.source == "agent",
-            KnownIssueModel.created_at >= since,
+        select(func.count(KnowledgeEntryModel.id)).where(
+            KnowledgeEntryModel.source == "agent",
+            KnowledgeEntryModel.created_at >= since,
         )
     )
     agent_entries = agent_entries_result.scalar() or 0
@@ -286,16 +286,16 @@ async def _kb_growth(session: Any, since: datetime) -> Dict[str, Any]:
     # Weekly new issues by source.
     weekly_result = await session.execute(
         select(
-            KnownIssueModel.source,
-            func.date_trunc("week", KnownIssueModel.created_at).label("week"),
-            func.count(KnownIssueModel.id).label("count"),
+            KnowledgeEntryModel.source,
+            func.date_trunc("week", KnowledgeEntryModel.created_at).label("week"),
+            func.count(KnowledgeEntryModel.id).label("count"),
         )
-        .where(KnownIssueModel.created_at >= since)
+        .where(KnowledgeEntryModel.created_at >= since)
         .group_by(
-            KnownIssueModel.source,
-            func.date_trunc("week", KnownIssueModel.created_at),
+            KnowledgeEntryModel.source,
+            func.date_trunc("week", KnowledgeEntryModel.created_at),
         )
-        .order_by(func.date_trunc("week", KnownIssueModel.created_at).desc())
+        .order_by(func.date_trunc("week", KnowledgeEntryModel.created_at).desc())
     )
     weekly = [
         {
@@ -308,8 +308,8 @@ async def _kb_growth(session: Any, since: datetime) -> Dict[str, Any]:
 
     # Total counts by source (all time).
     totals_result = await session.execute(
-        select(KnownIssueModel.source, func.count(KnownIssueModel.id))
-        .group_by(KnownIssueModel.source)
+        select(KnowledgeEntryModel.source, func.count(KnowledgeEntryModel.id))
+        .group_by(KnowledgeEntryModel.source)
     )
     totals = {row[0] or "manual": row[1] for row in totals_result}
 

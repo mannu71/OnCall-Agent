@@ -15,7 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from app.core.database import AsyncSessionLocal
 from app.models.db_models import (
     LogPatternModel,
-    KnownIssueModel,
+    KnowledgeEntryModel,
     BaselineMetricModel,
     AnalysisHistoryModel
 )
@@ -238,9 +238,9 @@ class KnowledgeBaseService:
             ]
     
     # ============================================
-    # KNOWN ISSUE OPERATIONS
+    # KNOWLEDGE ENTRY OPERATIONS
     # ============================================
-    
+
     async def add_known_issue(
         self,
         title: str,
@@ -268,7 +268,7 @@ class KnowledgeBaseService:
         embedding = await self.embedding_service.generate_embedding(combined_text)
         
         async with AsyncSessionLocal() as session:
-            issue_model = KnownIssueModel(
+            issue_model = KnowledgeEntryModel(
                 title=title,
                 description=description,
                 symptoms=symptoms,
@@ -317,9 +317,9 @@ class KnowledgeBaseService:
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(KnownIssueModel).where(
-                    KnownIssueModel.title == title,
-                    KnownIssueModel.category == category,
+                select(KnowledgeEntryModel).where(
+                    KnowledgeEntryModel.title == title,
+                    KnowledgeEntryModel.category == category,
                 )
             )
             existing = result.scalar_one_or_none()
@@ -340,7 +340,7 @@ class KnowledgeBaseService:
                     "action": "updated",
                 }
             else:
-                issue_model = KnownIssueModel(
+                issue_model = KnowledgeEntryModel(
                     title=title,
                     description=solution[:500],
                     symptoms=symptoms,
@@ -370,7 +370,7 @@ class KnowledgeBaseService:
         """Update the solution field of an existing known issue.
 
         Args:
-            issue_id: Primary key of the KnownIssueModel to update.
+            issue_id: Primary key of the KnowledgeEntryModel to update.
             new_solution: Replacement solution text.
             source: Provenance of the update.
 
@@ -379,12 +379,12 @@ class KnowledgeBaseService:
         """
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(KnownIssueModel).where(KnownIssueModel.id == issue_id)
+                select(KnowledgeEntryModel).where(KnowledgeEntryModel.id == issue_id)
             )
             existing = result.scalar_one_or_none()
 
             if not existing:
-                return {"error": f"KnownIssue id={issue_id} not found"}
+                return {"error": f"KnowledgeEntry id={issue_id} not found"}
 
             existing.solution = new_solution
             existing.source = source
@@ -441,7 +441,7 @@ class KnowledgeBaseService:
             query_str = f"""
                 SELECT id, title, description, symptoms, solution, category,
                        1 - (embedding <=> :embedding::vector) as similarity
-                FROM known_issues
+                FROM knowledge_entries
                 WHERE 1 - (embedding <=> :embedding::vector) > :threshold
                 {category_filter}
                 ORDER BY similarity DESC
@@ -464,6 +464,27 @@ class KnowledgeBaseService:
             
             return issues
     
+    # ============================================
+    # SKILL RECALL (convenience wrapper)
+    # ============================================
+
+    async def recall_skills_for_agent(
+        self,
+        query: str,
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Return matching skills for injection into the agent prompt.
+
+        Delegates to :class:`~app.core.skills.SkillService`.  Returns an
+        empty list (never raises) so callers don't need to guard.
+        """
+        try:
+            from app.core.skills import skill_service
+            return await skill_service.recall(query, limit=limit)
+        except Exception as exc:
+            logger.debug("knowledge_base.recall_skills_for_agent: %s", exc)
+            return []
+
     # ============================================
     # BASELINE METRIC OPERATIONS
     # ============================================

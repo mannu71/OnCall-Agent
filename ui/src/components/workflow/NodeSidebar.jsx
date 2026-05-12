@@ -157,6 +157,20 @@ const NodeSidebar = () => {
             enableAlerts: false,
             status: 'Ready'
           }
+        },
+        {
+          type: 'codeAnalyzer',
+          icon: '🔍',
+          title: 'Code Analyzer',
+          description: 'Search and analyze multiple code repositories',
+          data: {
+            label: 'Code Analyzer',
+            repos: [],
+            autoIndex: true,
+            staleAfterHours: 24,
+            preSummary: false,
+            status: 'Ready'
+          }
         }
       ]
     },

@@ -628,6 +628,11 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
           </>
         );
 
+      case 'codeAnalyzer':
+        return (
+          <CodeAnalyzerConfig config={config} handleConfigChange={handleConfigChange} />
+        );
+
       default:
         return <div>No configuration available for this node type.</div>;
     }
@@ -660,6 +665,215 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
       </div>
     </div>
   );
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Code Analyzer config sub-component
+// ─────────────────────────────────────────────────────────────────────────────
+
+function validateRepoPath(path) {
+  if (!path) return 'Path is required';
+  if (!path.startsWith('/') && !/^[A-Za-z]:[/\\]/.test(path))
+    return 'Must be an absolute path (starts with / or C:\\)';
+  if (path.includes('..'))
+    return 'Path must not contain ".." traversal segments';
+  return null;
+}
+
+function validateRepoName(name) {
+  if (!name) return 'Name is required';
+  if (!/^[a-z0-9][a-z0-9\-_]*$/.test(name))
+    return 'Name must be lowercase alphanumeric with hyphens/underscores';
+  return null;
+}
+
+function CodeAnalyzerConfig({ config, handleConfigChange }) {
+  const repos = config.repos || [];
+  const [fieldErrors, setFieldErrors] = useState({});
+
+  const updateRepo = (index, field, value) => {
+    const updated = repos.map((r, i) => (i === index ? { ...r, [field]: value } : r));
+    handleConfigChange('repos', updated);
+  };
+
+  const addRepo = () => {
+    handleConfigChange('repos', [
+      ...repos,
+      { name: '', path: '', language: 'python' },
+    ]);
+  };
+
+  const removeRepo = (index) => {
+    handleConfigChange('repos', repos.filter((_, i) => i !== index));
+  };
+
+  const handleBlur = (key, value) => {
+    const err = key === 'path' ? validateRepoPath(value) : validateRepoName(value);
+    setFieldErrors((prev) => ({ ...prev, [key]: err }));
+  };
+
+  const hasPathWarning = repos.some((r) => validateRepoPath(r.path));
+
+  return (
+    <>
+      <div className="config-field">
+        <label htmlFor="ca-label">Label</label>
+        <input
+          id="ca-label"
+          type="text"
+          value={config.label || ''}
+          onChange={(e) => handleConfigChange('label', e.target.value)}
+          placeholder="Code Analyzer"
+        />
+      </div>
+
+      <div className="config-field">
+        <label>
+          Repositories
+          {hasPathWarning && (
+            <span style={{ marginLeft: 8, color: '#f57c00', fontSize: 11 }}>
+              ⚠ one or more repos have path issues
+            </span>
+          )}
+        </label>
+        {repos.map((repo, idx) => (
+          <div
+            key={idx}
+            style={{
+              border: '1px solid #e0e0e0',
+              borderRadius: 6,
+              padding: '10px 12px',
+              marginBottom: 8,
+              background: '#fafafa',
+            }}
+          >
+            <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
+              <div style={{ flex: 1 }}>
+                <input
+                  type="text"
+                  value={repo.name || ''}
+                  onChange={(e) => updateRepo(idx, 'name', e.target.value)}
+                  onBlur={(e) => handleBlur(`name-${idx}`, e.target.value)}
+                  placeholder="repo-name (lowercase)"
+                  style={{ width: '100%', fontSize: 12 }}
+                />
+                {fieldErrors[`name-${idx}`] && (
+                  <span style={{ color: '#d32f2f', fontSize: 10 }}>
+                    {fieldErrors[`name-${idx}`]}
+                  </span>
+                )}
+              </div>
+              <select
+                value={repo.language || 'python'}
+                onChange={(e) => updateRepo(idx, 'language', e.target.value)}
+                style={{ fontSize: 12, minWidth: 100 }}
+              >
+                <option value="python">Python</option>
+                <option value="typescript">TypeScript</option>
+                <option value="mixed">Mixed</option>
+              </select>
+              <button
+                type="button"
+                onClick={() => removeRepo(idx)}
+                style={{
+                  background: '#ffebee',
+                  border: '1px solid #ef9a9a',
+                  borderRadius: 4,
+                  cursor: 'pointer',
+                  color: '#c62828',
+                  padding: '2px 8px',
+                  fontSize: 12,
+                }}
+              >
+                ✕
+              </button>
+            </div>
+            <div>
+              <input
+                type="text"
+                value={repo.path || ''}
+                onChange={(e) => updateRepo(idx, 'path', e.target.value)}
+                onBlur={(e) => handleBlur(`path-${idx}`, e.target.value)}
+                placeholder="/absolute/path/to/repo (as seen by server)"
+                style={{ width: '100%', fontSize: 12 }}
+              />
+              {fieldErrors[`path-${idx}`] && (
+                <span style={{ color: '#d32f2f', fontSize: 10 }}>
+                  {fieldErrors[`path-${idx}`]}
+                </span>
+              )}
+            </div>
+          </div>
+        ))}
+        <button
+          type="button"
+          onClick={addRepo}
+          style={{
+            background: '#e8f5e9',
+            border: '1px solid #a5d6a7',
+            borderRadius: 4,
+            cursor: 'pointer',
+            color: '#2e7d32',
+            padding: '6px 12px',
+            fontSize: 12,
+            width: '100%',
+          }}
+        >
+          + Add Repository
+        </button>
+        <small style={{ color: '#666', fontSize: 11 }}>
+          Use the path as seen by the server (container path if running in Docker).
+        </small>
+      </div>
+
+      <div className="config-field checkbox-field">
+        <label className="checkbox-label">
+          <input
+            type="checkbox"
+            checked={config.autoIndex !== false}
+            onChange={(e) => handleConfigChange('autoIndex', e.target.checked)}
+          />
+          <span>Auto-Index (index on first use and when stale)</span>
+        </label>
+      </div>
+
+      {config.autoIndex !== false && (
+        <div className="config-field">
+          <label htmlFor="ca-stale-hours">Re-index after (hours)</label>
+          <input
+            id="ca-stale-hours"
+            type="number"
+            value={config.staleAfterHours || 24}
+            onChange={(e) =>
+              handleConfigChange('staleAfterHours', parseInt(e.target.value, 10))
+            }
+            min={1}
+            style={{ width: 80 }}
+          />
+        </div>
+      )}
+
+      <div className="config-field checkbox-field">
+        <label className="checkbox-label">
+          <input
+            type="checkbox"
+            checked={config.preSummary || false}
+            onChange={(e) => handleConfigChange('preSummary', e.target.checked)}
+          />
+          <span>Pre-Execution Summary</span>
+        </label>
+        <small style={{ color: '#666', fontSize: 11 }}>
+          Runs a broad code search before the agent starts and injects a summary
+          (minimal tokens).
+        </small>
+      </div>
+    </>
+  );
+}
+
+CodeAnalyzerConfig.propTypes = {
+  config: PropTypes.object.isRequired,
+  handleConfigChange: PropTypes.func.isRequired,
 };
 
 NodeConfigPanel.propTypes = {

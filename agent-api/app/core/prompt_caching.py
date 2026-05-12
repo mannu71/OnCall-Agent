@@ -1,145 +1,292 @@
 """Anthropic prompt caching layer.
 
-Applies cache_control breakpoints to system prompts and large user messages
-to take advantage of Anthropic's prompt cache (up to 90 % cost reduction
-on cached tokens, 5-minute TTL per cache entry).
+"system_and_3" strategy — up to 4 cache breakpoints per request.
+
+Anthropic allows up to 4 cache breakpoints per request.  The strategy is:
+  1. System message (1 breakpoint) — stable, rarely changes between turns.
+  2. Last 3 non-system messages (3 breakpoints) — capture the stable reasoning
+     prefix that persists across the most recent tool-call round-trips.
+
+Total: 4 breakpoints, matching Anthropic's per-request limit.
+
+Cache TTL options:
+  - ``"5m"``  → ``{"type": "ephemeral"}``         (5-minute default, always supported)
+  - ``"1h"``  → ``{"type": "ephemeral", "ttl": 3600}`` (1-hour, newer API opt-in)
 
 Reference: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
 
-Usage:
-    from app.core.prompt_caching import apply_cache_control, strip_cache_control
+Usage::
 
-    # Before sending to Anthropic:
-    messages, system = apply_cache_control(messages, system=system_prompt)
+    from app.core.prompt_caching import apply_anthropic_cache_control, strip_cache_control
+
+    # Before sending to Anthropic (pass LangChain BaseMessage list):
+    cached_messages = apply_anthropic_cache_control(messages, cache_ttl="5m")
 
     # Before sending to any other provider:
-    messages = strip_cache_control(messages)
-
-This module is intentionally provider-agnostic in its interface: callers
-check the provider name themselves and route through the right helper.
+    clean_messages = strip_cache_control(messages)
 """
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, List, Literal
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 logger = logging.getLogger(__name__)
 
-# Anthropic requires ≥ 1024 tokens for caching to engage.
-# We estimate with a conservative chars-per-token ratio.
+# Anthropic requires ≥ 1024 tokens before caching engages.
 _MIN_CACHE_CHARS = 1024 * 4   # ≈ 1024 tokens at 4 chars/token
 _CHARS_PER_TOKEN = 4
+
+# Maximum breakpoints Anthropic permits per request
+_MAX_BREAKPOINTS = 4
+
+CacheTTL = Literal["5m", "1h"]
 
 
 def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // _CHARS_PER_TOKEN)
 
 
-def apply_cache_control(
-    messages: list[dict[str, Any]],
-    system: str | None = None,
-) -> tuple[list[dict[str, Any]], Any]:
-    """Apply Anthropic cache_control breakpoints to *messages* and *system*.
+def _make_cache_control(cache_ttl: CacheTTL = "5m") -> dict[str, Any]:
+    """Build the cache_control dict for the given TTL.
 
-    Modifies *messages* in place (safe to call repeatedly — idempotent for
-    already-annotated messages).
+    Anthropic's 5-minute TTL uses ``{"type": "ephemeral"}``.
+    The 1-hour TTL adds a ``"ttl"`` key when supported by the API version.
+    """
+    if cache_ttl == "1h":
+        return {"type": "ephemeral", "ttl": 3600}
+    return {"type": "ephemeral"}
 
-    Cache breakpoints are placed on:
-    1. The system prompt when it is long enough to meet Anthropic's minimum.
-    2. The most recent user message with substantial content (captures the
-       stable tool-schema / knowledge-base prefix that rarely changes).
+
+def _content_text(msg: BaseMessage) -> str:
+    """Extract plain text from a message (handles str and list-of-blocks)."""
+    content = msg.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(block.get("text", ""))
+            else:
+                parts.append(str(block))
+        return " ".join(parts)
+    return str(content)
+
+
+def _mark_last_block(msg: BaseMessage, cache_ttl: CacheTTL) -> BaseMessage:
+    """Return a copy of *msg* with cache_control on its last content block.
+
+    The breakpoint is placed on the *last* block of each selected message
+    so the cache boundary falls at the end of that message.
+    """
+    content = msg.content
+    cc = _make_cache_control(cache_ttl)
+
+    if isinstance(content, str):
+        # Wrap the string in a single-block list with cache_control
+        new_content: list[dict[str, Any]] = [
+            {"type": "text", "text": content, "cache_control": cc}
+        ]
+    elif isinstance(content, list):
+        blocks = list(content)
+        if not blocks:
+            return msg
+        last = blocks[-1]
+        if isinstance(last, dict):
+            blocks[-1] = {**last, "cache_control": cc}
+        else:
+            # Non-dict block — wrap it
+            blocks[-1] = {"type": "text", "text": str(last), "cache_control": cc}
+        new_content = blocks
+    else:
+        return msg  # Unsupported content shape — leave unchanged
+
+    # Reconstruct the same message type with new content
+    try:
+        return msg.__class__(content=new_content, **{
+            k: getattr(msg, k)
+            for k in ("name", "tool_call_id", "tool_calls", "additional_kwargs")
+            if hasattr(msg, k) and getattr(msg, k, None) is not None
+        })
+    except Exception:
+        # Fallback: return a shallow copy via dict round-trip
+        clone = msg.copy()
+        clone.content = new_content  # type: ignore[attr-defined]
+        return clone
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_anthropic_cache_control(
+    messages: List[BaseMessage],
+    *,
+    cache_ttl: CacheTTL = "5m",
+) -> List[BaseMessage]:
+    """Apply the "system_and_3" cache-control strategy to *messages*.
+
+    Breakpoint placement (up to 4 total):
+    1. The SystemMessage — always placed first when present and long enough.
+    2. The last 3 non-system messages — placed in reverse order until the
+       breakpoint budget is exhausted.
+
+    Messages shorter than ``_MIN_CACHE_CHARS`` do not receive a breakpoint
+    because Anthropic ignores them anyway.
 
     Args:
-        messages: List of message dicts in Anthropic / LangChain wire format.
-        system: Optional system prompt string.
+        messages: LangChain ``BaseMessage`` list (may include SystemMessage).
+        cache_ttl: ``"5m"`` (default) or ``"1h"`` for one-hour TTL.
 
     Returns:
-        (messages, annotated_system) — annotated_system is either the original
-        string (short prompt) or a list of content blocks with cache_control.
+        A new list with cache_control annotations applied.
     """
-    annotated_system: Any = system
+    result: list[BaseMessage] = list(messages)
+    budget = _MAX_BREAKPOINTS  # 4 breakpoints total
 
-    # Annotate system prompt if long enough
-    if system and len(system) >= _MIN_CACHE_CHARS:
-        annotated_system = [
-            {
-                "type": "text",
-                "text": system,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
-        logger.debug(
-            "Applied cache_control to system prompt (%d chars / ~%d tokens)",
-            len(system),
-            _estimate_tokens(system),
-        )
+    # ── Step 1: Annotate the system message ──────────────────────────────────
+    for i, msg in enumerate(result):
+        if isinstance(msg, SystemMessage):
+            text = _content_text(msg)
+            if len(text) >= _MIN_CACHE_CHARS:
+                result[i] = _mark_last_block(msg, cache_ttl)
+                budget -= 1
+                logger.debug(
+                    "prompt_caching: breakpoint on SystemMessage[%d] "
+                    "(%d chars / ~%d tokens)",
+                    i, len(text), _estimate_tokens(text),
+                )
+            break  # Only one system message
 
-    # Find and annotate the last substantial user message
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if msg.get("role") != "user":
+    # ── Step 2: Annotate the last 3 non-system messages ──────────────────────
+    non_system_indices = [
+        i for i, m in enumerate(result) if not isinstance(m, SystemMessage)
+    ]
+    # Take the last min(3, budget) indices
+    candidates = non_system_indices[-(min(3, budget)):]
+
+    for i in candidates:
+        if budget <= 0:
+            break
+        msg = result[i]
+        text = _content_text(msg)
+        if len(text) < _MIN_CACHE_CHARS:
             continue
-
-        content = msg.get("content", "")
-        if not isinstance(content, str):
-            break  # Already a list of blocks — skip
-
-        if len(content) < _MIN_CACHE_CHARS:
-            break  # Not large enough to benefit
-
-        messages[i] = {
-            **msg,
-            "content": [
-                {
-                    "type": "text",
-                    "text": content,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-        }
+        result[i] = _mark_last_block(msg, cache_ttl)
+        budget -= 1
         logger.debug(
-            "Applied cache_control to user message [%d] (%d chars / ~%d tokens)",
-            i,
-            len(content),
-            _estimate_tokens(content),
+            "prompt_caching: breakpoint on %s[%d] (%d chars / ~%d tokens)",
+            type(msg).__name__, i, len(text), _estimate_tokens(text),
         )
-        break
 
-    return messages, annotated_system
+    placed = _MAX_BREAKPOINTS - budget
+    logger.info("prompt_caching: placed %d/%d cache breakpoints (ttl=%s)",
+                placed, _MAX_BREAKPOINTS, cache_ttl)
+    return result
 
 
-def strip_cache_control(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def strip_cache_control(messages: List[BaseMessage]) -> List[BaseMessage]:
     """Remove all cache_control annotations from *messages*.
 
-    Use this before sending messages to non-Anthropic providers that do not
-    understand the cache_control block field.
+    Use this before sending to non-Anthropic providers that do not understand
+    the cache_control block field.
 
     Returns a new list — does not mutate the input.
     """
-    cleaned: list[dict[str, Any]] = []
+    cleaned: list[BaseMessage] = []
     for msg in messages:
-        content = msg.get("content")
+        content = msg.content
         if not isinstance(content, list):
             cleaned.append(msg)
             continue
 
-        stripped_blocks = []
+        stripped: list[Any] = []
         for block in content:
-            if isinstance(block, dict):
+            if isinstance(block, dict) and "cache_control" in block:
                 block = {k: v for k, v in block.items() if k != "cache_control"}
-            stripped_blocks.append(block)
+            stripped.append(block)
 
-        # Flatten single text-block lists back to a plain string
+        # Flatten single-text-block lists back to a plain string
         if (
-            len(stripped_blocks) == 1
-            and isinstance(stripped_blocks[0], dict)
-            and stripped_blocks[0].get("type") == "text"
+            len(stripped) == 1
+            and isinstance(stripped[0], dict)
+            and stripped[0].get("type") == "text"
+            and len(stripped[0]) == 2  # only "type" + "text"
         ):
-            cleaned.append({**msg, "content": stripped_blocks[0]["text"]})
+            new_content: Any = stripped[0]["text"]
         else:
-            cleaned.append({**msg, "content": stripped_blocks})
+            new_content = stripped
+
+        try:
+            clone = msg.__class__(content=new_content, **{
+                k: getattr(msg, k)
+                for k in ("name", "tool_call_id", "tool_calls", "additional_kwargs")
+                if hasattr(msg, k) and getattr(msg, k, None) is not None
+            })
+        except Exception:
+            clone = msg.copy()
+            clone.content = new_content  # type: ignore[attr-defined]
+        cleaned.append(clone)
 
     return cleaned
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Legacy shim — keep callers using the old apply_cache_control signature working
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_cache_control(
+    messages: list[dict[str, Any]],
+    system: str | None = None,
+    *,
+    cache_ttl: CacheTTL = "5m",
+) -> tuple[list[dict[str, Any]], Any]:
+    """Legacy interface for raw dict message lists (Anthropic wire format).
+
+    Converts to BaseMessage, applies the system_and_3 strategy, then converts
+    back to dicts.  New code should use ``apply_anthropic_cache_control``
+    directly with LangChain BaseMessages.
+
+    Returns:
+        (annotated_messages, annotated_system) — annotated_system is either
+        the original string (short/absent) or a list of content blocks with
+        cache_control.
+    """
+    cc = _make_cache_control(cache_ttl)
+    annotated_system: Any = system
+
+    if system and len(system) >= _MIN_CACHE_CHARS:
+        annotated_system = [{"type": "text", "text": system, "cache_control": cc}]
+        logger.debug(
+            "prompt_caching (legacy): breakpoint on system prompt "
+            "(%d chars / ~%d tokens)",
+            len(system), _estimate_tokens(system),
+        )
+
+    budget = _MAX_BREAKPOINTS - (1 if annotated_system is not system else 0)
+
+    # Find the last 3 user/assistant messages large enough to cache
+    candidates = [
+        i for i, m in enumerate(messages)
+        if m.get("role") in {"user", "assistant"}
+    ][-(min(3, budget)):]
+
+    for i in candidates:
+        msg = messages[i]
+        content = msg.get("content", "")
+        if isinstance(content, str) and len(content) >= _MIN_CACHE_CHARS:
+            messages[i] = {
+                **msg,
+                "content": [{"type": "text", "text": content, "cache_control": cc}],
+            }
+            logger.debug(
+                "prompt_caching (legacy): breakpoint on messages[%d] role=%s",
+                i, msg.get("role"),
+            )
+
+    return messages, annotated_system
 
 
 def is_anthropic_provider(provider: str | None) -> bool:

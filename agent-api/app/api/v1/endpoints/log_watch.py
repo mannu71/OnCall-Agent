@@ -21,8 +21,8 @@ from app.mcp.tools.alert_tools import (
     resolve_alert,
     dismiss_alert,
     get_alert_summary,
-    get_known_issues,
-    create_known_issue
+    get_knowledge_entries,
+    create_knowledge_entry,
 )
 from app.services.knowledge_base import knowledge_base
 from app.core.retry import with_retry
@@ -140,13 +140,17 @@ class ResolveAlertRequest(BaseModel):
     resolution: str = Field(..., description="Resolution description")
 
 
-class CreateKnownIssueRequest(BaseModel):
-    """Request model for creating known issues."""
-    title: str = Field(..., description="Issue title")
+class CreateKnowledgeEntryRequest(BaseModel):
+    """Request model for creating knowledge entries."""
+    title: str = Field(..., description="Entry title")
     description: str = Field(..., description="Detailed description")
-    symptoms: List[str] = Field(..., description="List of symptoms")
+    symptoms: List[str] = Field(..., description="List of symptoms / trigger phrases")
     solution: str = Field(..., description="Resolution steps")
-    category: str = Field(..., description="Issue category")
+    category: str = Field(..., description="Entry category")
+
+
+# Backward-compat alias
+CreateKnownIssueRequest = CreateKnowledgeEntryRequest
 
 
 class AddPatternRequest(BaseModel):
@@ -424,19 +428,40 @@ async def alert_summary(
 # KNOWLEDGE BASE ENDPOINTS
 # ============================================
 
-@router.get("/known-issues")
-async def list_known_issues(
+@router.get("/knowledge-entries")
+async def list_knowledge_entries(
     category: Optional[str] = Query(None, description="Filter by category"),
     limit: int = Query(50, description="Maximum results")
 ) -> Dict[str, Any]:
-    """Get known issues from knowledge base."""
-    return await get_known_issues(category=category, limit=limit)
+    """Get knowledge entries from the knowledge base."""
+    return await get_knowledge_entries(category=category, limit=limit)
 
 
-@router.post("/known-issues")
-async def add_known_issue(request: CreateKnownIssueRequest) -> Dict[str, Any]:
-    """Add a known issue to knowledge base."""
-    return await create_known_issue(
+# Backward-compat route alias
+@router.get("/known-issues", include_in_schema=False)
+async def list_known_issues_compat(
+    category: Optional[str] = Query(None),
+    limit: int = Query(50),
+) -> Dict[str, Any]:
+    return await get_knowledge_entries(category=category, limit=limit)
+
+
+@router.post("/knowledge-entries")
+async def add_knowledge_entry(request: CreateKnowledgeEntryRequest) -> Dict[str, Any]:
+    """Add a knowledge entry to the knowledge base."""
+    return await create_knowledge_entry(
+        title=request.title,
+        description=request.description,
+        symptoms=request.symptoms,
+        solution=request.solution,
+        category=request.category
+    )
+
+
+# Backward-compat route alias
+@router.post("/known-issues", include_in_schema=False)
+async def add_known_issue_compat(request: CreateKnowledgeEntryRequest) -> Dict[str, Any]:
+    return await create_knowledge_entry(
         title=request.title,
         description=request.description,
         symptoms=request.symptoms,

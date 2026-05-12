@@ -52,7 +52,8 @@ async def init_db():
     from app.models.db_models import (
         WorkflowModel, ExecutionModel,
         LLMConfigModel, MCPServerModel, LogPatternModel,
-        KnownIssueModel, BaselineMetricModel, AnalysisHistoryModel, AlertModel,
+        KnowledgeEntryModel, SkillModel,
+        BaselineMetricModel, AnalysisHistoryModel, AlertModel,
         ModelKeyModel
     )
     

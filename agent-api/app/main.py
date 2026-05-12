@@ -19,12 +19,17 @@ from app.config import settings
 from app.api.v1.api import api_router
 from app.api.middleware import register_exception_handlers
 from app.core.scheduler import workflow_scheduler
+from app.core.heartbeat import heartbeat_monitor
 from app.core.database import init_db
 from app.core.logging import setup_logging, get_logger
+from app.core.telemetry import setup_telemetry
 
 # Setup logging first
 setup_logging()
 logger = get_logger(__name__)
+
+# Initialise OTel tracing (no-op when opentelemetry-sdk is not installed)
+setup_telemetry()
 
 
 @asynccontextmanager
@@ -41,10 +46,18 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Database initialization skipped (may already exist): {e}")
     
     workflow_scheduler.start()
+
+    # Start proactive alarm monitoring (non-blocking background task).
+    # Heartbeat polls CloudWatch for new ALARM-state alerts and auto-triggers
+    # investigation workflows.  Degrades gracefully when AWS is unavailable.
+    heartbeat_monitor.start()
+
     yield
+
     # Shutdown
     logger.info("Shutting down Agent API...")
     workflow_scheduler.stop()
+    await heartbeat_monitor.stop()
 
 
 # Create FastAPI application
