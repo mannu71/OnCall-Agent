@@ -1,3 +1,4 @@
+version: '3.8'
 
 services:
   # PostgreSQL with pgvector extension
@@ -28,7 +29,6 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
-      - ./config:/app/config
       - ~/.aws:/root/.aws:ro
     environment:
       - API_HOST=0.0.0.0
@@ -41,7 +41,6 @@ services:
       - LOG_LEVEL=INFO
       - AWS_SSL_VERIFY=false
       - DATABASE_URL=postgresql://kycuser:kycpassword@postgres:5432/kycagent
-      - AZURE_DEVOPS_ENCRYPTION_KEY=GrGhRxAO3wOhLgaVvBU-BAurQ8177HhTIjem-4yPDDw=
     depends_on:
       postgres:
         condition: service_healthy

@@ -1,240 +1,124 @@
-"""
-Event Adapter: Normalize LangGraph events to React Flow canvas format
+"""SSE stream adapter — converts execution queue events to Server-Sent Events.
 
-This adapter sits between the LangGraph execution engine and the SSE streaming
-endpoint, translating internal execution events to the canonical event schema
-that the React Flow frontend expects.
+Usage (from a FastAPI endpoint):
 
-Mapping:
--------
-LangGraph Internal Events → Canonical Schema Events
+    from fastapi.responses import StreamingResponse
+    from app.workflow.event_adapter import execution_event_stream
 
-1. node_started → node_start
-   - Extracts nodeId, nodeType, label from node data
-   
-2. node_completed → node_done
-   - Adds duration, output, status
-   
-3. node_failed → node_error
-   - Adds error message, duration
-   
-4. llm_token → agent_token
-   - Preserves token and node_id
-   
-5. tool_call → agent_tool_call
-   - Preserves tool, args, node_id
-   
-6. tool_result → agent_tool_result
-   - Preserves tool, result, node_id
-
-Usage:
------
-```python
-from app.workflow.event_adapter import EventAdapter
-
-adapter = EventAdapter()
-
-# Normalize internal event to canonical format
-internal_event = {
-    "event_type": "node_started",
-    "data": {"node_id": "agent-1", "node_type": "agent", "label": "AI Agent"}
-}
-
-canonical_event = adapter.normalize(internal_event)
-# Returns: NodeStartEvent with data: {"nodeId": "agent-1", "nodeType": "agent", "label": "AI Agent"}
-```
-"""
-from typing import Any, Dict
-from datetime import datetime, timezone
-
-from app.workflow.event_schema import (
-    WorkflowEvent,
-    create_event,
-    EventType,
-)
-
-
-class EventAdapter:
-    """Adapter to normalize internal events to canonical schema."""
-    
-    def __init__(self):
-        """Initialize event adapter."""
-        self._event_mapping = {
-            # Workflow events (already canonical)
-            "workflow_started": self._passthrough,
-            "workflow_completed": self._passthrough,
-            "workflow_failed": self._passthrough,
-            
-            # Node events (need normalization)
-            "node_started": self._normalize_node_start,
-            "node_completed": self._normalize_node_done,
-            "node_failed": self._normalize_node_error,
-            
-            # Agent events (already canonical)
-            "llm_token": self._normalize_agent_token,
-            "tool_call": self._normalize_agent_tool_call,
-            "tool_result": self._normalize_agent_tool_result,
-            "agent_error": self._passthrough,
-            "agent_complete": self._passthrough,
-            
-            # System events (already canonical)
-            "keepalive": self._passthrough,
-            "error": self._passthrough,
-        }
-    
-    def normalize(self, internal_event: Dict[str, Any]) -> WorkflowEvent:
-        """Normalize an internal event to canonical schema.
-        
-        Args:
-            internal_event: Internal event dict with event_type and data
-            
-        Returns:
-            Canonical WorkflowEvent instance
-        """
-        event_type = internal_event.get("event_type")
-        data = internal_event.get("data", {})
-        timestamp = internal_event.get("timestamp")
-        
-        # Get normalizer function for this event type
-        normalizer = self._event_mapping.get(event_type, self._passthrough)
-        
-        # Normalize the data
-        normalized_data = normalizer(data)
-        
-        # Create canonical event
-        canonical_event = create_event(
-            event_type=self._map_event_type(event_type),
-            data=normalized_data
+    @router.get("/{execution_id}/stream")
+    async def stream_execution(execution_id: str):
+        return StreamingResponse(
+            execution_event_stream(execution_id, workflow_name),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-        
-        # Preserve original timestamp if provided
-        if timestamp:
-            canonical_event.timestamp = timestamp
-        
-        return canonical_event
-    
-    def _map_event_type(self, internal_type: str) -> EventType:
-        """Map internal event type to canonical event type.
-        
-        Args:
-            internal_type: Internal event type string
-            
-        Returns:
-            Canonical EventType
-        """
-        mapping = {
-            "node_started": "node_start",
-            "node_completed": "node_done",
-            "node_failed": "node_error",
-            "tool_call": "agent_tool_call",
-            "tool_result": "agent_tool_result",
-            "llm_token": "agent_token",
-        }
-        return mapping.get(internal_type, internal_type)
-    
-    def _passthrough(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Pass through data unchanged (already canonical)."""
-        return data
-    
-    def _normalize_node_start(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize node_started event to React Flow format.
-        
-        Internal format:
-            {"node_id": "agent-1", "node_type": "agent", "label": "AI Agent"}
-            
-        Canonical format:
-            {"nodeId": "agent-1", "nodeType": "agent", "label": "AI Agent"}
-        """
-        return {
-            "nodeId": data.get("node_id"),
-            "nodeType": data.get("node_type"),
-            "label": data.get("label", data.get("node_type", "Unknown"))
-        }
-    
-    def _normalize_node_done(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize node_completed event to React Flow format.
-        
-        Internal format:
-            {
-                "node_id": "agent-1",
-                "node_type": "agent",
-                "status": "success",
-                "duration": 12.5,
-                "output": "Task completed"
-            }
-            
-        Canonical format:
-            {
-                "nodeId": "agent-1",
-                "status": "success",
-                "output": "Task completed",
-                "duration": 12.5
-            }
-        """
-        return {
-            "nodeId": data.get("node_id"),
-            "status": data.get("status", "success"),
-            "output": data.get("output", ""),
-            "duration": data.get("duration", 0.0)
-        }
-    
-    def _normalize_node_error(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize node_failed event to React Flow format.
-        
-        Internal format:
-            {
-                "node_id": "agent-1",
-                "node_type": "agent",
-                "error": "Connection timeout",
-                "duration": 5.2
-            }
-            
-        Canonical format:
-            {
-                "nodeId": "agent-1",
-                "error": "Connection timeout",
-                "duration": 5.2
-            }
-        """
-        return {
-            "nodeId": data.get("node_id"),
-            "error": data.get("error", "Unknown error"),
-            "duration": data.get("duration", 0.0)
-        }
-    
-    def _normalize_agent_token(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize llm_token event (already mostly canonical).
-        
-        Ensures node_id is present for frontend routing.
-        """
-        return {
-            "token": data.get("token", ""),
-            "node_id": data.get("node_id", "unknown")
-        }
-    
-    def _normalize_agent_tool_call(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize tool_call event (already mostly canonical).
-        
-        Ensures all required fields are present.
-        """
-        return {
-            "tool": data.get("tool", "unknown"),
-            "args": data.get("args", {}),
-            "node_id": data.get("node_id", "unknown"),
-            "preview": data.get("preview")  # Optional
-        }
-    
-    def _normalize_agent_tool_result(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize tool_result event (already mostly canonical).
-        
-        Ensures all required fields are present.
-        """
-        return {
-            "tool": data.get("tool", "unknown"),
-            "result": data.get("result", ""),
-            "node_id": data.get("node_id", "unknown")
-        }
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import AsyncGenerator
+
+logger = logging.getLogger(__name__)
+
+_STREAM_TIMEOUT_SECONDS = 600   # hard ceiling — prevents zombie SSE connections
+_HEARTBEAT_INTERVAL_SECONDS = 15  # keep-alive ping cadence
+_TERMINAL_EVENTS = frozenset({"workflow_completed", "workflow_failed"})
 
 
-# Global adapter instance
-event_adapter = EventAdapter()
+async def execution_event_stream(
+    execution_id: str,
+    workflow_name: str,
+) -> AsyncGenerator[str, None]:
+    """Async generator that yields SSE-formatted strings for *execution_id*.
+
+    - Subscribes to the execution's asyncio.Queue via VisualWorkflowExecutor.
+    - Emits events as ``event: <type>\\ndata: <json>\\n\\n`` chunks.
+    - Sends ``: heartbeat`` comment lines every _HEARTBEAT_INTERVAL_SECONDS
+      to prevent proxy / browser timeouts.
+    - Closes the stream after a terminal event (workflow_completed /
+      workflow_failed) or after _STREAM_TIMEOUT_SECONDS.
+    - Always unsubscribes from the queue in the finally block.
+    """
+    from app.services.visual_workflow_executor import visual_executor
+
+    queue = visual_executor.subscribe_to_events(execution_id)
+    loop = asyncio.get_event_loop()
+
+    try:
+        # Initial handshake event
+        yield (
+            f"event: connected\n"
+            f"data: {json.dumps({'execution_id': execution_id, 'workflow_name': workflow_name})}\n\n"
+        )
+
+        deadline = loop.time() + _STREAM_TIMEOUT_SECONDS
+        last_heartbeat = loop.time()
+
+        while True:
+            now = loop.time()
+
+            if now >= deadline:
+                logger.warning(
+                    "SSE stream timed out after %ds for execution %s",
+                    _STREAM_TIMEOUT_SECONDS,
+                    execution_id,
+                )
+                break
+
+            # Heartbeat so the connection stays alive through idle stretches
+            if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
+                yield ": heartbeat\n\n"
+                last_heartbeat = now
+
+            try:
+                event = await asyncio.wait_for(
+                    queue.get(), timeout=_HEARTBEAT_INTERVAL_SECONDS
+                )
+            except asyncio.TimeoutError:
+                continue  # loop around → emit heartbeat if needed
+
+            yield event.to_sse()
+
+            if event.event_type in _TERMINAL_EVENTS:
+                break
+
+    except asyncio.CancelledError:
+        logger.debug("SSE stream cancelled for execution %s", execution_id)
+
+    finally:
+        visual_executor.unsubscribe_from_events(execution_id, queue)
+        yield (
+            f"event: stream_end\n"
+            f"data: {json.dumps({'execution_id': execution_id})}\n\n"
+        )
+
+
+async def workflow_name_event_stream(
+    workflow_name: str,
+) -> AsyncGenerator[str, None]:
+    """Stream events for the most-recently-started execution of *workflow_name*.
+
+    Used by the legacy ``/workflows/{name}/stream`` endpoint that the frontend
+    useWorkflowStream hook opens by workflow name rather than execution ID.
+    Polls active_executions until a matching execution appears (up to 10 s),
+    then delegates to execution_event_stream.
+    """
+    from app.services.visual_workflow_executor import visual_executor
+
+    # Wait up to 10 s for the execution to be registered
+    for _ in range(20):
+        for exec_id, exec_data in visual_executor.active_executions.items():
+            if exec_data.get("workflow_name") == workflow_name:
+                async for chunk in execution_event_stream(exec_id, workflow_name):
+                    yield chunk
+                return
+        await asyncio.sleep(0.5)
+
+    # No execution found — emit a single error event and close
+    yield (
+        f"event: agent_error\n"
+        f"data: {json.dumps({'error': f'No active execution found for workflow {workflow_name!r}', 'node_id': 'system'})}\n\n"
+    )
+    yield f"event: stream_end\ndata: {json.dumps({'workflow_name': workflow_name})}\n\n"

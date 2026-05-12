@@ -1,19 +1,41 @@
 """Execution history API routes."""
-from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, HTTPException, status, Query, Depends
+import asyncio
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, HTTPException, status, Query, Depends, Body
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from app.repositories import ExecutionRepository
 from app.api.deps import get_execution_repo
+from app.workflow.event_adapter import execution_event_stream
 
-
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/executions", tags=["executions"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HITL request / response models
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HITLApproveRequest(BaseModel):
+    request_id: str
+    approved: bool = True
+    reason: Optional[str] = None
+
+
+class HITLApproveResponse(BaseModel):
+    execution_id: str
+    request_id: str
+    approved: bool
+    message: str
 
 
 def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
     """Extract the main workflow output from execution results."""
-    # The infrastructure repo stores node results under 'output'; the app-level
-    # repo aliases it to both 'results' and 'result'. Support all three.
-    results = execution.get('results') or execution.get('result') or execution.get('output') or {}
+    results = execution.get('results') or {}
     
     orchestrator_output = next(
         (v for v in results.values() if isinstance(v, dict) and 'queries_executed' in v),
@@ -24,9 +46,7 @@ def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
         output = {
             'queries_executed': orchestrator_output.get('queries_executed', 0),
             'failures': orchestrator_output.get('failures', 0),
-            'results': orchestrator_output.get('results', []),
-            'token_usage': orchestrator_output.get('token_usage'),
-            'metadata': orchestrator_output.get('metadata'),
+            'results': orchestrator_output.get('results', [])
         }
         if orchestrator_output.get('error'):
             output['error'] = orchestrator_output['error']
@@ -43,10 +63,35 @@ def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
                 'log_groups_analyzed': cloudwatch_output.get('log_groups_analyzed', []),
                 'time_range': cloudwatch_output.get('time_range'),
                 'results': cloudwatch_output.get('data', {}),
-                'output': cloudwatch_output.get('output'),
+                            User Query
+                    │
+                    ▼
+                KB Recall (knowledge_base.search_known_issues / search_similar_patterns)
+                    │  prepends matching past resolutions as <memory-context> to the query
+                    ▼
+                _extract_cloudwatch_config()
+                    │  BFS over workflow edges — finds all cloudwatchAnalyzer nodes
+                    │  reachable from an agent node, merges their logGroups/region/profile
+                    ▼
+                _setup_tools()  (MCP tools)
+                    │  connects to MCP servers → LangChain BaseTool list
+                    ▼
+                build_cloudwatch_agent_tools()  [only if CW node is wired up]
+                    │  resolves AWS credentials via resolve_aws_credentials()
+                    │  wraps 5 async functions as LangChain StructuredTools
+                    │  appends them to the tool list
+                    ▼
+                cloudwatch_context injection (if upstream CW analysis already ran)
+                    │  prepends [Pre-computed CloudWatch Analysis] JSON into augmented query
+                    ▼
+                _build_agent()  → LangGraph create_react_agent StateGraph
+                    │  LLM + all tools → ReAct graph
+                    ▼
+                _execute_agent()  → agent.astream_events()
+                    │  ReAct loop: Thought → Tool Call → Observation → repeat → Final Answer
+                    ▼
+                _auto_learn()  → knowledge_base.record_analysis / add_known_issue    'output': cloudwatch_output.get('output'),
                 'model': cloudwatch_output.get('model'),
-                'token_usage': cloudwatch_output.get('token_usage'),
-                'metadata': cloudwatch_output.get('metadata'),
             }
             if cloudwatch_output.get('alerts'):
                 output['alerts'] = cloudwatch_output['alerts']
@@ -66,9 +111,6 @@ def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
                 'tool_calls': react_output.get('tool_calls', []),
                 'model': react_output.get('model'),
                 'provider': react_output.get('provider'),
-                'token_usage': react_output.get('token_usage'),
-                'metadata': react_output.get('metadata'),
-                'recall_hits': react_output.get('recall_hits', 0),
             }
 
     return execution
@@ -196,3 +238,98 @@ async def delete_all_executions(
     """Delete all execution history."""
     deleted_count = await execution_repo.delete_all()
     return {"message": f"Deleted {deleted_count} executions", "deleted_count": deleted_count}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSE stream
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/{execution_id}/stream")
+async def stream_execution_events(execution_id: str):
+    """Stream live execution events as Server-Sent Events.
+
+    Returns:
+        SSE stream of WorkflowEvent objects. Closes after workflow_completed /
+        workflow_failed or after the 10-minute hard timeout.
+    """
+    from app.services.visual_workflow_executor import visual_executor
+
+    exec_data = visual_executor.get_execution_status(execution_id)
+    workflow_name = (exec_data or {}).get("workflow_name", execution_id)
+
+    return StreamingResponse(
+        execution_event_stream(execution_id, workflow_name),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HITL approve / reject
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/{execution_id}/approve", response_model=HITLApproveResponse)
+async def approve_hitl_request(
+    execution_id: str,
+    body: HITLApproveRequest = Body(...),
+):
+    """Resume a paused HITL execution.
+
+    When the execution engine emits a ``hitl_pause`` event the workflow is
+    suspended waiting for human approval.  POST here with ``approved=true``
+    (or false to reject) to resume.
+
+    The payload is placed on the execution's HITL queue so the running
+    LangGraph coroutine can pick it up and continue (or abort) the graph.
+    """
+    from app.services.visual_workflow_executor import visual_executor
+    from app.workflow.event_schema import hitl_approved, hitl_rejected
+
+    exec_data = visual_executor.get_execution_status(execution_id)
+    if exec_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active execution '{execution_id}' found",
+        )
+
+    hitl_queue: asyncio.Queue | None = exec_data.get("hitl_queue")
+    if hitl_queue is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Execution '{execution_id}' is not waiting for HITL approval",
+        )
+
+    decision = {
+        "request_id": body.request_id,
+        "approved": body.approved,
+        "reason": body.reason,
+    }
+    await hitl_queue.put(decision)
+
+    # Publish SSE event so the frontend updates immediately
+    event = (
+        hitl_approved(execution_id, body.request_id)
+        if body.approved
+        else hitl_rejected(execution_id, body.request_id, reason=body.reason or "")
+    )
+    await visual_executor._publish_event(execution_id, event.event_type, event.data)
+
+    logger.info(
+        "HITL %s for execution %s (request_id=%s)",
+        "approved" if body.approved else "rejected",
+        execution_id,
+        body.request_id,
+    )
+
+    return HITLApproveResponse(
+        execution_id=execution_id,
+        request_id=body.request_id,
+        approved=body.approved,
+        message="Decision recorded — execution will resume shortly."
+        if body.approved
+        else "Execution rejected — workflow will be stopped.",
+    )

@@ -1,7 +1,74 @@
 """Application configuration."""
-from typing import List
+from __future__ import annotations
+
+import json
+import logging
+import os
+from functools import lru_cache
+from typing import List, Optional
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AWS Secrets Manager loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=64)
+def get_secret(key: str, region: str = "us-east-1") -> Optional[str]:
+    """Retrieve a secret value from AWS Secrets Manager, with env-var fallback.
+
+    In development (or when ``AWS_SECRETS_MANAGER_ENABLED`` is not 'true'),
+    the env var matching *key* is returned directly — no AWS call is made.
+
+    The result is cached per *(key, region)* for the lifetime of the process.
+    Call ``get_secret.cache_clear()`` in tests to reset.
+
+    Args:
+        key: Secret name / ARN in Secrets Manager.  Also used as the env-var
+             name looked up in the fallback path.
+        region: AWS region where the secret is stored.
+
+    Returns:
+        The secret string, or ``None`` if not found anywhere.
+    """
+    if os.getenv("AWS_SECRETS_MANAGER_ENABLED", "").lower() != "true":
+        value = os.getenv(key)
+        if value is None:
+            logger.debug("get_secret: env var '%s' not set (dev mode)", key)
+        return value
+
+    try:
+        import boto3  # type: ignore
+        client = boto3.client("secretsmanager", region_name=region)
+        response = client.get_secret_value(SecretId=key)
+        secret = response.get("SecretString") or response.get("SecretBinary")
+        if isinstance(secret, bytes):
+            secret = secret.decode("utf-8")
+        # If the secret is a JSON blob, callers get the raw JSON string —
+        # use get_secret_json() below to parse it.
+        return secret
+    except Exception as exc:
+        logger.warning("get_secret: failed to retrieve '%s': %s", key, exc)
+        return os.getenv(key)  # final fallback to env var
+
+
+def get_secret_json(key: str, region: str = "us-east-1") -> Optional[dict]:
+    """Like :func:`get_secret` but JSON-parses the result.
+
+    Returns ``None`` when the secret is absent or not valid JSON.
+    """
+    raw = get_secret(key, region)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("get_secret_json: secret '%s' is not valid JSON", key)
+        return None
 
 
 class Settings(BaseSettings):
@@ -42,82 +109,6 @@ class Settings(BaseSettings):
     # Scheduler settings
     scheduler_timezone: str = "UTC"
     max_concurrent_workflows: int = 5
-    
-    # Context compression settings
-    context_compression_enabled: bool = Field(
-        default=True,
-        description="Enable intelligent context compression for long conversations"
-    )
-    context_threshold_percent: float = Field(
-        default=0.50,
-        description="Token usage threshold (as fraction of context length) to trigger compression"
-    )
-    context_protect_first_n: int = Field(
-        default=3,
-        description="Number of initial messages (system prompt + first exchange) to protect from compression"
-    )
-    
-    # Rate limit tracking settings
-    rate_limit_tracking_enabled: bool = Field(
-        default=True,
-        description="Enable tracking of API rate limits from response headers"
-    )
-    rate_limit_warning_threshold: float = Field(
-        default=0.80,
-        description="Usage percentage threshold to trigger rate limit warnings"
-    )
-    
-    # Auxiliary client settings (for side tasks like summarization)
-    auxiliary_provider: str = Field(
-        default="auto",
-        description="Provider for auxiliary LLM tasks (auto, openrouter, anthropic, openai)"
-    )
-    auxiliary_model: str = Field(
-        default="",
-        description="Model to use for auxiliary tasks (empty = auto-select)"
-    )
-    auxiliary_base_url: str = Field(
-        default="",
-        description="Custom base URL for auxiliary provider"
-    )
-    
-    # Skills and trajectories directories
-    skills_dir: str = Field(
-        default="data/skills",
-        description="Directory containing skill SKILL.md files"
-    )
-    trajectories_dir: str = Field(
-        default="data/trajectories",
-        description="Directory for storing conversation trajectories"
-    )
-    
-    # Agent execution settings
-    agent_recursion_limit: int = Field(
-        default=50,
-        description="Maximum recursion depth for LangGraph agent execution (default: 50, LangGraph default: 25)"
-    )
-    agent_timeout_seconds: int = Field(
-        default=300,
-        description="Timeout in seconds for agent execution (default: 300 = 5 minutes)"
-    )
-    
-    # Embedding settings
-    embedding_provider: str = Field(
-        default="bedrock",
-        description="Provider for embedding generation (bedrock, openai, azure, cohere)"
-    )
-    embedding_model: str = Field(
-        default="amazon.titan-embed-text-v1",
-        description="Model ID for embedding generation"
-    )
-    embedding_region: str = Field(
-        default="us-east-1",
-        description="AWS region for Bedrock embeddings (only used for bedrock provider)"
-    )
-    embedding_dimensions: int = Field(
-        default=1536,
-        description="Embedding vector dimensions (1536 for Titan v1, 1024 for Titan v2, varies by model)"
-    )
     
     @property
     def async_database_url(self) -> str:

@@ -39,10 +39,9 @@ import {
 } from 'lucide-react';
 import { getMCPServers, addMCPServer, updateMCPServer, deleteMCPServer, getMCPInputValues, updateMCPInputValue, invalidateCache } from '../services/mcpService';
 import { getLLMs, addLLM, updateLLM, deleteLLM, discoverModels, addDiscoveredModels, bulkDeleteLLMs } from '../services/llmService';
-import { getModelKeys, upsertModelKey, deleteModelKey, getProviderSchemas } from '../services/modelKeyService';
+import { getModelKeys, upsertModelKey, deleteModelKey } from '../services/modelKeyService';
 import agentApiClient from '../services/agentApiClient';
 import { testLLMConnection as testLLMConnectionAPI } from '../services/apiClient';
-import AzureDevOpsSettings from '../components/releases/AzureDevOpsSettings';
 
 // Icon options for MCP Servers
 const MCP_SERVER_ICONS = [
@@ -139,9 +138,6 @@ const parseEnvVars = (envString) => {
 };
 
 const Settings = () => {
-    // Debug: Verify new code is loaded
-    console.log('Settings component loaded - VERSION 2.0 - Fixed provider fields - Timestamp:', new Date().toISOString());
-    
     const [servers, setServers] = useState({});
     const [openDialog, setOpenDialog] = useState(false);
     const [editingServer, setEditingServer] = useState(null);
@@ -174,7 +170,9 @@ const Settings = () => {
         endpoint: '',
         baseUrl: '',
         temperature: 0,
-        useForEmbeddings: false,
+        access_key_id: '',
+        secret_access_key: '',
+        session_token: '',
     });
 
     const [openAWSDialog, setOpenAWSDialog] = useState(false);
@@ -210,7 +208,6 @@ const Settings = () => {
 
     // Model Keys state
     const [modelKeys, setModelKeys] = useState([]);
-    const [providerSchemas, setProviderSchemas] = useState([]);
     const [openModelKeyDialog, setOpenModelKeyDialog] = useState(false);
     const [editingModelKeyProvider, setEditingModelKeyProvider] = useState(null);
     const [modelKeyFormData, setModelKeyFormData] = useState({
@@ -228,45 +225,37 @@ const Settings = () => {
     const originalMaskedValues = useRef({});
 
     const MODEL_KEY_PROVIDERS = [
-        { value: 'openai', label: 'OpenAI', icon: '🧠', fields: ['api_key'] },
-        { value: 'anthropic', label: 'Anthropic', icon: '🤖', fields: ['api_key'] },
-        { value: 'google', label: 'Google AI', icon: '✨', fields: ['api_key'] },
-        { value: 'groq', label: 'Groq', icon: '⚡', fields: ['api_key'] },
-        { value: 'azure openai', label: 'Azure OpenAI', icon: '☁️', fields: ['api_key', 'endpoint'] },
-        { value: 'bedrock', label: 'AWS Bedrock', icon: '🌩️', fields: ['access_key_id', 'secret_access_key', 'session_token', 'region'] },
-        { value: 'ollama', label: 'Ollama', icon: '🦙', fields: ['endpoint'] },
-        { value: 'custom', label: 'Custom', icon: '🔧', fields: ['api_key', 'secret_key', 'endpoint'] },
+        { value: 'OpenAI', label: 'OpenAI', icon: '🧠', fields: ['api_key'] },
+        { value: 'Anthropic', label: 'Anthropic', icon: '🤖', fields: ['api_key'] },
+        { value: 'Google', label: 'Google AI', icon: '✨', fields: ['api_key'] },
+        { value: 'Groq', label: 'Groq', icon: '⚡', fields: ['api_key'] },
+        { value: 'Azure OpenAI', label: 'Azure OpenAI', icon: '☁️', fields: ['api_key', 'endpoint'] },
+        { value: 'AWS Bedrock', label: 'AWS Bedrock', icon: '🌩️', fields: ['access_key_id', 'secret_access_key', 'session_token', 'region'] },
+        { value: 'Ollama', label: 'Ollama', icon: '🦙', fields: ['endpoint'] },
+        { value: 'Custom', label: 'Custom', icon: '🔧', fields: ['api_key', 'secret_key', 'endpoint'] },
     ];
 
     const emptyModelKeyForm = (provider) => {
-        // Default to 'openai' if no provider specified
-        const selectedProvider = provider || 'openai';
-        
-        // Only initialize fields that are relevant for this provider
-        const providerConfig = MODEL_KEY_PROVIDERS.find(p => p.value === selectedProvider);
         const base = {
-            provider: selectedProvider,
+            provider: provider || 'OpenAI',
+            api_key: '',
+            secret_key: '',
+            endpoint: '',
+            region: '',
+            access_key_id: '',
+            secret_access_key: '',
+            session_token: '',
             description: '',
         };
-        
-        // Only add fields that are configured for this provider
-        if (providerConfig) {
-            providerConfig.fields.forEach(field => {
-                base[field] = '';
-            });
-        }
-        
-        // Set default values for specific providers
-        if (selectedProvider === 'azure openai' && base.endpoint !== undefined) base.endpoint = 'https://your-resource.openai.azure.com';
-        if (selectedProvider === 'ollama' && base.endpoint !== undefined) base.endpoint = 'http://localhost:11434';
-        if (selectedProvider === 'bedrock' && base.region !== undefined) base.region = 'us-east-1';
-        
+        if (provider === 'Azure OpenAI') base.endpoint = 'https://your-resource.openai.azure.com';
+        if (provider === 'Ollama') base.endpoint = 'http://localhost:11434';
+        if (provider === 'AWS Bedrock') base.region = 'us-east-1';
         return base;
     };
 
     const discoverableProviders = (() => {
         const providers = [];
-        const supportedForDiscovery = ['openai', 'anthropic', 'google', 'groq', 'azure openai', 'ollama', 'bedrock'];
+        const supportedForDiscovery = ['OpenAI', 'Anthropic', 'Google', 'Groq', 'Azure OpenAI', 'Ollama', 'AWS Bedrock'];
         for (const mk of modelKeys) {
             if (!supportedForDiscovery.includes(mk.provider)) continue;
             const hasCreds = mk.has_api_key || mk.has_secret_key || mk.has_access_credentials || mk.endpoint;
@@ -291,7 +280,6 @@ const Settings = () => {
         loadCertificates();
         checkApiHealth();
         loadModelKeys();
-        loadProviderSchemas();
     }, []);
 
     const loadServers = async () => {
@@ -357,34 +345,21 @@ const Settings = () => {
         }
     };
 
-    const loadProviderSchemas = async () => {
-        try {
-            const schemas = await getProviderSchemas();
-            setProviderSchemas(schemas);
-        } catch (error) {
-            console.error('Failed to load provider schemas:', error);
-            setProviderSchemas([]);
-        }
-    };
-
     const handleOpenModelKeyDialog = (provider = null) => {
         if (provider) {
             const existing = modelKeys.find(k => k.provider === provider);
-            const providerConfig = MODEL_KEY_PROVIDERS.find(p => p.value === provider);
             setEditingModelKeyProvider(provider);
-            
-            // Only include fields that are configured for this provider
             const formData = {
                 provider,
+                api_key: existing?.api_key || '',
+                secret_key: existing?.secret_key || '',
+                endpoint: existing?.endpoint || '',
+                region: existing?.region || '',
+                access_key_id: existing?.access_key_id || '',
+                secret_access_key: existing?.secret_access_key || '',
+                session_token: existing?.session_token || '',
                 description: existing?.description || '',
             };
-            
-            if (providerConfig) {
-                providerConfig.fields.forEach(field => {
-                    formData[field] = existing?.[field] || '';
-                });
-            }
-            
             setModelKeyFormData(formData);
             originalMaskedValues.current = { ...formData };
         } else {
@@ -404,66 +379,23 @@ const Settings = () => {
         try {
             const providerConfig = MODEL_KEY_PROVIDERS.find(p => p.value === modelKeyFormData.provider);
             const data = { provider: modelKeyFormData.provider };
-            
-            console.log('=== DEBUG: handleSaveModelKey ===');
-            console.log('Provider:', modelKeyFormData.provider);
-            console.log('Provider config:', providerConfig);
-            console.log('Form data before filtering:', modelKeyFormData);
-            
-            // Only include fields that are configured for this provider
             if (providerConfig) {
-                const validFields = providerConfig.fields;
-                console.log('Valid fields for this provider:', validFields);
-                
-                validFields.forEach(field => {
+                providerConfig.fields.forEach(field => {
                     const value = modelKeyFormData[field];
-                    console.log(`Checking field '${field}':`, value);
-                    // Include the field if it has a value and either:
-                    // 1. It's different from the masked value (for edits), or
-                    // 2. We're creating a new entry (no original masked value)
-                    if (value && (value !== originalMaskedValues.current[field] || !editingModelKeyProvider)) {
+                    if (value && value !== originalMaskedValues.current[field]) {
                         data[field] = value;
-                        console.log(`  -> Including field '${field}'`);
-                    } else {
-                        console.log(`  -> Skipping field '${field}' (empty or unchanged)`);
                     }
                 });
             }
-            
-            // Add description if provided
-            if (modelKeyFormData.description) {
-                data.description = modelKeyFormData.description;
-            }
-            
-            console.log('Final data to send:', data);
-            console.log('=== END DEBUG ===');
-            
+            if (modelKeyFormData.description) data.description = modelKeyFormData.description;
+            if (modelKeyFormData.region && modelKeyFormData.provider === 'AWS Bedrock') data.region = modelKeyFormData.region;
             await upsertModelKey(data);
             setSaveMessage(`Saved keys for ${modelKeyFormData.provider}`);
             await loadModelKeys();
             handleCloseModelKeyDialog();
         } catch (error) {
             console.error('Error saving model key:', error);
-            
-            // Try to parse validation error from API
-            let errorMessage = 'Failed to save: ' + error.message;
-            try {
-                // Check if error response contains validation details
-                const response = await error.response?.json();
-                if (response?.detail) {
-                    const detail = response.detail;
-                    if (detail.errors && Array.isArray(detail.errors)) {
-                        errorMessage = 'Validation failed:\n' + 
-                            detail.errors.map(e => `• ${e.field}: ${e.message}`).join('\n');
-                    } else if (typeof detail === 'string') {
-                        errorMessage = detail;
-                    }
-                }
-            } catch (parseError) {
-                // Use original error message
-            }
-            
-            alert(errorMessage);
+            alert('Failed to save: ' + error.message);
         }
         setTimeout(() => setSaveMessage(''), 3000);
     };
@@ -704,8 +636,7 @@ const Settings = () => {
                 icon: llm.icon || '🧠',
                 endpoint: llm.endpoint || '',
                 baseUrl: llm.baseUrl || '',
-                temperature: llm.temperature ?? 0,
-                useForEmbeddings: llm.useForEmbeddings || llm.use_for_embeddings || false,
+                temperature: llm.temperature ?? 0
             });
         } else {
             setEditingLLM(null);
@@ -716,8 +647,7 @@ const Settings = () => {
                 icon: '🧠',
                 endpoint: '',
                 baseUrl: '',
-                temperature: 0,
-                useForEmbeddings: false,
+                temperature: 0
             });
         }
         setOpenLLMDialog(true);
@@ -737,12 +667,12 @@ const Settings = () => {
                 ...(!isReasoningModel(llmFormData.model) && { temperature: llmFormData.temperature }),
                 ...(llmFormData.endpoint && { endpoint: llmFormData.endpoint }),
                 ...(llmFormData.baseUrl && { baseUrl: llmFormData.baseUrl }),
-                useForEmbeddings: llmFormData.useForEmbeddings || false,
+                ...(llmFormData.access_key_id && { access_key_id: llmFormData.access_key_id }),
+                ...(llmFormData.secret_access_key && { secret_access_key: llmFormData.secret_access_key }),
+                ...(llmFormData.session_token && { session_token: llmFormData.session_token }),
             };
 
             const llmName = llmFormData.model;
-
-            console.log('Saving LLM config:', { name: llmName, config: llmConfig });
 
             if (editingLLM) {
                 await updateLLM(editingLLM, llmConfig, llmName);
@@ -757,8 +687,7 @@ const Settings = () => {
             setTimeout(() => setSaveMessage(''), 3000);
         } catch (error) {
             console.error('Error saving LLM:', error);
-            const errorMessage = error.message || 'Failed to save LLM configuration';
-            alert(`Failed to save LLM configuration: ${errorMessage}`);
+            alert('Failed to save LLM configuration');
         }
     };
 
@@ -1232,11 +1161,6 @@ const Settings = () => {
                     </CardContent>
                 </Card>
 
-                {/* Azure DevOps Settings Section */}
-                <div className="mb-6">
-                    <AzureDevOpsSettings />
-                </div>
-
                 {/* Model Keys Section */}
                 <Card className="mb-6">
                     <CardContent className="pt-6">
@@ -1248,32 +1172,24 @@ const Settings = () => {
                             </Button>
                         </div>
                         <p className="text-sm text-muted-foreground mb-4">
-                            Centralized API key and credential management for all model providers
+                            Centralized API key and secret key management for all model providers
                         </p>
                         <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-                            {providerSchemas.map((schema) => {
-                                const existing = modelKeys.find(k => k.provider.toLowerCase() === schema.provider.toLowerCase());
-                                const configuredFields = existing?.configured_fields || [];
-                                
+                            {MODEL_KEY_PROVIDERS.map((provider) => {
+                                const existing = modelKeys.find(k => k.provider === provider.value);
                                 return (
-                                    <div key={schema.provider} className="border rounded-lg p-4">
+                                    <div key={provider.value} className="border rounded-lg p-4">
                                         <div className="flex items-start justify-between mb-2">
                                             <div className="flex items-center gap-2">
-                                                <span className="text-xl">
-                                                    {schema.provider === 'openai' && '🧠'}
-                                                    {schema.provider === 'anthropic' && '🤖'}
-                                                    {schema.provider === 'groq' && '⚡'}
-                                                    {schema.provider === 'bedrock' && '🌩️'}
-                                                    {schema.provider === 'cloudwatch' && '☁️'}
-                                                </span>
-                                                <span className="font-medium text-sm">{schema.display_name}</span>
+                                                <span className="text-xl">{provider.icon}</span>
+                                                <span className="font-medium text-sm">{provider.label}</span>
                                             </div>
                                             <div className="flex gap-1">
                                                 <Button
                                                     size="icon"
                                                     variant="ghost"
                                                     className="h-7 w-7"
-                                                    onClick={() => handleOpenModelKeyDialog(schema.provider)}
+                                                    onClick={() => handleOpenModelKeyDialog(provider.value)}
                                                     title="Edit"
                                                 >
                                                     <Edit2 className="w-3.5 h-3.5" />
@@ -1283,7 +1199,7 @@ const Settings = () => {
                                                         size="icon"
                                                         variant="ghost"
                                                         className="h-7 w-7 text-red-600 hover:text-red-700"
-                                                        onClick={() => handleDeleteModelKey(schema.provider)}
+                                                        onClick={() => handleDeleteModelKey(provider.value)}
                                                         title="Delete"
                                                     >
                                                         <Trash2 className="w-3.5 h-3.5" />
@@ -1291,68 +1207,50 @@ const Settings = () => {
                                                 )}
                                             </div>
                                         </div>
-                                        
-                                        {/* Authentication Type Badge */}
-                                        <div className="mb-2">
-                                            {schema.auth_type === 'api_key' && (
-                                                <Badge variant="outline" className="text-xs">
-                                                    <Key className="w-3 h-3 mr-1" /> API Key Auth
-                                                </Badge>
-                                            )}
-                                            {schema.auth_type === 'aws_iam' && (
-                                                <Badge variant="outline" className="text-xs">
-                                                    <Cloud className="w-3 h-3 mr-1" /> AWS IAM Auth
-                                                </Badge>
-                                            )}
-                                            {schema.auth_type === 'api_key_or_aws_iam' && (
-                                                <Badge variant="outline" className="text-xs">
-                                                    <Key className="w-3 h-3 mr-1" /> Dual Auth
-                                                </Badge>
-                                            )}
-                                        </div>
-                                        
-                                        {/* Configured Fields */}
-                                        <div className="flex flex-wrap gap-1 mb-2">
-                                            {existing && configuredFields.length > 0 ? (
-                                                configuredFields.map(field => (
-                                                    <Badge 
-                                                        key={field} 
-                                                        variant="outline" 
-                                                        className="bg-green-50 text-green-700 border-green-200 text-xs"
-                                                    >
-                                                        {field.replace(/_/g, ' ')}
-                                                    </Badge>
-                                                ))
+                                        <div className="flex flex-wrap gap-1 mb-1">
+                                            {existing ? (
+                                                <>
+                                                    {existing.has_api_key && (
+                                                        <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200 gap-1 text-xs">
+                                                            <Key className="w-3 h-3" /> API Key
+                                                        </Badge>
+                                                    )}
+                                                    {existing.has_secret_key && (
+                                                        <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200 gap-1 text-xs">
+                                                            <Shield className="w-3 h-3" /> Secret
+                                                        </Badge>
+                                                    )}
+                                                    {existing.has_aws_credentials && (
+                                                        <Badge variant="outline" className="bg-orange-50 text-orange-700 border-orange-200 gap-1 text-xs">
+                                                            <Cloud className="w-3 h-3" /> AWS
+                                                        </Badge>
+                                                    )}
+                                                    {existing.endpoint && (
+                                                        <Badge variant="outline" className="bg-purple-50 text-purple-700 border-purple-200 gap-1 text-xs">
+                                                            Endpoint
+                                                        </Badge>
+                                                    )}
+                                                </>
                                             ) : (
                                                 <Badge variant="outline" className="text-muted-foreground text-xs">
                                                     Not configured
                                                 </Badge>
                                             )}
                                         </div>
-                                        
-                                        {/* Additional Info */}
                                         {existing?.endpoint && (
-                                            <p className="text-xs text-muted-foreground font-mono truncate mb-1" title={existing.endpoint}>
+                                            <p className="text-xs text-muted-foreground font-mono truncate" title={existing.endpoint}>
                                                 {existing.endpoint}
                                             </p>
                                         )}
                                         {existing?.region && (
-                                            <p className="text-xs text-muted-foreground mb-1">
-                                                Region: {existing.region}
-                                            </p>
+                                            <p className="text-xs text-muted-foreground">Region: {existing.region}</p>
                                         )}
-                                        
-                                        {/* Description */}
-                                        <p className="text-xs text-muted-foreground line-clamp-2">
-                                            {schema.description}
-                                        </p>
-                                        
                                         {!existing && (
                                             <Button
                                                 variant="outline"
                                                 size="sm"
                                                 className="mt-2 w-full text-xs h-7"
-                                                onClick={() => handleOpenModelKeyDialog(schema.provider)}
+                                                onClick={() => handleOpenModelKeyDialog(provider.value)}
                                             >
                                                 <Plus className="w-3 h-3 mr-1" /> Configure
                                             </Button>
@@ -1662,43 +1560,45 @@ const Settings = () => {
                                 </div>
                             )}
 
-                            {/* Use for Embeddings Checkbox */}
-                            <div className="flex items-start space-x-3 p-4 bg-blue-50 border border-blue-200 rounded-lg">
-                                <input
-                                    type="checkbox"
-                                    id="llm-use-for-embeddings"
-                                    checked={llmFormData.useForEmbeddings || false}
-                                    onChange={(e) => setLLMFormData({ 
-                                        ...llmFormData, 
-                                        useForEmbeddings: e.target.checked 
-                                    })}
-                                    className="mt-1 h-4 w-4 rounded border-gray-300"
-                                />
-                                <div className="flex-1">
-                                    <Label htmlFor="llm-use-for-embeddings" className="cursor-pointer font-medium">
-                                        Use for Embeddings
-                                    </Label>
-                                    <p className="text-sm text-muted-foreground mt-1">
-                                        Use this model for generating embeddings in knowledge base operations. 
-                                        Only one LLM can be active for embeddings at a time.
-                                    </p>
-                                </div>
-                            </div>
-
-                            {/* Note about credentials */}
-                            {(llmFormData.provider === 'AWS Bedrock' || llmFormData.provider === 'Bedrock' || llmFormData.provider === 'bedrock' || 
-                              llmFormData.provider === 'OpenAI' || llmFormData.provider === 'Anthropic' || 
-                              llmFormData.provider === 'Google' || llmFormData.provider === 'Groq' || 
-                              llmFormData.provider === 'Azure OpenAI') && (
-                                <Alert className="flex items-start gap-2">
-                                    <Key className="w-4 h-4 mt-0.5" />
-                                    <div>
-                                        <p className="text-sm">
-                                            <strong>API Credentials:</strong> Configure {llmFormData.provider} credentials in the <strong>Model Keys</strong> section below. 
-                                            Credentials are shared across all LLMs using the same provider.
-                                        </p>
+                            {/* AWS Credentials Section */}
+                            {(llmFormData.provider === 'AWS Bedrock' || llmFormData.provider === 'Bedrock' || llmFormData.provider === 'bedrock') && (
+                                <div className="p-4 bg-muted rounded-lg flex flex-col gap-3">
+                                    <div className="flex items-center gap-2">
+                                        <Key className="w-4 h-4 text-primary" />
+                                        <h4 className="text-sm font-medium">AWS Credentials</h4>
                                     </div>
-                                </Alert>
+                                    <div className="space-y-2">
+                                        <Label htmlFor="llm-aws-access-key">Access Key ID</Label>
+                                        <Input
+                                            id="llm-aws-access-key"
+                                            type="password"
+                                            placeholder="AKIA..."
+                                            value={llmFormData.access_key_id}
+                                            onChange={(e) => setLLMFormData({ ...llmFormData, access_key_id: e.target.value })}
+                                        />
+                                    </div>
+                                    <div className="space-y-2">
+                                        <Label htmlFor="llm-aws-secret-key">Secret Access Key</Label>
+                                        <Input
+                                            id="llm-aws-secret-key"
+                                            type="password"
+                                            placeholder="Secret key"
+                                            value={llmFormData.secret_access_key}
+                                            onChange={(e) => setLLMFormData({ ...llmFormData, secret_access_key: e.target.value })}
+                                        />
+                                    </div>
+                                    <div className="space-y-2">
+                                        <Label htmlFor="llm-aws-session-token">Session Token <span className="text-muted-foreground">(optional)</span></Label>
+                                        <Input
+                                            id="llm-aws-session-token"
+                                            type="password"
+                                            placeholder="For temporary credentials"
+                                            value={llmFormData.session_token}
+                                            onChange={(e) => setLLMFormData({ ...llmFormData, session_token: e.target.value })}
+                                        />
+                                    </div>
+                                    <p className="text-xs text-muted-foreground">Credentials are stored in the database and used automatically when running workflows.</p>
+                                </div>
                             )}
                         </div>
                         <DialogFooter className="mt-6">
@@ -1934,7 +1834,7 @@ const Settings = () => {
                                                         value={modelKeyFormData.api_key}
                                                         onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, api_key: e.target.value })}
                                                         type={showModelKeyFields.api_key ? 'text' : 'password'}
-                                                        placeholder={modelKeyFormData.provider === 'openai' ? 'sk-...' : modelKeyFormData.provider === 'anthropic' ? 'sk-ant-...' : 'Enter API key'}
+                                                        placeholder={modelKeyFormData.provider === 'OpenAI' ? 'sk-...' : modelKeyFormData.provider === 'Anthropic' ? 'sk-ant-...' : 'Enter API key'}
                                                         className="pr-10"
                                                     />
                                                     <Button
@@ -1986,13 +1886,13 @@ const Settings = () => {
                                         return (
                                             <div key={field} className="space-y-2">
                                                 <Label htmlFor="mk-endpoint">
-                                                    {modelKeyFormData.provider === 'ollama' ? 'Base URL' : 'Endpoint URL'}
+                                                    {modelKeyFormData.provider === 'Ollama' ? 'Base URL' : 'Endpoint URL'}
                                                 </Label>
                                                 <Input
                                                     id="mk-endpoint"
                                                     value={modelKeyFormData.endpoint}
                                                     onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, endpoint: e.target.value })}
-                                                    placeholder={modelKeyFormData.provider === 'ollama' ? 'http://localhost:11434' : 'https://...'}
+                                                    placeholder={modelKeyFormData.provider === 'Ollama' ? 'http://localhost:11434' : 'https://...'}
                                                 />
                                             </div>
                                         );

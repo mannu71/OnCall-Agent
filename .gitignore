@@ -54,8 +54,11 @@ worker/output/
 agent/data/
 agent-api/data/
 
+# Hermes agent (submodule/reference)
+hermes-agent-main/
+
 # Temporary files
 tmp/
 temp/
 *.tmp
-graph-rag-dotnet/
+.claude/worktrees/

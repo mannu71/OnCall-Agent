@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Recurse -Depth 2)",
+      "Bash(Select-Object FullName)",
+      "Bash(Format-Table -AutoSize)",
+      "PowerShell(cd \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\\\\.claude\\\\worktrees\\\\focused-mcnulty-6113ea\"; Get-ChildItem -Recurse -Depth 2 | Where-Object { $_.PSIsContainer } | Select-Object -ExpandProperty FullName | Sort-Object)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(cp \"C:\\\\Users\\\\csinvmmn\\\\Downloads\\\\files\\\\AGENTS_backend.md\" \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\\\\.claude\\\\worktrees\\\\focused-mcnulty-6113ea\\\\agent-api\\\\AGENTS.md\")",
+      "Bash(cp \"C:\\\\Users\\\\csinvmmn\\\\Downloads\\\\files\\\\AGENTS_frontend.md\" \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\\\\.claude\\\\worktrees\\\\focused-mcnulty-6113ea\\\\ui\\\\AGENTS.md\")"
+    ]
+  }
+}

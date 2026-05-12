@@ -1,4 +1,5 @@
 """Dependency injection container and factory functions."""
+from functools import lru_cache
 from typing import Optional
 
 from app.repositories import WorkflowRepository, ExecutionRepository

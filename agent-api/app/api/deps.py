@@ -2,90 +2,51 @@
 from typing import Generator
 from fastapi import Depends, HTTPException, status
 
-from app.infrastructure.persistence import (
-    WorkflowRepository,
-    ExecutionRepository,
-    LLMConfigRepository,
-    MCPConfigRepository,
-    ModelKeyRepository,
-)
+from app.repositories import WorkflowRepository, ExecutionRepository
+from app.core.dependencies import get_workflow_repository, get_execution_repository
 from app.workflow.engine import WorkflowEngine
 from app.core.scheduler import workflow_scheduler
 
 
-# --------------------------------------------------------------------------- #
-# Repository singletons (kept in-memory for the process lifetime)
-# --------------------------------------------------------------------------- #
-
-_workflow_repo: WorkflowRepository | None = None
-_execution_repo: ExecutionRepository | None = None
-_llm_config_repo: LLMConfigRepository | None = None
-_mcp_config_repo: MCPConfigRepository | None = None
-_model_key_repo: ModelKeyRepository | None = None
-
-
-# --------------------------------------------------------------------------- #
 # Repository dependencies
-# --------------------------------------------------------------------------- #
-
 def get_workflow_repo() -> WorkflowRepository:
-    """Get workflow repository dependency."""
-    global _workflow_repo
-    if _workflow_repo is None:
-        _workflow_repo = WorkflowRepository()
-    return _workflow_repo
+    """Get workflow repository dependency.
+    
+    Returns:
+        WorkflowRepository instance
+    """
+    return get_workflow_repository()
 
 
 def get_execution_repo() -> ExecutionRepository:
-    """Get execution repository dependency."""
-    global _execution_repo
-    if _execution_repo is None:
-        _execution_repo = ExecutionRepository()
-    return _execution_repo
+    """Get execution repository dependency.
+    
+    Returns:
+        ExecutionRepository instance
+    """
+    return get_execution_repository()
 
 
-def get_llm_config_repo() -> LLMConfigRepository:
-    """Get LLM config repository dependency."""
-    global _llm_config_repo
-    if _llm_config_repo is None:
-        _llm_config_repo = LLMConfigRepository()
-    return _llm_config_repo
-
-
-def get_mcp_config_repo() -> MCPConfigRepository:
-    """Get MCP config repository dependency."""
-    global _mcp_config_repo
-    if _mcp_config_repo is None:
-        _mcp_config_repo = MCPConfigRepository()
-    return _mcp_config_repo
-
-
-def get_model_key_repo() -> ModelKeyRepository:
-    """Get model key repository dependency."""
-    global _model_key_repo
-    if _model_key_repo is None:
-        _model_key_repo = ModelKeyRepository()
-    return _model_key_repo
-
-
-# --------------------------------------------------------------------------- #
 # Service dependencies
-# --------------------------------------------------------------------------- #
-
 def get_workflow_engine() -> WorkflowEngine:
-    """Get workflow engine instance."""
+    """Get workflow engine instance.
+    
+    Returns:
+        WorkflowEngine instance
+    """
     return WorkflowEngine()
 
 
 def get_scheduler():
-    """Get scheduler instance."""
+    """Get scheduler instance.
+    
+    Returns:
+        Workflow scheduler instance
+    """
     return workflow_scheduler
 
 
-# --------------------------------------------------------------------------- #
 # Common dependencies
-# --------------------------------------------------------------------------- #
-
 async def verify_workflow_exists(
     workflow_name: str,
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo)

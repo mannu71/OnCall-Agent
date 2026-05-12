@@ -7,9 +7,6 @@ autonomously during its reasoning loop.
 
 Each tool wraps a function from :mod:`app.mcp.tools.watch_tools`, binding
 pre-resolved AWS credentials so the LLM never sees raw secrets.
-
-All tool outputs are sanitized through CloudWatchToolSanitizer to prevent
-token explosion with filtering, deduplication, and hard token budgets.
 """
 from __future__ import annotations
 
@@ -19,12 +16,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
-from app.workflow.tools.cloudwatch_sanitizer import CloudWatchToolSanitizer
-
 logger = logging.getLogger(__name__)
-
-# Global sanitizer instance for session-wide metrics
-_sanitizer = CloudWatchToolSanitizer()
 
 
 # ------------------------------------------------------------------
@@ -117,50 +109,15 @@ def build_cloudwatch_agent_tools(
         time_range_minutes: int = 60,
         filter_pattern: Optional[str] = None,
     ) -> str:
-        """Fetch recent log events using CloudWatch Insights with sanitization.
-        
-        Output is sanitized through a pipeline that filters noise, deduplicates
-        events, and enforces token budgets to prevent context overflow.
-        """
-        from app.mcp.tools.watch_tools import get_watcher, _extract_credentials
-        from datetime import datetime, timedelta, timezone as _tz
-        
-        try:
-            # Use CloudWatch Insights for better control
-            if filter_pattern:
-                query = f"fields @timestamp, @message | filter @message like /{filter_pattern}/ | sort @timestamp desc | limit 100"
-            else:
-                query = "fields @timestamp, @message | sort @timestamp desc | limit 100"
-            
-            watcher = get_watcher(region=_region, **_extract_credentials(_creds))
-            end = datetime.now(_tz.utc)
-            start = end - timedelta(minutes=time_range_minutes)
-            
-            raw_result = await watcher.query_with_insights(
-                log_group_names=log_group_names,
-                query_string=query,
-                start_time=start,
-                end_time=end,
-                limit=100
-            )
-            
-            # Sanitize through the pipeline
-            return _sanitizer.sanitize(
-                raw_result=raw_result,
-                tool_name="cloudwatch_watch_logs",
-                context={
-                    "log_groups": log_group_names,
-                    "time_range_minutes": time_range_minutes,
-                    "filter_pattern": filter_pattern,
-                }
-            )
-            
-        except Exception as e:
-            import json
-            return json.dumps({
-                "error": True,
-                "message": f"Failed to fetch logs: {str(e)}"
-            })
+        import json
+        result = await watch_log_groups(
+            log_group_names=log_group_names,
+            time_range_minutes=time_range_minutes,
+            filter_pattern=filter_pattern,
+            region=_region,
+            credentials=_creds if _creds else None,
+        )
+        return json.dumps(result, indent=2, default=str)
 
     # -- analyse patterns --
     async def _analyze_patterns(
@@ -168,26 +125,15 @@ def build_cloudwatch_agent_tools(
         time_range_minutes: int = 60,
         pattern_types: Optional[List[str]] = None,
     ) -> str:
-        from app.mcp.tools.watch_tools import analyze_log_patterns, _extract_credentials
-        
-        raw_result = await analyze_log_patterns(
+        import json
+        result = await analyze_log_patterns(
             log_group_names=log_group_names,
             time_range_minutes=time_range_minutes,
             pattern_types=pattern_types,
             region=_region,
             credentials=_creds if _creds else None,
         )
-        
-        # Sanitize through the pipeline
-        return _sanitizer.sanitize(
-            raw_result=raw_result,
-            tool_name="cloudwatch_analyze_patterns",
-            context={
-                "log_groups": log_group_names,
-                "time_range_minutes": time_range_minutes,
-                "pattern_types": pattern_types,
-            }
-        )
+        return json.dumps(result, indent=2, default=str)
 
     # -- detect anomalies --
     async def _detect_anomalies(
@@ -196,9 +142,8 @@ def build_cloudwatch_agent_tools(
         baseline_minutes: int = 1440,
         sensitivity: str = "medium",
     ) -> str:
-        from app.mcp.tools.watch_tools import detect_anomalies, _extract_credentials
-        
-        raw_result = await detect_anomalies(
+        import json
+        result = await detect_anomalies(
             log_group_names=log_group_names,
             time_range_minutes=time_range_minutes,
             baseline_minutes=baseline_minutes,
@@ -206,18 +151,7 @@ def build_cloudwatch_agent_tools(
             region=_region,
             credentials=_creds if _creds else None,
         )
-        
-        # Sanitize through the pipeline
-        return _sanitizer.sanitize(
-            raw_result=raw_result,
-            tool_name="cloudwatch_detect_anomalies",
-            context={
-                "log_groups": log_group_names,
-                "time_range_minutes": time_range_minutes,
-                "baseline_minutes": baseline_minutes,
-                "sensitivity": sensitivity,
-            }
-        )
+        return json.dumps(result, indent=2, default=str)
 
     # -- correlate logs --
     async def _correlate_logs(
@@ -226,9 +160,8 @@ def build_cloudwatch_agent_tools(
         correlation_id: Optional[str] = None,
         trace_id: Optional[str] = None,
     ) -> str:
-        from app.mcp.tools.watch_tools import correlate_logs, _extract_credentials
-        
-        raw_result = await correlate_logs(
+        import json
+        result = await correlate_logs(
             log_group_names=log_group_names,
             correlation_id=correlation_id,
             time_range_minutes=time_range_minutes,
@@ -236,18 +169,7 @@ def build_cloudwatch_agent_tools(
             region=_region,
             credentials=_creds if _creds else None,
         )
-        
-        # Sanitize through the pipeline
-        return _sanitizer.sanitize(
-            raw_result=raw_result,
-            tool_name="cloudwatch_correlate_logs",
-            context={
-                "log_groups": log_group_names,
-                "time_range_minutes": time_range_minutes,
-                "correlation_id": correlation_id,
-                "trace_id": trace_id,
-            }
-        )
+        return json.dumps(result, indent=2, default=str)
 
     # -- search logs (Insights query) --
     async def _search_logs(
@@ -255,51 +177,35 @@ def build_cloudwatch_agent_tools(
         query: str,
         hours: int = 24,
     ) -> str:
-        """Run CloudWatch Insights query with sanitization."""
-        from app.mcp.tools.watch_tools import get_watcher, _extract_credentials
-        from datetime import datetime, timedelta, timezone as _tz
-        
-        # Enforce hard limit on query results
-        MAX_RESULTS = 100
-        
-        # Add limit to query if not present
-        if 'limit' not in query.lower():
-            query = f"{query} | limit {MAX_RESULTS}"
-        
-        # Cap hours to prevent massive queries
-        if hours > 24:
-            hours = 24
-        
+        import json
         try:
+            from app.mcp.tools.search_tools import CloudWatchLogsSearchTools
+        except ImportError:
+            # Fallback: use the watcher's Insights query directly if
+            # search_tools has import issues.
+            from app.mcp.tools.watch_tools import get_watcher, _extract_credentials
+            from datetime import datetime, timedelta, timezone as _tz
             watcher = get_watcher(region=_region, **_extract_credentials(_creds))
             end = datetime.now(_tz.utc)
             start = end - timedelta(hours=hours)
-            
-            raw_result = await watcher.query_with_insights(
+            result = await watcher.query_with_insights(
                 log_group_names=log_group_names,
                 query_string=query,
                 start_time=start,
                 end_time=end,
-                limit=MAX_RESULTS
             )
-            
-            # Sanitize through the pipeline
-            return _sanitizer.sanitize(
-                raw_result=raw_result,
-                tool_name="cloudwatch_search_logs",
-                context={
-                    "log_groups": log_group_names,
-                    "query": query,
-                    "hours": hours,
-                }
-            )
-            
-        except Exception as e:
-            import json
-            return json.dumps({
-                "error": True,
-                "message": f"Query failed: {str(e)}"
-            })
+            return json.dumps(result, indent=2, default=str)
+        search = CloudWatchLogsSearchTools(
+            profile_name=_creds.get("aws_profile"),
+            region_name=_region,
+        )
+        result = await search.search_logs_multi(
+            log_group_names=log_group_names,
+            query=query,
+            hours=hours,
+        )
+        # search_logs_multi returns a JSON string already
+        return result if isinstance(result, str) else json.dumps(result, indent=2, default=str)
 
     tools = [
         StructuredTool.from_function(

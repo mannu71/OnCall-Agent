@@ -445,16 +445,6 @@ async def analyze_log_patterns(
                 "statistics": query_result.get("statistics")
             }
         except Exception as e:
-            # Check if this is a fatal auth error that should stop the workflow
-            from app.core.error_classifier import classify_error, FailoverReason
-            classified = classify_error(e)
-            
-            # For non-retryable auth errors (like ExpiredTokenException),
-            # propagate the exception to stop the workflow immediately
-            if classified.reason == FailoverReason.AUTH_PERMANENT and not classified.retryable:
-                logger.error("analyze_log_patterns: %s query - propagating fatal auth error: %s", pattern_type, e)
-                raise
-            
             results[pattern_type] = {
                 "status": "error",
                 "error": str(e)
@@ -485,16 +475,6 @@ async def analyze_log_patterns(
         )
         unique_patterns = unique_result.get("results", [])[:50]
     except Exception as e:
-        # Check if this is a fatal auth error that should stop the workflow
-        from app.core.error_classifier import classify_error, FailoverReason
-        classified = classify_error(e)
-        
-        # For non-retryable auth errors (like ExpiredTokenException),
-        # propagate the exception to stop the workflow immediately
-        if classified.reason == FailoverReason.AUTH_PERMANENT and not classified.retryable:
-            logger.error("analyze_log_patterns: propagating fatal auth error: %s", e)
-            raise
-        
         logger.warning("analyze_log_patterns: unique_patterns query failed: %s", e)
 
     # Get overall statistics
@@ -513,16 +493,6 @@ async def analyze_log_patterns(
             end_time=end_time
         )
     except Exception as e:
-        # Check if this is a fatal auth error that should stop the workflow
-        from app.core.error_classifier import classify_error, FailoverReason
-        classified = classify_error(e)
-        
-        # For non-retryable auth errors (like ExpiredTokenException),
-        # propagate the exception to stop the workflow immediately
-        if classified.reason == FailoverReason.AUTH_PERMANENT and not classified.retryable:
-            logger.error("analyze_log_patterns: stats query - propagating fatal auth error: %s", e)
-            raise
-        
         stats_result = {"error": str(e)}
     
     return {

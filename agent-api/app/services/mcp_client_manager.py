@@ -10,6 +10,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from app.core.retry import with_retry
+from app.core.security import check_ssrf, SSRFError
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +199,11 @@ class MCPClientManager:
         """
         if server_id not in self.connections:
             raise ValueError(f"Not connected to server: {server_id}")
-        
+
+        # SSRF guard: reject any URL-shaped argument that targets a private range.
+        # This is a cooperative defence layer — the real boundary is OS isolation.
+        self._check_tool_arguments_ssrf(tool_name, arguments)
+
         try:
             logger.info("Executing tool '%s' on server '%s'", tool_name, server_id)
             logger.debug("Arguments: %s", arguments)
@@ -233,6 +238,35 @@ class MCPClientManager:
                 'isError': True
             }
     
+    @staticmethod
+    def _check_tool_arguments_ssrf(tool_name: str, arguments: Dict[str, Any]) -> None:
+        """Scan tool arguments for URL values and apply SSRF guard to each.
+
+        Iterates over all string argument values.  Any value that looks like
+        an HTTP/HTTPS URL is validated via check_ssrf.  Non-URL strings and
+        non-string values are skipped.
+
+        Raises:
+            SSRFError: When a URL argument targets a blocked network range.
+        """
+        if not arguments:
+            return
+
+        for key, value in arguments.items():
+            if not isinstance(value, str):
+                continue
+            stripped = value.strip()
+            if not stripped.startswith(("http://", "https://")):
+                continue
+            try:
+                check_ssrf(stripped)
+            except SSRFError as exc:
+                logger.warning(
+                    "SSRF guard blocked tool '%s' argument '%s': %s",
+                    tool_name, key, exc,
+                )
+                raise
+
     async def disconnect_all(self):
         """Disconnect from all MCP servers."""
         # Disconnect each server using individual disconnect to handle errors gracefully

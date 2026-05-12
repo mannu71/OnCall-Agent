@@ -1,5 +1,6 @@
 """Database configuration and connection management."""
 import logging
+from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import text
@@ -52,8 +53,7 @@ async def init_db():
         WorkflowModel, ExecutionModel,
         LLMConfigModel, MCPServerModel, LogPatternModel,
         KnownIssueModel, BaselineMetricModel, AnalysisHistoryModel, AlertModel,
-        ModelKeyModel,
-        TrajectoryModel, ContextReferenceModel, ContextLengthCacheModel
+        ModelKeyModel
     )
     
     async with async_engine.begin() as conn:

@@ -1,296 +1,230 @@
+"""Canonical event type definitions for the workflow execution pipeline.
+
+Both backend emitters (VisualWorkflowExecutor, ReactStrategy) and frontend
+consumers (useWorkflowStream.js) reference these types.  The frontend SSE
+event names are the string values of EventType constants.
+
+Wire format (SSE):
+    event: <event_type>
+    data: {"event_type": "...", "data": {...}, "timestamp": "...Z"}
 """
-Canonical SSE Event Schema for Visual Workflow Execution
+from __future__ import annotations
 
-This module defines the contract between the backend streaming system and the
-frontend React Flow canvas. All workflow execution events are normalized to
-this schema before being sent over SSE.
-
-Event Types:
------------
-1. Workflow-level events:
-   - workflow_started: Execution begins
-   - workflow_completed: Execution finished successfully
-   - workflow_failed: Execution failed
-
-2. Node-level events (React Flow compatible):
-   - node_start: Node execution begins
-   - node_update: Node execution progress update
-   - node_done: Node execution completed
-   - node_error: Node execution failed
-
-3. Agent streaming events:
-   - agent_token: Real-time LLM token output
-   - agent_tool_call: Agent invoking a tool
-   - agent_tool_result: Tool execution result
-   - agent_error: Agent error
-   - agent_complete: Agent finished
-
-4. System events:
-   - keepalive: Connection keep-alive ping
-   - error: System-level error
-
-Schema Structure:
-----------------
-All events follow this structure:
-{
-    "event_type": str,      # Event type from above
-    "timestamp": str,       # ISO 8601 timestamp
-    "data": {               # Event-specific payload
-        ...
-    }
-}
-
-React Flow Node Events:
-----------------------
-node_start: {
-    "nodeId": str,          # React Flow node ID
-    "nodeType": str,        # Node type (agent, llm, tool, etc.)
-    "label": str            # Human-readable node label
-}
-
-node_update: {
-    "nodeId": str,
-    "status": str,          # "running", "processing", etc.
-    "progress": float,      # Optional: 0.0 to 1.0
-    "message": str          # Optional: status message
-}
-
-node_done: {
-    "nodeId": str,
-    "status": str,          # "success" or "failed"
-    "output": str,          # Node output (truncated)
-    "duration": float       # Execution time in seconds
-}
-
-node_error: {
-    "nodeId": str,
-    "error": str,           # Error message
-    "duration": float       # Time until error
-}
-"""
+import json
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Literal, Optional
-from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional
 
 
-# Event type literals for type safety
-WorkflowEventType = Literal[
-    "workflow_started",
-    "workflow_completed",
-    "workflow_failed"
-]
+# ─────────────────────────────────────────────────────────────────────────────
+# Event type constants
+# ─────────────────────────────────────────────────────────────────────────────
 
-NodeEventType = Literal[
-    "node_start",
-    "node_update",
-    "node_done",
-    "node_error"
-]
+class EventType:
+    # Workflow lifecycle
+    WORKFLOW_STARTED   = "workflow_started"
+    WORKFLOW_COMPLETED = "workflow_completed"
+    WORKFLOW_FAILED    = "workflow_failed"
 
-AgentEventType = Literal[
-    "agent_token",
-    "agent_tool_call",
-    "agent_tool_result",
-    "agent_error",
-    "agent_complete"
-]
+    # Node lifecycle
+    NODE_STARTED   = "node_started"
+    NODE_COMPLETED = "node_completed"
+    NODE_FAILED    = "node_failed"
 
-SystemEventType = Literal[
-    "keepalive",
-    "error"
-]
+    # Agent streaming (consumed by useWorkflowStream.js)
+    LLM_TOKEN      = "llm_token"
+    TOOL_CALL      = "tool_call"
+    TOOL_RESULT    = "tool_result"
+    AGENT_ERROR    = "agent_error"
+    AGENT_COMPLETE = "agent_complete"
 
-EventType = Literal[
-    # Workflow events
-    "workflow_started",
-    "workflow_completed",
-    "workflow_failed",
-    # Node events (React Flow compatible)
-    "node_start",
-    "node_update",
-    "node_done",
-    "node_error",
-    # Agent streaming events
-    "agent_token",
-    "agent_tool_call",
-    "agent_tool_result",
-    "agent_error",
-    "agent_complete",
-    # System events
-    "keepalive",
-    "error"
-]
+    # Human-in-the-loop
+    HITL_PAUSE    = "hitl_pause"
+    HITL_APPROVED = "hitl_approved"
+    HITL_REJECTED = "hitl_rejected"
+
+    # Cost tracking
+    COST_UPDATE = "cost_update"
+
+    # Stream meta
+    STREAM_END = "stream_end"
+    HEARTBEAT  = "heartbeat"
 
 
-class WorkflowEvent(BaseModel):
-    """Base event model for all workflow execution events."""
-    event_type: EventType
-    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
-    data: Dict[str, Any] = Field(default_factory=dict)
+# ─────────────────────────────────────────────────────────────────────────────
+# Wire-format event model
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@dataclass
+class WorkflowEvent:
+    """A single event emitted by the execution pipeline."""
+
+    event_type: str
+    data: Dict[str, Any]
+    timestamp: str = field(default_factory=_utc_now)
 
     def to_sse(self) -> str:
-        """Convert to SSE format string."""
-        import json
-        # Use event: prefix for agent streaming events (allows client-side filtering)
-        if self.event_type.startswith("agent_"):
-            return f"event: {self.event_type}\ndata: {json.dumps(self.model_dump())}\n\n"
-        return f"data: {json.dumps(self.model_dump())}\n\n"
+        """Render as an SSE chunk (event + data lines with double newline)."""
+        payload = json.dumps(
+            {"event_type": self.event_type, "data": self.data, "timestamp": self.timestamp}
+        )
+        return f"event: {self.event_type}\ndata: {payload}\n\n"
+
+    def dict(self) -> Dict[str, Any]:
+        return {
+            "event_type": self.event_type,
+            "data": self.data,
+            "timestamp": self.timestamp,
+        }
 
 
-# Workflow-level events
-class WorkflowStartedEvent(WorkflowEvent):
-    """Workflow execution started."""
-    event_type: Literal["workflow_started"] = "workflow_started"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: execution_id, workflow_name, workflow_id"
+# ─────────────────────────────────────────────────────────────────────────────
+# Typed constructors — one per event type
+# ─────────────────────────────────────────────────────────────────────────────
+
+def workflow_started(
+    execution_id: str,
+    workflow_name: str,
+    workflow_id: Optional[int] = None,
+) -> WorkflowEvent:
+    return WorkflowEvent(
+        EventType.WORKFLOW_STARTED,
+        {"execution_id": execution_id, "workflow_name": workflow_name, "workflow_id": workflow_id},
     )
 
 
-class WorkflowCompletedEvent(WorkflowEvent):
-    """Workflow execution completed successfully."""
-    event_type: Literal["workflow_completed"] = "workflow_completed"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: execution_id, status, duration, nodes_executed"
+def workflow_completed(
+    execution_id: str,
+    duration: float,
+    nodes_executed: int,
+) -> WorkflowEvent:
+    return WorkflowEvent(
+        EventType.WORKFLOW_COMPLETED,
+        {
+            "execution_id": execution_id,
+            "status": "success",
+            "duration": duration,
+            "nodes_executed": nodes_executed,
+        },
     )
 
 
-class WorkflowFailedEvent(WorkflowEvent):
-    """Workflow execution failed."""
-    event_type: Literal["workflow_failed"] = "workflow_failed"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: execution_id, error, duration"
+def workflow_failed(execution_id: str, error: str, duration: float) -> WorkflowEvent:
+    return WorkflowEvent(
+        EventType.WORKFLOW_FAILED,
+        {"execution_id": execution_id, "error": error, "duration": duration},
     )
 
 
-# Node-level events (React Flow compatible)
-class NodeStartEvent(WorkflowEvent):
-    """Node execution started."""
-    event_type: Literal["node_start"] = "node_start"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: nodeId, nodeType, label"
+def node_started(node_id: str, node_type: str, label: str) -> WorkflowEvent:
+    return WorkflowEvent(
+        EventType.NODE_STARTED,
+        {"node_id": node_id, "node_type": node_type, "label": label},
     )
 
 
-class NodeUpdateEvent(WorkflowEvent):
-    """Node execution progress update."""
-    event_type: Literal["node_update"] = "node_update"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: nodeId, status, progress (optional), message (optional)"
+def node_completed(
+    node_id: str,
+    node_type: str,
+    status: str,
+    duration: float,
+    output: str = "",
+) -> WorkflowEvent:
+    return WorkflowEvent(
+        EventType.NODE_COMPLETED,
+        {
+            "node_id": node_id,
+            "node_type": node_type,
+            "status": status,
+            "duration": duration,
+            "output": output,
+        },
     )
 
 
-class NodeDoneEvent(WorkflowEvent):
-    """Node execution completed."""
-    event_type: Literal["node_done"] = "node_done"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: nodeId, status, output, duration"
+def node_failed(
+    node_id: str, node_type: str, error: str, duration: float
+) -> WorkflowEvent:
+    return WorkflowEvent(
+        EventType.NODE_FAILED,
+        {"node_id": node_id, "node_type": node_type, "error": error, "duration": duration},
     )
 
 
-class NodeErrorEvent(WorkflowEvent):
-    """Node execution failed."""
-    event_type: Literal["node_error"] = "node_error"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: nodeId, error, duration"
+def llm_token(token: str, node_id: str) -> WorkflowEvent:
+    return WorkflowEvent(EventType.LLM_TOKEN, {"token": token, "node_id": node_id})
+
+
+def tool_call_event(
+    tool_name: str, args: Dict[str, Any], node_id: str
+) -> WorkflowEvent:
+    return WorkflowEvent(
+        EventType.TOOL_CALL, {"tool": tool_name, "args": args, "node_id": node_id}
     )
 
 
-# Agent streaming events
-class AgentTokenEvent(WorkflowEvent):
-    """Real-time LLM token output."""
-    event_type: Literal["agent_token"] = "agent_token"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: token, node_id"
+def tool_result_event(tool_name: str, result: str, node_id: str) -> WorkflowEvent:
+    return WorkflowEvent(
+        EventType.TOOL_RESULT, {"tool": tool_name, "result": result, "node_id": node_id}
     )
 
 
-class AgentToolCallEvent(WorkflowEvent):
-    """Agent invoking a tool."""
-    event_type: Literal["agent_tool_call"] = "agent_tool_call"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: tool, args, node_id, preview (optional)"
+def agent_error(error: str, node_id: str) -> WorkflowEvent:
+    return WorkflowEvent(EventType.AGENT_ERROR, {"error": error, "node_id": node_id})
+
+
+def agent_complete(output: str, node_id: str) -> WorkflowEvent:
+    return WorkflowEvent(EventType.AGENT_COMPLETE, {"output": output, "node_id": node_id})
+
+
+def hitl_pause(
+    execution_id: str,
+    request_id: str,
+    root_cause: str,
+    suggestions: List[str],
+    tool_name: Optional[str] = None,
+    tool_params: Optional[Dict[str, Any]] = None,
+) -> WorkflowEvent:
+    return WorkflowEvent(
+        EventType.HITL_PAUSE,
+        {
+            "execution_id": execution_id,
+            "request_id": request_id,
+            "root_cause": root_cause,
+            "suggestions": suggestions,
+            "tool_name": tool_name,
+            "tool_params": tool_params,
+        },
     )
 
 
-class AgentToolResultEvent(WorkflowEvent):
-    """Tool execution result."""
-    event_type: Literal["agent_tool_result"] = "agent_tool_result"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: tool, result, node_id"
+def hitl_approved(execution_id: str, request_id: str) -> WorkflowEvent:
+    return WorkflowEvent(
+        EventType.HITL_APPROVED,
+        {"execution_id": execution_id, "request_id": request_id},
     )
 
 
-class AgentErrorEvent(WorkflowEvent):
-    """Agent error."""
-    event_type: Literal["agent_error"] = "agent_error"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: error, node_id, classified (optional)"
+def hitl_rejected(execution_id: str, request_id: str, reason: str = "") -> WorkflowEvent:
+    return WorkflowEvent(
+        EventType.HITL_REJECTED,
+        {"execution_id": execution_id, "request_id": request_id, "reason": reason},
     )
 
 
-class AgentCompleteEvent(WorkflowEvent):
-    """Agent finished."""
-    event_type: Literal["agent_complete"] = "agent_complete"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: output, node_id, metadata (optional)"
+def cost_update(
+    node_id: str, cost_usd: float, total_cost_usd: float, model: str
+) -> WorkflowEvent:
+    return WorkflowEvent(
+        EventType.COST_UPDATE,
+        {
+            "node_id": node_id,
+            "cost_usd": cost_usd,
+            "total_cost_usd": total_cost_usd,
+            "model": model,
+        },
     )
-
-
-# System events
-class KeepaliveEvent(WorkflowEvent):
-    """Connection keep-alive ping."""
-    event_type: Literal["keepalive"] = "keepalive"
-    data: Dict[str, Any] = Field(default_factory=dict)
-
-
-class ErrorEvent(WorkflowEvent):
-    """System-level error."""
-    event_type: Literal["error"] = "error"
-    data: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Contains: error, context (optional)"
-    )
-
-
-# Event factory
-def create_event(event_type: EventType, data: Dict[str, Any]) -> WorkflowEvent:
-    """Create a typed event from event_type and data.
-    
-    Args:
-        event_type: Event type string
-        data: Event payload
-        
-    Returns:
-        Typed WorkflowEvent instance
-    """
-    event_map = {
-        "workflow_started": WorkflowStartedEvent,
-        "workflow_completed": WorkflowCompletedEvent,
-        "workflow_failed": WorkflowFailedEvent,
-        "node_start": NodeStartEvent,
-        "node_update": NodeUpdateEvent,
-        "node_done": NodeDoneEvent,
-        "node_error": NodeErrorEvent,
-        "agent_token": AgentTokenEvent,
-        "agent_tool_call": AgentToolCallEvent,
-        "agent_tool_result": AgentToolResultEvent,
-        "agent_error": AgentErrorEvent,
-        "agent_complete": AgentCompleteEvent,
-        "keepalive": KeepaliveEvent,
-        "error": ErrorEvent,
-    }
-    
-    event_class = event_map.get(event_type, WorkflowEvent)
-    return event_class(event_type=event_type, data=data)

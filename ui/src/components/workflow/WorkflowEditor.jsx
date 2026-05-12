@@ -41,7 +41,14 @@ if (globalThis.window !== undefined) {
   };
 }
 
-const Flow = forwardRef(({ workflowName, initialNodes, initialEdges }, ref) => {
+// Node border styles for SSE-driven execution status
+const NODE_STATUS_STYLES = {
+  running:   { border: '2px solid #f59e0b', boxShadow: '0 0 0 3px rgba(245,158,11,0.2)' },
+  completed: { border: '2px solid #22c55e', boxShadow: '0 0 0 3px rgba(34,197,94,0.15)' },
+  failed:    { border: '2px solid #ef4444', boxShadow: '0 0 0 3px rgba(239,68,68,0.2)' },
+};
+
+const Flow = forwardRef(({ workflowName, initialNodes, initialEdges, nodeStatuses = {} }, ref) => {
   const defaultInitialNodes = [
     {
       id: 'agent-initial',
@@ -584,16 +591,21 @@ const Flow = forwardRef(({ workflowName, initialNodes, initialEdges }, ref) => {
         <ErrorBoundary>
           <ReactFlowProvider>
             <ReactFlow
-              nodes={nodes.map(node => ({
-                ...node,
-                data: {
-                  ...node.data,
-                  sendMessageToConnectedAgents: node.type === 'chat' ? sendMessageToConnectedAgents : undefined,
-                  hasConnections: node.type === 'chat' ? edges.some(edge =>
-                    edge.source === node.id && edge.sourceHandle === 'chat-output'
-                  ) : undefined
-                }
-              }))}
+              nodes={nodes.map(node => {
+                const statusStyle = NODE_STATUS_STYLES[nodeStatuses[node.id]] || {};
+                return {
+                  ...node,
+                  style: statusStyle.border ? { ...node.style, ...statusStyle } : node.style,
+                  data: {
+                    ...node.data,
+                    executionStatus: nodeStatuses[node.id] || null,
+                    sendMessageToConnectedAgents: node.type === 'chat' ? sendMessageToConnectedAgents : undefined,
+                    hasConnections: node.type === 'chat' ? edges.some(edge =>
+                      edge.source === node.id && edge.sourceHandle === 'chat-output'
+                    ) : undefined,
+                  },
+                };
+              })}
               edges={edges}
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}

@@ -3,7 +3,7 @@ import asyncio
 import uuid
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, List
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz

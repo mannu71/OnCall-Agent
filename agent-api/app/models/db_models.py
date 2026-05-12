@@ -57,7 +57,6 @@ class LLMConfigModel(Base):
     icon = Column(String(10))
     description = Column(Text)
     aws_profile = Column(String(100))
-    use_for_embeddings = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
 
@@ -105,7 +104,7 @@ class LogPatternModel(Base):
     pattern_type = Column(String(50), nullable=False)
     severity = Column(Integer, default=1)
     description = Column(Text)
-    embedding = Column(Vector(1024))
+    embedding = Column(Vector(1536))
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
 
@@ -121,7 +120,7 @@ class KnownIssueModel(Base):
     solution = Column(Text)
     category = Column(String(100))
     source = Column(String(50), default="manual")  # manual | agent | verified
-    embedding = Column(Vector(1024))
+    embedding = Column(Vector(1536))
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
 
@@ -171,39 +170,3 @@ class AlertModel(Base):
     created_at = Column(DateTime(timezone=True))
     resolved_at = Column(DateTime(timezone=True))
     resolved_by = Column(String(255))
-
-
-class TrajectoryModel(Base):
-    """Conversation trajectory storage."""
-    __tablename__ = "trajectories"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    trajectory_id = Column(String(255), unique=True, nullable=False)
-    execution_id = Column(String(255), index=True)
-    model = Column(String(255))
-    messages = Column(JSON, nullable=False)
-    tool_calls = Column(JSON)
-    completed = Column(Boolean, default=False)
-    trajectory_metadata = Column(JSON)  # Renamed from 'metadata' to avoid SQLAlchemy reserved word
-    created_at = Column(DateTime(timezone=True))
-
-
-class ContextReferenceModel(Base):
-    """Context reference tracking."""
-    __tablename__ = "context_references"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    execution_id = Column(String(255), index=True)
-    reference_type = Column(String(50), nullable=False)
-    target = Column(String(1000), nullable=False)
-    tokens_injected = Column(Integer)
-    created_at = Column(DateTime(timezone=True))
-
-
-class ContextLengthCacheModel(Base):
-    """Cached context lengths for models."""
-    __tablename__ = "context_length_cache"
-
-    model_provider_key = Column(String(255), primary_key=True)
-    context_length = Column(Integer, nullable=False)
-    discovered_at = Column(DateTime(timezone=True))

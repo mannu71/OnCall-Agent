@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import health, workflows, executions, mcp_config, certificates, llm_config, log_watch, model_keys, insights, skills, trajectories, usage, settings, releases
+from app.api.v1.endpoints import health, workflows, executions, mcp_config, certificates, llm_config, log_watch, model_keys, insights, curator
 
 api_router = APIRouter()
 
@@ -15,8 +15,4 @@ api_router.include_router(llm_config.router)
 api_router.include_router(log_watch.router)
 api_router.include_router(model_keys.router)
 api_router.include_router(insights.router)
-api_router.include_router(skills.router)
-api_router.include_router(trajectories.router)
-api_router.include_router(usage.router)
-api_router.include_router(settings.router)
-api_router.include_router(releases.router)
+api_router.include_router(curator.router)
