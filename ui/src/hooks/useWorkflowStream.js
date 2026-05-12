@@ -19,6 +19,8 @@ export function useWorkflowStream(workflowName, enabled = true) {
     const [nodeStatuses, setNodeStatuses] = useState({});
     // totalCost: cumulative USD cost from cost_update events
     const [totalCost, setTotalCost] = useState(0);
+    // agentCosts: per-agent USD spend { [nodeId]: number }
+    const [agentCosts, setAgentCosts] = useState({});
     const eventSourceRef = useRef(null);
 
     const clearEvents = useCallback(() => {
@@ -29,6 +31,7 @@ export function useWorkflowStream(workflowName, enabled = true) {
         setAgentToolCalls([]);
         setNodeStatuses({});
         setTotalCost(0);
+        setAgentCosts({});
     }, []);
 
     useEffect(() => {
@@ -179,6 +182,16 @@ export function useWorkflowStream(workflowName, enabled = true) {
                     const delta = parseFloat(data.data?.cost_usd || data.data?.delta_usd || 0);
                     if (delta > 0) {
                         setTotalCost(prev => Math.round((prev + delta) * 1e6) / 1e6);
+
+                        // Per-agent cost tracking — cost_update events may include
+                        // a node_id to attribute spend to a specific agent.
+                        const nodeId = data.data?.node_id;
+                        if (nodeId) {
+                            setAgentCosts(prev => ({
+                                ...prev,
+                                [nodeId]: Math.round(((prev[nodeId] || 0) + delta) * 1e6) / 1e6,
+                            }));
+                        }
                     }
                     setEvents(prev => [...prev, { ...data, event_type: 'cost_update', timestamp: data.timestamp || new Date().toISOString() }]);
                 } catch (err) {
@@ -262,6 +275,7 @@ export function useWorkflowStream(workflowName, enabled = true) {
         agentToolCalls,
         nodeStatuses,
         totalCost,
+        agentCosts,
     };
 }
 

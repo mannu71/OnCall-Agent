@@ -4,7 +4,6 @@ All direct SDK calls (Anthropic, Bedrock) must go through a concrete
 implementation of this class.  Callers never import anthropic or boto3
 directly — they call transport.complete() and transport.complete_stream().
 
-Reference: hermes-agent/agent/transports/ pattern.
 """
 from __future__ import annotations
 

@@ -8,7 +8,24 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:api.github.com)",
       "Bash(cp \"C:\\\\Users\\\\csinvmmn\\\\Downloads\\\\files\\\\AGENTS_backend.md\" \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\\\\.claude\\\\worktrees\\\\focused-mcnulty-6113ea\\\\agent-api\\\\AGENTS.md\")",
-      "Bash(cp \"C:\\\\Users\\\\csinvmmn\\\\Downloads\\\\files\\\\AGENTS_frontend.md\" \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\\\\.claude\\\\worktrees\\\\focused-mcnulty-6113ea\\\\ui\\\\AGENTS.md\")"
+      "Bash(cp \"C:\\\\Users\\\\csinvmmn\\\\Downloads\\\\files\\\\AGENTS_frontend.md\" \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\\\\.claude\\\\worktrees\\\\focused-mcnulty-6113ea\\\\ui\\\\AGENTS.md\")",
+      "Bash(xargs grep -l \"OpenTelemetry\\\\|from opentelemetry\\\\|otel\")",
+      "mcp__mcp-registry__search_mcp_registry",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:the-pocket.github.io)",
+      "Bash(gh api *)",
+      "Bash(python -c ' *)",
+      "Bash(findstr /C:\"\\\\\"dev\\\\\"\" /C:\"\\\\\"start\\\\\"\" /C:\"\\\\\"scripts\\\\\"\")",
+      "Bash(git -C \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\" checkout --theirs -- agent-api/app/core/__init__.py agent-api/app/core/context_compression.py agent-api/app/core/database.py agent-api/app/core/dependencies.py agent-api/app/core/error_classifier.py agent-api/app/core/exceptions.py agent-api/app/core/executor.py agent-api/app/core/logging.py agent-api/app/core/prompt_caching.py agent-api/app/core/redact.py agent-api/app/core/retry.py agent-api/app/core/scheduler.py agent-api/app/main.py agent-api/app/mcp/tools/watch_tools.py agent-api/app/models/db_models.py)",
+      "Bash(git -C \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\" checkout --theirs -- agent-api/app/repositories/__init__.py agent-api/app/repositories/db_repository.py agent-api/app/repositories/execution_repository.py agent-api/app/services/__init__.py agent-api/app/services/knowledge_base.py agent-api/app/services/mcp_client_manager.py agent-api/app/services/trajectory_service.py agent-api/app/services/visual_workflow_executor.py agent-api/app/workflow/event_adapter.py agent-api/app/workflow/event_schema.py agent-api/app/workflow/strategies/react.py agent-api/app/workflow/tools/cloudwatch_agent_tools.py agent-api/docker-compose.yml agent-api/init-db.sql agent-api/requirements.txt)",
+      "Bash(git -C \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\" checkout --theirs -- ui/package.json ui/src/App.jsx ui/src/components/monitoring/ExecutionLog.jsx ui/src/components/monitoring/ExecutionMonitor.jsx ui/src/components/sidebar/AppSidebar.jsx ui/src/components/workflow/NodeConfigPanel.jsx ui/src/components/workflow/WorkflowEditor.jsx ui/src/context/WorkflowStatusContext.jsx ui/src/hooks/useWorkflowStream.js ui/src/pages/Analytics.jsx ui/src/pages/Dashboard.jsx ui/src/pages/Settings.jsx ui/src/pages/workflow.jsx ui/src/services/agentApiClient.js ui/src/services/modelKeyService.js)",
+      "Bash(git -C \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\" add -A)",
+      "Bash(git -C \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\" diff --name-only --diff-filter=U)",
+      "Bash(git -C \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\" rm --cached .claude/worktrees/focused-mcnulty-6113ea .claude/worktrees/recursing-varahamihira-835709)",
+      "Bash(git -C \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\" status --short)",
+      "Bash(git -C \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\" rm -r --cached \".claude/worktrees/\")",
+      "Bash(grep -q \".claude/worktrees\" \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\\\\.gitignore\" || echo \".claude/worktrees/\" >> \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\\\\.gitignore\" && echo \"gitignore updated\")",
+      "Bash(git -C \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\" add .gitignore)"
     ]
   }
 }

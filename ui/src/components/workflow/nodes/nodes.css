@@ -10,7 +10,8 @@
 .output-node,
 .orchestrator-node,
 .scheduler-node,
-.cloudwatch-analyzer-node {
+.cloudwatch-analyzer-node,
+.code-analyzer-node {
   padding: 12px;
   border-radius: 8px;
   border: 2px solid #ddd;
@@ -33,7 +34,8 @@
 .output-node:hover,
 .orchestrator-node:hover,
 .scheduler-node:hover,
-.cloudwatch-analyzer-node:hover {
+.cloudwatch-analyzer-node:hover,
+.code-analyzer-node:hover {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
   transform: translateY(-1px);
 }
@@ -1524,6 +1526,70 @@
   color: #3949ab;
   font-family: 'Courier New', monospace;
   background: rgba(26, 35, 126, 0.08);
+  padding: 2px 6px;
+  border-radius: 3px;
+  display: inline-block;
+}
+
+/* ── Code Analyzer Node ────────────────────────────────────────────────────── */
+
+.code-analyzer-node {
+  border-color: #1b5e20;
+  background: linear-gradient(135deg, #e8f5e9 0%, #fff 100%);
+  min-width: 220px;
+}
+
+.code-analyzer-node:hover {
+  border-color: #2e7d32;
+  box-shadow: 0 4px 12px rgba(27, 94, 32, 0.2);
+}
+
+.code-analyzer-node .node-icon {
+  font-size: 20px;
+}
+
+.code-analyzer-node .node-title {
+  font-weight: 600;
+  color: #1b5e20;
+  font-size: 14px;
+}
+
+.code-analyzer-node .ready-status {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: rgba(27, 94, 32, 0.08);
+  border: 1px solid rgba(27, 94, 32, 0.25);
+  border-radius: 4px;
+  font-size: 11px;
+  color: #1b5e20;
+}
+
+.code-analyzer-node .processing-status {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: rgba(255, 152, 0, 0.1);
+  border: 1px solid rgba(255, 152, 0, 0.3);
+  border-radius: 4px;
+  font-size: 11px;
+  color: #e65100;
+}
+
+.code-analyzer-node .error-status {
+  margin-top: 8px;
+  padding: 6px 8px;
+  background: rgba(244, 67, 54, 0.1);
+  border: 1px solid rgba(244, 67, 54, 0.3);
+  border-radius: 4px;
+  font-size: 11px;
+  color: #c62828;
+}
+
+.code-analyzer-node .node-timestamp {
+  margin-top: 4px;
+  font-size: 10px;
+  color: #388e3c;
+  font-family: 'Courier New', monospace;
+  background: rgba(27, 94, 32, 0.07);
   padding: 2px 6px;
   border-radius: 3px;
   display: inline-block;

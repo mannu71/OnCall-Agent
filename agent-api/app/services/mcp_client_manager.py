@@ -1,21 +1,83 @@
-"""MCP Client Manager for connecting to and executing tools on MCP servers."""
+"""MCP Client Manager for connecting to and executing tools on MCP servers.
+
+Security hardening:
+- **Credential sanitization** — strips API keys / bearer tokens from tool
+  responses before they are returned to the LLM (prevents key exfiltration
+  via trajectory logging).
+- **Injection detection in descriptions** — scans tool description text for
+  prompt-injection patterns at connect time so poisoned MCP servers cannot
+  hijack the agent's reasoning.
+- **SSRF guard** — already present on tool *arguments*, unchanged.
+"""
 import asyncio
 import logging
 import os
 import os.path
 import glob
+import re
 from contextlib import AsyncExitStack
 from typing import Dict, List, Any, Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from app.core.retry import with_retry
-from app.core.security import check_ssrf, SSRFError
+from app.core.security import check_ssrf, SSRFError, scan_injection, InjectionError
 
 logger = logging.getLogger(__name__)
 
 # Default certificate directory in container
 CERTS_DIR = '/app/data/certs'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Credential sanitization
+# Strips common credential patterns from tool response text before the LLM
+# sees the output, preventing key material leaking into trajectory logs or
+# the model's context window.
+# ─────────────────────────────────────────────────────────────────────────────
+_CREDENTIAL_PATTERNS: list[re.Pattern[str]] = [
+    # GitHub personal access tokens  (ghp_*, gho_*, github_pat_*)
+    re.compile(r'\bghp_[A-Za-z0-9]{36,}\b'),
+    re.compile(r'\bgho_[A-Za-z0-9]{36,}\b'),
+    re.compile(r'\bgithub_pat_[A-Za-z0-9_]{36,}\b'),
+    # OpenAI / Anthropic style secret keys  (sk-…)
+    re.compile(r'\bsk-[A-Za-z0-9\-_]{20,}\b'),
+    # AWS access key IDs  (AKIA…)
+    re.compile(r'\bAKIA[A-Z0-9]{16}\b'),
+    # Generic Bearer tokens in Authorization headers
+    re.compile(r'(?i)Bearer\s+[A-Za-z0-9\-._~+/]+=*'),
+    # Generic "token": "…" JSON patterns
+    re.compile(r'(?i)"(?:token|api_?key|secret|password|credential)"\s*:\s*"[^"]{8,}"'),
+]
+_REDACTED = "[REDACTED]"
+
+
+def _sanitize_credential(text: str) -> str:
+    """Replace credential-shaped strings in *text* with ``[REDACTED]``."""
+    for pattern in _CREDENTIAL_PATTERNS:
+        text = pattern.sub(_REDACTED, text)
+    return text
+
+
+def _sanitize_tool_content(content: Any) -> Any:
+    """Recursively sanitize credential-shaped strings inside *content*.
+
+    Handles the MCP result shapes: plain str, list-of-content-blocks (dicts),
+    and nested lists.
+    """
+    if isinstance(content, str):
+        return _sanitize_credential(content)
+    if isinstance(content, list):
+        sanitized: list[Any] = []
+        for item in content:
+            if isinstance(item, dict):
+                item = dict(item)  # shallow copy
+                if "text" in item and isinstance(item["text"], str):
+                    item["text"] = _sanitize_credential(item["text"])
+            elif isinstance(item, str):
+                item = _sanitize_credential(item)
+            sanitized.append(item)
+        return sanitized
+    return content
 
 
 def find_certificate_file() -> Optional[str]:
@@ -154,7 +216,33 @@ class MCPClientManager:
             
             tools_result = await session.list_tools()
             tool_names = [tool.name for tool in tools_result.tools]
-            
+
+            # ── Injection detection in tool descriptions ─────────────────────
+            # Scan description text for prompt-injection patterns at connect time.
+            # A poisoned MCP server that embeds "ignore previous instructions" in
+            # a tool description would otherwise silently hijack the agent.
+            for tool in tools_result.tools:
+                description = getattr(tool, "description", None) or ""
+                if description:
+                    try:
+                        scan_injection(description)
+                    except InjectionError as inj_err:
+                        logger.warning(
+                            "MCP server '%s': tool '%s' description failed injection "
+                            "scan — tool will be registered but description is suspicious. "
+                            "Error: %s",
+                            server_id, tool.name, inj_err,
+                        )
+                        # Continue registration with a sanitized placeholder description
+                        # so the agent can still use the tool but won't be misled.
+                        try:
+                            tool.description = (
+                                f"[Description suppressed — injection pattern detected] "
+                                f"Original tool: {tool.name}"
+                            )
+                        except AttributeError:
+                            pass  # Frozen dataclass — leave as-is
+
             self.connections[server_id] = {
                 'config': config,
                 'session': session,
@@ -164,7 +252,7 @@ class MCPClientManager:
             self.tools[server_id] = tool_names
             # Store full tool objects for schema/description access by LangChain adapter
             self.tool_objects[server_id] = {tool.name: tool for tool in tools_result.tools}
-            
+
             logger.info("Connected to %s with %d tools: %s", server_id, len(tool_names), tool_names)
             return True
                 
@@ -181,21 +269,31 @@ class MCPClientManager:
                     del self._exit_stacks[server_id]
             return False
     
+    # Default per-tool call timeout in seconds.
+    # Callers can override via the ``tool_timeout`` argument to ``execute_tool()``.
+    TOOL_TIMEOUT: float = 60.0
+
     async def execute_tool(
         self,
         server_id: str,
         tool_name: str,
         arguments: Dict[str, Any],
+        *,
+        tool_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Execute a tool on an MCP server.
-        
+
         Args:
-            server_id: Server identifier
-            tool_name: Name of the tool to execute
-            arguments: Tool arguments
-        
+            server_id:    Server identifier.
+            tool_name:    Name of the tool to execute.
+            arguments:    Tool arguments.
+            tool_timeout: Per-call timeout in seconds.  When ``None`` the class-
+                          level ``TOOL_TIMEOUT`` default applies.  Pass ``0`` to
+                          disable the timeout entirely.
+
         Returns:
-            Tool execution result
+            Tool execution result dict with ``success``, ``content``,
+            ``isError`` keys.
         """
         if server_id not in self.connections:
             raise ValueError(f"Not connected to server: {server_id}")
@@ -204,22 +302,39 @@ class MCPClientManager:
         # This is a cooperative defence layer — the real boundary is OS isolation.
         self._check_tool_arguments_ssrf(tool_name, arguments)
 
+        timeout_secs = tool_timeout if tool_timeout is not None else self.TOOL_TIMEOUT
+
         try:
-            logger.info("Executing tool '%s' on server '%s'", tool_name, server_id)
+            logger.info("Executing tool '%s' on server '%s' (timeout=%.1fs)",
+                        tool_name, server_id, timeout_secs or 0)
             logger.debug("Arguments: %s", arguments)
-            
+
+            from app.core.telemetry import tool_span
             session = self.connections[server_id]['session']
-            
+
             async def _call_tool():
-                return await session.call_tool(tool_name, arguments)
-            
+                async with tool_span(tool_name):
+                    if timeout_secs:
+                        from datetime import timedelta
+                        return await asyncio.wait_for(
+                            session.call_tool(tool_name, arguments),
+                            timeout=timeout_secs,
+                        )
+                    return await session.call_tool(tool_name, arguments)
+
             result = await with_retry(_call_tool, max_retries=2)
             
             logger.info("Tool '%s' executed successfully", tool_name)
-            
+
+            raw_content = result.content if hasattr(result, 'content') else result
+            # ── Credential sanitization ───────────────────────────────────────
+            # Strip API keys / bearer tokens from tool output before returning
+            # to the LLM.
+            safe_content = _sanitize_tool_content(raw_content)
+
             return {
                 'success': True,
-                'content': result.content if hasattr(result, 'content') else result,
+                'content': safe_content,
                 'isError': result.isError if hasattr(result, 'isError') else False
             }
             

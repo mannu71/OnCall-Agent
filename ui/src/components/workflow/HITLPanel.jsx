@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import PropTypes from 'prop-types';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -11,8 +11,52 @@ import {
     Loader2,
     ChevronDown,
     ChevronRight,
+    Settings2,
+    ShieldCheck,
+    ShieldBan,
+    HelpCircle,
 } from 'lucide-react';
 import { agentApiClient } from '../../services/agentApiClient';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-tool permission model — stored in localStorage
+// Values: 'always_allow' | 'ask' | 'deny'
+// ─────────────────────────────────────────────────────────────────────────────
+const PERM_KEY = 'hitl_tool_permissions';
+
+function loadPermissions() {
+    try {
+        return JSON.parse(localStorage.getItem(PERM_KEY) || '{}');
+    } catch {
+        return {};
+    }
+}
+
+function savePermissions(perms) {
+    try {
+        localStorage.setItem(PERM_KEY, JSON.stringify(perms));
+    } catch {
+        /* localStorage unavailable */
+    }
+}
+
+function useToolPermissions() {
+    const [permissions, setPermissions] = useState(loadPermissions);
+
+    const setPermission = useCallback((toolName, level) => {
+        setPermissions(prev => {
+            const next = { ...prev, [toolName]: level };
+            savePermissions(next);
+            return next;
+        });
+    }, []);
+
+    const getPermission = useCallback((toolName) => {
+        return permissions[toolName] || 'ask';
+    }, [permissions]);
+
+    return { permissions, setPermission, getPermission };
+}
 
 /**
  * HITLPanel — Human-in-the-Loop approval panel.
@@ -33,6 +77,10 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
     const [decision, setDecision] = useState(null); // 'approved' | 'rejected'
     const [error, setError] = useState(null);
     const [suggestionsOpen, setSuggestionsOpen] = useState(true);
+    const [showPermConfig, setShowPermConfig] = useState(false);
+    const autoHandledRef = useRef(false);
+
+    const { getPermission, setPermission } = useToolPermissions();
 
     // Watch for hitl_pause events
     useEffect(() => {
@@ -41,18 +89,57 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
         const last = events[events.length - 1];
         if ((last.event_type || last.type) === 'hitl_pause') {
             const data = last.data || last.payload || last;
-            setHitlRequest({
+            const toolName = data.tool_name || null;
+            const newRequest = {
                 requestId: data.request_id,
                 executionId: data.execution_id || executionId,
-                rootCause: data.root_cause || 'Root cause analysis complete.',
+                rootCause: data.root_cause || data.draft_answer || 'Root cause analysis complete.',
                 suggestions: Array.isArray(data.suggestions) ? data.suggestions : [],
-                toolName: data.tool_name || null,
+                toolName,
                 toolParams: data.tool_params || null,
-            });
+            };
+            setHitlRequest(newRequest);
             setDecision(null);
             setError(null);
+            autoHandledRef.current = false;
+
+            // Auto-handle based on per-tool permission level
+            if (toolName) {
+                const perm = getPermission(toolName);
+                if (perm === 'always_allow') {
+                    autoHandledRef.current = true;
+                    // Fire async; update state immediately so UI shows outcome
+                    setDecision('approved');
+                    agentApiClient.approveHITL(
+                        newRequest.executionId || executionId,
+                        newRequest.requestId,
+                        true,
+                    ).catch(() => {});
+                    onDecision?.(true);
+                } else if (perm === 'deny') {
+                    autoHandledRef.current = true;
+                    setDecision('rejected');
+                    agentApiClient.approveHITL(
+                        newRequest.executionId || executionId,
+                        newRequest.requestId,
+                        false,
+                    ).catch(() => {});
+                    onDecision?.(false);
+                }
+            }
         }
-    }, [events, executionId]);
+    }, [events, executionId, getPermission, onDecision]);
+
+    // Shift+A — batch approve the current pending request
+    useEffect(() => {
+        const handleKey = (e) => {
+            if (e.shiftKey && e.key === 'A' && hitlRequest && !decision && !submitting) {
+                handleDecision(true);
+            }
+        };
+        window.addEventListener('keydown', handleKey);
+        return () => window.removeEventListener('keydown', handleKey);
+    });
 
     const handleDecision = useCallback(async (approved) => {
         if (!hitlRequest || submitting) return;
@@ -173,6 +260,43 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
                     </div>
                 )}
 
+                {/* Per-tool permission config */}
+                {hitlRequest.toolName && (
+                    <div>
+                        <button
+                            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                            onClick={() => setShowPermConfig(o => !o)}
+                        >
+                            <Settings2 className="w-3 h-3" />
+                            Tool permissions for <span className="font-mono ml-0.5">{hitlRequest.toolName}</span>
+                            {showPermConfig ? <ChevronDown className="w-3 h-3 ml-1" /> : <ChevronRight className="w-3 h-3 ml-1" />}
+                        </button>
+
+                        {showPermConfig && (
+                            <div className="mt-2 flex gap-2">
+                                {[
+                                    { level: 'always_allow', label: 'Always allow', Icon: ShieldCheck, cls: 'text-green-600 border-green-400' },
+                                    { level: 'ask',          label: 'Ask each time', Icon: HelpCircle,  cls: 'text-amber-600 border-amber-400' },
+                                    { level: 'deny',         label: 'Always deny',  Icon: ShieldBan,   cls: 'text-red-600 border-red-400' },
+                                ].map(({ level, label, Icon, cls }) => {
+                                    const active = getPermission(hitlRequest.toolName) === level;
+                                    return (
+                                        <button
+                                            key={level}
+                                            className={`flex items-center gap-1 text-xs px-2 py-1 rounded border transition-colors
+                                                ${active ? `${cls} bg-opacity-10 font-semibold` : 'border-muted text-muted-foreground hover:border-foreground'}`}
+                                            onClick={() => setPermission(hitlRequest.toolName, level)}
+                                        >
+                                            <Icon className="w-3 h-3" />
+                                            {label}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        )}
+                    </div>
+                )}
+
                 {/* Error */}
                 {error && (
                     <Alert variant="destructive">
@@ -186,6 +310,7 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
                         className="flex-1 bg-green-600 hover:bg-green-700 text-white"
                         onClick={() => handleDecision(true)}
                         disabled={submitting}
+                        title="Approve (Shift+A)"
                     >
                         {submitting ? (
                             <Loader2 className="w-4 h-4 animate-spin mr-1" />
@@ -209,6 +334,7 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
                         Reject &amp; Stop
                     </Button>
                 </div>
+                <p className="text-xs text-muted-foreground text-right">Shift+A to approve</p>
             </CardContent>
         </Card>
     );

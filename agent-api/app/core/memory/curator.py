@@ -1,18 +1,26 @@
-"""Autonomous Curator — background job for pattern_memory health maintenance.
+"""Autonomous Curator — background job for pattern_memory and skills health maintenance.
 
 Runs weekly (wired into app/core/scheduler.py).  Marks stale and low-confidence
-patterns so they stop polluting similarity searches and RAG recall.
+patterns so they stop polluting similarity searches and RAG recall.  Also
+curates the ``skills`` table — archiving unused skills and promoting high-value
+ones to 'verified' status.
 
-Rules (from the build plan):
+Pattern rules:
 - Not seen in 30+ days AND curator_status == 'active'  → set 'stale'
 - confidence_score < 0.3 AND occurrence_count < 3       → set 'archive'
-- A curator_runs row is written after each run
+
+Skill rules:
+- status == 'active' AND recall_count == 0
+  AND (last_used_at IS NULL OR last_used_at < 60 days ago) → set 'archived'
+- status == 'active' AND success_count >= 5             → set 'verified'
+
+A curator_runs row is written after each run.
 
 The curator uses cheap queries — it never calls an LLM.
-Reference: hermes-agent curator background job pattern.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict
@@ -26,25 +34,47 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Thresholds
 # ─────────────────────────────────────────────────────────────────────────────
-_STALE_DAYS           = 30
-_ARCHIVE_CONFIDENCE   = 0.3
-_ARCHIVE_OCCURRENCES  = 3
+_STALE_DAYS              = 30
+_ARCHIVE_CONFIDENCE      = 0.3
+_ARCHIVE_OCCURRENCES     = 3
+
+# Skill curation thresholds
+_SKILL_UNUSED_DAYS       = 60   # archive skills not recalled in this many days
+_SKILL_VERIFY_SUCCESSES  = 5    # promote to 'verified' after this many successes
+
+# Code-analyzer governance thresholds (Phase 1 — conservative)
+_GRAPH_SNAPSHOTS_KEEP    = 10   # snapshots to keep per repo (oldest pruned beyond this)
+_MEM_STALE_DAYS          = 90   # archive investigation_memory not accessed in N days
+_MEM_LOW_WEIGHT          = 0.3  # archive if resolution_weight is also below this
+_CLUSTER_DORMANT_DAYS    = 60   # mark incident_clusters 'monitoring' after N days quiet
+_RCA_STALE_DAYS          = 180  # flag rca_history with no recurrence in N months
 
 
 async def run_curator() -> Dict[str, Any]:
     """Main curator coroutine — call from the scheduler weekly.
 
     Returns:
-        Dict with counts of patterns staled/archived and the run timestamp.
+        Dict with counts of patterns staled/archived, skills archived/verified,
+        and the run timestamp.
     """
-    logger.info("Curator: starting pattern_memory health pass")
+    logger.info("Curator: starting pattern_memory + skills + code-analyzer health pass")
     now = datetime.now(timezone.utc)
-    stale_threshold = now - timedelta(days=_STALE_DAYS)
-    staled = 0
-    archived = 0
+    stale_threshold    = now - timedelta(days=_STALE_DAYS)
+    unused_threshold   = now - timedelta(days=_SKILL_UNUSED_DAYS)
+    mem_threshold      = now - timedelta(days=_MEM_STALE_DAYS)
+    cluster_threshold  = now - timedelta(days=_CLUSTER_DORMANT_DAYS)
+    staled            = 0
+    archived          = 0
+    skills_archived   = 0
+    skills_verified   = 0
+    snapshots_pruned  = 0
+    memory_archived   = 0
+    clusters_dormant  = 0
+    rca_flagged       = 0
+    orphans_detected  = 0
 
     async with AsyncSessionLocal() as session:
-        # Mark stale: active patterns not seen recently
+        # ── Pattern: mark stale ───────────────────────────────────────────────
         stale_result = await session.execute(
             text("""
                 UPDATE pattern_memory
@@ -57,7 +87,7 @@ async def run_curator() -> Dict[str, Any]:
         )
         staled = stale_result.rowcount  # type: ignore[attr-defined]
 
-        # Mark archive: low-confidence patterns seen rarely
+        # ── Pattern: mark archive ─────────────────────────────────────────────
         archive_result = await session.execute(
             text("""
                 UPDATE pattern_memory
@@ -74,7 +104,188 @@ async def run_curator() -> Dict[str, Any]:
         )
         archived = archive_result.rowcount  # type: ignore[attr-defined]
 
-        # Write curator run record (table created inline if missing)
+        # ── Skills: archive unused ────────────────────────────────────────────
+        # Skills that have never been recalled, or not recalled recently
+        try:
+            skill_archive_result = await session.execute(
+                text("""
+                    UPDATE skills
+                       SET status     = 'archived',
+                           updated_at = NOW()
+                     WHERE status = 'active'
+                       AND recall_count = 0
+                       AND (last_used_at IS NULL OR last_used_at < :unused_threshold)
+                """),
+                {"unused_threshold": unused_threshold},
+            )
+            skills_archived = skill_archive_result.rowcount  # type: ignore[attr-defined]
+            if skills_archived:
+                logger.info("Curator: archived %d unused skill(s)", skills_archived)
+        except Exception as exc:
+            logger.debug("Curator: skill archive pass skipped — %s", exc)
+
+        # ── Skills: promote to verified ───────────────────────────────────────
+        try:
+            skill_verify_result = await session.execute(
+                text("""
+                    UPDATE skills
+                       SET status     = 'verified',
+                           updated_at = NOW()
+                     WHERE status = 'active'
+                       AND success_count >= :min_successes
+                """),
+                {"min_successes": _SKILL_VERIFY_SUCCESSES},
+            )
+            skills_verified = skill_verify_result.rowcount  # type: ignore[attr-defined]
+            if skills_verified:
+                logger.info("Curator: promoted %d skill(s) to verified", skills_verified)
+        except Exception as exc:
+            logger.debug("Curator: skill verify pass skipped — %s", exc)
+
+        # ── Code-analyzer: prune old graph snapshots (keep last N per repo) ──
+        try:
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS code_graph_snapshots (
+                    id          SERIAL PRIMARY KEY,
+                    repo_name   VARCHAR(255),
+                    snapshot_at TIMESTAMPTZ DEFAULT NOW(),
+                    is_full     BOOLEAN DEFAULT FALSE,
+                    trigger     VARCHAR(50),
+                    parent_id   INTEGER,
+                    call_graph  JSONB,
+                    chunk_summary JSONB,
+                    added_edges   JSONB DEFAULT '[]',
+                    removed_edges JSONB DEFAULT '[]',
+                    modified_edges JSONB DEFAULT '[]',
+                    commit_sha  VARCHAR(40),
+                    tag         VARCHAR(255)
+                )
+            """))
+            prune_result = await session.execute(text("""
+                WITH ranked AS (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY repo_name
+                               ORDER BY snapshot_at DESC
+                           ) AS rn
+                      FROM code_graph_snapshots
+                )
+                DELETE FROM code_graph_snapshots
+                 WHERE id IN (SELECT id FROM ranked WHERE rn > :keep)
+            """), {"keep": _GRAPH_SNAPSHOTS_KEEP})
+            snapshots_pruned = prune_result.rowcount or 0
+            if snapshots_pruned:
+                logger.info("Curator: pruned %d old graph snapshot(s)", snapshots_pruned)
+        except Exception as exc:
+            logger.debug("Curator: snapshot prune skipped — %s", exc)
+
+        # ── Code-analyzer: archive stale investigation_memory ─────────────
+        try:
+            await session.execute(text("""
+                ALTER TABLE investigation_memory
+                    ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active'
+            """))
+            await session.execute(text("""
+                ALTER TABLE investigation_memory
+                    ADD COLUMN IF NOT EXISTS resolution_weight FLOAT DEFAULT 1.0
+            """))
+            mem_result = await session.execute(text("""
+                UPDATE investigation_memory
+                   SET status = 'archived',
+                       updated_at = NOW()
+                 WHERE status = 'active'
+                   AND last_accessed < :threshold
+                   AND resolution_weight < :weight
+            """), {
+                "threshold": mem_threshold,
+                "weight":    _MEM_LOW_WEIGHT,
+            })
+            memory_archived = mem_result.rowcount or 0
+            if memory_archived:
+                logger.info("Curator: archived %d stale investigation_memory row(s)", memory_archived)
+        except Exception as exc:
+            logger.debug("Curator: investigation_memory archive skipped — %s", exc)
+
+        # ── Code-analyzer: mark dormant incident_clusters ─────────────────
+        try:
+            cluster_result = await session.execute(text("""
+                UPDATE incident_clusters
+                   SET status = 'monitoring'
+                 WHERE status = 'active'
+                   AND last_seen < :threshold
+            """), {"threshold": cluster_threshold})
+            clusters_dormant = cluster_result.rowcount or 0
+            if clusters_dormant:
+                logger.info("Curator: marked %d incident cluster(s) as monitoring", clusters_dormant)
+        except Exception as exc:
+            logger.debug("Curator: incident_clusters dormancy pass skipped — %s", exc)
+
+        # ── Code-analyzer: flag stale-entity RCA entries ──────────────────
+        try:
+            await session.execute(text("""
+                ALTER TABLE rca_history
+                    ADD COLUMN IF NOT EXISTS integrity_flag VARCHAR(50)
+            """))
+            await session.execute(text("""
+                ALTER TABLE rca_history
+                    ADD COLUMN IF NOT EXISTS root_cause_entity_ids JSONB
+            """))
+            rca_result = await session.execute(text("""
+                UPDATE rca_history r
+                   SET integrity_flag = 'stale_entities'
+                 WHERE integrity_flag IS NULL
+                   AND root_cause_entity_ids IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM code_chunks c
+                        WHERE c.repo_name  = r.repo_name
+                          AND c.entity_id  = ANY(
+                              SELECT jsonb_array_elements_text(r.root_cause_entity_ids)
+                          )
+                   )
+            """))
+            rca_flagged = rca_result.rowcount or 0
+            if rca_flagged:
+                logger.info("Curator: flagged %d RCA(s) with stale entity IDs", rca_flagged)
+        except Exception as exc:
+            logger.debug("Curator: RCA integrity check skipped — %s", exc)
+
+        # ── Code-analyzer: mark orphaned investigation_memory entries ─────
+        try:
+            orphan_result = await session.execute(text("""
+                UPDATE investigation_memory im
+                   SET status = 'orphaned'
+                 WHERE im.status = 'active'
+                   AND im.entity_id IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM code_chunks c
+                        WHERE c.repo_name = im.repo_name
+                          AND c.entity_id = im.entity_id
+                   )
+            """))
+            orphans_detected = orphan_result.rowcount or 0
+            if orphans_detected:
+                logger.info(
+                    "Curator: marked %d investigation_memory row(s) as orphaned",
+                    orphans_detected,
+                )
+        except Exception as exc:
+            logger.debug("Curator: orphan detection skipped — %s", exc)
+
+        # ── Nullify orphaned cluster representative_rca_id ────────────────
+        try:
+            await session.execute(text("""
+                UPDATE incident_clusters ic
+                   SET representative_rca_id = NULL
+                 WHERE representative_rca_id IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM rca_history r
+                        WHERE r.id = ic.representative_rca_id
+                   )
+            """))
+        except Exception as exc:
+            logger.debug("Curator: cluster representative cleanup skipped — %s", exc)
+
+        # ── Write curator run record ──────────────────────────────────────────
         await session.execute(
             text("""
                 CREATE TABLE IF NOT EXISTS curator_runs (
@@ -86,6 +297,20 @@ async def run_curator() -> Dict[str, Any]:
                 )
             """)
         )
+        details = json.dumps({
+            "stale_threshold_days":     _STALE_DAYS,
+            "archive_confidence":       _ARCHIVE_CONFIDENCE,
+            "skill_unused_days":        _SKILL_UNUSED_DAYS,
+            "skill_verify_successes":   _SKILL_VERIFY_SUCCESSES,
+            "skills_archived":          skills_archived,
+            "skills_verified":          skills_verified,
+            # Code-analyzer governance
+            "snapshots_pruned":         snapshots_pruned,
+            "memory_archived":          memory_archived,
+            "clusters_dormant":         clusters_dormant,
+            "rca_flagged":              rca_flagged,
+            "orphans_detected":         orphans_detected,
+        })
         await session.execute(
             text("""
                 INSERT INTO curator_runs (ran_at, staled, archived, details)
@@ -95,19 +320,30 @@ async def run_curator() -> Dict[str, Any]:
                 "ran_at":   now,
                 "staled":   staled,
                 "archived": archived,
-                "details":  f'{{"stale_threshold_days": {_STALE_DAYS}, "archive_confidence": {_ARCHIVE_CONFIDENCE}}}',
+                "details":  details,
             },
         )
         await session.commit()
 
     logger.info(
-        "Curator: complete — staled=%d archived=%d",
-        staled, archived,
+        "Curator: complete — staled=%d archived=%d skills_archived=%d skills_verified=%d "
+        "snapshots_pruned=%d memory_archived=%d clusters_dormant=%d "
+        "rca_flagged=%d orphans_detected=%d",
+        staled, archived, skills_archived, skills_verified,
+        snapshots_pruned, memory_archived, clusters_dormant,
+        rca_flagged, orphans_detected,
     )
     return {
-        "ran_at":   now.isoformat(),
-        "staled":   staled,
-        "archived": archived,
+        "ran_at":           now.isoformat(),
+        "staled":           staled,
+        "archived":         archived,
+        "skills_archived":  skills_archived,
+        "skills_verified":  skills_verified,
+        "snapshots_pruned": snapshots_pruned,
+        "memory_archived":  memory_archived,
+        "clusters_dormant": clusters_dormant,
+        "rca_flagged":      rca_flagged,
+        "orphans_detected": orphans_detected,
     }
 
 
@@ -130,9 +366,18 @@ async def get_last_run() -> Dict[str, Any] | None:
     if row is None:
         return None
 
+    details = row.details or {}
     return {
-        "ran_at":   row.ran_at.isoformat() if row.ran_at else None,
-        "staled":   row.staled,
-        "archived": row.archived,
-        "details":  row.details,
+        "ran_at":           row.ran_at.isoformat() if row.ran_at else None,
+        "staled":           row.staled,
+        "archived":         row.archived,
+        "skills_archived":  details.get("skills_archived", 0),
+        "skills_verified":  details.get("skills_verified", 0),
+        # Code-analyzer governance (populated from Phase 1 onwards)
+        "snapshots_pruned": details.get("snapshots_pruned", 0),
+        "memory_archived":  details.get("memory_archived", 0),
+        "clusters_dormant": details.get("clusters_dormant", 0),
+        "rca_flagged":      details.get("rca_flagged", 0),
+        "orphans_detected": details.get("orphans_detected", 0),
+        "details":          details,
     }

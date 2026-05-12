@@ -1,20 +1,69 @@
 """Security guards for all outbound HTTP calls and filesystem access.
 
-Design follows the Hermes security model:
 - OS-level isolation (Docker/subprocess) is the real security boundary.
 - In-process guards here are accident-prevention layers, not containment.
 - SSRF guard: block private/reserved IP ranges, only allow HTTP/HTTPS.
 - Path jail: keep filesystem access inside an allowed root directory.
+- Write denylist: block writes to SSH keys, AWS creds, sudoers, etc.
 - Injection scan: cooperative detection of prompt-injection patterns.
 """
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Credential / sensitive-file write protection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_write_denied_paths() -> frozenset[str]:
+    """Exact file paths that must never be written to."""
+    home = str(Path.home())
+    return frozenset([
+        f"{home}/.ssh/authorized_keys",
+        f"{home}/.ssh/known_hosts",
+        f"{home}/.ssh/config",
+        f"{home}/.bashrc",
+        f"{home}/.bash_profile",
+        f"{home}/.zshrc",
+        f"{home}/.profile",
+        "/etc/passwd",
+        "/etc/shadow",
+        "/etc/sudoers",
+        "/etc/hosts",
+        "/etc/ssh/sshd_config",
+    ])
+
+
+def _build_write_denied_prefixes() -> tuple[str, ...]:
+    """Directory prefixes where writes are never permitted."""
+    home = str(Path.home())
+    return (
+        f"{home}/.ssh/",
+        f"{home}/.aws/",
+        f"{home}/.gnupg/",
+        f"{home}/.kube/",
+        f"{home}/.docker/",
+        f"{home}/.config/gcloud/",
+        "/etc/sudoers.d/",
+        "/etc/cron.d/",
+    )
+
+
+_WRITE_DENIED_PATHS: frozenset[str] = _build_write_denied_paths()
+_WRITE_DENIED_PREFIXES: tuple[str, ...] = _build_write_denied_prefixes()
+
+
+def get_safe_write_root() -> Optional[str]:
+    """Return ``AGENT_WRITE_SAFE_ROOT`` env var if set — restricts all writes
+    to that directory tree."""
+    return os.getenv("AGENT_WRITE_SAFE_ROOT")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,6 +120,10 @@ class PathJailError(ValueError):
     """Raised when a file path escapes the allowed jail directory."""
 
 
+class WriteBlockedError(ValueError):
+    """Raised when a write to a sensitive credential/system file is attempted."""
+
+
 class InjectionError(ValueError):
     """Raised when prompt injection is detected in user-supplied text."""
 
@@ -95,6 +148,79 @@ def _is_blocked_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
+
+def is_write_denied(path: str | Path) -> bool:
+    """Return True when writing to *path* should be blocked.
+
+    Checks (in order):
+    1. Exact denylist (SSH keys, /etc/passwd, sudoers, shell rc files)
+    2. Directory prefix denylist (.ssh/, .aws/, .gnupg/, .kube/, .docker/)
+    3. AGENT_WRITE_SAFE_ROOT containment
+
+    Returns True (blocked) / False (allowed).
+    """
+    resolved = str(Path(path).resolve())
+
+    if resolved in _WRITE_DENIED_PATHS:
+        return True
+
+    if resolved.startswith(_WRITE_DENIED_PREFIXES):
+        return True
+
+    safe_root = get_safe_write_root()
+    if safe_root:
+        jail = str(Path(safe_root).resolve())
+        if not resolved.startswith(jail + "/") and resolved != jail:
+            return True
+
+    return False
+
+
+def check_write_path(path: str | Path) -> Path:
+    """Assert that *path* may be written to.
+
+    Raises:
+        WriteBlockedError: When the path is in the credential denylist or
+            outside the safe-write-root jail.
+    """
+    if is_write_denied(path):
+        raise WriteBlockedError(
+            f"Write to '{path}' is blocked — path is a sensitive credential "
+            "or system file."
+        )
+    return Path(path).resolve()
+
+
+# Internal agent directories that should not be read by tools
+_INTERNAL_READ_BLOCK_DIRS: tuple[str, ...] = (
+    str(Path.home() / ".kyc_protect" / "cache"),
+    str(Path.home() / ".kyc_protect" / "skills"),
+)
+
+
+def check_read_path(path: str | Path, jail: Optional[str | Path] = None) -> Path:
+    """Validate that *path* is safe to read.
+
+    Blocks:
+    - Reads from internal agent cache directories (prompt-injection vector).
+    - Path traversal if *jail* is provided.
+
+    Returns the resolved Path when safe.
+    """
+    resolved = Path(path).resolve()
+
+    for blocked in _INTERNAL_READ_BLOCK_DIRS:
+        if str(resolved).startswith(blocked):
+            raise PathJailError(
+                f"Read from '{resolved}' is blocked — use the designated tools "
+                "to access agent cache data (prompt-injection prevention)."
+            )
+
+    if jail is not None:
+        return check_path(resolved, jail)
+
+    return resolved
+
 
 def check_ssrf(url: str, allowlist: Optional[list[str]] = None) -> None:
     """Validate *url* is safe to fetch.
@@ -179,8 +305,7 @@ def scan_injection(text: str) -> None:
 
     This is a cooperative / accident-prevention layer only — not a security
     boundary against an adversarial LLM. OS-level isolation (Docker,
-    subprocess jailing) is the real containment mechanism per the Hermes
-    security model.
+    subprocess jailing) is the real containment mechanism.
 
     Raises:
         InjectionError: When a suspicious pattern is detected.
