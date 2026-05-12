@@ -1530,12 +1530,42 @@ class ReactStrategy(BaseStrategy):
         instructions = agent_config.get("instructions", "")
         agent_mode = agent_config.get("agentMode", "single")
 
+        # Determine which capability groups are actually present so the role
+        # sentence and instructions accurately reflect what the agent can do.
+        _cw_tool_prefix = "cloudwatch_"
+        _code_tool_prefix = "code_"
+        _playbook_tool_names = {"save_playbook", "execute_skill"}
+        has_db_tools = any(
+            not t.name.startswith(_cw_tool_prefix)
+            and not t.name.startswith(_code_tool_prefix)
+            and t.name not in _playbook_tool_names
+            for t in tools
+            if hasattr(t, "name")
+        )
+
+        # ── Role sentence ──────────────────────────────────────────────────
+        capabilities = []
+        if has_db_tools:
+            capabilities.append("database and MCP tools")
+        if has_cloudwatch:
+            capabilities.append("AWS CloudWatch logs and metrics")
+        if has_code_analyzer:
+            capabilities.append("source-code analysis")
+
+        if capabilities:
+            capability_str = ", ".join(capabilities)
+            role_sentence = (
+                f"You are an expert on-call engineer assistant for KYC Protect "
+                f"with access to {capability_str}."
+            )
+        else:
+            role_sentence = "You are an expert on-call engineer assistant for KYC Protect."
+
+        # ── Base instructions ──────────────────────────────────────────────
         system_parts = [
-            "You are an expert on-call engineer assistant for KYC Protect.",
-            "You have access to database tools and can run SQL queries to investigate issues.",
+            role_sentence,
             "Always reason step by step and use the available tools to find accurate answers.",
-            "When querying databases, prefer targeted queries over full table scans.",
-            "Present your findings clearly with specific data from the query results.",
+            "Present your findings clearly with specific data from the tool results.",
             "When you resolve an issue or identify its root cause, use the save_playbook tool "
             "to record the resolution so future investigations can benefit from it.",
             "If the memory-context block at the start of the query lists 'Executable Skill' entries "
@@ -1543,48 +1573,64 @@ class ReactStrategy(BaseStrategy):
             "running manual tool calls — this reuses proven remediation steps and is faster.",
         ]
 
-        # CloudWatch-specific instructions when CW nodes are connected.
-        if has_cloudwatch:
+        # DB-specific guidance only when SQL/MCP tools are actually present.
+        if has_db_tools:
             system_parts.append(
-                "\nYou have access to 9 CloudWatch tools. Follow this investigation order:\n"
-                "\n**Step 1 — Check alarms first (fastest signal):**\n"
-                "- cloudwatch_list_alarms: list currently firing alarms. "
-                "Use state_value='ALARM' to get only active alarms. "
-                "This is always your first call — it tells you what AWS already knows is broken.\n"
-                "\n**Step 2 — Check metrics for the spike shape:**\n"
-                "- cloudwatch_get_metric_data: query infrastructure metrics (CPU, Lambda errors/duration, "
-                "ALB 5xx rate, etc.) using GetMetricData. Use this for multi-metric dashboards.\n"
-                "- cloudwatch_get_metric_statistics: simpler single-metric lookup via GetMetricStatistics. "
-                "Use for a quick check on one metric (e.g. Lambda Errors for a specific function).\n"
-                "\n**Step 3 — Analyse log patterns and anomalies:**\n"
-                "- cloudwatch_analyze_patterns: identify error/warning trends via Insights queries. "
-                "The 'unique_patterns' in the result uses semantic deduplication — "
-                "'normalized_pattern' shows the template (with <VAR> placeholders) and "
-                "'example_message' shows a real instance. Focus on high occurrence_count patterns.\n"
-                "- cloudwatch_detect_anomalies: compare current error counts against a 24-hour baseline "
-                "using z-score analysis. Check 'severity' (critical/high/medium/low) and 'z_score'. "
-                "You can pass per_group_sensitivity to tune thresholds per log group.\n"
-                "\n**Step 4 — Trace and inspect:**\n"
-                "- cloudwatch_correlate_logs: trace a request across services using correlation_id or "
-                "trace_id. Returns a sorted timeline of events across all log groups.\n"
-                "- cloudwatch_search_logs: run a custom CloudWatch Logs Insights query when you need "
-                "data not covered by the other tools.\n"
-                "- cloudwatch_watch_logs: retrieve raw log events. Supports max_events_per_group (up to "
-                "2000) for deep dives, and multi-region queries via the 'regions' list parameter.\n"
-                "\n**Discovery:**\n"
-                "- cloudwatch_discover_log_groups: find log group names by prefix or tag when you know "
-                "a service name but not the exact path "
-                "(e.g. prefix='/aws/lambda/kyc-' to find all KYC Lambda groups).\n"
-                "\n**General rules:**\n"
-                "- If pre-computed CloudWatch analysis is in the context (structured_analysis field), "
-                "review it before making additional queries — it may already contain the answer.\n"
-                "- Stop querying when you have enough evidence for a root-cause hypothesis. "
-                "Avoid redundant calls — each Insights query has a cost and latency.\n"
-                "- When reporting findings, cite the specific log group, timestamp, z_score or "
-                "occurrence_count, and normalized_pattern from the tool results."
+                "When querying databases, prefer targeted queries over full table scans. "
+                "Use WHERE clauses, date ranges, and LIMIT to avoid expensive full scans."
             )
 
-        # Code Analyzer instructions when codeAnalyzer nodes are connected.
+        # ── CloudWatch instructions ────────────────────────────────────────
+        if has_cloudwatch:
+            system_parts.append(
+                "\n"
+                "CLOUDWATCH INVESTIGATION TOOLS\n"
+                "You have 9 CloudWatch tools. Use them in this order during an incident:\n"
+                "\n"
+                "Step 1 - Check alarms first (fastest signal):\n"
+                "  cloudwatch_list_alarms — list currently firing alarms. "
+                "Always pass state_value='ALARM' to get only active ones. "
+                "This is always your first call — it tells you what AWS already knows is broken.\n"
+                "\n"
+                "Step 2 - Check metrics for the spike shape:\n"
+                "  cloudwatch_get_metric_data — query multiple infrastructure metrics at once "
+                "(CPU, Lambda errors/duration, ALB 5xx rate). Use for multi-metric investigations.\n"
+                "  cloudwatch_get_metric_statistics — single-metric lookup. "
+                "Use for a quick sanity check on one metric (e.g. Lambda Errors for one function).\n"
+                "\n"
+                "Step 3 - Analyse log patterns and anomalies:\n"
+                "  cloudwatch_analyze_patterns — identify error/warning trends. "
+                "The 'unique_patterns' list is semantically deduplicated: "
+                "'normalized_pattern' is the template (<VAR> replaces IDs/timestamps), "
+                "'example_message' is a real instance. Sort by occurrence_count descending.\n"
+                "  cloudwatch_detect_anomalies — compare current error counts against a "
+                "24-hour baseline using z-score analysis. "
+                "Focus on severity=critical/high and z_score > 2.0. "
+                "Pass per_group_sensitivity to tune thresholds per log group independently.\n"
+                "\n"
+                "Step 4 - Trace requests and inspect raw logs:\n"
+                "  cloudwatch_correlate_logs — trace a request across services "
+                "using correlation_id or trace_id. Returns events sorted by timestamp.\n"
+                "  cloudwatch_search_logs — run a custom CloudWatch Logs Insights query "
+                "for data not covered by the other tools.\n"
+                "  cloudwatch_watch_logs — retrieve raw log events. "
+                "Use max_events_per_group up to 2000 for deep dives. "
+                "Pass a 'regions' list for multi-region queries.\n"
+                "\n"
+                "Discovery (use when log group names are unknown):\n"
+                "  cloudwatch_discover_log_groups — find log groups by name prefix or tag. "
+                "Example: prefix='/aws/lambda/kyc-' finds all KYC Lambda log groups.\n"
+                "\n"
+                "CloudWatch rules:\n"
+                "  - If a 'structured_analysis' or pre-computed CloudWatch context block is "
+                "present, read it before making any tool calls — it may already contain the answer.\n"
+                "  - Stop querying when you have enough evidence for a root-cause hypothesis. "
+                "Each Insights query incurs AWS cost and latency; avoid redundant calls.\n"
+                "  - When reporting findings always cite: log group name, timestamp, "
+                "z_score or occurrence_count, and the normalized_pattern."
+            )
+
+        # ── Code Analyzer instructions ─────────────────────────────────────
         if has_code_analyzer:
             system_parts.append(
                 "\nYou also have access to code analysis tools for investigating source repositories. "
