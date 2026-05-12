@@ -1,18 +1,26 @@
 """API endpoints for CloudWatch Log Watch Analyzer."""
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from app.repositories import db_repository
 
+from app.core.aws_credentials import resolve_aws_credentials as _shared_resolve
 from app.mcp.tools.watch_tools import (
     watch_log_groups,
     analyze_log_patterns,
     detect_anomalies,
-    correlate_logs
+    correlate_logs,
+    discover_log_groups,
+)
+from app.mcp.tools.metrics_tools import (
+    get_metric_data,
+    get_metric_statistics,
+    list_metric_alarms,
 )
 from app.mcp.tools.alert_tools import (
     create_alert,
@@ -36,29 +44,15 @@ async def _resolve_aws_credentials(
     request_credentials: Optional[Any],
     region: str,
 ) -> tuple[Optional[Dict[str, Any]], str]:
-    """Return (credentials_dict, region) from request body or DB fallback."""
+    """Return (credentials_dict, region) — delegates to the shared resolver.
+
+    Using the shared :func:`app.core.aws_credentials.resolve_aws_credentials`
+    avoids duplicating credential-resolution logic (DB lookup, env-var
+    fallback, profile handling) that already lives in the core module.
+    """
     if request_credentials:
         return request_credentials.model_dump(), region
-
-    # Fall back to credentials stored in the model_keys table
-    try:
-        for key_name in ("AWS CloudWatch", "cloudwatch", "AWS Bedrock", "bedrock", "aws bedrock", "aws"):
-            mk = await db_repository.get_model_key(key_name, include_secrets=True)
-            if mk and mk.get("access_key_id"):
-                creds: Dict[str, Any] = {
-                    "access_key_id": mk["access_key_id"],
-                    "secret_access_key": mk.get("secret_access_key"),
-                }
-                if mk.get("session_token"):
-                    creds["session_token"] = mk["session_token"]
-                # Use stored region only when caller left it at default
-                if mk.get("region") and region == "us-east-1":
-                    region = mk["region"]
-                return creds, region
-    except Exception as e:
-        logger.warning("Could not load AWS credentials from model_keys: %s", e)
-
-    return None, region
+    return await _shared_resolve(aws_region=region)
 
 
 # ============================================
@@ -84,6 +78,8 @@ class WatchLogGroupsRequest(BaseModel):
     log_group_names: List[str] = Field(..., description="List of CloudWatch log group names")
     time_range_minutes: int = Field(60, description="Time range in minutes to look back")
     filter_pattern: Optional[str] = Field(None, description="CloudWatch Logs filter pattern")
+    max_events_per_group: int = Field(500, ge=1, le=2000, description="Max events per group (default 500)")
+    regions: Optional[List[str]] = Field(None, description="Optional list of AWS regions for multi-region queries")
     region: str = Field("us-east-1", description="AWS region")
     credentials: Optional[AWSCredentials] = Field(None, description="AWS credentials")
 
@@ -113,6 +109,35 @@ class CorrelateLogsRequest(BaseModel):
     correlation_id: Optional[str] = Field(None, description="Correlation ID to search for")
     trace_id: Optional[str] = Field(None, description="AWS X-Ray trace ID")
     time_range_minutes: int = Field(60, description="Time range in minutes to search")
+    region: str = Field("us-east-1", description="AWS region")
+    credentials: Optional[AWSCredentials] = Field(None, description="AWS credentials")
+
+
+class MetricDataRequest(BaseModel):
+    """Request model for CloudWatch Metrics queries."""
+    metric_queries: List[Dict[str, Any]] = Field(..., description="List of MetricDataQuery dicts (boto3 shape)")
+    time_range_minutes: int = Field(60, description="How far back to query (minutes)")
+    region: str = Field("us-east-1", description="AWS region")
+    credentials: Optional[AWSCredentials] = Field(None, description="AWS credentials")
+
+
+class MetricStatisticsRequest(BaseModel):
+    """Request model for single-metric CloudWatch statistics."""
+    namespace: str = Field(..., description="CloudWatch namespace, e.g. 'AWS/Lambda'")
+    metric_name: str = Field(..., description="Metric name, e.g. 'Errors'")
+    dimensions: List[Dict[str, str]] = Field(..., description="List of {Name, Value} pairs")
+    statistics: Optional[List[str]] = Field(None, description="Statistics to return")
+    period_seconds: int = Field(300, description="Aggregation period in seconds")
+    time_range_minutes: int = Field(60, description="How far back to query (minutes)")
+    region: str = Field("us-east-1", description="AWS region")
+    credentials: Optional[AWSCredentials] = Field(None, description="AWS credentials")
+
+
+class ListAlarmsRequest(BaseModel):
+    """Request model for listing CloudWatch Alarms."""
+    alarm_name_prefix: Optional[str] = Field(None, description="Alarm name prefix filter")
+    state_value: Optional[str] = Field(None, description="State filter: ALARM | OK | INSUFFICIENT_DATA")
+    max_records: int = Field(100, ge=1, le=500, description="Maximum alarms to return")
     region: str = Field("us-east-1", description="AWS region")
     credentials: Optional[AWSCredentials] = Field(None, description="AWS credentials")
 
@@ -275,9 +300,9 @@ async def test_aws_connection(request: TestConnectionRequest) -> Dict[str, Any]:
 @router.post("/watch")
 async def watch_logs(request: WatchLogGroupsRequest) -> Dict[str, Any]:
     """Watch multiple CloudWatch log groups and fetch recent logs.
-    
-    This endpoint retrieves logs from multiple log groups simultaneously,
-    enabling cross-service log analysis.
+
+    Supports configurable pagination (max_events_per_group) and multi-region
+    queries (regions list).
     """
     credentials, region = await _resolve_aws_credentials(request.credentials, request.region)
     return await with_retry(
@@ -285,6 +310,8 @@ async def watch_logs(request: WatchLogGroupsRequest) -> Dict[str, Any]:
         log_group_names=request.log_group_names,
         time_range_minutes=request.time_range_minutes,
         filter_pattern=request.filter_pattern,
+        max_events_per_group=request.max_events_per_group,
+        regions=request.regions,
         region=region,
         credentials=credentials,
         max_retries=2,
@@ -333,9 +360,9 @@ async def detect_log_anomalies(request: DetectAnomaliesRequest) -> Dict[str, Any
 @router.post("/correlate")
 async def correlate_log_events(request: CorrelateLogsRequest) -> Dict[str, Any]:
     """Correlate logs across multiple services using trace ID or correlation ID.
-    
-    This endpoint traces requests across multiple log groups to identify
-    the full request flow and pinpoint issues.
+
+    Traces requests across multiple log groups to identify the full request
+    flow and pinpoint issues.
     """
     credentials, region = await _resolve_aws_credentials(request.credentials, request.region)
     return await with_retry(
@@ -347,6 +374,152 @@ async def correlate_log_events(request: CorrelateLogsRequest) -> Dict[str, Any]:
         region=region,
         credentials=credentials,
         max_retries=2,
+    )
+
+
+@router.get("/discover-log-groups")
+async def discover_log_groups_endpoint(
+    prefix: Optional[str] = Query(None, description="Log group name prefix"),
+    tag_key: Optional[str] = Query(None, description="Tag key to filter by"),
+    tag_value: Optional[str] = Query(None, description="Tag value to filter by"),
+    limit: int = Query(50, ge=1, le=200, description="Max log groups to return"),
+    region: str = Query("us-east-1", description="AWS region"),
+) -> Dict[str, Any]:
+    """Discover CloudWatch log groups by name prefix or resource tags.
+
+    Use this when you know a service name but not the exact log group path,
+    e.g. ``prefix=/aws/lambda/kyc-`` to find all KYC Lambda log groups.
+    """
+    credentials, resolved_region = await _resolve_aws_credentials(None, region)
+    return await with_retry(
+        discover_log_groups,
+        prefix=prefix,
+        tag_key=tag_key,
+        tag_value=tag_value,
+        limit=limit,
+        region=resolved_region,
+        credentials=credentials,
+        max_retries=2,
+    )
+
+
+@router.post("/metrics")
+async def query_metrics(request: MetricDataRequest) -> Dict[str, Any]:
+    """Query CloudWatch Metrics using GetMetricData.
+
+    Supports up to 500 metrics per call. Returns time-series values for
+    infrastructure metrics like CPU, Lambda errors/duration, ALB 5xx rates.
+    """
+    credentials, region = await _resolve_aws_credentials(request.credentials, request.region)
+    return await with_retry(
+        get_metric_data,
+        metric_queries=request.metric_queries,
+        time_range_minutes=request.time_range_minutes,
+        region=region,
+        credentials=credentials,
+        max_retries=2,
+    )
+
+
+@router.post("/metric-statistics")
+async def query_metric_statistics(request: MetricStatisticsRequest) -> Dict[str, Any]:
+    """Query a single CloudWatch metric via GetMetricStatistics.
+
+    Simpler than /metrics for one-metric lookups. Returns datapoints with
+    Sum/Average/Max/Min/SampleCount.
+    """
+    credentials, region = await _resolve_aws_credentials(request.credentials, request.region)
+    return await with_retry(
+        get_metric_statistics,
+        namespace=request.namespace,
+        metric_name=request.metric_name,
+        dimensions=request.dimensions,
+        statistics=request.statistics,
+        period_seconds=request.period_seconds,
+        time_range_minutes=request.time_range_minutes,
+        region=region,
+        credentials=credentials,
+        max_retries=2,
+    )
+
+
+@router.post("/alarms")
+async def list_alarms(request: ListAlarmsRequest) -> Dict[str, Any]:
+    """List CloudWatch Metric Alarms.
+
+    Use ``state_value=ALARM`` to get only currently firing alarms — the
+    first check in most incident runbooks.
+    """
+    credentials, region = await _resolve_aws_credentials(request.credentials, request.region)
+    return await with_retry(
+        list_metric_alarms,
+        alarm_name_prefix=request.alarm_name_prefix,
+        state_value=request.state_value,
+        region=region,
+        credentials=credentials,
+        max_records=request.max_records,
+        max_retries=2,
+    )
+
+
+@router.get("/stream")
+async def stream_log_events(
+    log_group_name: str = Query(..., description="CloudWatch log group name to stream"),
+    filter_pattern: Optional[str] = Query(None, description="Optional filter pattern"),
+    poll_interval_seconds: int = Query(10, ge=5, le=60, description="Polling interval in seconds"),
+    region: str = Query("us-east-1", description="AWS region"),
+) -> StreamingResponse:
+    """Stream new CloudWatch log events as Server-Sent Events (SSE).
+
+    Polls ``filter_log_events`` every ``poll_interval_seconds`` and emits
+    any new events as ``data: <json>`` SSE messages.  Connect with
+    ``EventSource`` in the browser or ``curl -N`` in the terminal.
+
+    The stream runs until the client closes the connection.
+    """
+    credentials, resolved_region = await _resolve_aws_credentials(None, region)
+
+    async def _event_generator():
+        from app.mcp.tools.watch_tools import get_watcher, _extract_credentials
+        watcher = get_watcher(
+            region=resolved_region,
+            **_extract_credentials(credentials if credentials else {}),
+        )
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(minutes=1)
+        seen_event_ids: set = set()
+
+        while True:
+            try:
+                end_time = datetime.now(timezone.utc)
+                logs = await watcher.fetch_logs(
+                    log_group_name=log_group_name,
+                    start_time=start_time,
+                    end_time=end_time,
+                    filter_pattern=filter_pattern,
+                    limit=500,
+                )
+                for event in logs:
+                    eid = event.get("eventId") or event.get("ingestionTime")
+                    if eid and eid in seen_event_ids:
+                        continue
+                    if eid:
+                        seen_event_ids.add(eid)
+                    # Emit as SSE data line.
+                    yield f"data: {json.dumps(event, default=str)}\n\n"
+                start_time = end_time
+            except Exception as stream_err:
+                yield f"event: error\ndata: {json.dumps({'error': str(stream_err)})}\n\n"
+            await asyncio.sleep(poll_interval_seconds)
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
 

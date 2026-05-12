@@ -962,6 +962,49 @@ class VisualWorkflowExecutor:
                     region=aws_region,
                     credentials=credentials if credentials else None,
                 )
+            elif analysis_type == 'metrics':
+                from app.mcp.tools.metrics_tools import get_metric_data
+                metric_queries = node_data.get('metricQueries', [])
+                if not metric_queries:
+                    return {
+                        "status": "failed",
+                        "error": "No metricQueries configured for 'metrics' analysis type"
+                    }
+                return await get_metric_data(
+                    metric_queries=metric_queries,
+                    time_range_minutes=time_range_minutes,
+                    region=aws_region,
+                    credentials=credentials if credentials else None,
+                )
+            elif analysis_type == 'alarms':
+                from app.mcp.tools.metrics_tools import list_metric_alarms
+                return await list_metric_alarms(
+                    alarm_name_prefix=node_data.get('alarmNamePrefix'),
+                    state_value=node_data.get('alarmStateFilter'),
+                    region=aws_region,
+                    credentials=credentials if credentials else None,
+                )
+            elif analysis_type == 'custom-query':
+                from app.mcp.tools.watch_tools import get_watcher, _extract_credentials
+                from datetime import datetime, timedelta, timezone as _tz
+                custom_query = node_data.get('customInsightsQuery', '').strip()
+                if not custom_query:
+                    return {
+                        "status": "failed",
+                        "error": "No customInsightsQuery set for 'custom-query' analysis type"
+                    }
+                watcher = get_watcher(
+                    region=aws_region,
+                    **_extract_credentials(credentials if credentials else {}),
+                )
+                end_time = datetime.now(_tz.utc)
+                start_time = end_time - timedelta(minutes=time_range_minutes)
+                return await watcher.query_with_insights(
+                    log_group_names=log_groups,
+                    query_string=custom_query,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
             else:
                 return {
                     "status": "failed",
@@ -983,8 +1026,11 @@ class VisualWorkflowExecutor:
             if enable_alerts and isinstance(result, dict):
                 alerts = self._check_cloudwatch_alerts(result, analysis_type, error_threshold)
 
-            # Use the workflow's LLM to produce an agent-style analysis
-            llm_analysis, model_used = await self._analyze_cloudwatch_with_llm(
+            # Use the workflow's LLM to produce an agent-style analysis.
+            # _analyze_cloudwatch_with_llm returns a 3-tuple
+            # (text, model_name, structured_dict); the structured_dict may be
+            # None for providers that don't support structured output.
+            llm_result = await self._analyze_cloudwatch_with_llm(
                 raw_result=result,
                 analysis_type=analysis_type,
                 log_groups=log_groups,
@@ -992,6 +1038,11 @@ class VisualWorkflowExecutor:
                 alerts=alerts,
                 execution_id=context.get('execution_id'),
             )
+            if llm_result and len(llm_result) == 3:
+                llm_analysis, model_used, structured_analysis = llm_result
+            else:
+                llm_analysis, model_used = (llm_result or (None, None))
+                structured_analysis = None
 
             return {
                 "status": "success",
@@ -1002,6 +1053,7 @@ class VisualWorkflowExecutor:
                 "data": result,
                 "alerts": alerts if alerts else None,
                 "model": model_used,
+                "structured_analysis": structured_analysis,
             }
 
         except Exception as e:
@@ -1342,7 +1394,11 @@ class VisualWorkflowExecutor:
         alerts: list,
         execution_id: str,
     ) -> tuple:
-        """Use the workflow's LLM node to produce an agent-style analysis.
+        """Use the workflow's LLM node to produce a structured analysis.
+
+        Attempts structured output (Pydantic schema) for providers that
+        support it (OpenAI, Anthropic, Bedrock with Claude).  Falls back to
+        free-form text for others (Ollama, Groq).
 
         Returns:
             Tuple of (analysis_text, model_name).  Both are ``None`` when
@@ -1352,24 +1408,57 @@ class VisualWorkflowExecutor:
         try:
             from app.workflow.strategies.react import ReactStrategy
             from langchain_core.messages import SystemMessage, HumanMessage
+            from pydantic import BaseModel as _PydanticBase, Field as _Field
+            from typing import List as _List
             import json
+
+            # ----------------------------------------------------------
+            # Structured output schema
+            # ----------------------------------------------------------
+            class CloudWatchAnalysisSummary(_PydanticBase):
+                """Structured CloudWatch incident analysis for on-call engineers."""
+                headline: str = _Field(
+                    description="One-sentence incident summary suitable for Slack or PagerDuty."
+                )
+                severity: str = _Field(
+                    description="Overall severity: critical | high | medium | low | none."
+                )
+                key_findings: _List[str] = _Field(
+                    description="2-5 bullet points describing what was found."
+                )
+                root_cause_hypothesis: str = _Field(
+                    description=(
+                        "Most likely root cause based on the data. "
+                        "Use 'Unknown' if there is insufficient evidence."
+                    )
+                )
+                recommended_actions: _List[str] = _Field(
+                    description="Ordered list of actions for the on-call engineer."
+                )
+                related_services: _List[str] = _Field(
+                    default_factory=list,
+                    description="Other services likely involved, inferred from patterns.",
+                )
+                confidence: str = _Field(
+                    description="Confidence in this analysis: high | medium | low."
+                )
 
             active = self.active_executions.get(execution_id, {})
             workflow = active.get('workflow')
             if not workflow:
-                return None, None
+                return None, None, None
 
-            # Require an LLM node in the workflow
             nodes = workflow.get('nodes', [])
             if not any(n.get('type') == 'llm' for n in nodes):
                 logger.debug("CloudWatch LLM analysis skipped: no LLM node in workflow")
-                return None, None
+                return None, None, None
 
             strategy = ReactStrategy()
             llm_config = await strategy._resolve_llm_config(workflow)
             llm = strategy._build_llm(llm_config)
+            model_name = llm_config.get('model')
 
-            # Serialize raw data (truncate to stay within context limits)
+            # Serialize raw data (truncate to stay within context limits).
             data_str = json.dumps(raw_result, indent=2, default=str)
             if len(data_str) > 15_000:
                 data_str = data_str[:15_000] + "\n... [truncated]"
@@ -1390,35 +1479,89 @@ class VisualWorkflowExecutor:
             human_prompt = (
                 f"Analyze these **{analysis_type}** results from CloudWatch log groups "
                 f"{log_groups} over the last **{time_range}**.\n\n"
-                f"Provide:\n"
-                f"1. A concise summary of findings\n"
-                f"2. Key patterns or anomalies identified\n"
-                f"3. Severity assessment\n"
-                f"4. Recommended next steps\n\n"
                 f"Raw analysis data:\n```json\n{data_str}\n```"
                 f"{alert_section}"
             )
 
-            response = await asyncio.wait_for(
-                llm.ainvoke([
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=human_prompt),
-                ]),
-                timeout=60.0,
-            )
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=human_prompt),
+            ]
 
-            analysis = str(response.content) if response.content else None
-            model_name = llm_config.get('model')
-            if analysis:
-                logger.info(
-                    "CloudWatch LLM analysis complete (%d chars, model=%s)",
-                    len(analysis), model_name,
+            # ----------------------------------------------------------
+            # Try structured output first (OpenAI, Anthropic, Bedrock).
+            # Fall back gracefully to free-form text for other providers.
+            # ----------------------------------------------------------
+            provider = llm_config.get('provider', '').lower()
+            _structured_providers = {'openai', 'anthropic', 'bedrock', 'azure'}
+
+            structured_analysis: Optional[Dict[str, Any]] = None
+            analysis_text: Optional[str] = None
+
+            if provider in _structured_providers:
+                try:
+                    structured_llm = llm.with_structured_output(CloudWatchAnalysisSummary)
+                    parsed: CloudWatchAnalysisSummary = await asyncio.wait_for(
+                        structured_llm.ainvoke(messages),
+                        timeout=60.0,
+                    )
+                    structured_analysis = parsed.model_dump()
+                    # Build human-readable text from structured fields.
+                    analysis_text = (
+                        f"**{parsed.headline}**\n\n"
+                        f"Severity: {parsed.severity.upper()} (confidence: {parsed.confidence})\n\n"
+                        f"**Key Findings:**\n"
+                        + "\n".join(f"- {f}" for f in parsed.key_findings)
+                        + f"\n\n**Root Cause:** {parsed.root_cause_hypothesis}\n\n"
+                        f"**Recommended Actions:**\n"
+                        + "\n".join(f"{i+1}. {a}" for i, a in enumerate(parsed.recommended_actions))
+                        + (
+                            f"\n\n**Related Services:** {', '.join(parsed.related_services)}"
+                            if parsed.related_services else ""
+                        )
+                    )
+                    logger.info(
+                        "CloudWatch structured LLM analysis complete (severity=%s, model=%s)",
+                        parsed.severity, model_name,
+                    )
+                except Exception as struct_err:
+                    logger.warning(
+                        "CloudWatch structured output failed, falling back to free-form: %s",
+                        struct_err,
+                    )
+
+            # Free-form fallback (or primary path for unsupported providers).
+            if analysis_text is None:
+                free_form_prompt = human_prompt + (
+                    "\n\nProvide:\n"
+                    "1. A concise summary of findings\n"
+                    "2. Key patterns or anomalies identified\n"
+                    "3. Severity assessment\n"
+                    "4. Recommended next steps\n"
                 )
-            return analysis, model_name
+                response = await asyncio.wait_for(
+                    llm.ainvoke([
+                        SystemMessage(content=system_prompt),
+                        HumanMessage(content=free_form_prompt),
+                    ]),
+                    timeout=60.0,
+                )
+                analysis_text = str(response.content) if response.content else None
+                if analysis_text:
+                    logger.info(
+                        "CloudWatch free-form LLM analysis complete (%d chars, model=%s)",
+                        len(analysis_text), model_name,
+                    )
+
+            # Return text + optional structured dict via a 3-tuple so the
+            # caller can store both.  The caller only unpacks 2 values so we
+            # attach the structured dict as an attribute on a wrapper instead
+            # — cleanest without touching the return type contract.
+            return analysis_text, model_name, structured_analysis
 
         except Exception as e:
             logger.warning("CloudWatch LLM analysis failed (falling back to static): %s", e)
-            return None, None
+            return None, None, None
 
     @staticmethod
     def _build_cloudwatch_summary(result: Dict[str, Any], analysis_type: str, log_groups: list) -> str:

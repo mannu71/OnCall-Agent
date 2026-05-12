@@ -8,6 +8,9 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
   const fileInputRef = useRef(null);
   const [testingConnection, setTestingConnection] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState(null);
+  const [discoveringGroups, setDiscoveringGroups] = useState(false);
+  const [discoveredGroups, setDiscoveredGroups] = useState([]);
+  const [discoverPrefix, setDiscoverPrefix] = useState('');
   const [timeInput, setTimeInput] = useState(() => {
     // Initialize time from startTime first (most reliable), then cronExpression, or default to current time
     if (node?.data?.startTime) {
@@ -43,10 +46,35 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
     onUpdate(node.id, newConfig);
   };
 
+  const handleDiscoverGroups = async () => {
+    setDiscoveringGroups(true);
+    setDiscoveredGroups([]);
+    try {
+      const result = await agentApiClient.discoverCloudWatchLogGroups(
+        discoverPrefix || undefined,
+        config.awsRegion || 'us-east-1'
+      );
+      setDiscoveredGroups((result.log_groups || []).map(g => g.name).filter(Boolean));
+    } catch (error) {
+      setDiscoveredGroups([]);
+    } finally {
+      setDiscoveringGroups(false);
+    }
+  };
+
+  const handleAddDiscoveredGroup = (groupName) => {
+    const existing = config.logGroups || [];
+    if (!existing.includes(groupName)) {
+      handleConfigChange('logGroups', [...existing, groupName]);
+    }
+    setDiscoveredGroups([]);
+    setDiscoverPrefix('');
+  };
+
   const handleTestConnection = async () => {
     setTestingConnection(true);
     setConnectionStatus(null);
-    
+
     try {
       const result = await agentApiClient.testCloudWatchConnection(
         config.awsRegion || 'us-east-1',
@@ -558,19 +586,79 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                   </div>
                 ))}
               </div>
-              <button
-                className="add-btn"
-                onClick={() => handleConfigChange('logGroups', [...(config.logGroups || []), ''])}
-                style={{
-                  background: '#4caf50',
-                  color: 'white',
-                  border: 'none',
+              <div style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
+                <button
+                  className="add-btn"
+                  onClick={() => handleConfigChange('logGroups', [...(config.logGroups || []), ''])}
+                  style={{
+                    background: '#4caf50',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    padding: '8px 12px',
+                    flex: 1,
+                  }}
+                >+ Add</button>
+                <button
+                  type="button"
+                  onClick={handleDiscoverGroups}
+                  disabled={discoveringGroups}
+                  style={{
+                    background: discoveringGroups ? '#9e9e9e' : '#7b1fa2',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: discoveringGroups ? 'not-allowed' : 'pointer',
+                    padding: '8px 12px',
+                    flex: 1,
+                    fontSize: '12px',
+                  }}
+                >
+                  {discoveringGroups ? 'Discovering…' : '🔍 Discover'}
+                </button>
+              </div>
+
+              {/* Discover prefix input */}
+              <input
+                type="text"
+                value={discoverPrefix}
+                onChange={(e) => setDiscoverPrefix(e.target.value)}
+                placeholder="Prefix to discover, e.g. /aws/lambda/kyc-"
+                style={{ marginTop: '6px', width: '100%', fontSize: '12px', padding: '4px 6px', boxSizing: 'border-box' }}
+              />
+
+              {/* Discovered groups dropdown */}
+              {discoveredGroups.length > 0 && (
+                <div style={{
+                  marginTop: '6px',
+                  border: '1px solid #ccc',
                   borderRadius: '4px',
-                  cursor: 'pointer',
-                  padding: '8px 16px',
-                  width: '100%'
-                }}
-              >+ Add Log Group</button>
+                  maxHeight: '140px',
+                  overflowY: 'auto',
+                  background: '#fff',
+                }}>
+                  <div style={{ padding: '4px 8px', fontSize: '11px', color: '#666', borderBottom: '1px solid #eee' }}>
+                    Click to add to Log Groups
+                  </div>
+                  {discoveredGroups.map((g) => (
+                    <div
+                      key={g}
+                      onClick={() => handleAddDiscoveredGroup(g)}
+                      style={{
+                        padding: '5px 8px',
+                        cursor: 'pointer',
+                        fontSize: '12px',
+                        borderBottom: '1px solid #f5f5f5',
+                      }}
+                      onMouseOver={(e) => { e.currentTarget.style.background = '#e3f2fd'; }}
+                      onMouseOut={(e) => { e.currentTarget.style.background = ''; }}
+                    >
+                      {g}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             <div className="config-field">
@@ -584,8 +672,44 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                 <option value="activity-summary">Activity Summary</option>
                 <option value="anomaly-detection">Anomaly Detection</option>
                 <option value="correlation">Cross-Group Correlation</option>
+                <option value="metrics">CloudWatch Metrics</option>
+                <option value="alarms">CloudWatch Alarms</option>
+                <option value="custom-query">Custom Insights Query</option>
               </select>
             </div>
+
+            {/* Custom query textarea — shown only for custom-query type */}
+            {config.analysisType === 'custom-query' && (
+              <div className="config-field">
+                <label htmlFor="custom-insights-query">Insights Query</label>
+                <textarea
+                  id="custom-insights-query"
+                  rows={5}
+                  value={config.customInsightsQuery || ''}
+                  onChange={(e) => handleConfigChange('customInsightsQuery', e.target.value)}
+                  placeholder={`fields @timestamp, @message\n| filter @message like /error/\n| sort @timestamp desc\n| limit 100`}
+                  style={{ width: '100%', fontFamily: 'monospace', fontSize: '12px', resize: 'vertical', boxSizing: 'border-box' }}
+                />
+                <small style={{ color: '#666', fontSize: '11px' }}>CloudWatch Logs Insights query syntax</small>
+              </div>
+            )}
+
+            {/* Alarm filter — shown only for alarms type */}
+            {config.analysisType === 'alarms' && (
+              <div className="config-field">
+                <label htmlFor="alarm-state-filter">Alarm State Filter</label>
+                <select
+                  id="alarm-state-filter"
+                  value={config.alarmStateFilter || ''}
+                  onChange={(e) => handleConfigChange('alarmStateFilter', e.target.value)}
+                >
+                  <option value="">All states</option>
+                  <option value="ALARM">ALARM (firing)</option>
+                  <option value="OK">OK</option>
+                  <option value="INSUFFICIENT_DATA">Insufficient Data</option>
+                </select>
+              </div>
+            )}
 
             <div className="config-field">
               <label htmlFor="time-range">Time Range</label>

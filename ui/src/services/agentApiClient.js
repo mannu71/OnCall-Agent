@@ -300,6 +300,19 @@ export const agentApiClient = {
         });
         return response.data;
     },
+
+    /**
+     * Discover CloudWatch log groups by name prefix or tags.
+     * @param {string|undefined} prefix  - Log group name prefix
+     * @param {string} region            - AWS region (default us-east-1)
+     * @param {number} limit             - Max groups to return (default 50)
+     */
+    async discoverCloudWatchLogGroups(prefix, region = 'us-east-1', limit = 50) {
+        const params = new URLSearchParams({ region, limit });
+        if (prefix) params.append('prefix', prefix);
+        const response = await client.get(`/api/v1/log-watch/discover-log-groups?${params}`);
+        return response.data;
+    },
 };
 
 export default agentApiClient;

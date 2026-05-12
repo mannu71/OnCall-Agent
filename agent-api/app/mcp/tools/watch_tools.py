@@ -5,6 +5,7 @@ analyzing patterns, detecting anomalies, and correlating logs across services.
 """
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Callable
 from functools import wraps
@@ -195,32 +196,68 @@ class CloudWatchLogWatcher:
         )
         
         query_id = start_query_response['queryId']
-        
-        # Poll for results
-        while True:
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.client.get_query_results(queryId=query_id)
-            )
-            
-            status = response['status']
-            
-            if status == 'Complete':
-                return {
-                    'query_id': query_id,
-                    'status': status,
-                    'results': response.get('results', []),
-                    'statistics': response.get('statistics', {})
-                }
-            elif status in ['Failed', 'Cancelled']:
-                return {
-                    'query_id': query_id,
-                    'status': status,
-                    'error': response.get('statistics', {}).get('statusMessage', 'Query failed')
-                }
-            
-            # Wait before polling again
-            await asyncio.sleep(1)
+
+        # Poll for results — guarded by a 90-second timeout to prevent
+        # indefinite blocking and unnecessary AWS charges on runaway queries.
+        async def _poll() -> Dict[str, Any]:
+            while True:
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.client.get_query_results(queryId=query_id)
+                )
+
+                status = response['status']
+
+                if status == 'Complete':
+                    return {
+                        'query_id': query_id,
+                        'status': status,
+                        'results': response.get('results', []),
+                        'statistics': response.get('statistics', {})
+                    }
+                elif status in ['Failed', 'Cancelled']:
+                    return {
+                        'query_id': query_id,
+                        'status': status,
+                        'error': response.get('statistics', {}).get('statusMessage', 'Query failed')
+                    }
+
+                await asyncio.sleep(1)
+
+        try:
+            return await asyncio.wait_for(_poll(), timeout=90.0)
+        except asyncio.TimeoutError:
+            # Cancel the Insights query to avoid ongoing AWS charges.
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.client.stop_query(queryId=query_id)
+                )
+                logger.warning("query_with_insights: query %s stopped after 90s timeout", query_id)
+            except Exception as stop_err:
+                logger.warning("query_with_insights: could not stop query %s: %s", query_id, stop_err)
+            return {
+                'query_id': query_id,
+                'status': 'Timeout',
+                'error': 'Insights query exceeded 90-second limit and was stopped'
+            }
+
+
+def _normalize_message(msg: str) -> str:
+    """Normalise a log message for semantic pattern grouping.
+
+    Strips variable tokens (UUIDs, timestamps, standalone numbers, hex
+    literals) so that messages that differ only in dynamic values collapse
+    into a single representative pattern.
+    """
+    _TOKEN_RE = re.compile(
+        r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'  # UUIDs
+        r'|[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9:.Z+\-]+'  # ISO timestamps
+        r'|\b\d+\b'                                                           # standalone numbers
+        r'|0x[0-9a-fA-F]+',                                                  # hex literals
+        re.IGNORECASE,
+    )
+    return _TOKEN_RE.sub('<VAR>', msg)[:150]
 
 
 def get_watcher(
@@ -289,88 +326,108 @@ async def watch_log_groups(
     time_range_minutes: int = 60,
     filter_pattern: Optional[str] = None,
     region: str = "us-east-1",
-    credentials: Optional[Dict[str, Any]] = None
+    regions: Optional[List[str]] = None,
+    credentials: Optional[Dict[str, Any]] = None,
+    max_events_per_group: int = 500,
 ) -> Dict[str, Any]:
     """Watch multiple CloudWatch log groups and fetch recent logs.
-    
+
     This tool retrieves logs from multiple log groups simultaneously,
-    enabling cross-service log analysis.
-    
+    enabling cross-service log analysis. When *regions* is supplied the
+    query fans out to every region and results are tagged with their
+    origin region.
+
     Args:
-        log_group_names: List of CloudWatch log group names to watch
-        time_range_minutes: Time range in minutes to look back (default: 60)
-        filter_pattern: Optional CloudWatch Logs filter pattern
-        region: AWS region (default: us-east-1)
-        credentials: AWS credentials configuration (optional)
-        
+        log_group_names: List of CloudWatch log group names to watch.
+        time_range_minutes: Time range in minutes to look back (default: 60).
+        filter_pattern: Optional CloudWatch Logs filter pattern.
+        region: Primary AWS region (default: us-east-1). Ignored when *regions*
+            is provided.
+        regions: Optional list of AWS regions to query in parallel.  When
+            provided, each log group is queried in every listed region and
+            results include a ``region`` field on each event.
+        credentials: AWS credentials configuration (optional).
+        max_events_per_group: Maximum log events returned per group (default
+            500, max 2000). A ``truncated`` flag is set when more events
+            exist beyond this limit.
+
     Returns:
-        Dictionary containing logs from each log group and summary statistics
-        
-    Example:
-        ```python
-        result = await watch_log_groups(
-            log_group_names=[
-                "/aws/lambda/my-function",
-                "/aws/apigateway/my-api"
-            ],
-            time_range_minutes=30,
-            filter_pattern="[timestamp, message, level=ERROR*]"
-        )
-        ```
+        Dictionary containing logs from each log group and summary statistics.
     """
-    watcher = get_watcher(region=region, **_extract_credentials(credentials))
-    
+    # Clamp max_events_per_group to a safe ceiling.
+    max_events_per_group = min(max_events_per_group, 2000)
+
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=time_range_minutes)
-    
-    results = {}
+
+    # Determine the set of regions to fan-out across.
+    active_regions: List[str] = regions if regions and len(regions) > 1 else [region]
+    multi_region = len(active_regions) > 1
+
+    results: Dict[str, Any] = {}
     total_events = 0
-    errors = []
-    
-    # Fetch logs from all log groups concurrently
-    tasks = []
-    for log_group in log_group_names:
-        task = watcher.fetch_logs(
-            log_group_name=log_group,
-            start_time=start_time,
-            end_time=end_time,
-            filter_pattern=filter_pattern
-        )
-        tasks.append((log_group, task))
-    
-    for log_group, task in tasks:
+    errors: List[Dict[str, Any]] = []
+
+    # Build (region, log_group, coroutine) tuples for concurrent fetching.
+    fetch_tasks = []
+    for reg in active_regions:
+        watcher = get_watcher(region=reg, **_extract_credentials(credentials))
+        for log_group in log_group_names:
+            coro = watcher.fetch_logs(
+                log_group_name=log_group,
+                start_time=start_time,
+                end_time=end_time,
+                filter_pattern=filter_pattern,
+                limit=max_events_per_group,
+            )
+            fetch_tasks.append((reg, log_group, coro))
+
+    # Execute all fetches concurrently.
+    for reg, log_group, task in fetch_tasks:
+        result_key = f"{log_group}[{reg}]" if multi_region else log_group
         try:
             logs = await task
-            results[log_group] = {
-                "event_count": len(logs),
-                "events": logs[:100],  # Limit to 100 events per group
+            # Tag each event with its origin region when doing multi-region.
+            if multi_region:
+                for ev in logs:
+                    ev["region"] = reg
+            total_fetched = len(logs)
+            capped = logs[:max_events_per_group]
+            results[result_key] = {
+                "event_count": total_fetched,
+                "total_fetched": total_fetched,
+                "truncated": total_fetched > max_events_per_group,
+                "events": capped,
+                "region": reg,
                 "time_range": {
                     "start": start_time.isoformat(),
-                    "end": end_time.isoformat()
-                }
+                    "end": end_time.isoformat(),
+                },
             }
-            total_events += len(logs)
+            total_events += total_fetched
         except Exception as e:
-            errors.append({
-                "log_group": log_group,
-                "error": str(e)
-            })
-            results[log_group] = {
+            errors.append({"log_group": result_key, "region": reg, "error": str(e)})
+            results[result_key] = {
                 "event_count": 0,
+                "total_fetched": 0,
+                "truncated": False,
                 "events": [],
-                "error": str(e)
+                "region": reg,
+                "error": str(e),
             }
-    
+
     return {
         "success": True,
         "log_groups": results,
         "summary": {
             "total_log_groups": len(log_group_names),
-            "successful_log_groups": len(log_group_names) - len(errors),
+            "regions_queried": active_regions,
+            "successful_log_groups": len(log_group_names) * len(active_regions) - len(errors),
             "total_events": total_events,
-            "time_range_minutes": time_range_minutes
+            "time_range_minutes": time_range_minutes,
+            "max_events_per_group": max_events_per_group,
         },
-        "errors": errors if errors else None
+        "errors": errors if errors else None,
     }
 
 
@@ -473,7 +530,53 @@ async def analyze_log_patterns(
             start_time=start_time,
             end_time=end_time,
         )
-        unique_patterns = unique_result.get("results", [])[:50]
+        raw_unique = unique_result.get("results", [])
+        # Post-process: semantically group near-duplicate patterns by
+        # normalising dynamic tokens (IDs, timestamps, numbers).
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for entry in raw_unique:
+            raw_msg = ""
+            occ = 0
+            affected = 0
+            first_seen = ""
+            last_seen = ""
+            for field in entry:
+                f = field.get("field", "")
+                v = field.get("value", "")
+                if f == "error_pattern":
+                    raw_msg = v or ""
+                elif f == "occurrence_count":
+                    try:
+                        occ = int(float(v or 0))
+                    except (ValueError, TypeError):
+                        occ = 0
+                elif f == "affected_streams":
+                    try:
+                        affected = int(float(v or 0))
+                    except (ValueError, TypeError):
+                        affected = 0
+                elif f == "first_seen":
+                    first_seen = v
+                elif f == "last_seen":
+                    last_seen = v
+            key = _normalize_message(raw_msg)
+            if key in grouped:
+                grouped[key]["occurrence_count"] += occ
+                grouped[key]["affected_streams"] = max(grouped[key]["affected_streams"], affected)
+                if first_seen and (not grouped[key]["first_seen"] or first_seen < grouped[key]["first_seen"]):
+                    grouped[key]["first_seen"] = first_seen
+                if last_seen and last_seen > grouped[key].get("last_seen", ""):
+                    grouped[key]["last_seen"] = last_seen
+            else:
+                grouped[key] = {
+                    "normalized_pattern": key,
+                    "example_message": raw_msg[:300],
+                    "occurrence_count": occ,
+                    "affected_streams": affected,
+                    "first_seen": first_seen,
+                    "last_seen": last_seen,
+                }
+        unique_patterns = sorted(grouped.values(), key=lambda x: x["occurrence_count"], reverse=True)[:50]
     except Exception as e:
         logger.warning("analyze_log_patterns: unique_patterns query failed: %s", e)
 
@@ -515,8 +618,9 @@ async def detect_anomalies(
     time_range_minutes: int = 60,
     baseline_minutes: int = 1440,
     sensitivity: str = "medium",
+    per_group_sensitivity: Optional[Dict[str, str]] = None,
     region: str = "us-east-1",
-    credentials: Optional[Dict[str, Any]] = None
+    credentials: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Detect anomalies in log patterns compared to baseline.
     
@@ -527,7 +631,10 @@ async def detect_anomalies(
         log_group_names: List of CloudWatch log group names
         time_range_minutes: Current time range to analyze
         baseline_minutes: Baseline time range for comparison (default: 24 hours)
-        sensitivity: Anomaly detection sensitivity (low, medium, high)
+        sensitivity: Global anomaly detection sensitivity (low, medium, high)
+        per_group_sensitivity: Per-log-group sensitivity overrides. Keys are
+            log group names, values are 'low', 'medium', or 'high'. Groups not
+            listed fall back to the global *sensitivity*.
         region: AWS region
         credentials: AWS credentials configuration (optional)
         
@@ -549,13 +656,20 @@ async def detect_anomalies(
     baseline_start = end_time - timedelta(minutes=baseline_minutes + time_range_minutes)
     baseline_end = end_time - timedelta(minutes=baseline_minutes)
     
-    # Sensitivity thresholds
-    thresholds = {
-        "low": 3.0,      # 3x deviation
-        "medium": 2.0,   # 2x deviation
-        "high": 1.5      # 1.5x deviation
+    # Sensitivity thresholds (used for simple-deviation fallback)
+    _deviation_thresholds = {
+        "low": 3.0,
+        "medium": 2.0,
+        "high": 1.5,
     }
-    threshold = thresholds.get(sensitivity, 2.0)
+    # Z-score thresholds mirror the same names.
+    _z_thresholds = {
+        "low": 3.0,
+        "medium": 2.0,
+        "high": 1.5,
+    }
+    # Global defaults
+    threshold = _deviation_thresholds.get(sensitivity, 2.0)
     
     # Query for error counts in current period
     current_query = """
@@ -611,14 +725,6 @@ async def detect_anomalies(
         else:
             baseline_std = 0.0
 
-        # Map sensitivity to z-score thresholds.
-        z_thresholds = {
-            "low": 3.0,
-            "medium": 2.0,
-            "high": 1.5,
-        }
-        z_threshold = z_thresholds.get(sensitivity, 2.0)
-        
         # Check current period for anomalies using z-score.
         for result in current_result.get("results", []):
             timestamp = None
@@ -633,6 +739,19 @@ async def detect_anomalies(
                     except (ValueError, TypeError):
                         pass
             
+            # Resolve effective sensitivity for this log group.  Since the
+            # current Insights query aggregates across all groups we apply the
+            # global sensitivity here; per_group_sensitivity is advisory for
+            # callers who run single-group queries.
+            eff_sensitivity = sensitivity
+            if per_group_sensitivity and log_group_names:
+                # When only one group is queried use its override if present.
+                if len(log_group_names) == 1:
+                    eff_sensitivity = per_group_sensitivity.get(log_group_names[0], sensitivity)
+
+            eff_z_threshold = _z_thresholds.get(eff_sensitivity, 2.0)
+            eff_threshold = _deviation_thresholds.get(eff_sensitivity, 2.0)
+
             # Use z-score when we have enough baseline data; fall back to the
             # simple deviation multiplier otherwise.
             is_anomaly = False
@@ -641,10 +760,10 @@ async def detect_anomalies(
 
             if baseline_std > 0:
                 z_score = (count - baseline_avg) / baseline_std
-                is_anomaly = z_score > z_threshold
+                is_anomaly = z_score > eff_z_threshold
             elif baseline_avg > 0:
                 deviation = count / baseline_avg
-                is_anomaly = deviation > threshold
+                is_anomaly = deviation > eff_threshold
 
             if is_anomaly:
                 # Classify severity from z-score ranges.
@@ -795,4 +914,105 @@ async def correlate_logs(
         },
         "correlation_id": correlation_id,
         "trace_id": trace_id
+    }
+
+
+@handle_exceptions
+async def discover_log_groups(
+    prefix: Optional[str] = None,
+    tag_key: Optional[str] = None,
+    tag_value: Optional[str] = None,
+    limit: int = 50,
+    region: str = "us-east-1",
+    credentials: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Discover CloudWatch log groups by name prefix or resource tags.
+
+    Engineers can call this tool when they know a service name or tag but
+    not the exact log group path.  Prefix search is fast (single API call);
+    tag search paginates up to 200 groups before filtering.
+
+    Args:
+        prefix: Log group name prefix, e.g. '/aws/lambda/kyc-' to find all
+            KYC Lambda log groups.
+        tag_key: Tag key to filter by (e.g. 'Environment').
+        tag_value: Tag value to filter by (e.g. 'production').  Requires
+            *tag_key*.
+        limit: Maximum number of log groups to return (default 50).
+        region: AWS region (default: us-east-1).
+        credentials: AWS credentials configuration (optional).
+
+    Returns:
+        Dictionary with matching log groups, their ARNs, stored bytes, and
+        retention policy.
+    """
+    watcher = get_watcher(region=region, **_extract_credentials(credentials))
+    client = watcher.client
+
+    log_groups: List[Dict[str, Any]] = []
+    next_token = None
+
+    # Use prefix-based search (efficient).
+    describe_kwargs: Dict[str, Any] = {"limit": min(limit, 50)}
+    if prefix:
+        describe_kwargs["logGroupNamePrefix"] = prefix
+
+    while len(log_groups) < limit:
+        if next_token:
+            describe_kwargs["nextToken"] = next_token
+
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: client.describe_log_groups(**describe_kwargs),
+        )
+
+        for grp in response.get("logGroups", []):
+            log_groups.append({
+                "name": grp.get("logGroupName"),
+                "arn": grp.get("arn"),
+                "stored_bytes": grp.get("storedBytes", 0),
+                "retention_days": grp.get("retentionInDays"),
+                "creation_time": grp.get("creationTime"),
+            })
+
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+
+    search_method = "prefix" if prefix else "all"
+
+    # Optional tag filtering (applied after prefix discovery).
+    if tag_key and log_groups:
+        search_method = "tag" if not prefix else "prefix+tag"
+        filtered: List[Dict[str, Any]] = []
+        # Cap at 200 groups to avoid excessive list_tags_for_resource calls.
+        sample = log_groups[:200]
+        for grp in sample:
+            arn = grp.get("arn")
+            if not arn:
+                continue
+            try:
+                tags_resp = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: client.list_tags_for_resource(resourceArn=arn),
+                )
+                tags = tags_resp.get("tags", {})
+                if tag_value:
+                    if tags.get(tag_key) == tag_value:
+                        filtered.append(grp)
+                else:
+                    if tag_key in tags:
+                        filtered.append(grp)
+            except Exception as tag_err:
+                logger.debug("discover_log_groups: skipping tag check for %s: %s", arn, tag_err)
+        log_groups = filtered
+
+    return {
+        "success": True,
+        "log_groups": log_groups[:limit],
+        "count": min(len(log_groups), limit),
+        "search_method": search_method,
+        "prefix": prefix,
+        "tag_key": tag_key,
+        "tag_value": tag_value,
     }
