@@ -333,6 +333,297 @@ _TS_IMPORT_RE = re.compile(
 _TS_CALL_RE = re.compile(r"\b(\w{2,})\s*\(", re.MULTILINE)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# tree-sitter AST parsing (TypeScript / TSX / C#)
+# Lazy init — falls back to regex if tree-sitter is not installed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TS_PARSER:  Any = None
+_TSX_PARSER: Any = None
+_CS_PARSER:  Any = None
+
+_TS_DEF_QUERY = """
+  (function_declaration        name: (identifier)           @name) @def
+  (function_expression         name: (identifier)           @name) @def
+  (method_definition           name: (property_identifier)  @name) @def
+  (class_declaration           name: (type_identifier)      @name) @def
+  (interface_declaration       name: (type_identifier)      @name) @def
+  (type_alias_declaration      name: (type_identifier)      @name) @def
+  (lexical_declaration
+    (variable_declarator
+      name:  (identifier) @name
+      value: [(arrow_function)(function_expression)])) @def
+"""
+
+_TS_CALL_QUERY = """
+  (call_expression
+    function: (identifier) @callee) @call
+  (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)) @call
+"""
+
+_CS_DEF_QUERY = """
+  (method_declaration       name: (identifier) @name) @def
+  (constructor_declaration  name: (identifier) @name) @def
+  (class_declaration        name: (identifier) @name) @def
+  (interface_declaration    name: (identifier) @name) @def
+  (struct_declaration       name: (identifier) @name) @def
+  (record_declaration       name: (identifier) @name) @def
+  (enum_declaration         name: (identifier) @name) @def
+"""
+
+_CS_CALL_QUERY = """
+  (invocation_expression
+    function: (identifier) @callee) @call
+  (invocation_expression
+    function: (member_access_expression
+      name: (identifier) @callee)) @call
+"""
+
+_CS_USING_QUERY = """
+  (using_directive
+    [(qualified_name)(identifier)] @namespace)
+"""
+
+
+def _get_ts_parser(lang: str) -> Any:
+    """Return a cached tree-sitter Parser for *lang* ('typescript'|'tsx'|'csharp').
+
+    Returns None (never raises) if tree-sitter is not installed.
+    """
+    global _TS_PARSER, _TSX_PARSER, _CS_PARSER
+    try:
+        from tree_sitter import Parser, Language  # type: ignore[import]
+        if lang == "typescript" and _TS_PARSER is None:
+            import tree_sitter_typescript as _tst  # type: ignore[import]
+            _TS_PARSER = Parser(Language(_tst.language_typescript()))
+        if lang == "tsx" and _TSX_PARSER is None:
+            import tree_sitter_typescript as _tst  # type: ignore[import]
+            _TSX_PARSER = Parser(Language(_tst.language_tsx()))
+        if lang == "csharp" and _CS_PARSER is None:
+            import tree_sitter_c_sharp as _tsc  # type: ignore[import]
+            _CS_PARSER = Parser(Language(_tsc.language_c_sharp()))
+        return {"typescript": _TS_PARSER, "tsx": _TSX_PARSER, "csharp": _CS_PARSER}[lang]
+    except Exception:
+        return None
+
+
+def _extract_chunks_via_ts(
+    source: str,
+    file_path: str,
+    repo_name: str,
+    parser_lang: str,
+    chunk_lang: str,
+) -> Tuple[List[CodeChunk], List[CallEdge]]:
+    """Parse *source* with tree-sitter; return (chunks, call_edges).
+
+    Uses exact AST line ranges — no 80-line cap, no keyword false-positives,
+    call edges produced for all languages.
+    Returns ([], []) on any failure so callers fall back to regex silently.
+    """
+    parser = _get_ts_parser(parser_lang)
+    if parser is None:
+        return [], []
+    try:
+        tree  = parser.parse(source.encode())
+        lines = source.splitlines()
+        lang  = parser.language
+
+        is_cs  = parser_lang == "csharp"
+        def_q  = lang.query(_CS_DEF_QUERY  if is_cs else _TS_DEF_QUERY)
+        call_q = lang.query(_CS_CALL_QUERY if is_cs else _TS_CALL_QUERY)
+
+        chunks: List[CodeChunk] = []
+        seen:   set             = set()
+
+        captures = def_q.captures(tree.root_node)
+        # tree-sitter >=0.22 returns dict[str, list[Node]]
+        name_nodes = captures.get("name", [])
+        if not isinstance(name_nodes, list):
+            name_nodes = [name_nodes]
+
+        for name_node in name_nodes:
+            name     = name_node.text.decode(errors="replace")
+            def_node = name_node.parent
+            ls       = def_node.start_point[0] + 1
+            le       = def_node.end_point[0]   + 1
+            key      = (name, ls)
+            if key in seen:
+                continue
+            seen.add(key)
+            body  = "\n".join(lines[ls - 1 : le])
+            ctype = "class" if any(
+                t in def_node.type
+                for t in ("class", "interface", "struct", "record", "enum")
+            ) else "function"
+            chunks.append(CodeChunk(
+                repo_name=repo_name,
+                file_path=file_path,
+                name=name,
+                chunk_type=ctype,
+                body=body,
+                language=chunk_lang,
+                line_start=ls,
+                line_end=le,
+                entity_id=compute_entity_id(repo_name, f"{ctype}:{name}:{ls}"),
+            ))
+
+        func_ranges = [(c.line_start, c.line_end, c.name)
+                       for c in chunks if c.chunk_type == "function"]
+
+        def _caller_at(lineno: int) -> str:
+            best, best_sz = "", 10 ** 9
+            for s, e, n in func_ranges:
+                if s <= lineno <= e and (e - s) < best_sz:
+                    best, best_sz = n, e - s
+            return best
+
+        calls:      List[CallEdge] = []
+        seen_calls: set            = set()
+        callee_nodes = call_q.captures(tree.root_node).get("callee", [])
+        if not isinstance(callee_nodes, list):
+            callee_nodes = [callee_nodes]
+
+        for callee_node in callee_nodes:
+            callee = callee_node.text.decode(errors="replace")
+            lineno = callee_node.start_point[0] + 1
+            caller = _caller_at(lineno)
+            if not caller or caller == callee:
+                continue
+            ck = (caller, callee)
+            if ck in seen_calls:
+                continue
+            seen_calls.add(ck)
+            calls.append(CallEdge(
+                caller_repo=repo_name,
+                caller_name=caller,
+                caller_file=file_path,
+                callee_name=callee,
+            ))
+
+        return chunks, calls
+
+    except Exception as exc:
+        logger.debug(
+            "tree-sitter extraction failed for %s (%s): %s", file_path, parser_lang, exc,
+        )
+        return [], []
+
+
+def _extract_cs_imports_via_ts(
+    source: str, file_path: str, repo_name: str,
+) -> List[ImportEdge]:
+    """Extract C# `using` directives via tree-sitter; falls back to regex."""
+    parser = _get_ts_parser("csharp")
+    if parser is None:
+        return extract_csharp_imports(source, file_path, repo_name)
+    try:
+        tree = parser.parse(source.encode())
+        lang = parser.language
+        q    = lang.query(_CS_USING_QUERY)
+        ns_nodes = q.captures(tree.root_node).get("namespace", [])
+        if not isinstance(ns_nodes, list):
+            ns_nodes = [ns_nodes]
+        edges: List[ImportEdge] = []
+        for ns_node in ns_nodes:
+            namespace = ns_node.text.decode(errors="replace").strip()
+            if namespace:
+                edges.append(ImportEdge(
+                    repo_name=repo_name,
+                    file_path=file_path,
+                    from_module=namespace,
+                    import_name=namespace.split(".")[-1],
+                    is_relative=False,
+                ))
+        return edges
+    except Exception as exc:
+        logger.debug("tree-sitter import extraction failed for %s: %s", file_path, exc)
+        return extract_csharp_imports(source, file_path, repo_name)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# C# / .NET regex extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CS_METHOD_RE = re.compile(
+    r"(?:(?:public|private|protected|internal|static|async|virtual|override|"
+    r"abstract|sealed|partial|extern|new)\s+)*"
+    r"(?:[\w<>\[\]?,\s]+?)\s+(\w+)\s*\([^)]*\)\s*(?:where\s+[^{;]+)?\s*\{",
+    re.MULTILINE,
+)
+_CS_CLASS_RE = re.compile(
+    r"(?:(?:public|private|protected|internal|static|abstract|sealed|partial)\s+)*"
+    r"(?:class|interface|struct|record|enum)\s+(\w+)(?:<[^>]+>)?(?:\s*:\s*[^{\n]+)?\s*\{",
+    re.MULTILINE,
+)
+_CS_USING_RE = re.compile(
+    r"^using\s+(?:static\s+)?(?:\w+\s*=\s*)?([\w.]+)\s*;",
+    re.MULTILINE,
+)
+
+
+def extract_csharp_chunks(source: str, file_path: str, repo_name: str) -> List[CodeChunk]:
+    """Extract methods and classes from C# source via regex."""
+    lines  = source.splitlines()
+    chunks: List[CodeChunk] = []
+    seen:   set = set()
+
+    for pattern, ctype in [(_CS_METHOD_RE, "function"), (_CS_CLASS_RE, "class")]:
+        for m in pattern.finditer(source):
+            name = m.group(1)
+            if name in {"if", "for", "foreach", "while", "switch", "catch", "using", "lock"}:
+                continue
+            key = (name, ctype)
+            if key in seen:
+                continue
+            seen.add(key)
+            line_start = source[:m.start()].count("\n") + 1
+            line_end   = min(line_start + 79, len(lines))
+            body       = "\n".join(lines[line_start - 1 : line_end])
+            chunks.append(CodeChunk(
+                repo_name=repo_name,
+                file_path=file_path,
+                name=name,
+                chunk_type=ctype,
+                body=body,
+                language="csharp",
+                line_start=line_start,
+                line_end=line_end,
+                entity_id=compute_entity_id(repo_name, f"{ctype}:{name}"),
+            ))
+
+    return chunks
+
+
+def extract_csharp_imports(
+    source: str, file_path: str, repo_name: str,
+) -> List[ImportEdge]:
+    """Extract `using` directives from C# source."""
+    edges: List[ImportEdge] = []
+    for m in _CS_USING_RE.finditer(source):
+        namespace = m.group(1)
+        if namespace:
+            edges.append(ImportEdge(
+                repo_name=repo_name,
+                file_path=file_path,
+                from_module=namespace,
+                import_name=namespace.split(".")[-1],
+                is_relative=False,
+            ))
+    return edges
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# React / JSX regex extraction (extends TypeScript patterns with components)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_JSX_COMPONENT_RE = re.compile(
+    r"(?:export\s+)?(?:default\s+)?(?:function|const)\s+([A-Z]\w*)\s*[=(]",
+    re.MULTILINE,
+)
+
+
 def extract_typescript_chunks(source: str, file_path: str, repo_name: str) -> List[CodeChunk]:
     """Extract named functions and arrow functions from TypeScript/TSX source."""
     lines  = source.splitlines()
@@ -357,6 +648,43 @@ def extract_typescript_chunks(source: str, file_path: str, repo_name: str) -> Li
                 line_end=line_end,
                 entity_id=compute_entity_id(repo_name, norm_sig),
             ))
+
+    return chunks
+
+
+def extract_react_chunks(source: str, file_path: str, repo_name: str) -> List[CodeChunk]:
+    """Extract functions and React components from JSX/TSX source.
+
+    Runs the TypeScript extractor first, then adds any PascalCase components
+    matched by _JSX_COMPONENT_RE that weren't already captured (deduped by name).
+    """
+    chunks = extract_typescript_chunks(source, file_path, repo_name)
+    seen   = {c.name for c in chunks}
+    lines  = source.splitlines()
+
+    for m in _JSX_COMPONENT_RE.finditer(source):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        line_start = source[:m.start()].count("\n") + 1
+        line_end   = min(line_start + 79, len(lines))
+        body       = "\n".join(lines[line_start - 1 : line_end])
+        chunks.append(CodeChunk(
+            repo_name=repo_name,
+            file_path=file_path,
+            name=name,
+            chunk_type="function",
+            body=body,
+            language="react",
+            line_start=line_start,
+            line_end=line_end,
+            entity_id=compute_entity_id(repo_name, f"{name}()"),
+        ))
+        # Tag previously-captured TS chunks from this file as react
+        for c in chunks:
+            if c.language == "typescript" and c.file_path == file_path:
+                c.language = "react"
 
     return chunks
 
@@ -473,7 +801,7 @@ class CodeIndexer:
         Args:
             repo_name: Unique name for this repository.
             local_path: Absolute path to the local checkout.
-            language: 'python' | 'typescript' | 'mixed'
+            language: 'python' | 'typescript' | 'mixed' | 'csharp' | 'dotnet' | 'react'
             progress_callback: Optional async callable(files_done, total_files).
                 Called after each file is processed.  Failures are swallowed so
                 an SSE disconnect cannot abort indexing.
@@ -490,6 +818,10 @@ class CodeIndexer:
             extensions += [".py"]
         if language in {"typescript", "mixed"}:
             extensions += [".ts", ".tsx"]
+        if language in {"csharp", "dotnet"}:
+            extensions += [".cs"]
+        if language == "react":
+            extensions += [".jsx", ".tsx"]
 
         # ── Collect all files first so we know total_files ───────────────────
         all_files: List[Tuple[Path, str]] = []  # (file_path, ext)
@@ -527,9 +859,29 @@ class CodeIndexer:
                 chunks  = extract_python_chunks(source, relative, repo_name)
                 calls   = extract_python_calls(source, relative, repo_name)
                 imports = extract_python_imports(source, relative, repo_name)
-            else:
-                chunks  = extract_typescript_chunks(source, relative, repo_name)
-                calls   = []
+            elif ext == ".cs":
+                chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "csharp", "csharp")
+                if not chunks:
+                    chunks = extract_csharp_chunks(source, relative, repo_name)
+                    calls  = []
+                imports = _extract_cs_imports_via_ts(source, relative, repo_name)
+            elif ext == ".jsx":
+                chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "tsx", "react")
+                if not chunks:
+                    chunks = extract_react_chunks(source, relative, repo_name)
+                    calls  = []
+                imports = extract_typescript_imports(source, relative, repo_name)
+            elif ext == ".tsx":
+                chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "tsx", "typescript")
+                if not chunks:
+                    chunks = extract_typescript_chunks(source, relative, repo_name)
+                    calls  = []
+                imports = extract_typescript_imports(source, relative, repo_name)
+            else:  # .ts
+                chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "typescript", "typescript")
+                if not chunks:
+                    chunks = extract_typescript_chunks(source, relative, repo_name)
+                    calls  = []
                 imports = extract_typescript_imports(source, relative, repo_name)
 
             all_chunks.extend(chunks)

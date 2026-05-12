@@ -10,7 +10,7 @@ export const CONNECTION_MAP = {
       input: ["teams", "chat", "scheduler"],
       model: ["llm"],
       memory: ["memory"],
-      tool: ["tool", "database", "cloudwatchAnalyzer"]
+      tool: ["tool", "database", "cloudwatchAnalyzer", "codeAnalyzer"]
     },
     maxInputs: { model: 1, memory: 1 }
   },
@@ -40,7 +40,10 @@ export const CONNECTION_MAP = {
   },
 
   // CloudWatch Analyzer (behaves like a tool)
-  cloudwatchAnalyzer: { outputs: ["agent"], maxOutputs: 1 }
+  cloudwatchAnalyzer: { outputs: ["agent"], maxOutputs: 1 },
+
+  // Code Analyzer (behaves like a tool)
+  codeAnalyzer: { outputs: ["agent"], maxOutputs: 1 }
 };
 
 // Error messages
@@ -141,7 +144,7 @@ export const nodeCategories = {
   ai: ["llm"],
   data: ["database"],
   communication: ["teams", "chat", "output"],
-  tools: ["cloudwatchAnalyzer"],
+  tools: ["cloudwatchAnalyzer", "codeAnalyzer"],
   memory: ["memory"],
   workflow: ["orchestrator"],
   scheduling: ["scheduler"]

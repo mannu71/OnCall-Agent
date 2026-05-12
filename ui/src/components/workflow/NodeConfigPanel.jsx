@@ -871,15 +871,24 @@ function CodeAnalyzerConfig({ config, handleConfigChange }) {
               background: '#fafafa',
             }}
           >
-            <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
-              <div style={{ flex: 1 }}>
+            {/* Row 1: name + language + delete */}
+            <div style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'flex-start' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
                 <input
                   type="text"
                   value={repo.name || ''}
                   onChange={(e) => updateRepo(idx, 'name', e.target.value)}
                   onBlur={(e) => handleBlur(`name-${idx}`, e.target.value)}
-                  placeholder="repo-name (lowercase)"
-                  style={{ width: '100%', fontSize: 12 }}
+                  placeholder="repo-name"
+                  style={{
+                    width: '100%',
+                    fontSize: 12,
+                    padding: '4px 8px',
+                    border: '1px solid #d0d0d0',
+                    borderRadius: 4,
+                    background: '#fff',
+                    boxSizing: 'border-box',
+                  }}
                 />
                 {fieldErrors[`name-${idx}`] && (
                   <span style={{ color: '#d32f2f', fontSize: 10 }}>
@@ -890,28 +899,40 @@ function CodeAnalyzerConfig({ config, handleConfigChange }) {
               <select
                 value={repo.language || 'python'}
                 onChange={(e) => updateRepo(idx, 'language', e.target.value)}
-                style={{ fontSize: 12, minWidth: 100 }}
+                style={{
+                  fontSize: 12,
+                  width: 130,
+                  flexShrink: 0,
+                  padding: '4px 6px',
+                  border: '1px solid #d0d0d0',
+                  borderRadius: 4,
+                  background: '#fff',
+                }}
               >
                 <option value="python">Python</option>
                 <option value="typescript">TypeScript</option>
-                <option value="mixed">Mixed</option>
+                <option value="react">React / JSX</option>
+                <option value="csharp">C# / .NET</option>
+                <option value="mixed">Mixed (Py + TS)</option>
               </select>
               <button
                 type="button"
                 onClick={() => removeRepo(idx)}
                 style={{
+                  flexShrink: 0,
                   background: '#ffebee',
                   border: '1px solid #ef9a9a',
                   borderRadius: 4,
                   cursor: 'pointer',
                   color: '#c62828',
-                  padding: '2px 8px',
+                  padding: '4px 10px',
                   fontSize: 12,
                 }}
               >
                 ✕
               </button>
             </div>
+            {/* Row 2: path */}
             <div>
               <input
                 type="text"
@@ -919,7 +940,15 @@ function CodeAnalyzerConfig({ config, handleConfigChange }) {
                 onChange={(e) => updateRepo(idx, 'path', e.target.value)}
                 onBlur={(e) => handleBlur(`path-${idx}`, e.target.value)}
                 placeholder="/absolute/path/to/repo (as seen by server)"
-                style={{ width: '100%', fontSize: 12 }}
+                style={{
+                  width: '100%',
+                  fontSize: 12,
+                  padding: '4px 8px',
+                  border: '1px solid #d0d0d0',
+                  borderRadius: 4,
+                  background: '#fff',
+                  boxSizing: 'border-box',
+                }}
               />
               {fieldErrors[`path-${idx}`] && (
                 <span style={{ color: '#d32f2f', fontSize: 10 }}>
