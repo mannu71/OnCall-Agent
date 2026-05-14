@@ -109,6 +109,69 @@ agent-api/
 
 ---
 
+## Database Migrations
+
+The API stores execution history, workflow state, and token usage in PostgreSQL. Migrations are plain SQL files in `agent-api/migrations/` and must be run in order.
+
+### Migration files
+
+| File | Description |
+|---|---|
+| `001_initial_schema.sql` | Creates `executions`, `workflows`, and supporting tables |
+| `002_add_token_columns.sql` | Adds `input_tokens`, `output_tokens`, `total_tokens` to `executions` |
+
+### Running a migration against the Docker database
+
+The PostgreSQL container is named `kyc-agent-db` with credentials `kycuser / kycpassword / kycagent`.
+
+**Option A — inline SQL (quickest):**
+```bash
+docker exec kyc-agent-db psql -U kycuser -d kycagent -c \
+  "$(cat agent-api/migrations/002_add_token_columns.sql)"
+```
+
+**Option B — copy file into the container, then run:**
+```bash
+docker cp agent-api/migrations/002_add_token_columns.sql \
+  kyc-agent-db:/tmp/002_add_token_columns.sql
+
+docker exec kyc-agent-db psql -U kycuser -d kycagent \
+  -f /tmp/002_add_token_columns.sql
+```
+
+**Option C — connect interactively:**
+```bash
+docker exec -it kyc-agent-db psql -U kycuser -d kycagent
+# Then paste the contents of the migration file
+```
+
+### Verify the migration ran
+
+```bash
+docker exec kyc-agent-db psql -U kycuser -d kycagent \
+  -c "\d executions" | grep token
+```
+
+Expected output:
+```
+ input_tokens  | integer | default 0
+ output_tokens | integer | default 0
+ total_tokens  | integer | default 0
+```
+
+### Running all migrations (fresh install)
+
+```bash
+for f in agent-api/migrations/*.sql; do
+  echo "Running $f..."
+  docker exec kyc-agent-db psql -U kycuser -d kycagent -c "$(cat $f)"
+done
+```
+
+> **Note:** All migration statements use `IF NOT EXISTS` / `IF EXISTS` guards so they are safe to run multiple times.
+
+---
+
 ## Usage
 
 ### Creating a Workflow

@@ -235,6 +235,21 @@ const Settings = () => {
         { value: 'Custom', label: 'Custom', icon: '🔧', fields: ['api_key', 'secret_key', 'endpoint'] },
     ];
 
+    // Normalise provider names: DB may store "bedrock" while UI uses "AWS Bedrock"
+    const normalizeProvider = (p) => (p || '').toLowerCase().replace(/\s+/g, '');
+    const findModelKey = (uiProvider) => {
+        const norm = normalizeProvider(uiProvider);
+        return modelKeys.find(k =>
+            normalizeProvider(k.provider) === norm ||
+            // "awsbedrock" matches "bedrock"
+            (norm.includes('bedrock') && normalizeProvider(k.provider).includes('bedrock')) ||
+            (normalizeProvider(k.provider).includes('bedrock') && norm.includes('bedrock'))
+        );
+    };
+    // True when a model key record has at least one credential set
+    const keyIsConfigured = (mk) =>
+        mk && (mk.has_api_key || mk.has_secret_key || mk.has_access_credentials || mk.endpoint);
+
     const emptyModelKeyForm = (provider) => {
         const base = {
             provider: provider || 'OpenAI',
@@ -257,7 +272,8 @@ const Settings = () => {
         const providers = [];
         const supportedForDiscovery = ['OpenAI', 'Anthropic', 'Google', 'Groq', 'Azure OpenAI', 'Ollama', 'AWS Bedrock'];
         for (const mk of modelKeys) {
-            if (!supportedForDiscovery.includes(mk.provider)) continue;
+            const matchedProvider = supportedForDiscovery.find(p => normalizeProvider(p) === normalizeProvider(mk.provider) || (p === 'AWS Bedrock' && normalizeProvider(mk.provider).includes('bedrock')));
+            if (!matchedProvider) continue;
             const hasCreds = mk.has_api_key || mk.has_secret_key || mk.has_access_credentials || mk.endpoint;
             if (!hasCreds) continue;
             const providerCfg = MODEL_KEY_PROVIDERS.find(p => p.value === mk.provider);
@@ -347,7 +363,7 @@ const Settings = () => {
 
     const handleOpenModelKeyDialog = (provider = null) => {
         if (provider) {
-            const existing = modelKeys.find(k => k.provider === provider);
+            const existing = findModelKey(provider);
             setEditingModelKeyProvider(provider);
             const formData = {
                 provider,
@@ -993,6 +1009,68 @@ const Settings = () => {
                     </CardContent>
                 </Card>
 
+                {/* Model Keys Section — configure credentials before adding LLMs */}
+                <Card className="mb-6">
+                    <CardContent className="pt-6">
+                        <div className="flex justify-between items-center mb-2">
+                            <div>
+                                <h2 className="text-xl font-medium">Model Keys</h2>
+                                <p className="text-sm text-muted-foreground mt-0.5">
+                                    Centralized API key management — configure provider credentials here before adding LLMs
+                                </p>
+                            </div>
+                            <Button onClick={() => handleOpenModelKeyDialog()}>
+                                <Plus className="w-4 h-4 mr-2" />
+                                Add Provider Key
+                            </Button>
+                        </div>
+                        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4 mt-4">
+                            {MODEL_KEY_PROVIDERS.map((provider) => {
+                                const existing = findModelKey(provider.value);
+                                const configured = keyIsConfigured(existing);
+                                return (
+                                    <div
+                                        key={provider.value}
+                                        className={`border rounded-lg p-3 cursor-pointer transition-colors ${configured ? 'border-green-200 bg-green-50/30 hover:bg-green-50' : 'hover:bg-muted/40'}`}
+                                        onClick={() => handleOpenModelKeyDialog(provider.value)}
+                                    >
+                                        <div className="flex items-center justify-between mb-1.5">
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-lg">{provider.icon}</span>
+                                                <span className="font-medium text-sm">{provider.label}</span>
+                                            </div>
+                                            {existing && (
+                                                <Button
+                                                    size="icon"
+                                                    variant="ghost"
+                                                    className="h-6 w-6 text-red-500 hover:text-red-700 shrink-0"
+                                                    onClick={(e) => { e.stopPropagation(); handleDeleteModelKey(provider.value); }}
+                                                    title="Delete"
+                                                >
+                                                    <Trash2 className="w-3 h-3" />
+                                                </Button>
+                                            )}
+                                        </div>
+                                        <div className="flex flex-wrap gap-1">
+                                            {configured ? (
+                                                <>
+                                                    {existing.has_api_key && <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200 gap-1 text-[10px] px-1.5 py-0"><Key className="w-2.5 h-2.5" /> API Key</Badge>}
+                                                    {existing.has_secret_key && <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200 gap-1 text-[10px] px-1.5 py-0"><Shield className="w-2.5 h-2.5" /> Secret</Badge>}
+                                                    {existing.has_access_credentials && <Badge variant="outline" className="bg-orange-50 text-orange-700 border-orange-200 gap-1 text-[10px] px-1.5 py-0"><Cloud className="w-2.5 h-2.5" /> AWS</Badge>}
+                                                    {existing.endpoint && <Badge variant="outline" className="bg-purple-50 text-purple-700 border-purple-200 text-[10px] px-1.5 py-0">Endpoint</Badge>}
+                                                    {existing.region && <Badge variant="outline" className="text-[10px] px-1.5 py-0">{existing.region}</Badge>}
+                                                </>
+                                            ) : (
+                                                <span className="text-xs text-muted-foreground">Click to configure</span>
+                                            )}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </CardContent>
+                </Card>
+
                 {/* LLM Configuration Section */}
                 <Card className="mb-6">
                     <CardContent className="pt-6">
@@ -1157,107 +1235,6 @@ const Settings = () => {
                                     )}
                                 </TableBody>
                             </Table>
-                        </div>
-                    </CardContent>
-                </Card>
-
-                {/* Model Keys Section */}
-                <Card className="mb-6">
-                    <CardContent className="pt-6">
-                        <div className="flex justify-between items-center mb-2">
-                            <h2 className="text-xl font-medium">Model Keys</h2>
-                            <Button onClick={() => handleOpenModelKeyDialog()}>
-                                <Plus className="w-4 h-4 mr-2" />
-                                Add Provider Key
-                            </Button>
-                        </div>
-                        <p className="text-sm text-muted-foreground mb-4">
-                            Centralized API key and secret key management for all model providers
-                        </p>
-                        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-                            {MODEL_KEY_PROVIDERS.map((provider) => {
-                                const existing = modelKeys.find(k => k.provider === provider.value);
-                                return (
-                                    <div key={provider.value} className="border rounded-lg p-4">
-                                        <div className="flex items-start justify-between mb-2">
-                                            <div className="flex items-center gap-2">
-                                                <span className="text-xl">{provider.icon}</span>
-                                                <span className="font-medium text-sm">{provider.label}</span>
-                                            </div>
-                                            <div className="flex gap-1">
-                                                <Button
-                                                    size="icon"
-                                                    variant="ghost"
-                                                    className="h-7 w-7"
-                                                    onClick={() => handleOpenModelKeyDialog(provider.value)}
-                                                    title="Edit"
-                                                >
-                                                    <Edit2 className="w-3.5 h-3.5" />
-                                                </Button>
-                                                {existing && (
-                                                    <Button
-                                                        size="icon"
-                                                        variant="ghost"
-                                                        className="h-7 w-7 text-red-600 hover:text-red-700"
-                                                        onClick={() => handleDeleteModelKey(provider.value)}
-                                                        title="Delete"
-                                                    >
-                                                        <Trash2 className="w-3.5 h-3.5" />
-                                                    </Button>
-                                                )}
-                                            </div>
-                                        </div>
-                                        <div className="flex flex-wrap gap-1 mb-1">
-                                            {existing ? (
-                                                <>
-                                                    {existing.has_api_key && (
-                                                        <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200 gap-1 text-xs">
-                                                            <Key className="w-3 h-3" /> API Key
-                                                        </Badge>
-                                                    )}
-                                                    {existing.has_secret_key && (
-                                                        <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200 gap-1 text-xs">
-                                                            <Shield className="w-3 h-3" /> Secret
-                                                        </Badge>
-                                                    )}
-                                                    {existing.has_aws_credentials && (
-                                                        <Badge variant="outline" className="bg-orange-50 text-orange-700 border-orange-200 gap-1 text-xs">
-                                                            <Cloud className="w-3 h-3" /> AWS
-                                                        </Badge>
-                                                    )}
-                                                    {existing.endpoint && (
-                                                        <Badge variant="outline" className="bg-purple-50 text-purple-700 border-purple-200 gap-1 text-xs">
-                                                            Endpoint
-                                                        </Badge>
-                                                    )}
-                                                </>
-                                            ) : (
-                                                <Badge variant="outline" className="text-muted-foreground text-xs">
-                                                    Not configured
-                                                </Badge>
-                                            )}
-                                        </div>
-                                        {existing?.endpoint && (
-                                            <p className="text-xs text-muted-foreground font-mono truncate" title={existing.endpoint}>
-                                                {existing.endpoint}
-                                            </p>
-                                        )}
-                                        {existing?.region && (
-                                            <p className="text-xs text-muted-foreground">Region: {existing.region}</p>
-                                        )}
-                                        {!existing && (
-                                            <Button
-                                                variant="outline"
-                                                size="sm"
-                                                className="mt-2 w-full text-xs h-7"
-                                                onClick={() => handleOpenModelKeyDialog(provider.value)}
-                                            >
-                                                <Plus className="w-3 h-3 mr-1" /> Configure
-                                            </Button>
-                                        )}
-                                    </div>
-                                );
-                            })}
                         </div>
                     </CardContent>
                 </Card>
@@ -1560,46 +1537,63 @@ const Settings = () => {
                                 </div>
                             )}
 
-                            {/* AWS Credentials Section */}
-                            {(llmFormData.provider === 'AWS Bedrock' || llmFormData.provider === 'Bedrock' || llmFormData.provider === 'bedrock') && (
-                                <div className="p-4 bg-muted rounded-lg flex flex-col gap-3">
-                                    <div className="flex items-center gap-2">
-                                        <Key className="w-4 h-4 text-primary" />
-                                        <h4 className="text-sm font-medium">AWS Credentials</h4>
+                            {/* AWS / provider credentials — sourced from Model Keys */}
+                            {(llmFormData.provider === 'AWS Bedrock' || llmFormData.provider === 'Bedrock' || llmFormData.provider === 'bedrock') && (() => {
+                                const mk = findModelKey('AWS Bedrock');
+                                const hasCreds = mk && (mk.has_access_credentials || mk.has_api_key);
+                                return (
+                                    <div className={`rounded-md border p-3 flex items-start gap-3 ${hasCreds ? 'border-green-200 bg-green-50/40' : 'border-amber-200 bg-amber-50/40'}`}>
+                                        {hasCreds ? (
+                                            <>
+                                                <CheckCircle className="w-4 h-4 text-green-600 mt-0.5 shrink-0" />
+                                                <div>
+                                                    <p className="text-sm font-medium text-green-800">AWS credentials configured</p>
+                                                    <p className="text-xs text-green-700 mt-0.5">
+                                                        Using credentials from Model Keys{mk.region ? ` · Region: ${mk.region}` : ''}
+                                                    </p>
+                                                </div>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <XCircle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+                                                <div>
+                                                    <p className="text-sm font-medium text-amber-800">No AWS credentials found</p>
+                                                    <p className="text-xs text-amber-700 mt-0.5">
+                                                        Go to <strong>Model Keys → AWS Bedrock</strong> above to configure credentials
+                                                    </p>
+                                                </div>
+                                            </>
+                                        )}
                                     </div>
-                                    <div className="space-y-2">
-                                        <Label htmlFor="llm-aws-access-key">Access Key ID</Label>
-                                        <Input
-                                            id="llm-aws-access-key"
-                                            type="password"
-                                            placeholder="AKIA..."
-                                            value={llmFormData.access_key_id}
-                                            onChange={(e) => setLLMFormData({ ...llmFormData, access_key_id: e.target.value })}
-                                        />
+                                );
+                            })()}
+                            {(llmFormData.provider === 'OpenAI' || llmFormData.provider === 'Anthropic' || llmFormData.provider === 'Google' || llmFormData.provider === 'Groq') && (() => {
+                                const mk = findModelKey(llmFormData.provider);
+                                const hasCreds = mk && mk.has_api_key;
+                                return (
+                                    <div className={`rounded-md border p-3 flex items-start gap-3 ${hasCreds ? 'border-green-200 bg-green-50/40' : 'border-amber-200 bg-amber-50/40'}`}>
+                                        {hasCreds ? (
+                                            <>
+                                                <CheckCircle className="w-4 h-4 text-green-600 mt-0.5 shrink-0" />
+                                                <div>
+                                                    <p className="text-sm font-medium text-green-800">API key configured</p>
+                                                    <p className="text-xs text-green-700 mt-0.5">Using API key from Model Keys</p>
+                                                </div>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <XCircle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+                                                <div>
+                                                    <p className="text-sm font-medium text-amber-800">No API key found</p>
+                                                    <p className="text-xs text-amber-700 mt-0.5">
+                                                        Go to <strong>Model Keys → {llmFormData.provider}</strong> above to configure
+                                                    </p>
+                                                </div>
+                                            </>
+                                        )}
                                     </div>
-                                    <div className="space-y-2">
-                                        <Label htmlFor="llm-aws-secret-key">Secret Access Key</Label>
-                                        <Input
-                                            id="llm-aws-secret-key"
-                                            type="password"
-                                            placeholder="Secret key"
-                                            value={llmFormData.secret_access_key}
-                                            onChange={(e) => setLLMFormData({ ...llmFormData, secret_access_key: e.target.value })}
-                                        />
-                                    </div>
-                                    <div className="space-y-2">
-                                        <Label htmlFor="llm-aws-session-token">Session Token <span className="text-muted-foreground">(optional)</span></Label>
-                                        <Input
-                                            id="llm-aws-session-token"
-                                            type="password"
-                                            placeholder="For temporary credentials"
-                                            value={llmFormData.session_token}
-                                            onChange={(e) => setLLMFormData({ ...llmFormData, session_token: e.target.value })}
-                                        />
-                                    </div>
-                                    <p className="text-xs text-muted-foreground">Credentials are stored in the database and used automatically when running workflows.</p>
-                                </div>
-                            )}
+                                );
+                            })()}
                         </div>
                         <DialogFooter className="mt-6">
                             <Button variant="outline" onClick={handleCloseLLMDialog}>Cancel</Button>

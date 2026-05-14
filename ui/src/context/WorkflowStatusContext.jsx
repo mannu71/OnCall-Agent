@@ -12,10 +12,30 @@ export const useWorkflowStatus = () => {
   return context;
 };
 
+// Persist running workflow list so the Live Monitor survives F5 page refresh
+const SS_KEY = 'kyc_running_workflows';
+function readSession() {
+  try { const v = sessionStorage.getItem(SS_KEY); return v ? JSON.parse(v) : []; }
+  catch { return []; }
+}
+function writeSession(list) {
+  try { sessionStorage.setItem(SS_KEY, JSON.stringify(list)); } catch { /* ignore */ }
+}
+
 export const WorkflowStatusProvider = ({ children }) => {
-  const [runningWorkflows, setRunningWorkflows] = useState([]);
+  // Initialise from sessionStorage → monitor visible immediately after refresh
+  const [runningWorkflows, setRunningWorkflowsRaw] = useState(readSession);
   const [pendingWorkflows, setPendingWorkflows] = useState([]);
   const [lastCheck, setLastCheck] = useState(0);
+
+  // Keep sessionStorage in sync on every update
+  const setRunningWorkflows = useCallback((updater) => {
+    setRunningWorkflowsRaw(prev => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      writeSession(next);
+      return next;
+    });
+  }, []);
   const activeStreamsRef = useRef(new Map());
 
   const checkRunningWorkflows = useCallback(async () => {

@@ -181,7 +181,10 @@ class DatabaseRepository:
                 input=execution_data.get("input"),
                 output=execution_data.get("output"),
                 error=execution_data.get("error"),
-                logs=execution_data.get("logs")
+                logs=execution_data.get("logs"),
+                input_tokens=execution_data.get("input_tokens",   0) or 0,
+                output_tokens=execution_data.get("output_tokens", 0) or 0,
+                total_tokens=execution_data.get("total_tokens",   0) or 0,
             )
             session.add(execution)
             await session.commit()
@@ -286,10 +289,13 @@ class DatabaseRepository:
             "started_at": execution.started_at.isoformat() if execution.started_at else None,
             "completed_at": execution.completed_at.isoformat() if execution.completed_at else None,
             "duration_ms": execution.duration_ms,
-            "input": execution.input,
-            "output": execution.output,
-            "error": execution.error,
-            "logs": execution.logs
+            "input":         execution.input,
+            "output":        execution.output,
+            "error":         execution.error,
+            "logs":          execution.logs,
+            "input_tokens":  getattr(execution, "input_tokens",  0) or 0,
+            "output_tokens": getattr(execution, "output_tokens", 0) or 0,
+            "total_tokens":  getattr(execution, "total_tokens",  0) or 0,
         }
 
     # ============================================

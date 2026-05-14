@@ -88,14 +88,23 @@ def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
         )
         if react_output:
             execution['output'] = {
-                'type': 'react',
-                'final_answer': react_output.get('final_answer'),
-                'user_query': react_output.get('user_query'),
+                'type':          'react',
+                'final_answer':  react_output.get('final_answer'),
+                'user_query':    react_output.get('user_query'),
                 'message_count': react_output.get('message_count', 0),
-                'tool_calls': react_output.get('tool_calls', []),
-                'model': react_output.get('model'),
-                'provider': react_output.get('provider'),
+                'tool_calls':    react_output.get('tool_calls', []),
+                'model':         react_output.get('model'),
+                'provider':      react_output.get('provider'),
+                # Token usage — passed through from ReactStrategy._execute_agent
+                'input_tokens':  react_output.get('input_tokens',  0) or 0,
+                'output_tokens': react_output.get('output_tokens', 0) or 0,
+                'total_tokens':  react_output.get('total_tokens',  0) or 0,
             }
+
+    # Ensure top-level token fields are always present in the response
+    execution.setdefault('input_tokens',  execution.get('input_tokens',  0) or 0)
+    execution.setdefault('output_tokens', execution.get('output_tokens', 0) or 0)
+    execution.setdefault('total_tokens',  execution.get('total_tokens',  0) or 0)
 
     return execution
 

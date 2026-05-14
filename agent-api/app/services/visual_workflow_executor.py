@@ -387,12 +387,24 @@ class VisualWorkflowExecutor:
                     if isinstance(node_result, dict) and node_result.get("messages"):
                         trajectory.extend(node_result["messages"])
 
+            # Accumulate token usage from all node results (agent nodes carry
+            # input_tokens / output_tokens set by ReactStrategy._execute_agent)
+            input_tokens  = 0
+            output_tokens = 0
+            for node_result in (node_results.values() if isinstance(node_results, dict) else []):
+                if isinstance(node_result, dict):
+                    input_tokens  += node_result.get("input_tokens",  0) or 0
+                    output_tokens += node_result.get("output_tokens", 0) or 0
+
             await execution_repo.save({
                 **result,
-                "workflow_name": workflow.get('name'),
-                "workflow_id": workflow.get('id'),
-                "events": self.active_executions[execution_id].get('events', []),
-                "trajectory": trajectory or None,
+                "workflow_name":  workflow.get('name'),
+                "workflow_id":    workflow.get('id'),
+                "events":         self.active_executions[execution_id].get('events', []),
+                "trajectory":     trajectory or None,
+                "input_tokens":   input_tokens,
+                "output_tokens":  output_tokens,
+                "total_tokens":   input_tokens + output_tokens,
             })
         except Exception as e:
             logger.error(f"Failed to save execution to storage: {e}")
@@ -1611,9 +1623,17 @@ class VisualWorkflowExecutor:
 
         if analysis_type == 'error-patterns':
             patterns = result.get('patterns', {})
+            if not isinstance(patterns, dict):
+                patterns = {}
             error_data = patterns.get('error', {})
+            if not isinstance(error_data, dict):
+                error_data = {}
             for entry in error_data.get('data', []):
+                if not isinstance(entry, (list, tuple)):
+                    continue
                 for field in entry:
+                    if not isinstance(field, dict):
+                        continue
                     if field.get('field') == 'count()':
                         try:
                             count = float(field.get('value', 0))
@@ -1629,7 +1649,11 @@ class VisualWorkflowExecutor:
             # Check unique error patterns — alert when a single pattern
             # exceeds the threshold (indicates a repeated systematic issue).
             for pattern_entry in result.get('unique_patterns', []):
+                if not isinstance(pattern_entry, (list, tuple)):
+                    continue
                 for field in pattern_entry:
+                    if not isinstance(field, dict):
+                        continue
                     if field.get('field') == 'occurrence_count':
                         try:
                             occ_count = float(field.get('value', 0))
@@ -1637,7 +1661,7 @@ class VisualWorkflowExecutor:
                                 # Find the pattern text
                                 pattern_text = ""
                                 for f2 in pattern_entry:
-                                    if f2.get('field') == 'error_pattern':
+                                    if isinstance(f2, dict) and f2.get('field') == 'error_pattern':
                                         pattern_text = (f2.get('value') or '')[:120]
                                         break
                                 alerts.append({
@@ -1653,6 +1677,8 @@ class VisualWorkflowExecutor:
 
         elif analysis_type == 'anomaly-detection':
             for anomaly in result.get('anomalies', []):
+                if not isinstance(anomaly, dict):
+                    continue
                 z_info = ""
                 if anomaly.get('z_score'):
                     z_info = f", z-score={anomaly['z_score']}"

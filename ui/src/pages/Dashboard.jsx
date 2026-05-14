@@ -485,6 +485,33 @@ export default function Dashboard() {
               );
             })()}
 
+            {/* Token Usage — shown whenever token data is available (any execution type) */}
+            {(() => {
+              const inputTok  = selectedRun?.input_tokens  || selectedRun?.output?.input_tokens  || 0;
+              const outputTok = selectedRun?.output_tokens || selectedRun?.output?.output_tokens || 0;
+              const totalTok  = selectedRun?.total_tokens  || selectedRun?.output?.total_tokens  || 0;
+              if (!totalTok) return null;
+              return (
+                <div className="bg-white rounded-lg border border-slate-200 p-6">
+                  <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-4">⚡ Token Usage</p>
+                  <div className="grid grid-cols-3 gap-4 text-center">
+                    <div className="bg-blue-50 rounded-lg p-4">
+                      <p className="text-xs font-medium text-slate-500 mb-1">Input</p>
+                      <p className="text-2xl font-bold text-blue-700">{inputTok.toLocaleString()}</p>
+                    </div>
+                    <div className="bg-emerald-50 rounded-lg p-4">
+                      <p className="text-xs font-medium text-slate-500 mb-1">Output</p>
+                      <p className="text-2xl font-bold text-emerald-600">{outputTok.toLocaleString()}</p>
+                    </div>
+                    <div className="bg-slate-100 rounded-lg p-4">
+                      <p className="text-xs font-medium text-slate-500 mb-1">Total</p>
+                      <p className="text-2xl font-bold text-slate-900">{totalTok.toLocaleString()}</p>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
             {/* Results Section */}
             {(() => {
               const resultData = selectedRun?.result || {};

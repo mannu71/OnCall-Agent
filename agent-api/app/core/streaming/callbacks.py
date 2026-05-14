@@ -4,13 +4,15 @@ Enhanced streaming callbacks for real-time agent execution feedback.
 This module provides:
 - StreamCallback protocol with enhanced event handlers
 - LoggingStreamCallback implementation with structured logging
+- TokenUsageCallback: LangChain BaseCallbackHandler that captures exact token
+  counts from every LLM call (streaming and non-streaming)
 - Tool preview utilities for displaying tool call arguments
 - TTY and non-TTY output mode support
 """
 
 import logging
 import sys
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol
 
 from app.core.error_classifier import ClassifiedError
 
@@ -426,15 +428,123 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> Optiona
 
 def _truncate_preview(text: str, max_len: int) -> str:
     """Truncate preview text to maximum length.
-    
+
     Args:
         text: Text to truncate
         max_len: Maximum length
-        
+
     Returns:
         Truncated text with ellipsis if needed
     """
     if len(text) <= max_len:
         return text
-    
+
     return text[:max_len - 3] + "..."
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Token Usage Callback — exact per-execution token counting
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TokenUsageCallback:
+    """LangChain BaseCallbackHandler subclass that captures exact token counts.
+
+    Wired into the LangGraph run_config["callbacks"] list so it fires on every
+    LLM completion (streaming AND non-streaming).  The counts are read by
+    ReactStrategy._execute_agent() after the agent loop finishes.
+
+    Handles token key formats for all supported providers:
+    - ChatBedrockConverse: llm_output["usage"]["inputTokens"/"outputTokens"]
+    - ChatAnthropic:       llm_output["usage"]["input_tokens"/"output_tokens"]
+    - ChatOpenAI:          llm_output["token_usage"]["prompt_tokens"/"completion_tokens"]
+    - Fallback:            AIMessage.usage_metadata["input_tokens"/"output_tokens"]
+    """
+
+    # ── LangChain BaseCallbackHandler required attributes ────────────────────
+    # Declaring these avoids subclassing BaseCallbackHandler while satisfying
+    # every attribute access in langchain_core/callbacks/manager.py.
+    run_inline:          bool = False
+    raise_error:         bool = False
+    ignore_llm:          bool = False
+    ignore_chain:        bool = True   # only care about LLM events
+    ignore_agent:        bool = True
+    ignore_retriever:    bool = True
+    ignore_chat_model:   bool = False
+    ignore_retry:        bool = True
+    ignore_custom_event: bool = True
+
+    def __init__(self) -> None:
+        self.input_tokens:  int = 0
+        self.output_tokens: int = 0
+
+    # ── Catch-all: silently absorb any LangChain callback method we don't ────
+    # implement (e.g. on_llm_new_token, on_chain_start, on_tool_start …).
+    # LangChain calls these on every registered handler; without this, each
+    # missing method raises AttributeError and floods the logs with WARNINGs.
+    def __getattr__(self, name: str):  # noqa: ANN001
+        async def _noop(*args: Any, **kwargs: Any) -> None:  # noqa: ANN401
+            pass
+        return _noop
+
+    # ── LangChain callback entry point ───────────────────────────────────────
+
+    def on_llm_end(self, response: Any, **kwargs: Any) -> None:  # noqa: ANN401
+        """Called after every LLM completion (sync variant required by LC)."""
+        self._accumulate(response)
+
+    async def on_llm_end_async(self, response: Any, **kwargs: Any) -> None:  # noqa: ANN401
+        """Async variant — LangChain calls whichever is present."""
+        self._accumulate(response)
+
+    # ── Token extraction ─────────────────────────────────────────────────────
+
+    def _accumulate(self, response: Any) -> None:
+        """Extract and sum token counts from an LLMResult object."""
+        llm_output: Dict[str, Any] = getattr(response, "llm_output", None) or {}
+
+        inp, out = self._parse_llm_output(llm_output)
+
+        # Fallback: iterate generations for AIMessage.usage_metadata
+        if inp == 0 and out == 0:
+            generations: List[Any] = getattr(response, "generations", []) or []
+            for gen_list in generations:
+                for gen in (gen_list if isinstance(gen_list, list) else [gen_list]):
+                    msg = getattr(gen, "message", None)
+                    usage = getattr(msg, "usage_metadata", None) or {}
+                    inp  += usage.get("input_tokens",  0) or 0
+                    out  += usage.get("output_tokens", 0) or 0
+
+        self.input_tokens  += inp
+        self.output_tokens += out
+
+    @staticmethod
+    def _parse_llm_output(llm_output: Dict[str, Any]) -> tuple:
+        """Return (input_tokens, output_tokens) from provider llm_output dict."""
+        # ChatBedrockConverse: usage.inputTokens / outputTokens
+        usage = llm_output.get("usage", {}) or {}
+        if "inputTokens" in usage or "outputTokens" in usage:
+            return (
+                usage.get("inputTokens",  0) or 0,
+                usage.get("outputTokens", 0) or 0,
+            )
+
+        # ChatAnthropic: usage.input_tokens / output_tokens
+        if "input_tokens" in usage or "output_tokens" in usage:
+            return (
+                usage.get("input_tokens",  0) or 0,
+                usage.get("output_tokens", 0) or 0,
+            )
+
+        # ChatOpenAI: token_usage.prompt_tokens / completion_tokens
+        token_usage = llm_output.get("token_usage", {}) or {}
+        if token_usage:
+            return (
+                token_usage.get("prompt_tokens",     0) or 0,
+                token_usage.get("completion_tokens", 0) or 0,
+            )
+
+        return (0, 0)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens

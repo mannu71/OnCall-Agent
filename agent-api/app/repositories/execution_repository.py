@@ -121,7 +121,12 @@ class ExecutionRepository:
         
         if execution.get('error'):
             execution_data['error'] = execution.get('error')
-        
+
+        # Token usage
+        execution_data['input_tokens']  = execution.get('input_tokens',  0) or 0
+        execution_data['output_tokens'] = execution.get('output_tokens', 0) or 0
+        execution_data['total_tokens']  = execution.get('total_tokens',  0) or 0
+
         # Check if this is an update
         if execution_id:
             try:
@@ -225,9 +230,12 @@ class ExecutionRepository:
             'end_time': execution.get('completed_at'),
             'duration_ms': execution.get('duration_ms'),
             'duration': execution.get('duration_ms') / 1000 if execution.get('duration_ms') else None,
-            'input': execution.get('input'),
-            'result': execution.get('output'),
-            'results': execution.get('output'),
-            'error': execution.get('error'),
-            'logs': execution.get('logs', [])
+            'input':         execution.get('input'),
+            'result':        execution.get('output'),
+            'results':       execution.get('output'),
+            'error':         execution.get('error'),
+            'logs':          execution.get('logs', []),
+            'input_tokens':  execution.get('input_tokens',  0) or 0,
+            'output_tokens': execution.get('output_tokens', 0) or 0,
+            'total_tokens':  execution.get('total_tokens',  0) or 0,
         }

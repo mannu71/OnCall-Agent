@@ -66,7 +66,10 @@ class ExecutionModel(Base):
     output = Column(JSON)
     error = Column(Text)
     logs = Column(JSON)
-    trajectory = Column(JSON)  # Full message trace for analysis and training
+    trajectory    = Column(JSON)  # Full message trace for analysis and training
+    input_tokens  = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    total_tokens  = Column(Integer, default=0)
 
 
 class LLMConfigModel(Base):

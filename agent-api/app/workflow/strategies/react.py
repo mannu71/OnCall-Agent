@@ -608,7 +608,7 @@ class ReactStrategy(BaseStrategy):
             from app.core.auto_learn import AutoLearnService, AutoLearnConfig
 
             _config = AutoLearnConfig()
-            _svc = AutoLearnService(_config)
+            _svc = AutoLearnService(config=_config)
 
             # Derive a rough confidence score: high when a resolution keyword
             # was found, moderate otherwise.  The AutoLearnService gate uses
@@ -1797,6 +1797,13 @@ class ReactStrategy(BaseStrategy):
         if thread_id:
             run_config = {"configurable": {"thread_id": thread_id}}
 
+        # Attach a token-usage callback so we get exact counts regardless of
+        # streaming mode or provider (Bedrock, Anthropic, OpenAI).
+        from app.core.streaming.callbacks import TokenUsageCallback
+        token_cb = TokenUsageCallback()
+        run_config.setdefault("callbacks", [])
+        run_config["callbacks"].append(token_cb)
+
         try:
             async with agent_span("react_agent", execution_id=execution_id):
                 trace_id = get_current_trace_id()
@@ -1890,6 +1897,10 @@ class ReactStrategy(BaseStrategy):
         serialized_messages = []
         tool_calls_summary = []
         final_answer = ""
+        # Fallback token accumulators from AIMessage.usage_metadata
+        # (used only when token_cb didn't capture anything via on_llm_end)
+        fallback_input_tokens  = 0
+        fallback_output_tokens = 0
 
         for msg in messages:
             if isinstance(msg, HumanMessage):
@@ -1913,6 +1924,11 @@ class ReactStrategy(BaseStrategy):
                             {"tool": tc.get("name"), "args_keys": list((tc.get("args") or {}).keys())}
                         )
 
+                # Fallback: AIMessage.usage_metadata (LangChain ≥ 0.1)
+                usage = getattr(msg, "usage_metadata", None) or {}
+                fallback_input_tokens  += usage.get("input_tokens", 0)
+                fallback_output_tokens += usage.get("output_tokens", 0)
+
                 serialized_messages.append(entry)
                 if content:
                     final_answer = content
@@ -1927,16 +1943,28 @@ class ReactStrategy(BaseStrategy):
             elif isinstance(msg, SystemMessage):
                 pass
 
+        # Prefer token_cb (fires via on_llm_end, works for all providers and streaming
+        # modes); fall back to usage_metadata accumulation if token_cb got nothing.
+        total_input_tokens  = token_cb.input_tokens  or fallback_input_tokens
+        total_output_tokens = token_cb.output_tokens or fallback_output_tokens
+
         logger_instance.info(
-            "ReactStrategy: agent completed with %d messages, %d tool calls",
+            "ReactStrategy: agent completed with %d messages, %d tool calls, "
+            "input_tokens=%d output_tokens=%d (source=%s)",
             len(serialized_messages),
             len(tool_calls_summary),
+            total_input_tokens,
+            total_output_tokens,
+            "callback" if token_cb.input_tokens else "usage_metadata",
         )
 
         return {
-            "final_answer": final_answer,
-            "messages": serialized_messages,
-            "tool_calls": tool_calls_summary,
+            "final_answer":   final_answer,
+            "messages":       serialized_messages,
+            "tool_calls":     tool_calls_summary,
+            "input_tokens":   total_input_tokens,
+            "output_tokens":  total_output_tokens,
+            "total_tokens":   total_input_tokens + total_output_tokens,
         }
 
     @staticmethod
