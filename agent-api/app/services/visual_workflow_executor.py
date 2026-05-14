@@ -91,7 +91,8 @@ class VisualWorkflowExecutor:
     def _build_node_result(value: Dict[str, Any]) -> Dict[str, Any]:
         """Extract relevant fields from a node execution result."""
         node_result = {}
-        for field in ('status', 'output', 'trigger_time', 'model'):
+        for field in ('status', 'output', 'trigger_time', 'model',
+                      'input_tokens', 'output_tokens', 'total_tokens'):
             if field in value:
                 node_result[field] = value[field]
         
@@ -714,6 +715,9 @@ class VisualWorkflowExecutor:
                 'model': result.get('model'),
                 'provider': result.get('provider'),
                 'agent_data': node_data,
+                'input_tokens':  result.get('input_tokens',  0) or 0,
+                'output_tokens': result.get('output_tokens', 0) or 0,
+                'total_tokens':  result.get('total_tokens',  0) or 0,
             }
 
         except Exception as e:
