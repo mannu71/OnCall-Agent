@@ -1,0 +1,185 @@
+{
+  "headline": {
+    "total": 12,
+    "correct": 0,
+    "accuracy": 0.0,
+    "total_tokens": 345,
+    "tokens_per_correct": null,
+    "answers_per_kilo_token": 0.0,
+    "errors": 3
+  },
+  "by_category": {
+    "ambiguous": {
+      "total": 2,
+      "correct": 0,
+      "accuracy": 0.0,
+      "tokens_per_correct": null
+    },
+    "callers": {
+      "total": 1,
+      "correct": 0,
+      "accuracy": 0.0,
+      "tokens_per_correct": null
+    },
+    "cross_file": {
+      "total": 1,
+      "correct": 0,
+      "accuracy": 0.0,
+      "tokens_per_correct": null
+    },
+    "definition": {
+      "total": 5,
+      "correct": 0,
+      "accuracy": 0.0,
+      "tokens_per_correct": null
+    },
+    "semantic": {
+      "total": 3,
+      "correct": 0,
+      "accuracy": 0.0,
+      "tokens_per_correct": null
+    }
+  },
+  "by_language": {
+    "python": {
+      "total": 12,
+      "correct": 0,
+      "accuracy": 0.0,
+      "tokens_per_correct": null
+    }
+  },
+  "items": [
+    {
+      "id": "py-def-001",
+      "category": "definition",
+      "language": "python",
+      "tool": "get_function",
+      "correct": false,
+      "detail": "tool_error: Function 'apply_anthropic_cache_control' not found in the code index",
+      "tokens": 35,
+      "latency_ms": 102.2,
+      "error": null
+    },
+    {
+      "id": "py-def-002",
+      "category": "definition",
+      "language": "python",
+      "tool": "get_function",
+      "correct": false,
+      "detail": "infra_error",
+      "tokens": 13,
+      "latency_ms": 220.2,
+      "error": "AttributeError: 'NoneType' object has no attribute 'send'"
+    },
+    {
+      "id": "py-def-003",
+      "category": "definition",
+      "language": "python",
+      "tool": "get_function",
+      "correct": false,
+      "detail": "tool_error: Function 'search_code' not found in the code index",
+      "tokens": 26,
+      "latency_ms": 66.2,
+      "error": null
+    },
+    {
+      "id": "py-def-004",
+      "category": "definition",
+      "language": "python",
+      "tool": "get_function",
+      "correct": false,
+      "detail": "infra_error",
+      "tokens": 13,
+      "latency_ms": 2.3,
+      "error": "AttributeError: 'NoneType' object has no attribute 'send'"
+    },
+    {
+      "id": "py-def-005",
+      "category": "definition",
+      "language": "python",
+      "tool": "get_function",
+      "correct": false,
+      "detail": "tool_error: Function 'is_anthropic_provider' not found in the code index",
+      "tokens": 31,
+      "latency_ms": 57.8,
+      "error": null
+    },
+    {
+      "id": "py-sem-001",
+      "category": "semantic",
+      "language": "python",
+      "tool": "search_code",
+      "correct": false,
+      "detail": "no row matched ['file_path'] in 1 results",
+      "tokens": 39,
+      "latency_ms": 1949.8,
+      "error": null
+    },
+    {
+      "id": "py-sem-002",
+      "category": "semantic",
+      "language": "python",
+      "tool": "search_code",
+      "correct": false,
+      "detail": "no row matched ['file_path'] in 1 results",
+      "tokens": 40,
+      "latency_ms": 1224.3,
+      "error": null
+    },
+    {
+      "id": "py-sem-003",
+      "category": "semantic",
+      "language": "python",
+      "tool": "search_code",
+      "correct": false,
+      "detail": "no row matched ['name'] in 1 results",
+      "tokens": 40,
+      "latency_ms": 885.5,
+      "error": null
+    },
+    {
+      "id": "py-call-001",
+      "category": "callers",
+      "language": "python",
+      "tool": "get_callers",
+      "correct": false,
+      "detail": "recall=0.00 (need 1.0)",
+      "tokens": 18,
+      "latency_ms": 56.3,
+      "error": null
+    },
+    {
+      "id": "py-cross-001",
+      "category": "cross_file",
+      "language": "python",
+      "tool": "get_callers",
+      "correct": false,
+      "detail": "infra_error",
+      "tokens": 18,
+      "latency_ms": 1.7,
+      "error": "AttributeError: 'NoneType' object has no attribute 'send'"
+    },
+    {
+      "id": "py-amb-001",
+      "category": "ambiguous",
+      "language": "python",
+      "tool": "get_function",
+      "correct": false,
+      "detail": "tool_error: Function '_estimate_tokens' not found in the code index",
+      "tokens": 29,
+      "latency_ms": 56.7,
+      "error": null
+    },
+    {
+      "id": "py-amb-002",
+      "category": "ambiguous",
+      "language": "python",
+      "tool": "search_code",
+      "correct": false,
+      "detail": "no row matched ['file_path', 'name'] in 1 results",
+      "tokens": 43,
+      "latency_ms": 807.5,
+      "error": null
+    }
+  ]
+}

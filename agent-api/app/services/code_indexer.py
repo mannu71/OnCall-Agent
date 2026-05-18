@@ -61,6 +61,38 @@ _EMBED_MODEL = "amazon.titan-embed-text-v2:0"
 # functions get semantic edge-weight computation (others stay at 1.0).
 _EDGE_WEIGHT_THRESHOLD = int(os.getenv("EDGE_WEIGHT_THRESHOLD", "10000"))
 
+# In-process telemetry counters. They're plain dicts (not Prometheus clients) so
+# this module stays dependency-free; the indexer logs a summary at end-of-run
+# and any host metrics layer can scrape ``code_indexer_counters``.
+#
+# Legacy regex extractors were removed entirely; there is no
+# ``regex_fallback_used`` counter because there is no regex fallback.
+code_indexer_counters: Dict[str, int] = {
+    "files_parsed":          0,
+    "files_skipped":         0,
+    "files_failed":          0,
+    "chunks_emitted":        0,
+    "chunks_truncated":      0,
+    "parse_failures":        0,
+    "grammar_missing":       0,
+    "calls_qualified":       0,
+    "calls_resolved_xfile":  0,
+}
+
+
+def _bump(counter: str, n: int = 1) -> None:
+    """Increment a telemetry counter; never raises."""
+    try:
+        code_indexer_counters[counter] = code_indexer_counters.get(counter, 0) + n
+    except Exception:
+        pass
+
+
+def reset_counters() -> None:
+    """Reset all telemetry counters — used by tests."""
+    for k in list(code_indexer_counters):
+        code_indexer_counters[k] = 0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Canonical entity ID
@@ -75,6 +107,27 @@ def compute_entity_id(repo_name: str, normalized_signature: str) -> str:
     """
     key = f"{repo_name}::{normalized_signature.strip()}"
     return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _stable_entity_key(
+    chunk_type: str,
+    file_path: str,
+    name: str,
+    parent_class: str = "",
+    param_arity: int = 0,
+) -> str:
+    """Build a deterministic identity key that does **not** depend on line numbers.
+
+    Two calls with identical (chunk_type, file_path, name, parent_class,
+    param_arity) produce the same key — so unrelated edits above the function
+    no longer flip the entity_id (was line 687 bug).
+    """
+    return (
+        f"{chunk_type}:"
+        f"{file_path}:"
+        f"{parent_class}.{name}:"
+        f"arity={param_arity}"
+    )
 
 
 def _build_normalized_signature(
@@ -122,6 +175,13 @@ class CodeChunk:
     entity_id:  str  = ""   # stable identity across renames
     complexity: int  = 1   # approximate cyclomatic complexity
     embedding:  Optional[List[float]] = field(default=None, repr=False)
+    # Accuracy-enhancement fields.
+    parent_class:        str       = ""   # enclosing class for methods
+    parent_entity_id:    str       = ""   # parent class entity_id
+    decorators:          List[str] = field(default_factory=list)
+    param_arity:         int       = 0
+    truncated_for_embed: bool      = False
+    body_sha256:         str       = ""   # sha256(body) for incremental embedding skip
 
 
 @dataclass
@@ -153,179 +213,45 @@ class CallEdge:
     caller_file: str
     callee_name: str
     callee_file: str = ""
+    # Full dotted/member chain for member calls (e.g. ``self.repo.save``).
+    # Empty for plain identifier calls.
+    qualified_callee: str = ""
+    line_number:      int = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Python AST extraction
+# Python AST extraction (moved to code_indexing.extractors.python)
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _get_source_lines(source: str, node: ast.AST) -> tuple[int, int]:
-    return getattr(node, "lineno", 0), getattr(node, "end_lineno", 0)
-
-
-def _extract_docstring(
-    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
-) -> str:
-    if (
-        node.body
-        and isinstance(node.body[0], ast.Expr)
-        and isinstance(node.body[0].value, ast.Constant)
-        and isinstance(node.body[0].value.value, str)
-    ):
-        return node.body[0].value.value[:500]
-    return ""
+# Note: ``extract_python_chunks`` / ``extract_python_imports`` /
+# ``extract_python_calls`` are re-exported near the bottom of this module
+# (after their dependency ``_python_node_complexity`` is defined) to avoid a
+# circular import at module-load time.
 
 
-def _build_signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-    args = []
-    for arg in node.args.args:
-        ann = ast.unparse(arg.annotation) if arg.annotation else ""
-        args.append(f"{arg.arg}: {ann}" if ann else arg.arg)
-    ret = f" -> {ast.unparse(node.returns)}" if node.returns else ""
-    prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-    return f"{prefix} {node.name}({', '.join(args)}){ret}"
+def _py_decorator_names(node: ast.AST) -> List[str]:
+    """Return decorator names for a Python function/class (best effort)."""
+    out: List[str] = []
+    for d in getattr(node, "decorator_list", []) or []:
+        try:
+            out.append(ast.unparse(d))
+        except Exception:
+            pass
+    return out
 
 
-def extract_python_chunks(source: str, file_path: str, repo_name: str) -> List[CodeChunk]:
-    """Parse *source* as Python and return one CodeChunk per function/class."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError as exc:
-        logger.debug("Skipping %s (syntax error): %s", file_path, exc)
-        return []
-
-    lines  = source.splitlines()
-    chunks: List[CodeChunk] = []
-
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            start, end = _get_source_lines(source, node)
-            body = "\n".join(lines[start - 1 : end]) if start and end else ""
-            norm_sig = _build_normalized_signature(node)
-            chunks.append(CodeChunk(
-                repo_name=repo_name,
-                file_path=file_path,
-                name=node.name,
-                chunk_type="function",
-                body=body,
-                language="python",
-                signature=_build_signature(node),
-                docstring=_extract_docstring(node),
-                line_start=start,
-                line_end=end,
-                entity_id=compute_entity_id(repo_name, norm_sig),
-                complexity=_python_node_complexity(node),
-            ))
-        elif isinstance(node, ast.ClassDef):
-            start, end = _get_source_lines(source, node)
-            body = "\n".join(lines[start - 1 : end]) if start and end else ""
-            chunks.append(CodeChunk(
-                repo_name=repo_name,
-                file_path=file_path,
-                name=node.name,
-                chunk_type="class",
-                body=body,
-                language="python",
-                docstring=_extract_docstring(node),
-                line_start=start,
-                line_end=end,
-                entity_id=compute_entity_id(repo_name, f"class:{node.name}"),
-                complexity=_python_node_complexity(node),
-            ))
-
-    return chunks
+def _py_param_arity(node: ast.AST) -> int:
+    """Count declared parameters for a Python function/method."""
+    args = getattr(node, "args", None)
+    if not args:
+        return 0
+    n = len(args.args) + len(getattr(args, "kwonlyargs", []))
+    if getattr(args, "vararg", None):
+        n += 1
+    if getattr(args, "kwarg", None):
+        n += 1
+    return n
 
 
-def extract_python_imports(
-    source: str, file_path: str, repo_name: str,
-) -> List[ImportEdge]:
-    """Walk Python AST and return ImportEdge for each import statement."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-
-    edges: List[ImportEdge] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            is_relative = (node.level or 0) > 0
-            for alias in node.names:
-                edges.append(ImportEdge(
-                    repo_name=repo_name,
-                    file_path=file_path,
-                    from_module=module,
-                    import_name=alias.name,
-                    is_relative=is_relative,
-                ))
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                edges.append(ImportEdge(
-                    repo_name=repo_name,
-                    file_path=file_path,
-                    from_module=alias.name,
-                    import_name=alias.name,
-                    is_relative=False,
-                ))
-    return edges
-
-
-def extract_python_calls(
-    source: str, file_path: str, repo_name: str,
-) -> List[CallEdge]:
-    """Walk Python AST and return CallEdge for each function call site.
-
-    Only records calls where the callee is a simple Name (direct function call),
-    not attribute access chains like ``obj.method()`` — those are heuristically
-    resolved later via the entity graph.
-    """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-
-    edges: List[CallEdge] = []
-    # Build a mapping line→function_name for caller attribution
-    func_ranges: List[Tuple[int, int, str]] = []  # (start, end, name)
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            func_ranges.append((
-                getattr(node, "lineno", 0),
-                getattr(node, "end_lineno", 0),
-                node.name,
-            ))
-
-    def _caller_at(lineno: int) -> str:
-        # Return the innermost function that contains this line
-        best = ""
-        best_size = 10**9
-        for start, end, name in func_ranges:
-            if start <= lineno <= end:
-                size = end - start
-                if size < best_size:
-                    best_size = size
-                    best = name
-        return best
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            callee_name = ""
-            if isinstance(node.func, ast.Name):
-                callee_name = node.func.id
-            elif isinstance(node.func, ast.Attribute):
-                callee_name = node.func.attr
-            if not callee_name:
-                continue
-            caller = _caller_at(getattr(node, "lineno", 0))
-            if not caller or caller == callee_name:
-                continue
-            edges.append(CallEdge(
-                caller_repo=repo_name,
-                caller_name=caller,
-                caller_file=file_path,
-                callee_name=callee_name,
-            ))
-    return edges
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -415,594 +341,28 @@ def extract_log_patterns(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TypeScript / TSX regex extraction (no full parser dependency)
+# Tree-sitter extractors moved to code_indexing.extractors.typescript
+# (re-exported near the bottom of this module to keep load order safe)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_TS_FUNCTION_RE = re.compile(
-    r"(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)(?:\s*:\s*[^\{]+)?\s*\{",
-    re.MULTILINE,
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Embedder — AWS Bedrock Titan (extracted to code_indexing.embedding)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from app.services.code_indexing.embedding import _embed_text, _embed_texts  # noqa: E402,F401
+from app.services.code_indexing.extractors.python import (  # noqa: E402,F401
+    extract_python_calls,
+    extract_python_chunks,
+    extract_python_imports,
 )
-_TS_ARROW_RE = re.compile(
-    r"(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(?[^)]*\)?\s*(?::\s*[^\=]+)?\s*=>\s*\{",
-    re.MULTILINE,
+from app.services.code_indexing.extractors.typescript import (  # noqa: E402,F401
+    _extract_chunks_via_ts,
+    _extract_cs_imports_via_ts,
+    _extract_imports_via_ts,
+    extract_typescript_imports,
 )
-_TS_IMPORT_RE = re.compile(
-    r"""import\s+(?:\*\s+as\s+\w+|\{([^}]+)\}|(\w+))\s+from\s+['"]([^'"]+)['"]""",
-    re.MULTILINE,
-)
-_TS_CALL_RE = re.compile(r"\b(\w{2,})\s*\(", re.MULTILINE)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# tree-sitter AST parsing (TypeScript / TSX / C#)
-# Lazy init — falls back to regex if tree-sitter is not installed.
-# ─────────────────────────────────────────────────────────────────────────────
-
-_TS_PARSER:   Any = None
-_TSX_PARSER:  Any = None
-_CS_PARSER:   Any = None
-_JAVA_PARSER: Any = None
-_GO_PARSER:   Any = None
-_RUST_PARSER: Any = None
-_RUBY_PARSER: Any = None
-_KT_PARSER:   Any = None
-
-_TS_DEF_QUERY = """
-  (function_declaration        name: (identifier)           @name) @def
-  (function_expression         name: (identifier)           @name) @def
-  (method_definition           name: (property_identifier)  @name) @def
-  (class_declaration           name: (type_identifier)      @name) @def
-  (interface_declaration       name: (type_identifier)      @name) @def
-  (type_alias_declaration      name: (type_identifier)      @name) @def
-  (lexical_declaration
-    (variable_declarator
-      name:  (identifier) @name
-      value: [(arrow_function)(function_expression)])) @def
-"""
-
-_TS_CALL_QUERY = """
-  (call_expression
-    function: (identifier) @callee) @call
-  (call_expression
-    function: (member_expression
-      property: (property_identifier) @callee)) @call
-"""
-
-_CS_DEF_QUERY = """
-  (method_declaration       name: (identifier) @name) @def
-  (constructor_declaration  name: (identifier) @name) @def
-  (class_declaration        name: (identifier) @name) @def
-  (interface_declaration    name: (identifier) @name) @def
-  (struct_declaration       name: (identifier) @name) @def
-  (record_declaration       name: (identifier) @name) @def
-  (enum_declaration         name: (identifier) @name) @def
-"""
-
-_CS_CALL_QUERY = """
-  (invocation_expression
-    function: (identifier) @callee) @call
-  (invocation_expression
-    function: (member_access_expression
-      name: (identifier) @callee)) @call
-"""
-
-_CS_USING_QUERY = """
-  (using_directive
-    [(qualified_name)(identifier)] @namespace)
-"""
-
-# ── Java ──────────────────────────────────────────────────────────────────────
-_JAVA_DEF_QUERY = """
-  (method_declaration       name: (identifier) @name) @def
-  (constructor_declaration  name: (identifier) @name) @def
-  (class_declaration        name: (identifier) @name) @def
-  (interface_declaration    name: (identifier) @name) @def
-  (enum_declaration         name: (identifier) @name) @def
-  (record_declaration       name: (identifier) @name) @def
-"""
-_JAVA_CALL_QUERY = """
-  (method_invocation name: (identifier) @callee) @call
-"""
-_JAVA_IMPORT_QUERY = """
-  (import_declaration (scoped_identifier) @path)
-  (import_declaration (identifier) @path)
-"""
-
-# ── Go ────────────────────────────────────────────────────────────────────────
-_GO_DEF_QUERY = """
-  (function_declaration name: (identifier) @name) @def
-  (method_declaration   name: (field_identifier) @name) @def
-  (type_declaration (type_spec name: (type_identifier) @name)) @def
-"""
-_GO_CALL_QUERY = """
-  (call_expression function: (identifier) @callee) @call
-  (call_expression function: (selector_expression field: (field_identifier) @callee)) @call
-"""
-_GO_IMPORT_QUERY = """
-  (import_spec path: (interpreted_string_literal) @path)
-"""
-
-# ── Rust ──────────────────────────────────────────────────────────────────────
-_RUST_DEF_QUERY = """
-  (function_item name: (identifier) @name) @def
-  (struct_item   name: (type_identifier) @name) @def
-  (enum_item     name: (type_identifier) @name) @def
-  (trait_item    name: (type_identifier) @name) @def
-  (impl_item     type: (type_identifier) @name) @def
-"""
-_RUST_CALL_QUERY = """
-  (call_expression function: (identifier) @callee) @call
-  (call_expression function: (field_expression field: (field_identifier) @callee)) @call
-"""
-_RUST_IMPORT_QUERY = """
-  (use_declaration [(scoped_identifier)(identifier)] @path)
-"""
-
-# ── Ruby ──────────────────────────────────────────────────────────────────────
-_RUBY_DEF_QUERY = """
-  (method           name: (identifier) @name) @def
-  (singleton_method name: (identifier) @name) @def
-  (class            name: (constant) @name) @def
-  (module           name: (constant) @name) @def
-"""
-_RUBY_CALL_QUERY = """
-  (call method: (identifier) @callee) @call
-"""
-_RUBY_IMPORT_QUERY = """
-  (call method: (identifier) @_m
-        arguments: (argument_list (string (string_content) @path)))
-"""
-
-# ── Kotlin ────────────────────────────────────────────────────────────────────
-_KT_DEF_QUERY = """
-  (function_declaration (simple_identifier) @name) @def
-  (class_declaration    (type_identifier) @name) @def
-  (object_declaration   (type_identifier) @name) @def
-"""
-_KT_CALL_QUERY = """
-  (call_expression (simple_identifier) @callee) @call
-  (call_expression (navigation_expression (simple_identifier) @callee)) @call
-"""
-_KT_IMPORT_QUERY = """
-  (import_header [(identifier)(scoped_identifier)] @path)
-"""
-
-# ── Query router (parser_lang → (def_query, call_query)) ─────────────────────
-_LANG_QUERIES: Dict[str, Tuple[str, str]] = {
-    "typescript": (_TS_DEF_QUERY,   _TS_CALL_QUERY),
-    "tsx":        (_TS_DEF_QUERY,   _TS_CALL_QUERY),
-    "csharp":     (_CS_DEF_QUERY,   _CS_CALL_QUERY),
-    "java":       (_JAVA_DEF_QUERY, _JAVA_CALL_QUERY),
-    "go":         (_GO_DEF_QUERY,   _GO_CALL_QUERY),
-    "rust":       (_RUST_DEF_QUERY, _RUST_CALL_QUERY),
-    "ruby":       (_RUBY_DEF_QUERY, _RUBY_CALL_QUERY),
-    "kotlin":     (_KT_DEF_QUERY,   _KT_CALL_QUERY),
-}
-
-_CLASS_TYPE_KEYWORDS = frozenset(
-    ["class", "interface", "struct", "record", "enum", "trait", "module", "object"]
-)
-
-
-def _get_ts_parser(lang: str) -> Any:
-    """Return a cached tree-sitter Parser for *lang*.
-
-    Returns None (never raises) if the grammar package is not installed.
-    """
-    global _TS_PARSER, _TSX_PARSER, _CS_PARSER
-    global _JAVA_PARSER, _GO_PARSER, _RUST_PARSER, _RUBY_PARSER, _KT_PARSER
-    try:
-        from tree_sitter import Parser, Language  # type: ignore[import]
-        if lang == "typescript" and _TS_PARSER is None:
-            import tree_sitter_typescript as _tst  # type: ignore[import]
-            _TS_PARSER = Parser(Language(_tst.language_typescript()))
-        if lang == "tsx" and _TSX_PARSER is None:
-            import tree_sitter_typescript as _tst  # type: ignore[import]
-            _TSX_PARSER = Parser(Language(_tst.language_tsx()))
-        if lang == "csharp" and _CS_PARSER is None:
-            import tree_sitter_c_sharp as _tsc  # type: ignore[import]
-            _CS_PARSER = Parser(Language(_tsc.language_c_sharp()))
-        if lang == "java" and _JAVA_PARSER is None:
-            import tree_sitter_java as _tsj  # type: ignore[import]
-            _JAVA_PARSER = Parser(Language(_tsj.language_java()))
-        if lang == "go" and _GO_PARSER is None:
-            import tree_sitter_go as _tsg  # type: ignore[import]
-            _GO_PARSER = Parser(Language(_tsg.language_go()))
-        if lang == "rust" and _RUST_PARSER is None:
-            import tree_sitter_rust as _tsr  # type: ignore[import]
-            _RUST_PARSER = Parser(Language(_tsr.language_rust()))
-        if lang == "ruby" and _RUBY_PARSER is None:
-            import tree_sitter_ruby as _tsrb  # type: ignore[import]
-            _RUBY_PARSER = Parser(Language(_tsrb.language_ruby()))
-        if lang == "kotlin" and _KT_PARSER is None:
-            import tree_sitter_kotlin as _tsk  # type: ignore[import]
-            _KT_PARSER = Parser(Language(_tsk.language_kotlin()))
-        return {
-            "typescript": _TS_PARSER,  "tsx":    _TSX_PARSER,
-            "csharp":     _CS_PARSER,  "java":   _JAVA_PARSER,
-            "go":         _GO_PARSER,  "rust":   _RUST_PARSER,
-            "ruby":       _RUBY_PARSER,"kotlin": _KT_PARSER,
-        }.get(lang)
-    except Exception:
-        return None
-
-
-def _extract_chunks_via_ts(
-    source: str,
-    file_path: str,
-    repo_name: str,
-    parser_lang: str,
-    chunk_lang: str,
-) -> Tuple[List[CodeChunk], List[CallEdge]]:
-    """Parse *source* with tree-sitter; return (chunks, call_edges).
-
-    Uses exact AST line ranges — no 80-line cap, no keyword false-positives,
-    call edges produced for all languages.
-    Returns ([], []) on any failure so callers fall back to regex silently.
-    """
-    parser = _get_ts_parser(parser_lang)
-    if parser is None:
-        return [], []
-    try:
-        tree  = parser.parse(source.encode())
-        lines = source.splitlines()
-        lang  = parser.language
-
-        dq_str, cq_str = _LANG_QUERIES.get(parser_lang, (_TS_DEF_QUERY, _TS_CALL_QUERY))
-        def_q  = lang.query(dq_str)
-        call_q = lang.query(cq_str)
-
-        chunks: List[CodeChunk] = []
-        seen:   set             = set()
-
-        captures = def_q.captures(tree.root_node)
-        # tree-sitter >=0.22 returns dict[str, list[Node]]
-        name_nodes = captures.get("name", [])
-        if not isinstance(name_nodes, list):
-            name_nodes = [name_nodes]
-
-        for name_node in name_nodes:
-            name     = name_node.text.decode(errors="replace")
-            def_node = name_node.parent
-            ls       = def_node.start_point[0] + 1
-            le       = def_node.end_point[0]   + 1
-            key      = (name, ls)
-            if key in seen:
-                continue
-            seen.add(key)
-            body  = "\n".join(lines[ls - 1 : le])
-            ctype = "class" if any(
-                t in def_node.type
-                for t in ("class", "interface", "struct", "record", "enum")
-            ) else "function"
-            chunks.append(CodeChunk(
-                repo_name=repo_name,
-                file_path=file_path,
-                name=name,
-                chunk_type=ctype,
-                body=body,
-                language=chunk_lang,
-                line_start=ls,
-                line_end=le,
-                entity_id=compute_entity_id(repo_name, f"{ctype}:{name}:{ls}"),
-            ))
-
-        func_ranges = [(c.line_start, c.line_end, c.name)
-                       for c in chunks if c.chunk_type == "function"]
-
-        def _caller_at(lineno: int) -> str:
-            best, best_sz = "", 10 ** 9
-            for s, e, n in func_ranges:
-                if s <= lineno <= e and (e - s) < best_sz:
-                    best, best_sz = n, e - s
-            return best
-
-        calls:      List[CallEdge] = []
-        seen_calls: set            = set()
-        callee_nodes = call_q.captures(tree.root_node).get("callee", [])
-        if not isinstance(callee_nodes, list):
-            callee_nodes = [callee_nodes]
-
-        for callee_node in callee_nodes:
-            callee = callee_node.text.decode(errors="replace")
-            lineno = callee_node.start_point[0] + 1
-            caller = _caller_at(lineno)
-            if not caller or caller == callee:
-                continue
-            ck = (caller, callee)
-            if ck in seen_calls:
-                continue
-            seen_calls.add(ck)
-            calls.append(CallEdge(
-                caller_repo=repo_name,
-                caller_name=caller,
-                caller_file=file_path,
-                callee_name=callee,
-            ))
-
-        return chunks, calls
-
-    except Exception as exc:
-        logger.debug(
-            "tree-sitter extraction failed for %s (%s): %s", file_path, parser_lang, exc,
-        )
-        return [], []
-
-
-def _extract_imports_via_ts(
-    source: str,
-    file_path: str,
-    repo_name: str,
-    parser_lang: str,
-    import_query_str: str,
-) -> List[ImportEdge]:
-    """Generic tree-sitter import extractor; returns [] on any failure."""
-    parser = _get_ts_parser(parser_lang)
-    if parser is None:
-        return []
-    try:
-        tree = parser.parse(source.encode())
-        lang = parser.language
-        q    = lang.query(import_query_str)
-        path_nodes = q.captures(tree.root_node).get("path", [])
-        if not isinstance(path_nodes, list):
-            path_nodes = [path_nodes]
-        edges: List[ImportEdge] = []
-        for pn in path_nodes:
-            raw = pn.text.decode(errors="replace").strip().strip('"\'')
-            if not raw:
-                continue
-            edges.append(ImportEdge(
-                repo_name=repo_name,
-                file_path=file_path,
-                from_module=raw,
-                import_name=raw.split(".")[-1].split("/")[-1],
-                is_relative=raw.startswith("."),
-            ))
-        return edges
-    except Exception as exc:
-        logger.debug("tree-sitter import extraction failed for %s (%s): %s", file_path, parser_lang, exc)
-        return []
-
-
-def _extract_cs_imports_via_ts(
-    source: str, file_path: str, repo_name: str,
-) -> List[ImportEdge]:
-    """Extract C# `using` directives via tree-sitter; falls back to regex."""
-    parser = _get_ts_parser("csharp")
-    if parser is None:
-        return extract_csharp_imports(source, file_path, repo_name)
-    try:
-        tree = parser.parse(source.encode())
-        lang = parser.language
-        q    = lang.query(_CS_USING_QUERY)
-        ns_nodes = q.captures(tree.root_node).get("namespace", [])
-        if not isinstance(ns_nodes, list):
-            ns_nodes = [ns_nodes]
-        edges: List[ImportEdge] = []
-        for ns_node in ns_nodes:
-            namespace = ns_node.text.decode(errors="replace").strip()
-            if namespace:
-                edges.append(ImportEdge(
-                    repo_name=repo_name,
-                    file_path=file_path,
-                    from_module=namespace,
-                    import_name=namespace.split(".")[-1],
-                    is_relative=False,
-                ))
-        return edges
-    except Exception as exc:
-        logger.debug("tree-sitter import extraction failed for %s: %s", file_path, exc)
-        return extract_csharp_imports(source, file_path, repo_name)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# C# / .NET regex extraction
-# ─────────────────────────────────────────────────────────────────────────────
-
-_CS_METHOD_RE = re.compile(
-    r"(?:(?:public|private|protected|internal|static|async|virtual|override|"
-    r"abstract|sealed|partial|extern|new)\s+)*"
-    r"(?:[\w<>\[\]?,\s]+?)\s+(\w+)\s*\([^)]*\)\s*(?:where\s+[^{;]+)?\s*\{",
-    re.MULTILINE,
-)
-_CS_CLASS_RE = re.compile(
-    r"(?:(?:public|private|protected|internal|static|abstract|sealed|partial)\s+)*"
-    r"(?:class|interface|struct|record|enum)\s+(\w+)(?:<[^>]+>)?(?:\s*:\s*[^{\n]+)?\s*\{",
-    re.MULTILINE,
-)
-_CS_USING_RE = re.compile(
-    r"^using\s+(?:static\s+)?(?:\w+\s*=\s*)?([\w.]+)\s*;",
-    re.MULTILINE,
-)
-
-
-def extract_csharp_chunks(source: str, file_path: str, repo_name: str) -> List[CodeChunk]:
-    """Extract methods and classes from C# source via regex."""
-    lines  = source.splitlines()
-    chunks: List[CodeChunk] = []
-    seen:   set = set()
-
-    for pattern, ctype in [(_CS_METHOD_RE, "function"), (_CS_CLASS_RE, "class")]:
-        for m in pattern.finditer(source):
-            name = m.group(1)
-            if name in {"if", "for", "foreach", "while", "switch", "catch", "using", "lock"}:
-                continue
-            key = (name, ctype)
-            if key in seen:
-                continue
-            seen.add(key)
-            line_start = source[:m.start()].count("\n") + 1
-            line_end   = min(line_start + 79, len(lines))
-            body       = "\n".join(lines[line_start - 1 : line_end])
-            chunks.append(CodeChunk(
-                repo_name=repo_name,
-                file_path=file_path,
-                name=name,
-                chunk_type=ctype,
-                body=body,
-                language="csharp",
-                line_start=line_start,
-                line_end=line_end,
-                entity_id=compute_entity_id(repo_name, f"{ctype}:{name}"),
-            ))
-
-    return chunks
-
-
-def extract_csharp_imports(
-    source: str, file_path: str, repo_name: str,
-) -> List[ImportEdge]:
-    """Extract `using` directives from C# source."""
-    edges: List[ImportEdge] = []
-    for m in _CS_USING_RE.finditer(source):
-        namespace = m.group(1)
-        if namespace:
-            edges.append(ImportEdge(
-                repo_name=repo_name,
-                file_path=file_path,
-                from_module=namespace,
-                import_name=namespace.split(".")[-1],
-                is_relative=False,
-            ))
-    return edges
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# React / JSX regex extraction (extends TypeScript patterns with components)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_JSX_COMPONENT_RE = re.compile(
-    r"(?:export\s+)?(?:default\s+)?(?:function|const)\s+([A-Z]\w*)\s*[=(]",
-    re.MULTILINE,
-)
-
-
-def extract_typescript_chunks(source: str, file_path: str, repo_name: str) -> List[CodeChunk]:
-    """Extract named functions and arrow functions from TypeScript/TSX source."""
-    lines  = source.splitlines()
-    chunks: List[CodeChunk] = []
-
-    for pattern, ctype in [(_TS_FUNCTION_RE, "function"), (_TS_ARROW_RE, "function")]:
-        for m in pattern.finditer(source):
-            name       = m.group(1)
-            line_start = source[:m.start()].count("\n") + 1
-            # Grab a reasonable body window (up to 80 lines)
-            line_end = min(line_start + 79, len(lines))
-            body = "\n".join(lines[line_start - 1 : line_end])
-            norm_sig = f"{name}()"  # TS regex can't reconstruct full sig
-            chunks.append(CodeChunk(
-                repo_name=repo_name,
-                file_path=file_path,
-                name=name,
-                chunk_type=ctype,
-                body=body,
-                language="typescript",
-                line_start=line_start,
-                line_end=line_end,
-                entity_id=compute_entity_id(repo_name, norm_sig),
-            ))
-
-    return chunks
-
-
-def extract_react_chunks(source: str, file_path: str, repo_name: str) -> List[CodeChunk]:
-    """Extract functions and React components from JSX/TSX source.
-
-    Runs the TypeScript extractor first, then adds any PascalCase components
-    matched by _JSX_COMPONENT_RE that weren't already captured (deduped by name).
-    """
-    chunks = extract_typescript_chunks(source, file_path, repo_name)
-    seen   = {c.name for c in chunks}
-    lines  = source.splitlines()
-
-    for m in _JSX_COMPONENT_RE.finditer(source):
-        name = m.group(1)
-        if name in seen:
-            continue
-        seen.add(name)
-        line_start = source[:m.start()].count("\n") + 1
-        line_end   = min(line_start + 79, len(lines))
-        body       = "\n".join(lines[line_start - 1 : line_end])
-        chunks.append(CodeChunk(
-            repo_name=repo_name,
-            file_path=file_path,
-            name=name,
-            chunk_type="function",
-            body=body,
-            language="react",
-            line_start=line_start,
-            line_end=line_end,
-            entity_id=compute_entity_id(repo_name, f"{name}()"),
-        ))
-        # Tag previously-captured TS chunks from this file as react
-        for c in chunks:
-            if c.language == "typescript" and c.file_path == file_path:
-                c.language = "react"
-
-    return chunks
-
-
-def extract_typescript_imports(
-    source: str, file_path: str, repo_name: str,
-) -> List[ImportEdge]:
-    """Extract ES import statements from TypeScript source via regex."""
-    edges: List[ImportEdge] = []
-    for m in _TS_IMPORT_RE.finditer(source):
-        named_group = m.group(1)  # "{A, B, C}"
-        default_name = m.group(2)  # "React"
-        from_module = m.group(3)
-
-        is_relative = from_module.startswith(".")
-        if named_group:
-            for name in re.split(r"\s*,\s*", named_group):
-                name = name.strip().split(" as ")[0].strip()
-                if name:
-                    edges.append(ImportEdge(
-                        repo_name=repo_name,
-                        file_path=file_path,
-                        from_module=from_module,
-                        import_name=name,
-                        is_relative=is_relative,
-                    ))
-        elif default_name:
-            edges.append(ImportEdge(
-                repo_name=repo_name,
-                file_path=file_path,
-                from_module=from_module,
-                import_name=default_name,
-                is_relative=is_relative,
-            ))
-    return edges
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Embedder — AWS Bedrock Titan
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def _embed_text(text_to_embed: str, region: str = "us-east-1") -> Optional[List[float]]:
-    """Call Bedrock Titan and return a 1536-dim embedding vector."""
-    import json as _json
-    import boto3
-
-    def _call() -> Optional[List[float]]:
-        client  = boto3.client("bedrock-runtime", region_name=region)
-        payload = _json.dumps({"inputText": text_to_embed[:8191]})
-        try:
-            resp = client.invoke_model(
-                modelId=_EMBED_MODEL,
-                body=payload,
-                contentType="application/json",
-                accept="application/json",
-            )
-            result = _json.loads(resp["body"].read())
-            return result.get("embedding")
-        except Exception as exc:
-            logger.warning("Bedrock embedding failed: %s", exc)
-            return None
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _call)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1025,9 +385,22 @@ class CodeIndexer:
         bedrock_region: str = "us-east-1",
         jail_path: Optional[str] = None,
     ):
+        # ``CODE_INDEXER_EMBED=false`` is supported as an emergency escape
+        # hatch (chunks persist with NULL vectors when Bedrock is unreachable).
+        # Default is True; the Settings-page model + region drives the actual
+        # call so most operators never need to flip this.
+        env_embed = os.getenv("CODE_INDEXER_EMBED")
+        if env_embed is not None and embed is True:
+            embed = env_embed.lower() not in ("false", "0", "no", "off")
         self.embed = embed
         self.bedrock_region = bedrock_region
         self.jail_path = jail_path  # If set, all file access is checked against this root
+        if not self.embed:
+            logger.info(
+                "CodeIndexer: embedding disabled (CODE_INDEXER_EMBED=%s); "
+                "chunks will be persisted without vectors.",
+                env_embed,
+            )
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -1078,6 +451,8 @@ class CodeIndexer:
             extensions += [".py"]
         if language in {"typescript", "mixed"}:
             extensions += [".ts", ".tsx"]
+        if language in {"javascript", "mixed"}:
+            extensions += [".js", ".mjs", ".cjs", ".jsx"]
         if language in {"csharp", "dotnet"}:
             extensions += [".cs"]
         if language == "react":
@@ -1092,6 +467,9 @@ class CodeIndexer:
             extensions += [".rs"]
         if language == "ruby":
             extensions += [".rb"]
+        # Deduplicate while preserving order.
+        seen_exts: set[str] = set()
+        extensions = [e for e in extensions if not (e in seen_exts or seen_exts.add(e))]
 
         # ── Collect all files ────────────────────────────────────────────────
         changed_set: Optional[set[str]] = None
@@ -1133,37 +511,34 @@ class CodeIndexer:
                         None, lambda: file_path.read_text(encoding="utf-8", errors="ignore")
                     )
                 except OSError:
+                    _bump("files_failed")
                     return
 
-                # Extract chunks + calls + imports per language
+                # Extract chunks + calls + imports per language.
+                # Non-Python languages go through tree-sitter exclusively;
+                # if the grammar is missing, chunks=[] and a warning is logged
+                # (no regex fallback — legacy extractors were removed).
                 if ext == ".py":
                     chunks  = extract_python_chunks(source, relative, repo_name)
                     calls   = extract_python_calls(source, relative, repo_name)
                     imports = extract_python_imports(source, relative, repo_name)
                 elif ext == ".cs":
                     chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "csharp", "csharp")
-                    if not chunks:
-                        chunks = extract_csharp_chunks(source, relative, repo_name)
-                        calls  = []
                     imports = _extract_cs_imports_via_ts(source, relative, repo_name)
                 elif ext == ".jsx":
                     chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "tsx", "react")
-                    if not chunks:
-                        chunks = extract_react_chunks(source, relative, repo_name)
-                        calls  = []
-                    imports = extract_typescript_imports(source, relative, repo_name)
+                    imports = extract_typescript_imports(source, relative, repo_name, "tsx")
                 elif ext == ".tsx":
                     chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "tsx", "typescript")
-                    if not chunks:
-                        chunks = extract_typescript_chunks(source, relative, repo_name)
-                        calls  = []
-                    imports = extract_typescript_imports(source, relative, repo_name)
+                    imports = extract_typescript_imports(source, relative, repo_name, "tsx")
                 elif ext in {".ts"}:
                     chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "typescript", "typescript")
-                    if not chunks:
-                        chunks = extract_typescript_chunks(source, relative, repo_name)
-                        calls  = []
-                    imports = extract_typescript_imports(source, relative, repo_name)
+                    imports = extract_typescript_imports(source, relative, repo_name, "typescript")
+                elif ext in {".js", ".mjs", ".cjs"}:
+                    chunks, calls = _extract_chunks_via_ts(
+                        source, relative, repo_name, "javascript", "javascript",
+                    )
+                    imports = extract_typescript_imports(source, relative, repo_name, "javascript")
                 elif ext == ".java":
                     chunks, calls = _extract_chunks_via_ts(source, relative, repo_name, "java", "java")
                     imports = _extract_imports_via_ts(source, relative, repo_name, "java", _JAVA_IMPORT_QUERY)
@@ -1186,6 +561,11 @@ class CodeIndexer:
                 func_ranges = [(c.line_start, c.line_end, c.name) for c in chunks]
                 logs = extract_log_patterns(source, relative, repo_name, func_ranges)
 
+                if chunks:
+                    _bump("files_parsed")
+                else:
+                    _bump("files_skipped")
+
                 all_chunks.extend(chunks)
                 all_calls.extend(calls)
                 all_imports.extend(imports)
@@ -1203,6 +583,10 @@ class CodeIndexer:
         logger.info(
             "CodeIndexer: extracted %d chunks, %d calls, %d imports, %d log patterns from %s (%s)",
             len(all_chunks), len(all_calls), len(all_imports), len(all_logs), repo_name, language,
+        )
+        logger.info(
+            "CodeIndexer: accuracy counters %s",
+            {k: v for k, v in code_indexer_counters.items() if v},
         )
 
         # ── Phase 1: embed + upsert synchronously ────────────────────────────
@@ -1222,7 +606,70 @@ class CodeIndexer:
     # ── Phase 1 helpers ───────────────────────────────────────────────────────
 
     async def _embed_chunks(self, chunks: List[CodeChunk]) -> None:
+        """Embed chunks, skipping Bedrock calls when body hash is unchanged.
+
+        For each chunk we compute sha256(body) and look up any existing row
+        with the same (repo_name, file_path, name, chunk_type).  If the stored
+        hash matches we reuse the existing embedding — zero Bedrock calls for
+        unchanged chunks (Fix 1, Phase 5).
+        """
+        if not chunks:
+            return
+
+        async with AsyncSessionLocal() as session:
+            # Ensure body_sha256 column exists before querying it
+            await session.execute(text(
+                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS body_sha256 VARCHAR(64)"
+            ))
+            await session.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_code_chunks_body_sha256 "
+                "ON code_chunks (body_sha256)"
+            ))
+            await session.commit()
+            # Build a VALUES list for the lookup of existing hashes+embeddings
+            placeholders = ",".join(
+                f"(:rn{i}, :fp{i}, :nm{i}, :ct{i})" for i in range(len(chunks))
+            )
+            params: dict = {}
+            for i, c in enumerate(chunks):
+                params[f"rn{i}"] = c.repo_name
+                params[f"fp{i}"] = c.file_path
+                params[f"nm{i}"] = c.name
+                params[f"ct{i}"] = c.chunk_type
+            rows = await session.execute(
+                text(f"""
+                    SELECT repo_name, file_path, name, chunk_type,
+                           body_sha256, embedding::text
+                      FROM code_chunks
+                     WHERE (repo_name, file_path, name, chunk_type)
+                           IN ({placeholders})
+                """),
+                params,
+            )
+            existing: dict = {
+                (r.repo_name, r.file_path, r.name, r.chunk_type):
+                    (r.body_sha256, r.embedding)
+                for r in rows.fetchall()
+            }
+
         for chunk in chunks:
+            new_hash = hashlib.sha256(chunk.body.encode()).hexdigest()
+            chunk.body_sha256 = new_hash
+            lookup_key = (chunk.repo_name, chunk.file_path, chunk.name, chunk.chunk_type)
+            cached = existing.get(lookup_key)
+            if cached and cached[0] == new_hash and cached[1] is not None:
+                # Body unchanged — parse stored embedding string back to floats
+                emb_str: str = cached[1]
+                # Postgres returns vector as '[0.1,0.2,...]'
+                try:
+                    chunk.embedding = [
+                        float(v) for v in emb_str.strip("[]").split(",") if v
+                    ]
+                except Exception:
+                    chunk.embedding = None  # fall through to re-embed below
+                if chunk.embedding:
+                    continue  # skip Bedrock call
+            # Hash changed or no existing row — call Bedrock
             text_to_embed = f"{chunk.signature}\n{chunk.docstring}\n{chunk.body}"[:4096]
             chunk.embedding = await _embed_text(text_to_embed, self.bedrock_region)
 
@@ -1231,13 +678,47 @@ class CodeIndexer:
             return
 
         async with AsyncSessionLocal() as session:
-            # Ensure all optional columns exist (idempotent)
+            # Create table on first run (idempotent)
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS code_chunks (
+                    id                    SERIAL PRIMARY KEY,
+                    repo_name             VARCHAR(255)  NOT NULL,
+                    file_path             TEXT          NOT NULL,
+                    name                  TEXT          NOT NULL,
+                    chunk_type            VARCHAR(50)   NOT NULL,
+                    signature             TEXT,
+                    body                  TEXT,
+                    docstring             TEXT,
+                    language              VARCHAR(50),
+                    line_start            INTEGER,
+                    line_end              INTEGER,
+                    embedding             vector(1536),
+                    entity_id             VARCHAR(16),
+                    predecessor_entity_id VARCHAR(16),
+                    enrichment_phase      VARCHAR(10)   DEFAULT 'raw',
+                    complexity            INTEGER       DEFAULT 1,
+                    search_vector         tsvector,
+                    indexed_at            TIMESTAMPTZ   DEFAULT NOW(),
+                    UNIQUE (repo_name, file_path, name, chunk_type)
+                )
+            """))
+            await session.commit()
+
+            # Ensure optional columns exist on older installs (idempotent)
             for ddl in [
                 "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS enrichment_phase VARCHAR(10) DEFAULT 'raw'",
                 "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS entity_id VARCHAR(16)",
                 "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS predecessor_entity_id VARCHAR(16)",
                 "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS complexity INTEGER DEFAULT 1",
                 "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS search_vector tsvector",
+                # Accuracy-enhancement columns (see code_indexer accuracy plan).
+                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS parent_class VARCHAR(255)",
+                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS parent_entity_id VARCHAR(16)",
+                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS decorators JSONB DEFAULT '[]'::jsonb",
+                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS param_arity INTEGER DEFAULT 0",
+                # Phase 5 Fix 1: body hash for incremental embedding skip
+                "ALTER TABLE code_chunks ADD COLUMN IF NOT EXISTS body_sha256 VARCHAR(64)",
+                "CREATE INDEX IF NOT EXISTS ix_code_chunks_body_sha256 ON code_chunks (body_sha256)",
             ]:
                 await session.execute(text(ddl))
 
@@ -1246,18 +727,29 @@ class CodeIndexer:
                     f"[{','.join(str(v) for v in chunk.embedding)}]"
                     if chunk.embedding else None
                 )
+                # Populate body_sha256 if not already set by _embed_chunks
+                if not chunk.body_sha256:
+                    chunk.body_sha256 = hashlib.sha256(chunk.body.encode()).hexdigest()
+                # Fix 2 (Phase 5): The DO UPDATE clause rebuilds search_vector so
+                # BM25 search reflects the latest signature/name/docstring rather
+                # than the stale values captured on the original INSERT.
                 await session.execute(
                     text("""
                         INSERT INTO code_chunks
                             (repo_name, file_path, name, chunk_type, signature, body,
                              docstring, language, line_start, line_end, embedding,
                              entity_id, enrichment_phase, complexity, search_vector,
+                             body_sha256,
+                             parent_class, parent_entity_id, decorators, param_arity,
                              indexed_at)
                         VALUES
                             (:repo_name, :file_path, :name, :chunk_type, :signature, :body,
                              :docstring, :language, :line_start, :line_end,
                              :embedding::vector, :entity_id, 'raw', :complexity,
                              to_tsvector('english', coalesce(:sig,'') || ' ' || coalesce(:name2,'') || ' ' || coalesce(:body2,'')),
+                             :body_sha256,
+                             :parent_class, :parent_entity_id,
+                             CAST(:decorators AS JSONB), :param_arity,
                              NOW())
                         ON CONFLICT (repo_name, file_path, name, chunk_type)
                         DO UPDATE SET
@@ -1270,7 +762,15 @@ class CodeIndexer:
                             entity_id        = EXCLUDED.entity_id,
                             enrichment_phase = 'raw',
                             complexity       = EXCLUDED.complexity,
-                            search_vector    = EXCLUDED.search_vector,
+                            body_sha256      = EXCLUDED.body_sha256,
+                            search_vector    = to_tsvector('english',
+                                coalesce(EXCLUDED.signature,'') || ' ' ||
+                                coalesce(EXCLUDED.name,'') || ' ' ||
+                                coalesce(EXCLUDED.docstring,'')),
+                            parent_class     = EXCLUDED.parent_class,
+                            parent_entity_id = EXCLUDED.parent_entity_id,
+                            decorators       = EXCLUDED.decorators,
+                            param_arity      = EXCLUDED.param_arity,
                             indexed_at       = NOW()
                     """),
                     {
@@ -1287,10 +787,15 @@ class CodeIndexer:
                         "embedding":  emb,
                         "entity_id":  chunk.entity_id or None,
                         "complexity": chunk.complexity,
+                        "body_sha256": chunk.body_sha256,
                         # separate short params for tsvector to avoid 50k body
                         "sig":        chunk.signature[:500],
                         "name2":      chunk.name,
                         "body2":      chunk.body[:2000],
+                        "parent_class":     chunk.parent_class or "",
+                        "parent_entity_id": chunk.parent_entity_id or None,
+                        "decorators":       json.dumps(chunk.decorators or []),
+                        "param_arity":      chunk.param_arity or 0,
                     },
                 )
             await session.commit()
@@ -1342,16 +847,26 @@ class CodeIndexer:
                 "ALTER TABLE code_calls ADD COLUMN IF NOT EXISTS "
                 "indexed_at TIMESTAMPTZ DEFAULT NOW()"
             ))
+            await session.execute(text(
+                "ALTER TABLE code_calls ADD COLUMN IF NOT EXISTS "
+                "qualified_callee VARCHAR(1000)"
+            ))
+            await session.execute(text(
+                "ALTER TABLE code_calls ADD COLUMN IF NOT EXISTS "
+                "line_number INTEGER DEFAULT 0"
+            ))
 
             for call in deduped:
                 await session.execute(text("""
                     INSERT INTO code_calls
                         (caller_repo, caller_name, caller_file,
                          callee_name, callee_file,
+                         qualified_callee, line_number,
                          call_frequency, edge_weight, indexed_at)
                     VALUES
                         (:repo, :caller, :caller_file,
                          :callee, :callee_file,
+                         :qualified, :line_no,
                          1, 1.0, NOW())
                     ON CONFLICT DO NOTHING
                 """), {
@@ -1360,6 +875,8 @@ class CodeIndexer:
                     "caller_file": call.caller_file,
                     "callee":      call.callee_name,
                     "callee_file": call.callee_file,
+                    "qualified":   call.qualified_callee or None,
+                    "line_no":     call.line_number or 0,
                 })
             await session.commit()
 
@@ -1438,6 +955,9 @@ class CodeIndexer:
                 repo_name, exc, exc_info=True,
             )
 
+    # TODO(post-phase2): delete entire edge-weight cosine block — SCIP gives real call edges
+    # in code_references. This O(N²) cosine on caller/callee names is a heuristic
+    # superseded by SCIP's deterministic call graph (see app.services.code_indexing.scip_loader).
     async def _compute_edge_weights(self, repo_name: str) -> None:
         """Compute cosine-similarity edge weights for code_calls rows.
 
@@ -1823,22 +1343,106 @@ class CodeIndexer:
         return await loop.run_in_executor(None, _run)
 
     async def _resolve_cross_file_calls(self, repo_name: str) -> None:
-        """Populate callee_file in code_calls by joining imports + chunks."""
+        """Populate callee_file and callee_entity_id for unresolved code_calls rows.
+
+        Resolution preference:
+          1. Same-file match — if a chunk with the same name lives in
+             ``caller_file``, prefer it (handles helper functions in same module).
+          2. Unique repo-wide match — exactly one chunk in the repo with that
+             name. Set ``callee_file`` and ``callee_entity_id``.
+          3. Ambiguous match — leave unresolved (avoid wrong edges).
+        """
         async with AsyncSessionLocal() as session:
+            # Step 1: same-file preference.
             await session.execute(text("""
                 UPDATE code_calls cc
-                   SET callee_file = ch.file_path
+                   SET callee_file      = ch.file_path,
+                       callee_entity_id = ch.entity_id
                   FROM code_chunks ch
-                 WHERE ch.repo_name = cc.caller_repo
-                   AND ch.name      = cc.callee_name
+                 WHERE ch.repo_name   = cc.caller_repo
+                   AND ch.file_path   = cc.caller_file
+                   AND ch.name        = cc.callee_name
                    AND cc.caller_repo = :rn
                    AND (cc.callee_file IS NULL OR cc.callee_file = '')
             """), {"rn": repo_name})
+
+            # Step 2: unique repo-wide match.
+            await session.execute(text("""
+                UPDATE code_calls cc
+                   SET callee_file      = sub.file_path,
+                       callee_entity_id = sub.entity_id
+                  FROM (
+                      SELECT name, MIN(file_path) AS file_path,
+                             MIN(entity_id)       AS entity_id,
+                             COUNT(*)             AS match_count
+                        FROM code_chunks
+                       WHERE repo_name = :rn
+                       GROUP BY name
+                      HAVING COUNT(*) = 1
+                  ) sub
+                 WHERE sub.name        = cc.callee_name
+                   AND cc.caller_repo  = :rn
+                   AND (cc.callee_file IS NULL OR cc.callee_file = '')
+            """), {"rn": repo_name})
+
+            # Count how many we resolved this pass for telemetry.
+            res = await session.execute(text("""
+                SELECT COUNT(*) FROM code_calls
+                 WHERE caller_repo = :rn
+                   AND callee_file IS NOT NULL
+                   AND callee_file <> ''
+            """), {"rn": repo_name})
+            resolved = res.scalar() or 0
             await session.commit()
-        logger.info("CodeIndexer: resolved cross-file calls for %s", repo_name)
+
+        _bump("calls_resolved_xfile", int(resolved))
+        logger.info(
+            "CodeIndexer: resolved %d cross-file calls for %s",
+            resolved, repo_name,
+        )
 
     async def _link_test_files(self, repo_name: str) -> None:
-        """Insert test→source edges into code_test_links."""
+        """Insert test→source edges into code_test_links using structural rules.
+
+        Phase 5 replacement: three complementary linkage rules produce a
+        confidence score rather than a binary name-equality match.
+
+        Rule A (name heuristic, confidence 0.4):
+            Strip test/setup/teardown prefixes from the test chunk name; if the
+            result matches a source chunk name, create a link.
+
+        Rule B (import-based, confidence 0.4):
+            If the test file imports the source chunk's module (via code_imports),
+            link all test chunks in that file to source chunks in that module.
+
+        Rule C (body-mention, confidence 0.4):
+            If the test chunk's body contains a token matching the source chunk's
+            name AND the test file is under a tests/ directory, create a link.
+
+        Confidence is additive: a link that matches all three rules scores 1.0.
+        The highest confidence seen for a (test_chunk, source_chunk) pair wins.
+
+        # TODO(phase2-scip): replace with SCIP reference edges when
+        # scip_loader populates code_references.
+        """
+        _TEST_DIR_PATTERNS_LINK = ("%/tests/%", "%/test/%", "%/spec/%", "%/__tests__/%",
+                                   "tests/%", "test/%", "spec/%", "__tests__/%")
+        _TEST_NAME_PREFIXES = ("test_", "test", "setup_", "teardown_", "spec_")
+
+        def _strip_test_prefix(name: str) -> str:
+            lower = name.lower()
+            for pfx in _TEST_NAME_PREFIXES:
+                if lower.startswith(pfx) and len(name) > len(pfx):
+                    return name[len(pfx):]
+            return name
+
+        def _is_under_tests(fp: str) -> bool:
+            fp_norm = fp.replace("\\", "/")
+            return any(
+                fp_norm.startswith(p.lstrip("%/")) or ("/" + p.lstrip("%/")) in fp_norm
+                for p in _TEST_DIR_PATTERNS_LINK
+            ) or "test" in fp_norm or "spec" in fp_norm
+
         async with AsyncSessionLocal() as session:
             await session.execute(text("""
                 CREATE TABLE IF NOT EXISTS code_test_links (
@@ -1848,48 +1452,109 @@ class CodeIndexer:
                     source_file  VARCHAR(1000),
                     test_name    VARCHAR(500),
                     source_name  VARCHAR(500),
+                    confidence   FLOAT        DEFAULT 0.4,
                     indexed_at   TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (repo_name, test_file, test_name, source_name)
                 )
             """))
-            # Match test chunks to source chunks by heuristic name proximity
-            rows = await session.execute(text("""
-                SELECT tc.file_path  AS test_file,
-                       tc.name       AS test_name,
-                       sc.file_path  AS source_file,
-                       sc.name       AS source_name
-                  FROM code_chunks tc
-                  JOIN code_chunks sc
-                    ON sc.repo_name = tc.repo_name
-                   AND sc.name = tc.name  -- exact name match after test prefix stripped
-                 WHERE tc.repo_name = :rn
+            # Ensure confidence column exists on older installs (idempotent)
+            await session.execute(text(
+                "ALTER TABLE code_test_links "
+                "ADD COLUMN IF NOT EXISTS confidence FLOAT DEFAULT 0.4"
+            ))
+
+            # ── Load test chunks ─────────────────────────────────────────────
+            tc_rows = await session.execute(text("""
+                SELECT id, file_path, name, body
+                  FROM code_chunks
+                 WHERE repo_name = :rn
                    AND (
-                         tc.file_path LIKE '%test%'
-                      OR tc.file_path LIKE '%spec%'
-                      OR tc.file_path LIKE '%__tests__%'
-                   )
-                   AND NOT (
-                         sc.file_path LIKE '%test%'
-                      OR sc.file_path LIKE '%spec%'
-                      OR sc.file_path LIKE '%__tests__%'
+                         file_path LIKE '%test%'
+                      OR file_path LIKE '%spec%'
+                      OR file_path LIKE '%__tests__%'
                    )
             """), {"rn": repo_name})
-            links = rows.fetchall()
-            for lnk in links:
+            test_chunks = tc_rows.fetchall()
+
+            # ── Load source chunks (non-test) ────────────────────────────────
+            sc_rows = await session.execute(text("""
+                SELECT id, file_path, name, body
+                  FROM code_chunks
+                 WHERE repo_name = :rn
+                   AND file_path NOT LIKE '%test%'
+                   AND file_path NOT LIKE '%spec%'
+                   AND file_path NOT LIKE '%__tests__%'
+            """), {"rn": repo_name})
+            source_chunks = sc_rows.fetchall()
+
+            # ── Load import edges for import-based rule ──────────────────────
+            imp_rows = await session.execute(text("""
+                SELECT DISTINCT file_path, import_name
+                  FROM code_imports
+                 WHERE repo_name = :rn
+            """), {"rn": repo_name})
+            # test_file -> set of imported names (lowercase)
+            file_imports: dict = {}
+            for imp in imp_rows.fetchall():
+                file_imports.setdefault(imp.file_path, set()).add(imp.import_name.lower())
+
+            # ── Collect links with confidence ────────────────────────────────
+            # key: (test_file, test_name, source_file, source_name) -> confidence
+            best: dict = {}
+
+            for tc in test_chunks:
+                tc_file: str = tc.file_path
+                tc_name: str = tc.name
+                tc_body: str = tc.body or ""
+                tc_imports: set = file_imports.get(tc_file, set())
+                is_under_tests_dir = _is_under_tests(tc_file)
+
+                stripped = _strip_test_prefix(tc_name).lower()
+
+                for sc in source_chunks:
+                    sc_name_lower = sc.name.lower()
+                    link_key = (tc_file, tc_name, sc.file_path, sc.name)
+                    conf = 0.0
+
+                    # Rule A — name heuristic (score 0.4)
+                    if stripped and stripped == sc_name_lower:
+                        conf += 0.4
+
+                    # Rule B — import-based (score 0.4)
+                    if sc_name_lower in tc_imports:
+                        conf += 0.4
+
+                    # Rule C — body mention; word-boundary only, tests/ dir only (score 0.4)
+                    if is_under_tests_dir and sc_name_lower in tc_body.lower():
+                        if re.search(r'\b' + re.escape(sc.name) + r'\b', tc_body):
+                            conf += 0.4
+
+                    if conf > 0.0:
+                        conf = min(1.0, round(conf, 2))
+                        if best.get(link_key, 0.0) < conf:
+                            best[link_key] = conf
+
+            # ── Persist ──────────────────────────────────────────────────────
+            for (tf, tn, sf, sn), conf in best.items():
                 await session.execute(text("""
                     INSERT INTO code_test_links
-                        (repo_name, test_file, source_file, test_name, source_name, indexed_at)
-                    VALUES (:rn, :tf, :sf, :tn, :sn, NOW())
-                    ON CONFLICT (repo_name, test_file, test_name, source_name) DO NOTHING
+                        (repo_name, test_file, source_file, test_name,
+                         source_name, confidence, indexed_at)
+                    VALUES (:rn, :tf, :sf, :tn, :sn, :conf, NOW())
+                    ON CONFLICT (repo_name, test_file, test_name, source_name)
+                    DO UPDATE SET
+                        confidence = GREATEST(code_test_links.confidence, EXCLUDED.confidence),
+                        indexed_at = NOW()
                 """), {
-                    "rn": repo_name,
-                    "tf": lnk.test_file,
-                    "sf": lnk.source_file,
-                    "tn": lnk.test_name,
-                    "sn": lnk.source_name,
+                    "rn": repo_name, "tf": tf, "sf": sf,
+                    "tn": tn, "sn": sn, "conf": conf,
                 })
             await session.commit()
-        logger.info("CodeIndexer: linked %d test→source pairs for %s", len(links), repo_name)
+
+        logger.info(
+            "CodeIndexer: linked %d test→source pairs for %s (structural rules)",
+            len(best), repo_name,
+        )
 
     async def _index_log_patterns(self, patterns: List[LogPattern]) -> None:
         """Upsert log call-site patterns into code_log_patterns."""

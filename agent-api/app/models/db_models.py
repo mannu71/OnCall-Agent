@@ -1,5 +1,18 @@
 """SQLAlchemy database models."""
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, JSON, Float
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import declarative_base
 from pgvector.sqlalchemy import Vector
 
@@ -90,6 +103,11 @@ class LLMConfigModel(Base):
     aws_profile = Column(String(100))
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
+    # Flags this config as the active embedding model — Settings page sets
+    # this through ``llm_config_repository.save``; the code indexer's
+    # embedder reads the flagged row at runtime. Column already exists in
+    # ``llm_configs`` (see migrations/add_use_for_embeddings_to_llm_configs.sql).
+    use_for_embeddings = Column(Boolean, default=False)
 
 
 class ModelKeyModel(Base):
@@ -255,3 +273,58 @@ class AlertModel(Base):
     created_at = Column(DateTime(timezone=True))
     resolved_at = Column(DateTime(timezone=True))
     resolved_by = Column(String(255))
+
+
+# ---------------------------------------------------------------------------
+# SCIP code-intelligence tables (Phase 2)
+#
+# Populated by ``app.services.code_indexing.scip_loader.load_scip_index``.
+# Used by ``app.services.code_indexer._resolve_cross_file_call`` to replace
+# the legacy heuristic resolver with compiler-grade SCIP lookups.
+# ---------------------------------------------------------------------------
+
+
+def _utcnow() -> datetime:
+    """Return the current UTC time (timezone-aware)."""
+    return datetime.now(timezone.utc)
+
+
+class CodeSymbol(Base):
+    """A symbol (function, class, method, …) extracted from a SCIP index."""
+    __tablename__ = "code_symbols"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    repo_name = Column(String(255), nullable=False, index=True)
+    symbol_id = Column(String(1024), nullable=False)
+    """SCIP moniker — globally unique identifier produced by scip-python."""
+
+    kind = Column(String(50))           # function | class | method | variable | ...
+    file_path = Column(String(1024), nullable=False)
+    line_start = Column(Integer, nullable=False)
+    line_end = Column(Integer)
+    signature = Column(Text)
+    language = Column(String(50), default="python")
+    indexed_at = Column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("repo_name", "symbol_id", name="uq_code_symbols_repo_symbol"),
+        Index("ix_code_symbols_file", "repo_name", "file_path"),
+    )
+
+
+class CodeReference(Base):
+    """A single occurrence (definition, reference, or import) of a CodeSymbol."""
+    __tablename__ = "code_references"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    repo_name = Column(String(255), nullable=False, index=True)
+    symbol_id = Column(String(1024), nullable=False, index=True)
+    file_path = Column(String(1024), nullable=False)
+    line = Column(Integer, nullable=False)
+    role = Column(String(20))           # 'definition' | 'reference' | 'import'
+    caller_symbol = Column(String(1024), index=True)
+    """The enclosing symbol at this call site (for callers query)."""
+
+    __table_args__ = (
+        Index("ix_code_refs_lookup", "repo_name", "symbol_id", "role"),
+    )
