@@ -37,13 +37,21 @@ class TrajectoryService:
             execution_id: The execution's string ID (uuid).
             trajectory: List of LangChain message dicts produced by ReactStrategy.
         """
+        # UUID strings (generated during in-memory execution before the row is
+        # committed) cannot be cast to integer. Skip — the trajectory will be
+        # saved correctly once persist_execution writes the DB row and calls us
+        # again with the real integer ID.
+        if not execution_id.isdigit():
+            logger.debug(
+                "save_trajectory: execution_id '%s' is not a numeric DB id — "
+                "skipping (trajectory will be saved by persist_execution).",
+                execution_id,
+            )
+            return
+
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(ExecutionModel).where(
-                    ExecutionModel.id == int(execution_id)
-                    if execution_id.isdigit()
-                    else ExecutionModel.id == execution_id
-                )
+                select(ExecutionModel).where(ExecutionModel.id == int(execution_id))
             )
             record = result.scalar_one_or_none()
             if record is None:
@@ -70,10 +78,17 @@ class TrajectoryService:
         execution_id: str,
     ) -> Optional[List[Dict[str, Any]]]:
         """Return the stored trajectory for *execution_id*, or None."""
+        if not execution_id.isdigit():
+            logger.warning(
+                "get_trajectory: non-numeric execution_id '%s' — returning None.",
+                execution_id,
+            )
+            return None
+
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(ExecutionModel.trajectory).where(
-                    ExecutionModel.id == execution_id
+                    ExecutionModel.id == int(execution_id)
                 )
             )
             row = result.one_or_none()

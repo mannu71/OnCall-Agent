@@ -13,6 +13,7 @@ from app.core.transport.provider import (
     ProviderTransport,
     TransportMessage,
     TransportResponse,
+    UsageCallback,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,7 @@ class BedrockTransport(ProviderTransport):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         system: Optional[str] = None,
+        on_usage: Optional[UsageCallback] = None,
     ) -> AsyncGenerator[str, None]:
         import asyncio
 
@@ -131,12 +133,39 @@ class BedrockTransport(ProviderTransport):
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(None, _invoke_stream)
 
+        # Bedrock streams usage data in a terminal message_stop / metadata chunk.
+        # Capture it so the optional on_usage callback can record per-execution
+        # token spend (parity with the non-streaming path).
+        in_tok = 0
+        out_tok = 0
         for event in response.get("body"):
             chunk = json.loads(event["chunk"]["bytes"])
-            if chunk.get("type") == "content_block_delta":
+            ctype = chunk.get("type")
+            if ctype == "content_block_delta":
                 delta = chunk.get("delta", {})
                 if delta.get("type") == "text_delta":
                     yield delta.get("text", "")
+            elif ctype == "message_delta":
+                # invocation usage is reported here for Anthropic-on-Bedrock
+                usage = chunk.get("usage") or {}
+                in_tok = usage.get("input_tokens", in_tok) or in_tok
+                out_tok = usage.get("output_tokens", out_tok) or out_tok
+            elif ctype == "message_stop":
+                metrics = chunk.get("amazon-bedrock-invocationMetrics") or {}
+                in_tok = metrics.get("inputTokenCount", in_tok) or in_tok
+                out_tok = metrics.get("outputTokenCount", out_tok) or out_tok
+
+        if on_usage is not None and (in_tok or out_tok):
+            try:
+                await on_usage({
+                    "input_tokens": in_tok,
+                    "output_tokens": out_tok,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "model": model_id,
+                })
+            except Exception:  # noqa: BLE001
+                logger.warning("on_usage callback raised", exc_info=True)
 
     def get_langchain_llm(self, model: str, **kwargs: Any) -> Any:
         from langchain_aws import ChatBedrockConverse

@@ -1,160 +1,89 @@
-"""Trajectories API endpoints for managing conversation trajectories."""
+"""Trajectories API — read agent message traces persisted on ExecutionModel.
 
-from typing import List, Optional
-from datetime import datetime
+Backs the TrajectoryReplay.jsx dashboard view. Trajectories are keyed by
+execution_id (not a separate trajectory_id) because they live on the
+ExecutionModel.trajectory JSON column written by ReactStrategy.
+"""
+
+from typing import Any, Dict, List, Optional
+
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.services.trajectory_service import trajectory_service, TrajectoryEntry
-
+from app.services.trajectory_service import trajectory_service
 
 router = APIRouter(prefix="/trajectories", tags=["trajectories"])
 
 
-# Response models
-class TrajectoryMetadata(BaseModel):
-    """Trajectory metadata response."""
-    trajectory_id: str = Field(..., description="Unique trajectory identifier")
-    execution_id: str = Field(..., description="Associated execution ID")
-    model: str = Field(..., description="Model used for this trajectory")
-    timestamp: datetime = Field(..., description="Trajectory creation timestamp")
-    completed: bool = Field(..., description="Whether execution completed successfully")
-    message_count: int = Field(..., description="Number of messages in trajectory")
-    tool_call_count: int = Field(..., description="Number of tool calls made")
+class TrajectorySummary(BaseModel):
+    execution_id: str
+    workflow_name: Optional[str] = None
+    status: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    message_count: int = 0
 
 
 class TrajectoryDetail(BaseModel):
-    """Detailed trajectory response."""
-    trajectory_id: str = Field(..., description="Unique trajectory identifier")
-    execution_id: str = Field(..., description="Associated execution ID")
-    model: str = Field(..., description="Model used for this trajectory")
-    timestamp: datetime = Field(..., description="Trajectory creation timestamp")
-    completed: bool = Field(..., description="Whether execution completed successfully")
-    messages: List[dict] = Field(..., description="Conversation messages")
-    tool_calls: List[dict] = Field(..., description="Tool calls made during execution")
-    metadata: dict = Field(..., description="Additional metadata")
+    execution_id: str
+    messages: List[Dict[str, Any]] = Field(default_factory=list)
+    message_count: int = 0
 
 
 class ReplayResponse(BaseModel):
-    """Response from trajectory replay."""
-    trajectory_id: str = Field(..., description="Replayed trajectory ID")
-    messages: List[dict] = Field(..., description="Messages from the trajectory")
-    message_count: int = Field(..., description="Number of messages replayed")
+    execution_id: str
+    messages: List[Dict[str, Any]]
+    message_count: int
 
 
-def _trajectory_entry_to_metadata(entry: TrajectoryEntry) -> TrajectoryMetadata:
-    """Convert TrajectoryEntry to TrajectoryMetadata response."""
-    return TrajectoryMetadata(
-        trajectory_id=entry.trajectory_id,
-        execution_id=entry.execution_id,
-        model=entry.model,
-        timestamp=entry.timestamp,
-        completed=entry.completed,
-        message_count=len(entry.messages),
-        tool_call_count=len(entry.tool_calls),
-    )
-
-
-def _trajectory_entry_to_detail(entry: TrajectoryEntry) -> TrajectoryDetail:
-    """Convert TrajectoryEntry to TrajectoryDetail response."""
-    return TrajectoryDetail(
-        trajectory_id=entry.trajectory_id,
-        execution_id=entry.execution_id,
-        model=entry.model,
-        timestamp=entry.timestamp,
-        completed=entry.completed,
-        messages=entry.messages,
-        tool_calls=entry.tool_calls,
-        metadata=entry.metadata,
-    )
-
-
-@router.get("", response_model=List[TrajectoryMetadata])
+@router.get("", response_model=List[TrajectorySummary])
 async def list_trajectories(
-    execution_id: Optional[str] = Query(
-        None,
-        description="Filter trajectories by execution ID"
-    ),
-    limit: int = Query(
-        100,
-        ge=1,
-        le=1000,
-        description="Maximum number of trajectories to return"
+    workflow_name: Optional[str] = Query(None, description="Filter by workflow name"),
+    limit: int = Query(20, ge=1, le=1000),
+) -> List[TrajectorySummary]:
+    rows = await trajectory_service.list_trajectories(
+        workflow_name=workflow_name, limit=limit
     )
-) -> List[TrajectoryMetadata]:
-    """List stored trajectories with optional filtering.
-    
-    Returns a list of trajectory metadata, optionally filtered by execution ID.
-    Results are ordered by creation time (newest first).
-    
-    Args:
-        execution_id: Optional filter by execution ID
-        limit: Maximum number of results (1-1000, default 100)
-    
-    Returns:
-        List of trajectory metadata objects
-    """
-    trajectories = await trajectory_service.list_trajectories(
+    return [TrajectorySummary(**r) for r in rows]
+
+
+@router.get("/{execution_id}", response_model=TrajectoryDetail)
+async def get_trajectory(execution_id: str) -> TrajectoryDetail:
+    trajectory = await trajectory_service.get_trajectory(execution_id)
+    if trajectory is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Trajectory for execution '{execution_id}' not found",
+        )
+    return TrajectoryDetail(
         execution_id=execution_id,
-        limit=limit
+        messages=trajectory,
+        message_count=len(trajectory),
     )
-    
-    return [_trajectory_entry_to_metadata(t) for t in trajectories]
 
 
-@router.get("/{trajectory_id}", response_model=TrajectoryDetail)
-async def get_trajectory(trajectory_id: str) -> TrajectoryDetail:
-    """Get detailed information about a specific trajectory.
-    
-    Returns the complete trajectory including all messages, tool calls,
-    and metadata.
-    
-    Args:
-        trajectory_id: Unique trajectory identifier
-    
-    Returns:
-        Detailed trajectory information
-    
-    Raises:
-        HTTPException: 404 if trajectory not found
-    """
-    trajectory = await trajectory_service.load_trajectory(trajectory_id)
-    
+@router.post("/{execution_id}/replay", response_model=ReplayResponse)
+async def replay_trajectory(execution_id: str) -> ReplayResponse:
+    trajectory = await trajectory_service.get_trajectory(execution_id)
     if not trajectory:
         raise HTTPException(
             status_code=404,
-            detail=f"Trajectory '{trajectory_id}' not found"
+            detail=f"Trajectory for execution '{execution_id}' not found or empty",
         )
-    
-    return _trajectory_entry_to_detail(trajectory)
+    return ReplayResponse(
+        execution_id=execution_id,
+        messages=trajectory,
+        message_count=len(trajectory),
+    )
 
 
-@router.post("/{trajectory_id}/replay", response_model=ReplayResponse)
-async def replay_trajectory(trajectory_id: str) -> ReplayResponse:
-    """Replay a trajectory and return its messages.
-    
-    This endpoint loads a trajectory and returns its messages for replay.
-    The messages can be used to reconstruct the conversation state.
-    
-    Args:
-        trajectory_id: Unique trajectory identifier
-    
-    Returns:
-        Replay response with messages
-    
-    Raises:
-        HTTPException: 404 if trajectory not found
-    """
-    messages = await trajectory_service.replay_trajectory(trajectory_id)
-    
-    if not messages:
+@router.get("/{execution_id}/atropos")
+async def get_atropos(execution_id: str) -> Dict[str, Any]:
+    """Trajectory in Atropos format for RL fine-tuning pipelines."""
+    payload = await trajectory_service.get_atropos_format(execution_id)
+    if payload is None:
         raise HTTPException(
             status_code=404,
-            detail=f"Trajectory '{trajectory_id}' not found or has no messages"
+            detail=f"Trajectory for execution '{execution_id}' not found",
         )
-    
-    return ReplayResponse(
-        trajectory_id=trajectory_id,
-        messages=messages,
-        message_count=len(messages),
-    )
+    return payload

@@ -384,6 +384,77 @@ class NodeConfigGenerator:
                 "label": {"ui:autofocus": True},
                 "type": {"ui:widget": "select"}
             }
+        },
+        "wiki": {
+            "schema": {
+                "type": "object",
+                "title": "Wiki Output Configuration",
+                "properties": {
+                    "label": {
+                        "type": "string",
+                        "title": "Name",
+                        "default": "Wiki"
+                    },
+                    "format": {
+                        "type": "string",
+                        "title": "Format",
+                        "enum": ["Summary", "Table", "Raw Markdown", "Bullet Points"],
+                        "default": "Summary"
+                    },
+                    "platform": {
+                        "type": "string",
+                        "title": "Platform",
+                        "enum": ["Azure DevOps Wiki", "Confluence", "GitHub Wiki"],
+                        "default": "Azure DevOps Wiki"
+                    },
+                    "wikiUrl": {
+                        "type": "string",
+                        "title": "Wiki URL"
+                    },
+                    "pagePath": {
+                        "type": "string",
+                        "title": "Page Path"
+                    },
+                    "project": {
+                        "type": "string",
+                        "title": "Project"
+                    },
+                    "pat": {
+                        "type": "string",
+                        "title": "PAT Token (optional)"
+                    },
+                    "tokenVar": {
+                        "type": "string",
+                        "title": "Token Env Var",
+                        "default": "ADO_WIKI_PAT"
+                    },
+                    "selectedQueries": {
+                        "type": "string",
+                        "title": "Filter Queries (Optional)",
+                        "description": "Comma-separated list of query labels or IDs to include (e.g. 'Profiles Updated, customer email notifications'). Leave empty to include all."
+                    },
+                    "writeMode": {
+                        "type": "string",
+                        "title": "Write Mode",
+                        "enum": ["Overwrite", "Append", "Prepend"],
+                        "default": "Overwrite",
+                        "description": "How to save data if the page already exists. 'Overwrite' replaces content. 'Append' adds to the bottom. 'Prepend' adds to the top."
+                    }
+                },
+                "required": ["label", "format", "platform"]
+            },
+            "uiSchema": {
+                "label": {"ui:autofocus": True},
+                "format": {"ui:widget": "select"},
+                "platform": {"ui:widget": "select"},
+                "writeMode": {"ui:widget": "select"},
+                "selectedQueries": {"ui:placeholder": "e.g., Profiles Updated, customer email notifications"},
+                "wikiUrl": {"ui:placeholder": "https://dev.azure.com/org/proj/_wiki/wikis/wikiId"},
+                "pagePath": {"ui:placeholder": "/Releases/Release-1.0"},
+                "project": {"ui:placeholder": "MyProject"},
+                "pat": {"ui:widget": "password", "ui:placeholder": "Optional secure PAT"},
+                "tokenVar": {"ui:placeholder": "ADO_WIKI_PAT"}
+            }
         }
     }
     
@@ -581,6 +652,7 @@ class NodeConfigGenerator:
             "scheduler": "Control",
             "chat": "Interface",
             "output": "Interface",
+            "wiki": "Interface",
             "memory": "Storage"
         }
         return categories.get(node_type, "Other")

@@ -12,6 +12,34 @@ from app.services.credential_transformer import CredentialTransformer
 logger = logging.getLogger(__name__)
 
 
+# Canonical provider name -> all known aliases stored in ``model_keys.provider``.
+# The discover-models endpoint and the Settings UI use the canonical form on
+# the left; legacy rows / CLI scripts use the form on the right. Lookup tries
+# every variant so neither side has to migrate.
+_PROVIDER_ALIASES: Dict[str, tuple] = {
+    "aws bedrock":  ("AWS Bedrock", "bedrock", "Bedrock", "aws-bedrock", "aws_bedrock"),
+    "openai":       ("OpenAI", "openai", "open_ai", "open-ai"),
+    "anthropic":    ("Anthropic", "anthropic"),
+    "azure openai": ("Azure OpenAI", "azure_openai", "azure-openai", "azure"),
+    "google":       ("Google", "google", "google-genai", "google_genai", "gemini"),
+    "groq":         ("Groq", "groq"),
+    "ollama":       ("Ollama", "ollama"),
+}
+
+
+def _provider_aliases(provider: str) -> List[str]:
+    """Return every spelling that should match *provider* in the DB."""
+    if not provider:
+        return [provider]
+    key = provider.strip().lower()
+    aliases = _PROVIDER_ALIASES.get(key)
+    if aliases is None:
+        # Unknown provider — try the input as-is plus a lowercase copy.
+        return list({provider, provider.lower()})
+    # Include the input value too in case the caller passes a novel variant.
+    return list({provider, *aliases})
+
+
 class ModelKeyRepository:
     """Repository for model key (API credential) data access."""
     
@@ -43,13 +71,18 @@ class ModelKeyRepository:
         Returns:
             Model key dict or None
         """
+        # Accept both the canonical UI form ("AWS Bedrock", "Azure OpenAI")
+        # and shorter aliases ("bedrock", "azure", "openai") so the LLM-config
+        # endpoint and the model-keys table can be edited independently
+        # without breaking lookup.
+        aliases = _provider_aliases(provider)
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(ModelKeyModel).where(ModelKeyModel.provider == provider)
+                select(ModelKeyModel).where(ModelKeyModel.provider.in_(aliases))
             )
-            k = result.scalar_one_or_none()
+            k = result.scalars().first()
             return self._model_key_to_dict(k, include_secrets) if k else None
-    
+
     async def create(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new model key.
         

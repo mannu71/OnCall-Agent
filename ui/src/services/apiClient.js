@@ -331,6 +331,29 @@ export async function deleteCertificate(filename) {
 }
 
 // ============================================
+// Code Analyzer APIs
+// ============================================
+
+/**
+ * List repositories discovered under REPOS_BASE_PATH.
+ * Returns { base_path, base_exists, repos: [{name, path, is_git,
+ *   detected_languages, suggested_language, file_count_sample}] }.
+ * When the base directory is missing, ``base_exists`` is false and
+ * ``repos`` is an empty list — never throws on that case.
+ */
+export async function listCodeAnalyzerRepos() {
+    return apiRequest('/code-analyzer/repos');
+}
+
+/**
+ * Fetch metadata for a single repository (jailed under REPOS_BASE_PATH).
+ * 404 if not found, 400 if the name fails the path-jail.
+ */
+export async function getCodeAnalyzerRepo(repoName) {
+    return apiRequest(`/code-analyzer/repos/${encodeURIComponent(repoName)}`);
+}
+
+// ============================================
 // Utility exports
 // ============================================
 
@@ -385,6 +408,10 @@ export const apiClient = {
     getCertificates,
     uploadCertificate,
     deleteCertificate,
+
+    // Code Analyzer
+    listCodeAnalyzerRepos,
+    getCodeAnalyzerRepo,
 
     // Utility
     getApiBaseUrl,

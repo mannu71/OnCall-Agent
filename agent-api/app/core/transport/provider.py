@@ -9,7 +9,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
+
+
+# Callback signature for receiving aggregated token usage from streaming calls.
+# Argument is a dict with keys: input_tokens, output_tokens,
+# cache_creation_input_tokens, cache_read_input_tokens, model.
+UsageCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 
 
 @dataclass
@@ -26,6 +32,8 @@ class TransportResponse:
     model: str
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
     cost_usd: float = 0.0
     raw: Any = field(default=None, repr=False)
 
@@ -78,6 +86,7 @@ class ProviderTransport(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         system: Optional[str] = None,
+        on_usage: Optional[UsageCallback] = None,
     ) -> AsyncGenerator[str, None]:
         """Stream a completion response, yielding text tokens as they arrive.
 
@@ -87,6 +96,10 @@ class ProviderTransport(ABC):
             max_tokens: Maximum tokens in the response.
             temperature: Sampling temperature.
             system: Optional system prompt.
+            on_usage: Optional async callback invoked once after the stream
+                completes with aggregated token usage. Lets callers maintain
+                a per-execution token ledger from the streaming path, which
+                otherwise discards usage data.
 
         Yields:
             Text token strings.

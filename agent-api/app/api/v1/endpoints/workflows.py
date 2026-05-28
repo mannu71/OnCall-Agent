@@ -17,6 +17,7 @@ from app.repositories import WorkflowRepository, ExecutionRepository
 from app.api.deps import get_workflow_repo, get_execution_repo, verify_workflow_exists
 from app.core.scheduler import workflow_scheduler
 from app.services.visual_workflow_executor import visual_executor
+from app.services.workflow_output_extractor import extract_workflow_output
 from app.core.exceptions import NotFoundException
 from app.config import settings
 
@@ -30,8 +31,11 @@ def _get_now_timestamp() -> str:
 
 
 def _find_scheduler_node(nodes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Find the scheduler node in the nodes list."""
-    return next((n for n in nodes if n.get('type') == 'scheduler'), None)
+    """Find the scheduler node in the nodes list.
+
+    Supports both legacy 'scheduler' type and new 'schedule' type.
+    """
+    return next((n for n in nodes if n.get('type') in ('scheduler', 'schedule')), None)
 
 
 def _clear_schedule_fields(workflow_dict: Dict[str, Any]) -> None:
@@ -40,41 +44,125 @@ def _clear_schedule_fields(workflow_dict: Dict[str, Any]) -> None:
     logger.info("[SYNC] No scheduler node found, clearing schedule")
 
 
+def _params_to_cron(params: Dict[str, Any]) -> Optional[str]:
+    """Convert new-schema Schedule node params to a UTC cron expression.
+
+    New Schedule node stores: ``params.frequency``, ``params.time`` (HH:MM local),
+    ``params.tz`` (IANA timezone), ``params.days`` (unused for now).
+    """
+    frequency = (params.get('frequency') or 'Daily').strip()
+    time_str = params.get('time') or '09:00'
+    tz_str = params.get('tz') or 'UTC'
+
+    freq_lower = frequency.lower()
+
+    # Fixed-interval frequencies — no time conversion needed
+    if freq_lower in ('every 5 min', 'every 5 minutes'):
+        return '*/5 * * * *'
+    if freq_lower in ('every 15 min', 'every 15 minutes'):
+        return '*/15 * * * *'
+    if freq_lower in ('every 30 min', 'every 30 minutes'):
+        return '*/30 * * * *'
+    if freq_lower == 'hourly':
+        return '0 * * * *'
+
+    # Time-based frequencies — convert local time in tz to UTC
+    try:
+        hour, minute = (int(p) for p in time_str.split(':'))
+    except (ValueError, AttributeError):
+        hour, minute = 9, 0
+
+    try:
+        from zoneinfo import ZoneInfo
+        local_dt = datetime(2024, 1, 15, hour, minute, tzinfo=ZoneInfo(tz_str))
+        utc_dt = local_dt.astimezone(ZoneInfo('UTC'))
+        utc_hour, utc_minute = utc_dt.hour, utc_dt.minute
+    except Exception:
+        utc_hour, utc_minute = hour, minute
+
+    if freq_lower == 'weekly':
+        return f'{utc_minute} {utc_hour} * * 1'
+    if freq_lower == 'monthly':
+        return f'{utc_minute} {utc_hour} 1 * *'
+    # Daily (default)
+    return f'{utc_minute} {utc_hour} * * *'
+
+
+def _frequency_to_recurrence(frequency: str) -> str:
+    """Map UI frequency label to legacy recurrence string."""
+    f = (frequency or 'daily').lower()
+    if 'weekly' in f:
+        return 'weekly'
+    if 'monthly' in f:
+        return 'monthly'
+    return 'daily'
+
+
 def _sync_update_to_scheduler_node(scheduler_node: Dict[str, Any], update_data: Dict[str, Any]) -> None:
-    """Sync top-level schedule fields from update_data to scheduler node."""
+    """Sync top-level schedule fields from update_data to scheduler node.
+
+    Handles both old-schema nodes (``data.cronExpression``) and new-schema
+    nodes (``params.frequency`` / ``params.time``).
+    """
     if not update_data:
         return
-    
+
+    params = scheduler_node.get('params')
     node_data = scheduler_node.get('data', {})
-    
-    if schedule := update_data.get('schedule'):
-        node_data['cronExpression'] = schedule
-    if 'enabled' in update_data:
-        node_data['enabled'] = update_data['enabled']
-    if start_time := update_data.get('startTime'):
-        node_data['startTime'] = start_time
-    if recurrence := update_data.get('recurrence'):
-        node_data['recurrence'] = recurrence
+
+    if params is not None:
+        # New schema node — update params directly
+        if 'enabled' in update_data:
+            params['enabled'] = update_data['enabled']
+        # If a raw cron arrives from the Schedule Management page, store it
+        if schedule := update_data.get('schedule'):
+            params['_cronOverride'] = schedule
+    else:
+        # Old schema node — update data fields
+        if schedule := update_data.get('schedule'):
+            node_data['cronExpression'] = schedule
+        if 'enabled' in update_data:
+            node_data['enabled'] = update_data['enabled']
+        if start_time := update_data.get('startTime'):
+            node_data['startTime'] = start_time
+        if recurrence := update_data.get('recurrence'):
+            node_data['recurrence'] = recurrence
 
 
 def _sync_scheduler_to_workflow(scheduler_node: Dict[str, Any], workflow_dict: Dict[str, Any]) -> None:
-    """Sync scheduler node data to workflow-level fields."""
-    node_data = scheduler_node.get('data', {})
-    cron_expression = node_data.get('cronExpression')
-    enabled = node_data.get('enabled', True)
-    
+    """Sync scheduler node data to workflow-level fields.
+
+    Supports both schemas:
+    - Old (legacy): ``node.data.cronExpression`` / ``startTime`` / ``recurrence``
+    - New (LangflowEditor): ``node.params.frequency`` / ``time`` / ``tz``
+    """
+    params = scheduler_node.get('params')
+    node_data = scheduler_node.get('data') or {}
+
+    if params is not None:
+        # New schema — derive cron from params.frequency + time + tz
+        cron_expression = params.get('_cronOverride') or _params_to_cron(params)
+        enabled = params.get('enabled', True)
+        start_time = params.get('time')
+        recurrence = _frequency_to_recurrence(params.get('frequency', 'Daily'))
+    else:
+        # Old schema
+        cron_expression = node_data.get('cronExpression')
+        enabled = node_data.get('enabled', True)
+        start_time = node_data.get('startTime')
+        recurrence = node_data.get('recurrence')
+
     if not cron_expression:
         return
-    
+
     workflow_dict['schedule'] = cron_expression
     workflow_dict['enabled'] = enabled
-    
-    # Also preserve startTime and recurrence at workflow level for frontend convenience
-    if start_time := node_data.get('startTime'):
+
+    if start_time:
         workflow_dict['startTime'] = start_time
-    if recurrence := node_data.get('recurrence'):
+    if recurrence:
         workflow_dict['recurrence'] = recurrence
-    
+
     logger.info(f"[SYNC] Synced from scheduler node: {cron_expression=}, {enabled=}")
 
 
@@ -97,7 +185,8 @@ def _sync_scheduler_node(workflow_dict: Dict[str, Any], update_data: Optional[Di
             _clear_schedule_fields(workflow_dict)
         return
 
-    if 'data' not in scheduler_node:
+    # Ensure old-schema nodes have a data dict; new-schema nodes use params (already present)
+    if scheduler_node.get('params') is None and 'data' not in scheduler_node:
         scheduler_node['data'] = {}
 
     # If update_data has top-level schedule fields, sync them TO the scheduler node first
@@ -111,27 +200,43 @@ def _sync_scheduler_node(workflow_dict: Dict[str, Any], update_data: Optional[Di
 
 def _validate_orchestrator_nodes(workflow_dict: Dict[str, Any]) -> None:
     """Validate that all orchestrator nodes have SQL files attached.
-    
+
+    Supports both schema shapes:
+    - Legacy (ReactFlow):  node['data']['fileName'] / node['data']['fileContent']
+    - New (LangflowEditor): node['params']['sqlFile'] / node['params']['sqlContent']
+
     Args:
         workflow_dict: Workflow dictionary with nodes
-        
+
     Raises:
         HTTPException: If any orchestrator node is missing SQL file
     """
     nodes = workflow_dict.get('nodes', [])
     orchestrator_nodes = [n for n in nodes if n.get('type') == 'orchestrator']
-    
+
     nodes_without_sql = []
     for node in orchestrator_nodes:
-        node_data = node.get('data', {})
-        file_name = node_data.get('fileName')
-        file_content = node_data.get('fileContent')
-        
-        # Must have either fileContent (new upload) or fileName (existing file)
+        # New schema: params.sqlFile / params.sqlContent
+        params = node.get('params', {})
+        file_name = params.get('sqlFile') or params.get('fileName')
+        file_content = params.get('sqlContent') or params.get('fileContent')
+
+        # Legacy schema fallback: data.fileName / data.fileContent
         if not file_name and not file_content:
-            node_label = node_data.get('label', f"Orchestrator {node.get('id', 'unknown')}")
+            node_data = node.get('data', {})
+            file_name = node_data.get('fileName')
+            file_content = node_data.get('fileContent')
+
+        # Must have either content (new upload) or file name (existing file)
+        if not file_name and not file_content:
+            node_label = (
+                params.get('label')
+                or node.get('name')
+                or node.get('data', {}).get('label')
+                or f"Orchestrator {node.get('id', 'unknown')}"
+            )
             nodes_without_sql.append(node_label)
-    
+
     if nodes_without_sql:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -217,9 +322,9 @@ async def update_workflow(
     
     # Log scheduler node data if present
     if 'nodes' in workflow_dict:
-        scheduler_node = next((n for n in workflow_dict['nodes'] if n.get('type') == 'scheduler'), None)
+        scheduler_node = _find_scheduler_node(workflow_dict['nodes'])
         if scheduler_node:
-            logger.info(f"[UPDATE] Scheduler node data BEFORE sync: {scheduler_node.get('data', {})}")
+            logger.info(f"[UPDATE] Scheduler node BEFORE sync: data={scheduler_node.get('data')}, params={scheduler_node.get('params')}")
     
     # Sync scheduler node and fields
     _sync_scheduler_node(workflow_dict, update_data)
@@ -238,11 +343,123 @@ async def update_workflow(
         if field in existing_workflow:
             workflow_dict[field] = existing_workflow[field]
     
+    # ── Detect codeAnalyzer repos that need indexing ─────────────────────
+    repos_to_index = await _extract_unindexed_repos(workflow_dict)
+    if repos_to_index:
+        # Disable the workflow while background indexing runs so it cannot
+        # be executed with un-indexed repos.
+        workflow_dict["enabled"] = False
+        workflow_dict["indexing_status"] = "indexing"
+        logger.info(
+            "[UPDATE] workflow='%s' has %d unindexed repo(s) %s — disabling and firing background indexer",
+            workflow_name, len(repos_to_index), repos_to_index,
+        )
+
     # Pass original workflow_name for rename detection
     saved_workflow = await workflow_repo.save(workflow_dict, original_name=workflow_name)
     await workflow_scheduler.reload_workflows()
-    
+
+    if repos_to_index:
+        # Resolve the model the workflow's LLM node targets so the indexer
+        # uses the same model the user just configured (not the global default).
+        indexer_model_id = await _resolve_workflow_model_id(workflow_dict)
+        # Fire-and-forget: does not block the HTTP response
+        from app.crawler.background_indexer import index_workflow_repos
+        task = asyncio.create_task(
+            index_workflow_repos(saved_workflow["name"], repos_to_index, model_id=indexer_model_id)
+        )
+        visual_executor.background_tasks.add(task)
+        task.add_done_callback(visual_executor.background_tasks.discard)
+
     return WorkflowResponse(**saved_workflow)
+
+
+async def _extract_unindexed_repos(workflow_dict: dict) -> list:
+    """Return repo names from codeAnalyzer nodes not yet in repo_abstractions.
+
+    Only repos missing from the ``repo_abstractions`` table are returned so
+    that re-saving a workflow with already-indexed repos does not trigger a
+    redundant background index run.
+    """
+    from app.core.database import AsyncSessionLocal
+    from sqlalchemy import text
+
+    repo_names: list = []
+    for node in workflow_dict.get("nodes") or []:
+        if node.get("type") == "codeAnalyzer":
+            for r in node.get("data", {}).get("repos") or []:
+                name = r.get("name") if isinstance(r, dict) else r
+                if name:
+                    repo_names.append(name)
+
+    if not repo_names:
+        return []
+
+    async with AsyncSessionLocal() as session:
+        rows = await session.execute(
+            text("SELECT repo_name FROM repo_abstractions WHERE repo_name = ANY(:names)"),
+            {"names": repo_names},
+        )
+        already_indexed = {r[0] for r in rows.fetchall()}
+
+    return [n for n in repo_names if n not in already_indexed]
+
+
+async def _resolve_workflow_model_id(workflow_dict: dict) -> "Optional[str]":
+    """Return the Bedrock model ID (with cross-region prefix) for the workflow's LLM node.
+
+    Looks at the workflow's ``llm`` node to find which LLM config it references,
+    then looks that config up in the DB and applies the same inference-profile
+    remapping that ReactStrategy._build_llm() uses (prepend eu./us./ap.).
+
+    Falls back to None when no llm node is found or the config cannot be
+    resolved — call_llm will then use the first entry from llm_configs as usual.
+    """
+    from app.repositories.db_repository import db_repository
+
+    # Find the llm node
+    llm_node = next(
+        (n for n in (workflow_dict.get("nodes") or []) if n.get("type") == "llm"),
+        None,
+    )
+    if not llm_node:
+        return None
+
+    data = llm_node.get("data") or {}
+    config_name = data.get("configName") or data.get("llmConfigId") or data.get("model")
+    if not config_name:
+        return None
+
+    try:
+        db_configs = await db_repository.list_llm_configs()
+        cfg = db_configs.get(config_name) or next(iter(db_configs.values()), None)
+        if not cfg:
+            return None
+
+        model  = cfg.get("model", "")
+        region = cfg.get("region", "us-east-1")
+
+        # Apply cross-region inference profile prefix (same logic as ReactStrategy)
+        _PROFILE_PREFIXES  = ("us.", "eu.", "ap.")
+        _NEEDS_PROFILE_FOR = ("anthropic.", "amazon.", "meta.", "mistral.")
+        if (model and
+                not any(model.startswith(p) for p in _PROFILE_PREFIXES) and
+                any(model.startswith(p) for p in _NEEDS_PROFILE_FOR)):
+            if region.startswith("eu-"):
+                model = f"eu.{model}"
+            elif region.startswith("ap-"):
+                model = f"ap.{model}"
+            else:
+                model = f"us.{model}"
+
+        logger.info(
+            "_resolve_workflow_model_id: workflow='%s' llm_node config='%s' → model=%s",
+            workflow_dict.get("name"), config_name, model,
+        )
+        return model or None
+    except Exception as exc:
+        logger.warning("_resolve_workflow_model_id: failed (%s), indexer will use default", exc)
+        return None
 
 
 def _cleanup_active_executions(workflow_name: str) -> None:
@@ -446,4 +663,7 @@ async def get_workflow_executions(
     execution_repo: ExecutionRepository = Depends(get_execution_repo)
 ):
     """Get execution history for a workflow."""
-    return await execution_repo.list_by_workflow(workflow_name, limit=limit)
+    # Harmonized with /executions list endpoint: enrich each row with `output`
+    # and top-level token fields via the shared extractor.
+    executions = await execution_repo.list_by_workflow(workflow_name, limit=limit)
+    return [extract_workflow_output(exec) for exec in executions]

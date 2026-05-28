@@ -162,8 +162,11 @@ class MCPClientManager:
             if server_id in self._exit_stacks:
                 try:
                     await self._exit_stacks[server_id].aclose()
-                except Exception:
-                    pass
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "MCP server %s cleanup after connect-timeout failed: %s",
+                        server_id, cleanup_exc, exc_info=True,
+                    )
                 finally:
                     self._exit_stacks.pop(server_id, None)
             return False

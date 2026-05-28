@@ -43,16 +43,22 @@ router = APIRouter(prefix="/log-watch", tags=["Log Watch Analyzer"])
 async def _resolve_aws_credentials(
     request_credentials: Optional[Any],
     region: str,
+    aws_profile: Optional[str] = None,
 ) -> tuple[Optional[Dict[str, Any]], str]:
     """Return (credentials_dict, region) — delegates to the shared resolver.
 
     Using the shared :func:`app.core.aws_credentials.resolve_aws_credentials`
     avoids duplicating credential-resolution logic (DB lookup, env-var
     fallback, profile handling) that already lives in the core module.
+
+    When *aws_profile* is provided it is passed directly to the shared
+    resolver, which returns it immediately without touching the DB.  This
+    lets the Discover endpoint use the same profile as the cloudwatch_tool
+    node rather than always falling back to the Bedrock IAM user.
     """
     if request_credentials:
         return request_credentials.model_dump(), region
-    return await _shared_resolve(aws_region=region)
+    return await _shared_resolve(aws_profile=aws_profile, aws_region=region)
 
 
 # ============================================
@@ -384,13 +390,16 @@ async def discover_log_groups_endpoint(
     tag_value: Optional[str] = Query(None, description="Tag value to filter by"),
     limit: int = Query(50, ge=1, le=200, description="Max log groups to return"),
     region: str = Query("us-east-1", description="AWS region"),
+    profile: Optional[str] = Query(None, description="AWS CLI profile name (e.g. 'test-dev'). "
+                                   "When set, uses this profile from ~/.aws/credentials instead "
+                                   "of the default Bedrock IAM user."),
 ) -> Dict[str, Any]:
     """Discover CloudWatch log groups by name prefix or resource tags.
 
     Use this when you know a service name but not the exact log group path,
     e.g. ``prefix=/aws/lambda/kyc-`` to find all KYC Lambda log groups.
     """
-    credentials, resolved_region = await _resolve_aws_credentials(None, region)
+    credentials, resolved_region = await _resolve_aws_credentials(None, region, aws_profile=profile)
     return await with_retry(
         discover_log_groups,
         prefix=prefix,

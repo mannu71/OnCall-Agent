@@ -220,6 +220,37 @@ class StructuredSummary:
             "open_questions": self.open_questions,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "StructuredSummary":
+        """Inverse of :meth:`to_dict` — restore a summary from a JSON dict.
+
+        Used by :class:`ContextCompactionManager` to load a persisted
+        summary from the ``memory_summaries`` Postgres table on first
+        access for a given ``session_id``.
+        """
+        generated_raw = data.get("generated_at")
+        if isinstance(generated_raw, str):
+            generated_at = datetime.fromisoformat(generated_raw)
+        elif isinstance(generated_raw, datetime):
+            generated_at = generated_raw
+        else:
+            generated_at = datetime.utcnow()
+
+        return cls(
+            goals=data.get("goals", ""),
+            progress=data.get("progress", ""),
+            decisions=list(data.get("decisions") or []),
+            symbols_resolved=list(data.get("symbols_resolved") or []),
+            files_touched=list(data.get("files_touched") or []),
+            open_questions=list(data.get("open_questions") or []),
+            generated_at=generated_at,
+            summary_id=data.get("summary_id") or str(uuid.uuid4())[:8],
+            previous_summary_id=data.get("previous_summary_id"),
+            token_count_at_summarization=int(
+                data.get("token_count_at_summarization") or 0
+            ),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Summarisation prompt + LLM call

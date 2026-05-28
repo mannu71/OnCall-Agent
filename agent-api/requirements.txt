@@ -13,6 +13,9 @@ pydantic-settings>=2.3.4
 # YAML Processing
 pyyaml>=6.0.1
 
+# Gitignore-aware file crawling (used by code crawler)
+pathspec>=0.11.0
+
 # SSE Support
 sse-starlette==1.8.2
 
@@ -25,6 +28,11 @@ httpx>=0.27.0
 
 # AWS SDK for Bedrock and CloudWatch
 boto3>=1.34.0
+
+# Accurate token counting for CloudWatch sanitizer and budget enforcement
+# Falls back to char/4 heuristic if unavailable, but tiktoken is required
+# for precise budget cuts (char/4 drifts 15-40% on JSON-heavy payloads).
+tiktoken>=0.7.0
 
 # LangChain ecosystem
 langchain>=1.2.0
@@ -55,3 +63,8 @@ tree-sitter-kotlin>=0.3.0
 tree-sitter-go>=0.23.0
 tree-sitter-rust>=0.23.0
 tree-sitter-ruby>=0.23.0
+tree-sitter-python>=0.23.0
+tree-sitter-javascript>=0.23.0
+
+# Cryptography (for encrypted secrets / PAT)
+cryptography>=42.0.0

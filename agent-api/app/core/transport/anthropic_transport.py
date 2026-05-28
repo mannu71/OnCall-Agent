@@ -13,6 +13,7 @@ from app.core.transport.provider import (
     ProviderTransport,
     TransportMessage,
     TransportResponse,
+    UsageCallback,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,14 +92,24 @@ class AnthropicTransport(ProviderTransport):
             block.text for block in response.content
             if hasattr(block, "text")
         )
-        in_tok  = response.usage.input_tokens
-        out_tok = response.usage.output_tokens
+        usage   = response.usage
+        in_tok  = usage.input_tokens
+        out_tok = usage.output_tokens
+        cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        cache_read   = getattr(usage, "cache_read_input_tokens", 0) or 0
+
+        logger.info(
+            "anthropic.usage input=%d output=%d cache_create=%d cache_read=%d",
+            in_tok, out_tok, cache_create, cache_read,
+        )
 
         return TransportResponse(
             content=content,
             model=response.model,
             input_tokens=in_tok,
             output_tokens=out_tok,
+            cache_creation_input_tokens=cache_create,
+            cache_read_input_tokens=cache_read,
             cost_usd=_estimate_cost(in_tok, out_tok),
             raw=response,
         )
@@ -111,6 +122,7 @@ class AnthropicTransport(ProviderTransport):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         system: Optional[str] = None,
+        on_usage: Optional[UsageCallback] = None,
     ) -> AsyncGenerator[str, None]:
         from app.core.prompt_caching import apply_cache_control
 
@@ -120,8 +132,9 @@ class AnthropicTransport(ProviderTransport):
             api_messages, system=system_prompt
         )
 
+        resolved_model = model or self.default_model
         kwargs: dict = dict(
-            model=model or self.default_model,
+            model=resolved_model,
             max_tokens=max_tokens,
             temperature=temperature,
             messages=api_messages,
@@ -132,6 +145,33 @@ class AnthropicTransport(ProviderTransport):
         async with self._client.messages.stream(**kwargs) as stream:
             async for text in stream.text_stream:
                 yield text
+            # Final message carries the aggregated usage object — propagate it
+            # to the caller's ledger so streaming spend is no longer invisible.
+            try:
+                final_msg = await stream.get_final_message()
+                usage = final_msg.usage
+                in_tok  = getattr(usage, "input_tokens", 0) or 0
+                out_tok = getattr(usage, "output_tokens", 0) or 0
+                cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                cache_read   = getattr(usage, "cache_read_input_tokens", 0) or 0
+                logger.info(
+                    "anthropic.usage input=%d output=%d cache_create=%d cache_read=%d",
+                    in_tok, out_tok, cache_create, cache_read,
+                )
+                if on_usage is not None:
+                    try:
+                        await on_usage({
+                            "input_tokens": in_tok,
+                            "output_tokens": out_tok,
+                            "cache_creation_input_tokens": cache_create,
+                            "cache_read_input_tokens": cache_read,
+                            "cost_usd": _estimate_cost(in_tok, out_tok),
+                            "model": getattr(final_msg, "model", resolved_model),
+                        })
+                    except Exception:  # noqa: BLE001
+                        logger.warning("on_usage callback raised", exc_info=True)
+            except Exception:  # noqa: BLE001
+                logger.debug("anthropic.usage: final message unavailable", exc_info=True)
 
     def get_langchain_llm(self, model: str, **kwargs: Any) -> Any:
         from langchain_anthropic import ChatAnthropic

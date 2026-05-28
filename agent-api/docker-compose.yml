@@ -30,6 +30,14 @@ services:
     volumes:
       - ./data:/app/data
       - ~/.aws:/root/.aws:ro
+      # Mount the entire repos parent directory read-only so any sibling
+      # repo selected from the UI becomes accessible at
+      # /app/data/indexed_repos/<repo-name> without a container restart.
+      # The path-jail (REPOS_BASE_PATH below) still confines tool access
+      # to /app/data/indexed_repos and rejects ../ escapes.
+      # NOTE: exposes every directory under the mount root to the container;
+      # acceptable for local/dev hosts, harden for shared environments.
+      - C:/Users/csinvmmn/source/repos:/app/data/indexed_repos:ro
     environment:
       - API_HOST=0.0.0.0
       - API_PORT=8000
@@ -41,6 +49,8 @@ services:
       - LOG_LEVEL=INFO
       - AWS_SSL_VERIFY=false
       - DATABASE_URL=postgresql://kycuser:kycpassword@postgres:5432/kycagent
+      - REPOS_BASE_PATH=/app/data/indexed_repos
+      - PROVIDER_TRANSPORT=bedrock
     depends_on:
       postgres:
         condition: service_healthy

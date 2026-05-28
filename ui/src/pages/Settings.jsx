@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Button } from '@/components/ui/button';
 import { 
     Dialog, 
@@ -173,6 +173,10 @@ const Settings = () => {
         access_key_id: '',
         secret_access_key: '',
         session_token: '',
+        // Flags this LLM config as the active embedding model. Server-side
+        // ``llm_config_repository.save`` enforces single-row exclusivity
+        // (saving with true unsets the flag on any other row).
+        use_for_embeddings: false,
     });
 
     const [openAWSDialog, setOpenAWSDialog] = useState(false);
@@ -202,37 +206,20 @@ const Settings = () => {
     const [certificates, setCertificates] = useState([]);
     const [certUploadLoading, setCertUploadLoading] = useState(false);
 
-    // API Health state
-    const [apiHealth, setApiHealth] = useState(null);
-    const [apiHealthLoading, setApiHealthLoading] = useState(false);
-
     // Model Keys state
     const [modelKeys, setModelKeys] = useState([]);
-    const [openModelKeyDialog, setOpenModelKeyDialog] = useState(false);
-    const [editingModelKeyProvider, setEditingModelKeyProvider] = useState(null);
-    const [modelKeyFormData, setModelKeyFormData] = useState({
-        provider: 'OpenAI',
-        api_key: '',
-        secret_key: '',
-        endpoint: '',
-        region: '',
+    const [bedrockCredentials, setBedrockCredentials] = useState({
         access_key_id: '',
         secret_access_key: '',
         session_token: '',
+        region: 'us-east-1',
         description: '',
     });
     const [showModelKeyFields, setShowModelKeyFields] = useState({});
     const originalMaskedValues = useRef({});
 
     const MODEL_KEY_PROVIDERS = [
-        { value: 'OpenAI', label: 'OpenAI', icon: '🧠', fields: ['api_key'] },
-        { value: 'Anthropic', label: 'Anthropic', icon: '🤖', fields: ['api_key'] },
-        { value: 'Google', label: 'Google AI', icon: '✨', fields: ['api_key'] },
-        { value: 'Groq', label: 'Groq', icon: '⚡', fields: ['api_key'] },
-        { value: 'Azure OpenAI', label: 'Azure OpenAI', icon: '☁️', fields: ['api_key', 'endpoint'] },
         { value: 'AWS Bedrock', label: 'AWS Bedrock', icon: '🌩️', fields: ['access_key_id', 'secret_access_key', 'session_token', 'region'] },
-        { value: 'Ollama', label: 'Ollama', icon: '🦙', fields: ['endpoint'] },
-        { value: 'Custom', label: 'Custom', icon: '🔧', fields: ['api_key', 'secret_key', 'endpoint'] },
     ];
 
     // Normalise provider names: DB may store "bedrock" while UI uses "AWS Bedrock"
@@ -250,37 +237,43 @@ const Settings = () => {
     const keyIsConfigured = (mk) =>
         mk && (mk.has_api_key || mk.has_secret_key || mk.has_access_credentials || mk.endpoint);
 
-    const emptyModelKeyForm = (provider) => {
-        const base = {
-            provider: provider || 'OpenAI',
-            api_key: '',
-            secret_key: '',
-            endpoint: '',
-            region: '',
-            access_key_id: '',
-            secret_access_key: '',
-            session_token: '',
-            description: '',
-        };
-        if (provider === 'Azure OpenAI') base.endpoint = 'https://your-resource.openai.azure.com';
-        if (provider === 'Ollama') base.endpoint = 'http://localhost:11434';
-        if (provider === 'AWS Bedrock') base.region = 'us-east-1';
-        return base;
-    };
+    // Sync loaded bedrock keys to form state
+    useEffect(() => {
+        const existing = modelKeys.find(k => k.provider === 'AWS Bedrock' || normalizeProvider(k.provider).includes('bedrock'));
+        if (existing) {
+            const initialForm = {
+                access_key_id: existing.access_key_id || '',
+                secret_access_key: existing.secret_access_key || '',
+                session_token: existing.session_token || '',
+                region: existing.region || 'us-east-1',
+                description: existing.description || '',
+            };
+            setBedrockCredentials(initialForm);
+            originalMaskedValues.current = { ...initialForm };
+        } else {
+            setBedrockCredentials({
+                access_key_id: '',
+                secret_access_key: '',
+                session_token: '',
+                region: 'us-east-1',
+                description: '',
+            });
+            originalMaskedValues.current = {};
+        }
+    }, [modelKeys]);
 
     const discoverableProviders = (() => {
         const providers = [];
-        const supportedForDiscovery = ['OpenAI', 'Anthropic', 'Google', 'Groq', 'Azure OpenAI', 'Ollama', 'AWS Bedrock'];
+        const supportedForDiscovery = ['AWS Bedrock'];
         for (const mk of modelKeys) {
             const matchedProvider = supportedForDiscovery.find(p => normalizeProvider(p) === normalizeProvider(mk.provider) || (p === 'AWS Bedrock' && normalizeProvider(mk.provider).includes('bedrock')));
             if (!matchedProvider) continue;
             const hasCreds = mk.has_api_key || mk.has_secret_key || mk.has_access_credentials || mk.endpoint;
             if (!hasCreds) continue;
-            const providerCfg = MODEL_KEY_PROVIDERS.find(p => p.value === mk.provider);
             providers.push({
-                provider: mk.provider,
-                icon: providerCfg?.icon || '🔧',
-                label: providerCfg?.label || mk.provider,
+                provider: 'AWS Bedrock',
+                icon: '🌩️',
+                label: 'AWS Bedrock',
                 region: mk.region,
                 endpoint: mk.endpoint,
                 source: 'model-keys',
@@ -294,7 +287,6 @@ const Settings = () => {
         loadServers();
         loadLLMConfigs();
         loadCertificates();
-        checkApiHealth();
         loadModelKeys();
     }, []);
 
@@ -361,69 +353,45 @@ const Settings = () => {
         }
     };
 
-    const handleOpenModelKeyDialog = (provider = null) => {
-        if (provider) {
-            const existing = findModelKey(provider);
-            setEditingModelKeyProvider(provider);
-            const formData = {
-                provider,
-                api_key: existing?.api_key || '',
-                secret_key: existing?.secret_key || '',
-                endpoint: existing?.endpoint || '',
-                region: existing?.region || '',
-                access_key_id: existing?.access_key_id || '',
-                secret_access_key: existing?.secret_access_key || '',
-                session_token: existing?.session_token || '',
-                description: existing?.description || '',
-            };
-            setModelKeyFormData(formData);
-            originalMaskedValues.current = { ...formData };
-        } else {
-            setEditingModelKeyProvider(null);
-            setModelKeyFormData(emptyModelKeyForm());
-            originalMaskedValues.current = {};
-        }
-        setOpenModelKeyDialog(true);
-    };
-
-    const handleCloseModelKeyDialog = () => {
-        setOpenModelKeyDialog(false);
-        setEditingModelKeyProvider(null);
-    };
-
-    const handleSaveModelKey = async () => {
+    const handleSaveBedrockCredentials = async () => {
         try {
-            const providerConfig = MODEL_KEY_PROVIDERS.find(p => p.value === modelKeyFormData.provider);
-            const data = { provider: modelKeyFormData.provider };
-            if (providerConfig) {
-                providerConfig.fields.forEach(field => {
-                    const value = modelKeyFormData[field];
-                    if (value && value !== originalMaskedValues.current[field]) {
-                        data[field] = value;
-                    }
-                });
-            }
-            if (modelKeyFormData.description) data.description = modelKeyFormData.description;
-            if (modelKeyFormData.region && modelKeyFormData.provider === 'AWS Bedrock') data.region = modelKeyFormData.region;
+            const data = { provider: 'AWS Bedrock' };
+            const fields = ['access_key_id', 'secret_access_key', 'session_token'];
+            fields.forEach(field => {
+                const value = bedrockCredentials[field];
+                if (value && value !== originalMaskedValues.current[field]) {
+                    data[field] = value;
+                }
+            });
+            if (bedrockCredentials.region) data.region = bedrockCredentials.region;
+            if (bedrockCredentials.description) data.description = bedrockCredentials.description;
+
             await upsertModelKey(data);
-            setSaveMessage(`Saved keys for ${modelKeyFormData.provider}`);
+            setSaveMessage('Saved AWS Bedrock credentials');
             await loadModelKeys();
-            handleCloseModelKeyDialog();
         } catch (error) {
-            console.error('Error saving model key:', error);
-            alert('Failed to save: ' + error.message);
+            console.error('Error saving AWS Bedrock credentials:', error);
+            alert('Failed to save credentials: ' + error.message);
         }
         setTimeout(() => setSaveMessage(''), 3000);
     };
 
-    const handleDeleteModelKey = async (provider) => {
-        if (globalThis.confirm(`Delete all keys for "${provider}"?`)) {
+    const handleDeleteBedrockCredentials = async () => {
+        if (globalThis.confirm('Delete AWS Bedrock credentials?')) {
             try {
-                await deleteModelKey(provider);
-                setSaveMessage(`Deleted keys for ${provider}`);
+                await deleteModelKey('AWS Bedrock');
+                setSaveMessage('Deleted AWS Bedrock credentials');
+                setBedrockCredentials({
+                    access_key_id: '',
+                    secret_access_key: '',
+                    session_token: '',
+                    region: 'us-east-1',
+                    description: '',
+                });
+                originalMaskedValues.current = {};
                 await loadModelKeys();
             } catch (error) {
-                console.error('Error deleting model key:', error);
+                console.error('Error deleting AWS Bedrock credentials:', error);
                 alert('Failed to delete: ' + error.message);
             }
             setTimeout(() => setSaveMessage(''), 3000);
@@ -438,25 +406,6 @@ const Settings = () => {
         } catch (error) {
             console.error('Failed to load certificates:', error);
             setCertificates([]);
-        }
-    };
-
-    // API Health check
-    const checkApiHealth = async () => {
-        setApiHealthLoading(true);
-        try {
-            const health = await agentApiClient.getHealth();
-            setApiHealth({
-                status: 'healthy',
-                ...health
-            });
-        } catch (error) {
-            setApiHealth({
-                status: 'error',
-                message: error.message || 'Failed to connect to API'
-            });
-        } finally {
-            setApiHealthLoading(false);
         }
     };
 
@@ -652,7 +601,9 @@ const Settings = () => {
                 icon: llm.icon || '🧠',
                 endpoint: llm.endpoint || '',
                 baseUrl: llm.baseUrl || '',
-                temperature: llm.temperature ?? 0
+                temperature: llm.temperature ?? 0,
+                // Backend exposes both snake_case and camelCase; tolerate either.
+                use_for_embeddings: Boolean(llm.use_for_embeddings ?? llm.useForEmbeddings ?? false),
             });
         } else {
             setEditingLLM(null);
@@ -663,7 +614,8 @@ const Settings = () => {
                 icon: '🧠',
                 endpoint: '',
                 baseUrl: '',
-                temperature: 0
+                temperature: 0,
+                use_for_embeddings: false,
             });
         }
         setOpenLLMDialog(true);
@@ -686,14 +638,22 @@ const Settings = () => {
                 ...(llmFormData.access_key_id && { access_key_id: llmFormData.access_key_id }),
                 ...(llmFormData.secret_access_key && { secret_access_key: llmFormData.secret_access_key }),
                 ...(llmFormData.session_token && { session_token: llmFormData.session_token }),
+                // Always send the embedding flag (true or false) so unchecking
+                // an existing row clears the flag — the server doesn't auto-
+                // unset on an absent field.
+                use_for_embeddings: Boolean(llmFormData.use_for_embeddings),
             };
 
-            const llmName = llmFormData.model;
-
+            // On Add: row name = model string (legacy convention).
+            // On Edit: keep the existing row name — do NOT pass newName, so
+            // updateLLM() leaves the name field alone. Previously the form
+            // re-synced name <- model on every keystroke in the model field
+            // and then handleSaveLLM passed it as newName, silently renaming
+            // the row (and breaking workflows that referenced the old name).
             if (editingLLM) {
-                await updateLLM(editingLLM, llmConfig, llmName);
+                await updateLLM(editingLLM, llmConfig);
             } else {
-                await addLLM(llmName, llmConfig);
+                await addLLM(llmFormData.model, llmConfig);
             }
 
             setSaveMessage(editingLLM ? `Updated LLM: ${llmName}` : `Added new LLM: ${llmName}`);
@@ -721,24 +681,24 @@ const Settings = () => {
         }
     };
 
-    const PROVIDERS = ['OpenAI', 'Groq', 'Anthropic', 'Google', 'Azure OpenAI', 'Ollama', 'Custom'];
+    const PROVIDERS = ['AWS Bedrock'];
 
     const getModelOptions = (provider) => {
         switch (provider) {
-            case 'OpenAI':
-                return ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo', 'o1', 'o1-mini', 'o1-preview'];
-            case 'Groq':
-                return ['llama-3.3-70b-versatile', 'llama-3.1-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768', 'gemma2-9b-it'];
-            case 'Anthropic':
-                return ['claude-sonnet-4-20250514', 'claude-opus-4-20250514', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-opus-20240229'];
-            case 'Google':
-                return ['gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash', 'gemini-1.0-pro'];
-            case 'Azure OpenAI':
-                return ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-35-turbo'];
-            case 'Ollama':
-                return ['llama3.2', 'llama3.1', 'mistral', 'mixtral', 'codellama', 'phi3', 'gemma2'];
-            case 'Custom':
-                return [];
+            case 'AWS Bedrock':
+                return [
+                    'anthropic.claude-3-5-sonnet-20241022-v2:0',
+                    'anthropic.claude-3-5-haiku-20241022-v1:0',
+                    'anthropic.claude-3-opus-20240229-v1:0',
+                    'anthropic.claude-3-sonnet-20240229-v1:0',
+                    'anthropic.claude-3-haiku-20240307-v1:0',
+                    'meta.llama3-1-70b-instruct-v1:0',
+                    'meta.llama3-1-8b-instruct-v1:0',
+                    'amazon.titan-embed-text-v1',
+                    'amazon.titan-embed-text-v2:0',
+                    'cohere.embed-english-v3',
+                    'cohere.embed-multilingual-v3'
+                ];
             default:
                 return [];
         }
@@ -757,62 +717,6 @@ const Settings = () => {
                         {saveMessage}
                     </div>
                 )}
-
-                {/* API Health Check Section */}
-                <Card className="mb-6">
-                    <CardContent className="pt-6">
-                        <div className="flex justify-between items-center mb-4">
-                            <h2 className="text-xl font-medium">API Status</h2>
-                            <Button
-                                variant="outline"
-                                onClick={checkApiHealth}
-                                disabled={apiHealthLoading}
-                            >
-                                {apiHealthLoading ? (
-                                    <>
-                                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                                        Checking...
-                                    </>
-                                ) : (
-                                    <>
-                                        <RefreshCw className="w-4 h-4 mr-2" />
-                                        Check API
-                                    </>
-                                )}
-                            </Button>
-                        </div>
-                        <div className="flex items-center gap-4">
-                            {apiHealth ? (
-                                <>
-                                    {apiHealth.status === 'healthy' ? (
-                                        <Badge variant="default" className="bg-green-600">
-                                            <CheckCircle className="w-3 h-3 mr-1" />
-                                            Connected
-                                        </Badge>
-                                    ) : (
-                                        <Badge variant="destructive">
-                                            <XCircle className="w-3 h-3 mr-1" />
-                                            Error
-                                        </Badge>
-                                    )}
-                                    <p className="text-sm text-muted-foreground">
-                                        {apiHealth.status === 'healthy' ? (
-                                            <>
-                                                Scheduler: {apiHealth.scheduler_running ? 'Running' : 'Stopped'}
-                                            </>
-                                        ) : (
-                                            apiHealth.message
-                                        )}
-                                    </p>
-                                </>
-                            ) : (
-                                <p className="text-sm text-muted-foreground">
-                                    Click "Check API" to verify connection
-                                </p>
-                            )}
-                        </div>
-                    </CardContent>
-                </Card>
 
                 <Card className="mb-6">
                     <CardContent className="pt-6">
@@ -1009,232 +913,296 @@ const Settings = () => {
                     </CardContent>
                 </Card>
 
-                {/* Model Keys Section — configure credentials before adding LLMs */}
+                {/* AWS Bedrock Configuration (Credentials & Models) */}
                 <Card className="mb-6">
-                    <CardContent className="pt-6">
-                        <div className="flex justify-between items-center mb-2">
-                            <div>
-                                <h2 className="text-xl font-medium">Model Keys</h2>
+                    <CardContent className="pt-6 space-y-8">
+                        {/* Section 1: Credentials */}
+                        <div>
+                            <div className="mb-4">
+                                <h2 className="text-xl font-medium text-foreground flex items-center gap-2">
+                                    <span>🌩️</span> AWS Bedrock Credentials
+                                </h2>
                                 <p className="text-sm text-muted-foreground mt-0.5">
-                                    Centralized API key management — configure provider credentials here before adding LLMs
+                                    Configure AWS credentials here before adding Bedrock language models
                                 </p>
                             </div>
-                            <Button onClick={() => handleOpenModelKeyDialog()}>
-                                <Plus className="w-4 h-4 mr-2" />
-                                Add Provider Key
-                            </Button>
-                        </div>
-                        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4 mt-4">
-                            {MODEL_KEY_PROVIDERS.map((provider) => {
-                                const existing = findModelKey(provider.value);
-                                const configured = keyIsConfigured(existing);
-                                return (
-                                    <div
-                                        key={provider.value}
-                                        className={`border rounded-lg p-3 cursor-pointer transition-colors ${configured ? 'border-green-200 bg-green-50/30 hover:bg-green-50' : 'hover:bg-muted/40'}`}
-                                        onClick={() => handleOpenModelKeyDialog(provider.value)}
-                                    >
-                                        <div className="flex items-center justify-between mb-1.5">
-                                            <div className="flex items-center gap-2">
-                                                <span className="text-lg">{provider.icon}</span>
-                                                <span className="font-medium text-sm">{provider.label}</span>
-                                            </div>
-                                            {existing && (
-                                                <Button
-                                                    size="icon"
-                                                    variant="ghost"
-                                                    className="h-6 w-6 text-red-500 hover:text-red-700 shrink-0"
-                                                    onClick={(e) => { e.stopPropagation(); handleDeleteModelKey(provider.value); }}
-                                                    title="Delete"
-                                                >
-                                                    <Trash2 className="w-3 h-3" />
-                                                </Button>
-                                            )}
-                                        </div>
-                                        <div className="flex flex-wrap gap-1">
-                                            {configured ? (
-                                                <>
-                                                    {existing.has_api_key && <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200 gap-1 text-[10px] px-1.5 py-0"><Key className="w-2.5 h-2.5" /> API Key</Badge>}
-                                                    {existing.has_secret_key && <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200 gap-1 text-[10px] px-1.5 py-0"><Shield className="w-2.5 h-2.5" /> Secret</Badge>}
-                                                    {existing.has_access_credentials && <Badge variant="outline" className="bg-orange-50 text-orange-700 border-orange-200 gap-1 text-[10px] px-1.5 py-0"><Cloud className="w-2.5 h-2.5" /> AWS</Badge>}
-                                                    {existing.endpoint && <Badge variant="outline" className="bg-purple-50 text-purple-700 border-purple-200 text-[10px] px-1.5 py-0">Endpoint</Badge>}
-                                                    {existing.region && <Badge variant="outline" className="text-[10px] px-1.5 py-0">{existing.region}</Badge>}
-                                                </>
-                                            ) : (
-                                                <span className="text-xs text-muted-foreground">Click to configure</span>
-                                            )}
+                            
+                            <div className="grid gap-4 md:grid-cols-2 mt-4">
+                                <div className="space-y-4">
+                                    <div className="space-y-2">
+                                        <Label htmlFor="bedrock-region">AWS Region</Label>
+                                        <Input
+                                            id="bedrock-region"
+                                            value={bedrockCredentials.region}
+                                            onChange={(e) => setBedrockCredentials({ ...bedrockCredentials, region: e.target.value })}
+                                            placeholder="us-east-1"
+                                        />
+                                    </div>
+                                    <div className="space-y-2">
+                                        <Label htmlFor="bedrock-access-key">Access Key ID</Label>
+                                        <div className="relative">
+                                            <Input
+                                                id="bedrock-access-key"
+                                                value={bedrockCredentials.access_key_id}
+                                                onChange={(e) => setBedrockCredentials({ ...bedrockCredentials, access_key_id: e.target.value })}
+                                                type={showModelKeyFields.access_key_id ? 'text' : 'password'}
+                                                placeholder="AKIA..."
+                                                className="pr-10"
+                                            />
+                                            <Button
+                                                type="button"
+                                                size="icon"
+                                                variant="ghost"
+                                                onClick={() => setShowModelKeyFields(prev => ({ ...prev, access_key_id: !prev.access_key_id }))}
+                                                className="absolute right-0 top-0 h-full"
+                                            >
+                                                {showModelKeyFields.access_key_id ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                            </Button>
                                         </div>
                                     </div>
-                                );
-                            })}
-                        </div>
-                    </CardContent>
-                </Card>
-
-                {/* LLM Configuration Section */}
-                <Card className="mb-6">
-                    <CardContent className="pt-6">
-                        <div className="flex justify-between items-center mb-4">
-                            <h2 className="text-xl font-medium">Language Models (LLMs)</h2>
-                            <div className="flex gap-2">
-                                <Button variant="outline" onClick={() => {
-                                    setDiscoverProvider('');
-                                    setAWSFormData({ region: 'us-east-1', access_key_id: '', secret_access_key: '', session_token: '' });
-                                    loadModelKeys();
-                                    setDiscoveredModels([]);
-                                    setSelectedModels([]);
-                                    setOpenAWSDialog(true);
-                                }}>
-                                    <RefreshCw className="w-4 h-4 mr-2" />
-                                    Discover Models
-                                </Button>
-                                <Button onClick={() => handleOpenLLMDialog()}>
-                                    <Plus className="w-4 h-4 mr-2" />
-                                    Add LLM
-                                </Button>
-                            </div>
-                        </div>
-
-                        {selectedForDelete.length > 0 && (
-                            <div className="flex items-center gap-3 mt-2 p-2 border rounded-md bg-muted/50">
-                                <span className="text-sm text-muted-foreground">{selectedForDelete.length} selected</span>
-                                <Button
-                                    variant="destructive"
-                                    size="sm"
-                                    onClick={async () => {
-                                        try {
-                                            await bulkDeleteLLMs(selectedForDelete);
-                                            setSaveMessage(`Deleted ${selectedForDelete.length} models`);
-                                            setSelectedForDelete([]);
-                                            await loadLLMConfigs();
-                                            setTimeout(() => setSaveMessage(''), 3000);
-                                        } catch (err) {
-                                            alert('Failed to delete models: ' + err.message);
-                                        }
-                                    }}
-                                >
-                                    <Trash2 className="w-3 h-3 mr-1" />
-                                    Delete Selected
-                                </Button>
-                                <Button variant="ghost" size="sm" onClick={() => setSelectedForDelete([])}>
-                                    Clear
-                                </Button>
-                            </div>
-                        )}
-
-                        <div className="border rounded-lg">
-                            <Table>
-                                <TableHeader>
-                                    <TableRow>
-                                        <TableHead className="w-12">
-                                            <input
-                                                type="checkbox"
-                                                checked={selectedForDelete.length > 0 && selectedForDelete.length === Object.keys(llms).length}
-                                                onChange={() => {
-                                                    setSelectedForDelete(selectedForDelete.length === Object.keys(llms).length ? [] : Object.keys(llms));
-                                                }}
+                                    <div className="space-y-2">
+                                        <Label htmlFor="bedrock-secret-key">Secret Access Key</Label>
+                                        <div className="relative">
+                                            <Input
+                                                id="bedrock-secret-key"
+                                                value={bedrockCredentials.secret_access_key}
+                                                onChange={(e) => setBedrockCredentials({ ...bedrockCredentials, secret_access_key: e.target.value })}
+                                                type={showModelKeyFields.secret_access_key ? 'text' : 'password'}
+                                                placeholder="Enter secret key"
+                                                className="pr-10"
                                             />
-                                        </TableHead>
-                                        <TableHead>Icon</TableHead>
-                                        <TableHead>Name</TableHead>
-                                        <TableHead>Provider</TableHead>
-                                        <TableHead>Model</TableHead>
-                                        <TableHead>Status</TableHead>
-                                        <TableHead className="text-right">Actions</TableHead>
-                                    </TableRow>
-                                </TableHeader>
-                                <TableBody>
-                                    {Object.entries(llms).map(([name, config]) => {
-                                        const status = llmConnectionStatus[name];
-                                        return (
-                                            <TableRow key={name}>
-                                                <TableCell>
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={selectedForDelete.includes(name)}
-                                                        onChange={(e) => {
-                                                            if (e.target.checked) {
-                                                                setSelectedForDelete([...selectedForDelete, name]);
-                                                            } else {
-                                                                setSelectedForDelete(selectedForDelete.filter(n => n !== name));
-                                                            }
-                                                        }}
-                                                    />
-                                                </TableCell>
-                                                <TableCell>{config.icon || '🧠'}</TableCell>
-                                                <TableCell>
-                                                    <span className="text-sm font-medium">{name}</span>
-                                                </TableCell>
-                                                <TableCell>
-                                                    <Badge variant="outline">{config.provider}</Badge>
-                                                </TableCell>
-                                                <TableCell>
-                                                    <code className="text-xs font-mono">{config.model}</code>
-                                                </TableCell>
-                                                <TableCell>
-                                                    {status?.status === 'testing' && (
-                                                        <Badge variant="outline" className="gap-1">
-                                                            <Clock className="w-3 h-3" />
-                                                            Testing...
-                                                        </Badge>
-                                                    )}
-                                                    {status?.status === 'connected' && (
-                                                        <Badge variant="default" className="bg-green-600 gap-1">
-                                                            <CheckCircle className="w-3 h-3" />
-                                                            {status.message}
-                                                        </Badge>
-                                                    )}
-                                                    {status?.status === 'error' && (
-                                                        <Badge variant="destructive" className="gap-1" title={status.message}>
-                                                            <XCircle className="w-3 h-3" />
-                                                            {status.message}
-                                                        </Badge>
-                                                    )}
-                                                    {!status && (
-                                                        <Badge variant="outline">Not tested</Badge>
-                                                    )}
-                                                </TableCell>
-                                                <TableCell className="text-right">
-                                                    <div className="flex justify-end gap-1">
-                                                        <Button
-                                                            size="icon"
-                                                            variant="ghost"
-                                                            onClick={() => testLLMConnection(name, config)}
-                                                            title="Test Connection"
-                                                        >
-                                                            <RefreshCw className="w-4 h-4" />
-                                                        </Button>
-                                                        <Button
-                                                            size="icon"
-                                                            variant="ghost"
-                                                            onClick={() => handleOpenLLMDialog(name)}
-                                                            title="Edit"
-                                                        >
-                                                            <Edit2 className="w-4 h-4" />
-                                                        </Button>
-                                                        <Button
-                                                            size="icon"
-                                                            variant="ghost"
-                                                            onClick={() => handleDeleteLLM(name)}
-                                                            title="Delete"
-                                                            className="text-red-600 hover:text-red-700"
-                                                        >
-                                                            <Trash2 className="w-4 h-4" />
-                                                        </Button>
-                                                    </div>
+                                            <Button
+                                                type="button"
+                                                size="icon"
+                                                variant="ghost"
+                                                onClick={() => setShowModelKeyFields(prev => ({ ...prev, secret_access_key: !prev.secret_access_key }))}
+                                                className="absolute right-0 top-0 h-full"
+                                            >
+                                                {showModelKeyFields.secret_access_key ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                            </Button>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div className="space-y-4 flex flex-col justify-between">
+                                    <div className="space-y-4">
+                                        <div className="space-y-2">
+                                            <Label htmlFor="bedrock-session-token">Session Token <span className="text-muted-foreground">(optional)</span></Label>
+                                            <div className="relative">
+                                                <Input
+                                                    id="bedrock-session-token"
+                                                    value={bedrockCredentials.session_token}
+                                                    onChange={(e) => setBedrockCredentials({ ...bedrockCredentials, session_token: e.target.value })}
+                                                    type={showModelKeyFields.session_token ? 'text' : 'password'}
+                                                    placeholder="For temporary credentials"
+                                                    className="pr-10"
+                                                />
+                                                <Button
+                                                    type="button"
+                                                    size="icon"
+                                                    variant="ghost"
+                                                    onClick={() => setShowModelKeyFields(prev => ({ ...prev, session_token: !prev.session_token }))}
+                                                    className="absolute right-0 top-0 h-full"
+                                                >
+                                                    {showModelKeyFields.session_token ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                                </Button>
+                                            </div>
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label htmlFor="bedrock-description">Description <span className="text-muted-foreground">(optional)</span></Label>
+                                            <Input
+                                                id="bedrock-description"
+                                                value={bedrockCredentials.description}
+                                                onChange={(e) => setBedrockCredentials({ ...bedrockCredentials, description: e.target.value })}
+                                                placeholder="e.g., AWS Bedrock keys"
+                                            />
+                                        </div>
+                                    </div>
+                                    <div className="flex gap-2 pt-2 justify-end">
+                                        {keyIsConfigured(findModelKey('AWS Bedrock')) && (
+                                            <Button variant="outline" className="text-red-600 hover:text-red-700 border-red-200" onClick={handleDeleteBedrockCredentials}>
+                                                <Trash2 className="w-4 h-4 mr-2" />
+                                                Delete Credentials
+                                            </Button>
+                                        )}
+                                        <Button onClick={handleSaveBedrockCredentials}>
+                                            <Shield className="w-4 h-4 mr-2" />
+                                            Save Credentials
+                                        </Button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div className="border-t border-border pt-6">
+                            <div className="flex justify-between items-center mb-4">
+                                <div>
+                                    <h2 className="text-xl font-medium text-foreground flex items-center gap-2">
+                                        <span>🧠</span> AWS Bedrock Models (LLMs)
+                                    </h2>
+                                    <p className="text-sm text-muted-foreground mt-0.5">
+                                        Manage your configured Bedrock language models for workflows
+                                    </p>
+                                </div>
+                                <div className="flex gap-2">
+                                    <Button variant="outline" onClick={() => {
+                                        setDiscoverProvider('AWS Bedrock');
+                                        loadModelKeys();
+                                        setDiscoveredModels([]);
+                                        setSelectedModels([]);
+                                        setOpenAWSDialog(true);
+                                    }}>
+                                        <RefreshCw className="w-4 h-4 mr-2" />
+                                        Discover Models
+                                    </Button>
+                                    <Button onClick={() => handleOpenLLMDialog()}>
+                                        <Plus className="w-4 h-4 mr-2" />
+                                        Add Bedrock Model
+                                    </Button>
+                                </div>
+                            </div>
+
+                            {selectedForDelete.length > 0 && (
+                                <div className="flex items-center gap-3 mt-2 p-2 border rounded-md bg-muted/50 mb-4">
+                                    <span className="text-sm text-muted-foreground">{selectedForDelete.length} selected</span>
+                                    <Button
+                                        variant="destructive"
+                                        size="sm"
+                                        onClick={async () => {
+                                            try {
+                                                await bulkDeleteLLMs(selectedForDelete);
+                                                setSaveMessage(`Deleted ${selectedForDelete.length} models`);
+                                                setSelectedForDelete([]);
+                                                await loadLLMConfigs();
+                                                setTimeout(() => setSaveMessage(''), 3000);
+                                            } catch (err) {
+                                                alert('Failed to delete models: ' + err.message);
+                                            }
+                                        }}
+                                    >
+                                        <Trash2 className="w-3 h-3 mr-1" />
+                                        Delete Selected
+                                    </Button>
+                                    <Button variant="ghost" size="sm" onClick={() => setSelectedForDelete([])}>
+                                        Clear
+                                    </Button>
+                                </div>
+                            )}
+
+                            <div className="border rounded-lg">
+                                <Table>
+                                    <TableHeader>
+                                        <TableRow>
+                                            <TableHead className="w-12">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={selectedForDelete.length > 0 && selectedForDelete.length === Object.keys(llms).length}
+                                                    onChange={() => {
+                                                        setSelectedForDelete(selectedForDelete.length === Object.keys(llms).length ? [] : Object.keys(llms));
+                                                    }}
+                                                />
+                                            </TableHead>
+                                            <TableHead>Icon</TableHead>
+                                            <TableHead>Name</TableHead>
+                                            <TableHead>Provider</TableHead>
+                                            <TableHead>Model</TableHead>
+                                            <TableHead>Status</TableHead>
+                                            <TableHead className="text-right">Actions</TableHead>
+                                        </TableRow>
+                                    </TableHeader>
+                                    <TableBody>
+                                        {Object.entries(llms).map(([name, config]) => {
+                                            const status = llmConnectionStatus[name];
+                                            return (
+                                                <TableRow key={name}>
+                                                    <TableCell>
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={selectedForDelete.includes(name)}
+                                                            onChange={(e) => {
+                                                                if (e.target.checked) {
+                                                                    setSelectedForDelete([...selectedForDelete, name]);
+                                                                } else {
+                                                                    setSelectedForDelete(selectedForDelete.filter(n => n !== name));
+                                                                }
+                                                            }}
+                                                        />
+                                                    </TableCell>
+                                                    <TableCell>{config.icon || '🧠'}</TableCell>
+                                                    <TableCell>
+                                                        <span className="text-sm font-medium">{name}</span>
+                                                    </TableCell>
+                                                    <TableCell>
+                                                        <Badge variant="outline">{config.provider}</Badge>
+                                                    </TableCell>
+                                                    <TableCell>
+                                                        <code className="text-xs font-mono">{config.model}</code>
+                                                    </TableCell>
+                                                    <TableCell>
+                                                        {status?.status === 'testing' && (
+                                                            <Badge variant="outline" className="gap-1">
+                                                                <Clock className="w-3 h-3" />
+                                                                Testing...
+                                                            </Badge>
+                                                        )}
+                                                        {status?.status === 'connected' && (
+                                                            <Badge variant="default" className="bg-green-600 gap-1">
+                                                                <CheckCircle className="w-3 h-3" />
+                                                                {status.message}
+                                                            </Badge>
+                                                        )}
+                                                        {status?.status === 'error' && (
+                                                            <Badge variant="destructive" className="gap-1" title={status.message}>
+                                                                <XCircle className="w-3 h-3" />
+                                                                {status.message}
+                                                            </Badge>
+                                                        )}
+                                                        {!status && (
+                                                            <Badge variant="outline">Not tested</Badge>
+                                                        )}
+                                                    </TableCell>
+                                                    <TableCell className="text-right">
+                                                        <div className="flex justify-end gap-1">
+                                                            <Button
+                                                                size="icon"
+                                                                variant="ghost"
+                                                                onClick={() => testLLMConnection(name, config)}
+                                                                title="Test Connection"
+                                                            >
+                                                                <RefreshCw className="w-4 h-4" />
+                                                            </Button>
+                                                            <Button
+                                                                size="icon"
+                                                                variant="ghost"
+                                                                onClick={() => handleOpenLLMDialog(name)}
+                                                                title="Edit"
+                                                            >
+                                                                <Edit2 className="w-4 h-4" />
+                                                            </Button>
+                                                            <Button
+                                                                size="icon"
+                                                                variant="ghost"
+                                                                onClick={() => handleDeleteLLM(name)}
+                                                                title="Delete"
+                                                                className="text-red-600 hover:text-red-700"
+                                                            >
+                                                                <Trash2 className="w-4 h-4" />
+                                                            </Button>
+                                                        </div>
+                                                    </TableCell>
+                                                </TableRow>
+                                            );
+                                        })}
+                                        {Object.keys(llms).length === 0 && (
+                                            <TableRow>
+                                                <TableCell colSpan={7} className="text-center py-6 text-muted-foreground">
+                                                    No LLMs configured. Click "Add Bedrock Model" to get started.
                                                 </TableCell>
                                             </TableRow>
-                                        );
-                                    })}
-                                    {Object.keys(llms).length === 0 && (
-                                        <TableRow>
-                                            <TableCell colSpan={7} className="text-center py-6 text-muted-foreground">
-                                                No LLMs configured. Click "Add LLM" to get started.
-                                            </TableCell>
-                                        </TableRow>
-                                    )}
-                                </TableBody>
-                            </Table>
+                                        )}
+                                    </TableBody>
+                                </Table>
+                            </div>
                         </div>
                     </CardContent>
                 </Card>
@@ -1403,7 +1371,7 @@ const Settings = () => {
                     <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
                         <DialogHeader>
                             <DialogTitle>
-                                {editingLLM ? `Edit LLM: ${llmFormData.model || editingLLM}` : 'Add New LLM'}
+                                {editingLLM ? `Edit Bedrock Model: ${llmFormData.model || editingLLM}` : 'Add New AWS Bedrock Model'}
                             </DialogTitle>
                         </DialogHeader>
                         <div className="flex flex-col gap-4 mt-4">
@@ -1431,80 +1399,39 @@ const Settings = () => {
 
                             <div className="space-y-2">
                                 <Label htmlFor="llm-provider">Provider</Label>
-                                <select
+                                <Input
                                     id="llm-provider"
-                                    value={llmFormData.provider}
-                                    onChange={(e) => setLLMFormData({
-                                        ...llmFormData,
-                                        provider: e.target.value,
-                                        model: '' // Reset model when provider changes
-                                    })}
-                                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                                >
-                                    {PROVIDERS.map(provider => (
-                                        <option key={provider} value={provider}>{provider}</option>
-                                    ))}
-                                </select>
+                                    value="AWS Bedrock"
+                                    disabled
+                                    className="bg-muted text-muted-foreground"
+                                />
                             </div>
 
                             <div className="space-y-2">
-                                <Label htmlFor="llm-model">Model</Label>
+                                <Label htmlFor="llm-model">Model ID</Label>
                                 <Input
                                     id="llm-model"
                                     value={llmFormData.model}
                                     onChange={(e) => {
                                         const newValue = e.target.value;
-                                        setLLMFormData({ ...llmFormData, model: newValue, name: newValue });
+                                        setLLMFormData(prev => ({
+                                            ...prev,
+                                            model: newValue,
+                                            ...(editingLLM ? {} : { name: newValue }),
+                                        }));
                                     }}
-                                    placeholder={(() => {
-                                        if (llmFormData.provider === 'Ollama') return 'e.g., llama3.2:latest';
-                                        if (llmFormData.provider === 'Custom') return 'Enter custom model name';
-                                        return 'Select or type model name';
-                                    })()}
-                                    list={llmFormData.provider === 'Custom' ? undefined : 'model-suggestions'}
+                                    placeholder="Select or type Bedrock model ID"
+                                    list="model-suggestions"
                                 />
-                                {llmFormData.provider !== 'Custom' && (
-                                    <datalist id="model-suggestions">
-                                        {getModelOptions(llmFormData.provider).map(model => (
-                                            <option key={model} value={model} />
-                                        ))}
-                                    </datalist>
-                                )}
+                                <datalist id="model-suggestions">
+                                    {getModelOptions('AWS Bedrock').map(model => (
+                                        <option key={model} value={model} />
+                                    ))}
+                                </datalist>
                                 <p className="text-sm text-muted-foreground">
-                                    {llmFormData.provider === 'Custom' 
-                                        ? 'Enter the model identifier'
-                                        : 'Select from suggestions or type a custom model name'}
+                                    Select from suggestions or type a custom Bedrock model identifier (e.g., anthropic.claude-3-5-sonnet-20241022-v2:0)
                                 </p>
                             </div>
-
-                            {llmFormData.provider === 'Azure OpenAI' && (
-                                <div className="space-y-2">
-                                    <Label htmlFor="llm-endpoint">Endpoint URL</Label>
-                                    <Input
-                                        id="llm-endpoint"
-                                        value={llmFormData.endpoint || ''}
-                                        onChange={(e) => setLLMFormData({ ...llmFormData, endpoint: e.target.value })}
-                                        placeholder="https://your-resource.openai.azure.com"
-                                    />
-                                    <p className="text-sm text-muted-foreground">
-                                        Your Azure OpenAI endpoint URL
-                                    </p>
-                                </div>
-                            )}
-
-                            {llmFormData.provider === 'Ollama' && (
-                                <div className="space-y-2">
-                                    <Label htmlFor="llm-baseUrl">Base URL</Label>
-                                    <Input
-                                        id="llm-baseUrl"
-                                        value={llmFormData.baseUrl || 'http://localhost:11434'}
-                                        onChange={(e) => setLLMFormData({ ...llmFormData, baseUrl: e.target.value })}
-                                    />
-                                    <p className="text-sm text-muted-foreground">
-                                        Ollama server URL (default: http://localhost:11434)
-                                    </p>
-                                </div>
-                            )}
 
                             {/* Temperature Setting */}
                             {isReasoningModel(llmFormData.model) ? (
@@ -1512,7 +1439,7 @@ const Settings = () => {
                                     <Info className="w-4 h-4 mt-0.5" />
                                     <div>
                                         <p className="text-sm">
-                                            Reasoning models (o1, o3, o4-mini, etc.) do not support temperature settings.
+                                            Reasoning models do not support temperature settings.
                                         </p>
                                     </div>
                                 </Alert>
@@ -1537,8 +1464,8 @@ const Settings = () => {
                                 </div>
                             )}
 
-                            {/* AWS / provider credentials — sourced from Model Keys */}
-                            {(llmFormData.provider === 'AWS Bedrock' || llmFormData.provider === 'Bedrock' || llmFormData.provider === 'bedrock') && (() => {
+                            {/* AWS credentials info Box — sourced from Model Keys */}
+                            {(() => {
                                 const mk = findModelKey('AWS Bedrock');
                                 const hasCreds = mk && (mk.has_access_credentials || mk.has_api_key);
                                 return (
@@ -1549,7 +1476,7 @@ const Settings = () => {
                                                 <div>
                                                     <p className="text-sm font-medium text-green-800">AWS credentials configured</p>
                                                     <p className="text-xs text-green-700 mt-0.5">
-                                                        Using credentials from Model Keys{mk.region ? ` · Region: ${mk.region}` : ''}
+                                                        Using credentials from AWS Bedrock Credentials{mk.region ? ` · Region: ${mk.region}` : ''}
                                                     </p>
                                                 </div>
                                             </>
@@ -1559,7 +1486,7 @@ const Settings = () => {
                                                 <div>
                                                     <p className="text-sm font-medium text-amber-800">No AWS credentials found</p>
                                                     <p className="text-xs text-amber-700 mt-0.5">
-                                                        Go to <strong>Model Keys → AWS Bedrock</strong> above to configure credentials
+                                                        Go to <strong>AWS Bedrock Credentials</strong> section above to configure credentials
                                                     </p>
                                                 </div>
                                             </>
@@ -1567,33 +1494,56 @@ const Settings = () => {
                                     </div>
                                 );
                             })()}
-                            {(llmFormData.provider === 'OpenAI' || llmFormData.provider === 'Anthropic' || llmFormData.provider === 'Google' || llmFormData.provider === 'Groq') && (() => {
-                                const mk = findModelKey(llmFormData.provider);
-                                const hasCreds = mk && mk.has_api_key;
-                                return (
-                                    <div className={`rounded-md border p-3 flex items-start gap-3 ${hasCreds ? 'border-green-200 bg-green-50/40' : 'border-amber-200 bg-amber-50/40'}`}>
-                                        {hasCreds ? (
-                                            <>
-                                                <CheckCircle className="w-4 h-4 text-green-600 mt-0.5 shrink-0" />
-                                                <div>
-                                                    <p className="text-sm font-medium text-green-800">API key configured</p>
-                                                    <p className="text-xs text-green-700 mt-0.5">Using API key from Model Keys</p>
-                                                </div>
-                                            </>
-                                        ) : (
-                                            <>
-                                                <XCircle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
-                                                <div>
-                                                    <p className="text-sm font-medium text-amber-800">No API key found</p>
-                                                    <p className="text-xs text-amber-700 mt-0.5">
-                                                        Go to <strong>Model Keys → {llmFormData.provider}</strong> above to configure
-                                                    </p>
-                                                </div>
-                                            </>
-                                        )}
+
+                            {/* Use-for-embeddings flag */}
+                            <div className="rounded-md border p-3 bg-muted/30">
+                                <label className="flex items-start gap-3 cursor-pointer">
+                                    <input
+                                        type="checkbox"
+                                        className="mt-1"
+                                        checked={!!llmFormData.use_for_embeddings}
+                                        onChange={(e) => setLLMFormData({
+                                            ...llmFormData,
+                                            use_for_embeddings: e.target.checked,
+                                        })}
+                                    />
+                                    <div>
+                                        <p className="text-sm font-medium">Use for embeddings</p>
+                                        <p className="text-xs text-muted-foreground mt-0.5">
+                                            Pick this model for vector embeddings (code indexer, semantic search).
+                                            Only one row can be flagged at a time — saving here will unset any other.
+                                        </p>
                                     </div>
-                                );
-                            })()}
+                                </label>
+                            </div>
+
+                            {/* Data leaves container warning */}
+                            {llmFormData.use_for_embeddings && (
+                                <div
+                                    className="rounded-md border border-amber-300 bg-amber-50 p-3"
+                                    role="alert"
+                                    aria-live="polite"
+                                >
+                                    <div className="flex items-start gap-3">
+                                        <span aria-hidden="true" className="text-amber-700 text-base leading-none">
+                                            ⚠
+                                        </span>
+                                        <div>
+                                            <p className="text-sm font-medium text-amber-900">
+                                                Data leaves the container during indexing
+                                            </p>
+                                            <p className="text-xs text-amber-800 mt-1">
+                                                Embedding calls flow to <strong>AWS Bedrock</strong>. Tree-sitter
+                                                chunks (function bodies, signatures, docstrings) are sent to the
+                                                model for vector generation. Other layers — SCIP, trigram, BM25
+                                                and the 7-stage reranker — run entirely inside the container.
+                                                Confirm this is acceptable for your KYC compliance posture before
+                                                enabling.
+                                            </p>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
                         </div>
                         <DialogFooter className="mt-6">
                             <Button variant="outline" onClick={handleCloseLLMDialog}>Cancel</Button>
@@ -1614,48 +1564,28 @@ const Settings = () => {
                 }}>
                     <DialogContent className="sm:max-w-[600px] max-h-[80vh]">
                         <DialogHeader>
-                            <DialogTitle>Discover Models</DialogTitle>
+                            <DialogTitle>Discover AWS Bedrock Models</DialogTitle>
                         </DialogHeader>
                         {discoveredModels.length === 0 ? (
                             <div className="flex flex-col gap-4 mt-4">
-                                <div className="space-y-2">
-                                    <Label htmlFor="discover-provider-select">Provider Configuration</Label>
-                                    <select
-                                        id="discover-provider-select"
-                                        value={discoverProvider}
-                                        onChange={(e) => setDiscoverProvider(e.target.value)}
-                                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                                    >
-                                        <option value="">-- Select a configured provider --</option>
-                                        {discoverableProviders.map(p => (
-                                            <option key={p.provider} value={p.provider}>
-                                                {p.icon} {p.label}{p.region ? ` (${p.region})` : ''}{p.endpoint ? ` - ${p.endpoint}` : ''}
-                                            </option>
-                                        ))}
-                                    </select>
-                                    <p className="text-xs text-muted-foreground">
-                                        Select a provider with credentials configured in Model Keys
+                                <div className="space-y-2 bg-muted/30 p-4 rounded-lg border border-border">
+                                    <div className="flex items-center gap-2 font-medium text-sm text-foreground">
+                                        🌩️ AWS Bedrock Model Discovery
+                                    </div>
+                                    <p className="text-xs text-muted-foreground mt-1">
+                                        Querying AWS Bedrock to list all active foundation models in your configured region.
                                     </p>
+                                    {discoverableProviders.length > 0 ? (
+                                        <div className="mt-3 text-xs text-green-700 bg-green-50/50 border border-green-200 rounded px-2.5 py-1.5 flex items-center gap-1.5 w-fit">
+                                            <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                                            Using configured credentials (Region: {discoverableProviders[0].region || 'us-east-1'})
+                                        </div>
+                                    ) : (
+                                        <div className="mt-3 text-xs text-amber-700 bg-amber-50/50 border border-amber-200 rounded px-2.5 py-1.5">
+                                            ⚠️ No AWS credentials saved. Please configure credentials in the AWS Bedrock Credentials section first.
+                                        </div>
+                                    )}
                                 </div>
-
-                                {discoverableProviders.length === 0 && (
-                                    <div className="rounded-md border bg-yellow-50 border-yellow-200 p-3 text-sm text-yellow-800">
-                                        No providers configured. Go to Model Keys section below to configure API credentials first.
-                                    </div>
-                                )}
-
-                                {discoverProvider && (
-                                    <div className="rounded-md border bg-muted/50 p-3 text-sm text-muted-foreground">
-                                        {(() => {
-                                            const cfg = discoverableProviders.find(p => p.provider === discoverProvider);
-                                            if (!cfg) return 'Provider not found.';
-                                            const parts = [`Using ${cfg.label} credentials from Model Keys.`];
-                                            if (cfg.region) parts.push(`Region: ${cfg.region}`);
-                                            if (cfg.endpoint) parts.push(`Endpoint: ${cfg.endpoint}`);
-                                            return parts.join(' ');
-                                        })()}
-                                    </div>
-                                )}
                             </div>
                         ) : (
                             <div className="flex flex-col gap-3 mt-4">
@@ -1691,11 +1621,11 @@ const Settings = () => {
                                                             checked={selectedModels.includes(model.name)}
                                                             disabled={model.already_exists}
                                                             onChange={(e) => {
-                                                                if (e.target.checked) {
-                                                                    setSelectedModels([...selectedModels, model.name]);
-                                                                } else {
-                                                                    setSelectedModels(selectedModels.filter(n => n !== model.name));
-                                                                }
+                                                                 if (e.target.checked) {
+                                                                     setSelectedModels([...selectedModels, model.name]);
+                                                                 } else {
+                                                                     setSelectedModels(selectedModels.filter(n => n !== model.name));
+                                                                 }
                                                             }}
                                                         />
                                                     </TableCell>
@@ -1746,7 +1676,7 @@ const Settings = () => {
                                             setAwsDiscovering(false);
                                         }
                                     }}
-                                    disabled={awsDiscovering || !discoverProvider}
+                                    disabled={awsDiscovering || discoverableProviders.length === 0}
                                 >
                                     {awsDiscovering ? (
                                         <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Discovering...</>
@@ -1789,193 +1719,7 @@ const Settings = () => {
                     </DialogContent>
                 </Dialog>
 
-                {/* Add/Edit Model Key Dialog */}
-                <Dialog open={openModelKeyDialog} onOpenChange={(open) => !open && handleCloseModelKeyDialog()}>
-                    <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
-                        <DialogHeader>
-                            <DialogTitle>
-                                {editingModelKeyProvider ? `Edit Keys: ${editingModelKeyProvider}` : 'Configure Provider Keys'}
-                            </DialogTitle>
-                        </DialogHeader>
-                        <div className="flex flex-col gap-4 mt-4">
-                            {!editingModelKeyProvider && (
-                                <div className="space-y-2">
-                                    <Label htmlFor="mk-provider-select">Provider</Label>
-                                    <select
-                                        id="mk-provider-select"
-                                        value={modelKeyFormData.provider}
-                                        onChange={(e) => setModelKeyFormData(emptyModelKeyForm(e.target.value))}
-                                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                                    >
-                                        {MODEL_KEY_PROVIDERS.map(p => (
-                                            <option key={p.value} value={p.value}>{p.icon} {p.label}</option>
-                                        ))}
-                                    </select>
-                                </div>
-                            )}
-
-                            {modelKeyFormData.provider && (() => {
-                                const providerCfg = MODEL_KEY_PROVIDERS.find(p => p.value === modelKeyFormData.provider);
-                                if (!providerCfg) return null;
-                                return providerCfg.fields.map(field => {
-                                    if (field === 'api_key') {
-                                        return (
-                                            <div key={field} className="space-y-2">
-                                                <Label htmlFor="mk-api-key">API Key</Label>
-                                                <div className="relative">
-                                                    <Input
-                                                        id="mk-api-key"
-                                                        value={modelKeyFormData.api_key}
-                                                        onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, api_key: e.target.value })}
-                                                        type={showModelKeyFields.api_key ? 'text' : 'password'}
-                                                        placeholder={modelKeyFormData.provider === 'OpenAI' ? 'sk-...' : modelKeyFormData.provider === 'Anthropic' ? 'sk-ant-...' : 'Enter API key'}
-                                                        className="pr-10"
-                                                    />
-                                                    <Button
-                                                        type="button"
-                                                        size="icon"
-                                                        variant="ghost"
-                                                        onClick={() => setShowModelKeyFields(prev => ({ ...prev, api_key: !prev.api_key }))}
-                                                        className="absolute right-0 top-0 h-full"
-                                                    >
-                                                        {showModelKeyFields.api_key ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                                                    </Button>
-                                                </div>
-                                                {editingModelKeyProvider && (
-                                                    <p className="text-xs text-muted-foreground">Clear or change to update; leave as-is to keep existing</p>
-                                                )}
-                                            </div>
-                                        );
-                                    }
-                                    if (field === 'secret_key') {
-                                        return (
-                                            <div key={field} className="space-y-2">
-                                                <Label htmlFor="mk-secret-key">Secret Key</Label>
-                                                <div className="relative">
-                                                    <Input
-                                                        id="mk-secret-key"
-                                                        value={modelKeyFormData.secret_key}
-                                                        onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, secret_key: e.target.value })}
-                                                        type={showModelKeyFields.secret_key ? 'text' : 'password'}
-                                                        placeholder="Enter secret key"
-                                                        className="pr-10"
-                                                    />
-                                                    <Button
-                                                        type="button"
-                                                        size="icon"
-                                                        variant="ghost"
-                                                        onClick={() => setShowModelKeyFields(prev => ({ ...prev, secret_key: !prev.secret_key }))}
-                                                        className="absolute right-0 top-0 h-full"
-                                                    >
-                                                        {showModelKeyFields.secret_key ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                                                    </Button>
-                                                </div>
-                                                {editingModelKeyProvider && (
-                                                    <p className="text-xs text-muted-foreground">Clear or change to update; leave as-is to keep existing</p>
-                                                )}
-                                            </div>
-                                        );
-                                    }
-                                    if (field === 'endpoint') {
-                                        return (
-                                            <div key={field} className="space-y-2">
-                                                <Label htmlFor="mk-endpoint">
-                                                    {modelKeyFormData.provider === 'Ollama' ? 'Base URL' : 'Endpoint URL'}
-                                                </Label>
-                                                <Input
-                                                    id="mk-endpoint"
-                                                    value={modelKeyFormData.endpoint}
-                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, endpoint: e.target.value })}
-                                                    placeholder={modelKeyFormData.provider === 'Ollama' ? 'http://localhost:11434' : 'https://...'}
-                                                />
-                                            </div>
-                                        );
-                                    }
-                                    if (field === 'region') {
-                                        return (
-                                            <div key={field} className="space-y-2">
-                                                <Label htmlFor="mk-region">AWS Region</Label>
-                                                <Input
-                                                    id="mk-region"
-                                                    value={modelKeyFormData.region}
-                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, region: e.target.value })}
-                                                    placeholder="us-east-1"
-                                                />
-                                            </div>
-                                        );
-                                    }
-                                    if (field === 'access_key_id') {
-                                        return (
-                                            <div key={field} className="space-y-2">
-                                                <Label htmlFor="mk-aws-access-key">Access Key ID</Label>
-                                                <Input
-                                                    id="mk-aws-access-key"
-                                                    type="password"
-                                                    value={modelKeyFormData.access_key_id}
-                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, access_key_id: e.target.value })}
-                                                    placeholder="AKIA..."
-                                                />
-                                            </div>
-                                        );
-                                    }
-                                    if (field === 'secret_access_key') {
-                                        return (
-                                            <div key={field} className="space-y-2">
-                                                <Label htmlFor="mk-aws-secret-key">Secret Access Key</Label>
-                                                <Input
-                                                    id="mk-aws-secret-key"
-                                                    type="password"
-                                                    value={modelKeyFormData.secret_access_key}
-                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, secret_access_key: e.target.value })}
-                                                    placeholder="Secret key"
-                                                />
-                                            </div>
-                                        );
-                                    }
-                                    if (field === 'session_token') {
-                                        return (
-                                            <div key={field} className="space-y-2">
-                                                <Label htmlFor="mk-aws-session-token">Session Token <span className="text-muted-foreground">(optional)</span></Label>
-                                                <Input
-                                                    id="mk-aws-session-token"
-                                                    type="password"
-                                                    value={modelKeyFormData.session_token}
-                                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, session_token: e.target.value })}
-                                                    placeholder="For temporary credentials"
-                                                />
-                                            </div>
-                                        );
-                                    }
-                                    return null;
-                                });
-                            })()}
-
-                            <div className="space-y-2">
-                                <Label htmlFor="mk-description">Description <span className="text-muted-foreground">(optional)</span></Label>
-                                <Input
-                                    id="mk-description"
-                                    value={modelKeyFormData.description}
-                                    onChange={(e) => setModelKeyFormData({ ...modelKeyFormData, description: e.target.value })}
-                                    placeholder="e.g., Production OpenAI key"
-                                />
-                            </div>
-
-                            <div className="rounded-md border bg-muted/50 p-3 text-sm text-muted-foreground">
-                                <div className="flex items-center gap-2 mb-1">
-                                    <Shield className="w-4 h-4" />
-                                    <span className="font-medium">Secure Storage</span>
-                                </div>
-                                Keys are stored in the database and masked when retrieved.
-                            </div>
-                        </div>
-                        <DialogFooter className="mt-6">
-                            <Button variant="outline" onClick={handleCloseModelKeyDialog}>Cancel</Button>
-                            <Button onClick={handleSaveModelKey}>
-                                {editingModelKeyProvider ? 'Update' : 'Save'}
-                            </Button>
-                        </DialogFooter>
-                    </DialogContent>
-                </Dialog>
+                {/* Dialog for model key is removed since it is now configured inline */}
 
             </div>
         </div>

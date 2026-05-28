@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,6 +74,9 @@ class AutoLearnConfig:
 
     # Whether to attempt skill distillation.
     distill_skills: bool = os.getenv("AUTO_LEARN_DISTILL_SKILLS", "true").lower() != "false"
+
+    # Whether to attempt dynamic node code generation.
+    compile_dynamic_nodes: bool = os.getenv("AUTO_LEARN_COMPILE_NODES", "true").lower() != "false"
 
     # Confidence delta added per occurrence.
     confidence_delta: float = 0.10
@@ -153,6 +157,7 @@ class AutoLearnResult:
     pattern_bumped: bool = False
     trajectory_saved: bool = False
     skill_distilled: bool = False
+    dynamic_node_compiled: bool = False
     skipped_reason: Optional[str] = None   # set when learning was skipped
     error: Optional[str] = None
 
@@ -268,6 +273,16 @@ class AutoLearnService:
             and len(tool_calls) >= self._cfg.min_tool_calls_for_skill
         ):
             result.skill_distilled = await self._distill_skill(execution_id, state)
+
+        # ── 5. Dynamic Node Compilation ───────────────────────────────────────
+        if (
+            self._cfg.compile_dynamic_nodes
+            and self._llm is not None
+            and len(tool_calls) >= self._cfg.min_tool_calls_for_skill
+        ):
+            user_query = state.get("user_query") or state.get("trigger") or ""
+            if any(kw in user_query.lower() for kw in ("parse", "extract", "hex", "regex", "map", "resolve")):
+                result.dynamic_node_compiled = await self._distill_dynamic_node(execution_id, state)
 
         return result
 
@@ -421,6 +436,66 @@ class AutoLearnService:
             return False
         except Exception as exc:
             logger.warning("auto_learn: skill distillation failed — %s", exc)
+            return False
+
+    async def _distill_dynamic_node(
+        self,
+        execution_id: str,
+        state: Dict[str, Any],
+    ) -> bool:
+        """Use LLM to distill incident logs into a dynamically compiled python GraphNode class."""
+        if self._llm is None:
+            return False
+
+        try:
+            from app.workflow.dynamic_loader import DynamicNodeCompiler
+            from langchain_core.messages import SystemMessage, HumanMessage
+
+            # 1. Ask the LLM to output a standalone Python GraphNode class following our exact structure
+            _COMPILER_SYSTEM_PROMPT = """\
+You are an advanced self-programming compiler agent for an on-call response system.
+Your job is to translate a completed incident investigation trajectory into a standalone, safe, and optimized Python class inheriting from GraphNode.
+
+The class MUST:
+1. Be named <SnakeCaseConverted>Node (e.g., if node name is 'log_parser', class is 'LogParserNode').
+2. Inherit from `app.engine.crawler_engine.workflow_graph.GraphNode`.
+3. Implement the `async def exec(self, prep_result: Any) -> Any` method.
+4. Implement optional `async def prep(self, shared: Dict[str, Any]) -> Any` and `async def post(self, shared: Dict[str, Any], exec_result: Any) -> str`.
+5. Strictly adhere to safety guidelines:
+   - NO imports of `os`, `sys`, `subprocess`, `socket`, `shutil`, `importlib`, `pty` or `ctypes`.
+   - NO dynamic code evaluation (`eval`, `exec`, `__import__`).
+   - NO raw file system writes or network socket calls.
+   - Use standard library safe imports like `re`, `json`, `datetime` or `urllib.parse`.
+
+Output ONLY the exact Python code within ```python ``` blocks. Do not add markdown explanation, notes, or preamble outside the code fences."""
+
+            user_query = state.get("user_query") or state.get("trigger") or ""
+            root_cause = state.get("root_cause") or state.get("final_answer") or ""
+
+            prompt_msg = f"""\
+Generate a custom GraphNode subclass named 'log_parser' to automate the parsing of this incident query.
+Incident Query: {user_query}
+Root cause: {root_cause}
+Logs gathered in tool calls: {json.dumps(state.get("tool_calls", []))}
+"""
+
+            response = await self._llm.ainvoke([
+                SystemMessage(content=_COMPILER_SYSTEM_PROMPT),
+                HumanMessage(content=prompt_msg),
+            ])
+            raw = response.content if hasattr(response, "content") else str(response)
+
+            # Strip markdown fences
+            raw = re.sub(r"^```(?:python)?\s*", "", raw.strip(), flags=re.MULTILINE)
+            raw = re.sub(r"\s*```$", "", raw.strip(), flags=re.MULTILINE)
+
+            # 2. Compile and Register via DynamicNodeCompiler
+            compiler = DynamicNodeCompiler()
+            compiler.compile_and_register(node_name="log_parser", code_content=raw)
+            return True
+
+        except Exception as exc:
+            logger.warning("auto_learn: dynamic node compilation failed — %s", exc)
             return False
 
 

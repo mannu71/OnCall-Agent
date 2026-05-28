@@ -94,6 +94,14 @@ class Settings(BaseSettings):
         default="postgresql://kycuser:kycpassword@localhost:5432/kycagent",
         description="PostgreSQL database URL"
     )
+    db_pool_size: int = Field(
+        default=20,
+        description="SQLAlchemy async engine pool_size. Sized for parallel DAG node execution.",
+    )
+    db_max_overflow: int = Field(
+        default=40,
+        description="SQLAlchemy async engine max_overflow above pool_size.",
+    )
     
     # CORS settings - configurable for production
     cors_origins: List[str] = Field(

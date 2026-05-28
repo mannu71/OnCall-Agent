@@ -103,7 +103,11 @@ class SupervisorConfig:
     """
 
     # Score >= this → PASS immediately.
-    pass_threshold: float = float(os.getenv("SUPERVISOR_PASS_THRESHOLD", "0.72"))
+    # Lowered from 0.72 → 0.60 for token efficiency: most well-formed answers
+    # score in the 0.60–0.72 band; sending them through a supervisor retry
+    # doubles input-token cost for marginal quality gain. Override per-env via
+    # SUPERVISOR_PASS_THRESHOLD to restore strict mode.
+    pass_threshold: float = float(os.getenv("SUPERVISOR_PASS_THRESHOLD", "0.60"))
 
     # Score >= this (but < pass_threshold) → HITL when hitl_enabled=True.
     hitl_threshold: float = float(os.getenv("SUPERVISOR_HITL_THRESHOLD", "0.50"))

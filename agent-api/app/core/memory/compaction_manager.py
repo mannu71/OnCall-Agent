@@ -6,8 +6,9 @@ Responsibilities
 1. Track accumulated messages per session.
 2. Call ``compact()`` when the estimated token count approaches the context
    window budget.
-3. Persist the StructuredSummary in memory (keyed by session_id) so it
-   survives across multiple compaction rounds.
+3. Persist the StructuredSummary to the Postgres ``memory_summaries`` table
+   so it survives container restarts (with an in-process LRU fallback when
+   the database is unavailable — typical in unit tests).
 
 Note on naming
 --------------
@@ -18,14 +19,6 @@ two managers solve different problems:
 
   * MemoryManager (manager.py)            — persistent agent knowledge providers
   * ContextCompactionManager (this file)  — bounded context window via compaction
-
-TODO (persistent storage)
---------------------------
-The current implementation stores summaries in an in-process dict.  This
-means summaries are lost on server restart.  For production use, serialise
-the StructuredSummary (via ``.to_dict()``) and persist it to the database
-table of your choice (e.g. a ``memory_summaries`` table keyed by
-``session_id``).  Restore on first access by looking up the session_id.
 """
 from __future__ import annotations
 
@@ -42,8 +35,74 @@ from app.core.memory.compaction import (
 
 logger = logging.getLogger(__name__)
 
-# In-memory store: session_id -> StructuredSummary
+# In-process fallback store — used when Postgres is unreachable (CI / tests)
+# so the compaction code path doesn't crash. Production reads/writes go to
+# the ``memory_summaries`` table created in Task #2 DDL.
 _summary_store: Dict[str, StructuredSummary] = {}
+
+
+async def _db_load_summary(session_id: str) -> Optional[StructuredSummary]:
+    """Read the ``memory_summaries`` row for *session_id* from Postgres."""
+    try:
+        from sqlalchemy import text
+        from app.core.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text(
+                    "SELECT summary FROM memory_summaries "
+                    "WHERE session_id = :sid LIMIT 1"
+                ),
+                {"sid": session_id},
+            )
+            row = result.first()
+            if row is None or row[0] is None:
+                return None
+            payload = row[0]
+            # Postgres JSONB comes back as a dict already; tolerate string too.
+            if isinstance(payload, str):
+                import json as _json
+                payload = _json.loads(payload)
+            return StructuredSummary.from_dict(payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "ContextCompactionManager: _db_load_summary failed (%s) — "
+            "falling back to in-process store", exc,
+        )
+        return None
+
+
+async def _db_save_summary(session_id: str, summary: StructuredSummary) -> bool:
+    """Upsert the ``memory_summaries`` row for *session_id*.
+
+    Returns True if the row was written to Postgres, False if the DB
+    was unavailable (caller may want to keep the in-process copy in sync).
+    """
+    try:
+        import json as _json
+        from sqlalchemy import text
+        from app.core.database import AsyncSessionLocal
+
+        payload = _json.dumps(summary.to_dict())
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                text("""
+                    INSERT INTO memory_summaries (session_id, summary, updated_at)
+                    VALUES (:sid, CAST(:payload AS JSONB), NOW())
+                    ON CONFLICT (session_id) DO UPDATE SET
+                        summary    = EXCLUDED.summary,
+                        updated_at = NOW()
+                """),
+                {"sid": session_id, "payload": payload},
+            )
+            await session.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "ContextCompactionManager: _db_save_summary failed (%s) — "
+            "summary survives in-process only, lost on restart", exc,
+        )
+        return False
 
 
 class ContextCompactionManager:
@@ -122,7 +181,7 @@ class ContextCompactionManager:
             self._session_id, len(messages), total, self._compaction_threshold,
         )
 
-        prior_summary = self._load_summary()
+        prior_summary = await self._load_summary()
 
         compacted, new_summary = await compact(
             messages,
@@ -134,7 +193,7 @@ class ContextCompactionManager:
             summarization_model=self._summarization_model,
         )
 
-        self._save_summary(new_summary)
+        await self._save_summary(new_summary)
 
         logger.info(
             "ContextCompactionManager[%s]: compaction complete. "
@@ -157,10 +216,24 @@ class ContextCompactionManager:
     # Internal
     # ──────────────────────────────────────────────────────────────────
 
-    def _load_summary(self) -> Optional[StructuredSummary]:
+    async def _load_summary(self) -> Optional[StructuredSummary]:
+        """Read this session's summary, preferring Postgres over the in-process cache.
+
+        On a Postgres miss we still consult the in-process fallback so a
+        summary that was written during a DB outage isn't lost mid-session.
+        """
+        db_summary = await _db_load_summary(self._session_id)
+        if db_summary is not None:
+            _summary_store[self._session_id] = db_summary   # keep cache warm
+            return db_summary
         return _summary_store.get(self._session_id)
 
-    def _save_summary(self, summary: StructuredSummary) -> None:
-        # TODO: Persist to database for cross-restart durability.
-        # Serialise via summary.to_dict() and store with key self._session_id.
+    async def _save_summary(self, summary: StructuredSummary) -> None:
+        """Persist this session's summary to Postgres + the in-process cache.
+
+        The in-process write happens unconditionally so the same instance
+        can read it back even if the DB write fails (typical in dev /
+        unit-test environments).
+        """
         _summary_store[self._session_id] = summary
+        await _db_save_summary(self._session_id, summary)

@@ -120,7 +120,9 @@ class WorkflowTranslator:
         "scheduler": [],
         "chat": [],
         "output": [],
+        "wiki": [],
         "memory": [],
+        "router": ["label", "routes"],
     }
     
     # Valid node types
@@ -129,7 +131,8 @@ class WorkflowTranslator:
     # Valid connection rules (source_type -> target_type -> valid_handles)
     CONNECTION_RULES = {
         "llm": {
-            "agent": {"sourceHandle": "model-output", "targetHandle": "model"}
+            "agent": {"sourceHandle": "model-output", "targetHandle": "model"},
+            "router": {"sourceHandle": "model-output", "targetHandle": "model"}
         },
         "tool": {
             "orchestrator": {"sourceHandle": "tool-output", "targetHandle": "database"},
@@ -141,19 +144,24 @@ class WorkflowTranslator:
             "cloudwatchAnalyzer": {}
         },
         "orchestrator": {
-            "agent": {"sourceHandle": "output", "targetHandle": "input"}
+            "agent": {"sourceHandle": "output", "targetHandle": "input"},
+            "wiki": {"sourceHandle": "output", "targetHandle": "msg"}
         },
         "cloudwatchAnalyzer": {
             "agent": {"sourceHandle": "output", "targetHandle": "input"}
         },
         "agent": {
-            "output": {"sourceHandle": "agent-output", "targetHandle": "input"}
+            "output": {"sourceHandle": "agent-output", "targetHandle": "input"},
+            "wiki": {"sourceHandle": "agent-output", "targetHandle": "msg"}
         },
         "chat": {
             "agent": {"sourceHandle": "chat-output", "targetHandle": "input"}
         },
         "memory": {
             "agent": {"sourceHandle": "memory-output", "targetHandle": "memory"}
+        },
+        "router": {
+            "agent": {"sourceHandle": "route-output", "targetHandle": "input"}
         }
     }
     

@@ -438,7 +438,7 @@ const ExecutionMonitor = ({ workflowName, executionId, autoStart = false, onClos
     const [expanded, setExpanded] = useState(true);
     const {
         status, events, error, isConnected, clearEvents,
-        totalCost, agentCosts,
+        totalCost, agentCosts, totalTokens,
     } = useWorkflowStream(workflowName, autoStart);
 
     const connectionStatus = isConnected
@@ -467,6 +467,12 @@ const ExecutionMonitor = ({ workflowName, executionId, autoStart = false, onClos
                     </div>
 
                     <div className="flex items-center gap-2">
+                        {totalTokens > 0 && (
+                            <span className="flex items-center gap-1 text-xs text-muted-foreground" title="Total LLM tokens consumed">
+                                <Zap className="w-3 h-3" />
+                                {totalTokens.toLocaleString()} tok
+                            </span>
+                        )}
                         {totalCost > 0 && (
                             <span className="flex items-center gap-1 text-xs text-muted-foreground" title="Estimated LLM cost">
                                 <DollarSign className="w-3 h-3" />

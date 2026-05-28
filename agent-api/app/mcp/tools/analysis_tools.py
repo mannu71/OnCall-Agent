@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import boto3
 import json
 from datetime import datetime
@@ -54,11 +55,16 @@ class CloudWatchLogsAnalysisTools:
         """
 
         # Start the query
-        start_query_response = self.logs_client.start_query(
-            logGroupName=log_group_name,
-            startTime=start_ts,
-            endTime=end_ts,
-            queryString=query,
+        loop = asyncio.get_running_loop()
+        start_query_response = await loop.run_in_executor(
+            None,
+            functools.partial(
+                self.logs_client.start_query,
+                logGroupName=log_group_name,
+                startTime=start_ts,
+                endTime=end_ts,
+                queryString=query,
+            ),
         )
 
         query_id = start_query_response["queryId"]
@@ -67,7 +73,10 @@ class CloudWatchLogsAnalysisTools:
         response = None
         while response is None or response["status"] == "Running":
             await asyncio.sleep(1)  # Wait before checking again
-            response = self.logs_client.get_query_results(queryId=query_id)
+            response = await loop.run_in_executor(
+                None,
+                functools.partial(self.logs_client.get_query_results, queryId=query_id),
+            )
 
         # Get the hourly distribution
         hourly_query = """
@@ -77,11 +86,15 @@ class CloudWatchLogsAnalysisTools:
         """
 
         # Start the hourly query
-        hourly_query_response = self.logs_client.start_query(
-            logGroupName=log_group_name,
-            startTime=start_ts,
-            endTime=end_ts,
-            queryString=hourly_query,
+        hourly_query_response = await loop.run_in_executor(
+            None,
+            functools.partial(
+                self.logs_client.start_query,
+                logGroupName=log_group_name,
+                startTime=start_ts,
+                endTime=end_ts,
+                queryString=hourly_query,
+            ),
         )
 
         hourly_query_id = hourly_query_response["queryId"]
@@ -90,8 +103,12 @@ class CloudWatchLogsAnalysisTools:
         hourly_response = None
         while hourly_response is None or hourly_response["status"] == "Running":
             await asyncio.sleep(1)  # Wait before checking again
-            hourly_response = self.logs_client.get_query_results(
-                queryId=hourly_query_id
+            hourly_response = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    self.logs_client.get_query_results,
+                    queryId=hourly_query_id,
+                ),
             )
 
         # Process the main summary results
@@ -159,11 +176,16 @@ class CloudWatchLogsAnalysisTools:
         """
 
         # Start the query
-        start_query_response = self.logs_client.start_query(
-            logGroupName=log_group_name,
-            startTime=start_ts,
-            endTime=end_ts,
-            queryString=error_query,
+        loop = asyncio.get_running_loop()
+        start_query_response = await loop.run_in_executor(
+            None,
+            functools.partial(
+                self.logs_client.start_query,
+                logGroupName=log_group_name,
+                startTime=start_ts,
+                endTime=end_ts,
+                queryString=error_query,
+            ),
         )
 
         query_id = start_query_response["queryId"]
@@ -172,7 +194,10 @@ class CloudWatchLogsAnalysisTools:
         response = None
         while response is None or response["status"] == "Running":
             await asyncio.sleep(1)  # Wait before checking again
-            response = self.logs_client.get_query_results(queryId=query_id)
+            response = await loop.run_in_executor(
+                None,
+                functools.partial(self.logs_client.get_query_results, queryId=query_id),
+            )
 
         # Process the results
         error_patterns = {

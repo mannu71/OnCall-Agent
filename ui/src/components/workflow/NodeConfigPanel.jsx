@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import PropTypes from 'prop-types';
 import { localTimeToCron, cronToLocalTime } from '../../utils/cronUtils';
 import { agentApiClient } from '../../services/agentApiClient';
@@ -52,7 +52,9 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
     try {
       const result = await agentApiClient.discoverCloudWatchLogGroups(
         discoverPrefix || undefined,
-        config.awsRegion || 'us-east-1'
+        config.awsRegion || 'us-east-1',
+        50,
+        config.awsProfile || undefined,
       );
       setDiscoveredGroups((result.log_groups || []).map(g => g.name).filter(Boolean));
     } catch (error) {
@@ -696,19 +698,60 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
 
             {/* Alarm filter — shown only for alarms type */}
             {config.analysisType === 'alarms' && (
-              <div className="config-field">
-                <label htmlFor="alarm-state-filter">Alarm State Filter</label>
-                <select
-                  id="alarm-state-filter"
-                  value={config.alarmStateFilter || ''}
-                  onChange={(e) => handleConfigChange('alarmStateFilter', e.target.value)}
+              <>
+                {/* ── Active Alarms Only shortcut ────────────────────────────── */}
+                <div
+                  className="config-field checkbox-field"
+                  style={{
+                    background: config.activeAlarmsOnly ? '#fff3e0' : undefined,
+                    borderRadius: 6,
+                    padding: config.activeAlarmsOnly ? '8px 10px' : undefined,
+                    border: config.activeAlarmsOnly ? '1px solid #ffb74d' : undefined,
+                  }}
                 >
-                  <option value="">All states</option>
-                  <option value="ALARM">ALARM (firing)</option>
-                  <option value="OK">OK</option>
-                  <option value="INSUFFICIENT_DATA">Insufficient Data</option>
-                </select>
-              </div>
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={config.activeAlarmsOnly || false}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        // Batch both keys into one config snapshot so neither
+                        // overwrites the other via stale closure.
+                        const newConfig = {
+                          ...config,
+                          activeAlarmsOnly: checked,
+                          alarmStateFilter: checked ? 'ALARM' : '',
+                        };
+                        setConfig(newConfig);
+                        onUpdate(node.id, newConfig);
+                      }}
+                    />
+                    <span>🔴 Active Alarms Only</span>
+                  </label>
+                  <small style={{ color: '#e65100', fontSize: '11px', marginTop: '4px', display: 'block' }}>
+                    {config.activeAlarmsOnly
+                      ? 'Only alarms currently in ALARM (firing) state will be analyzed'
+                      : 'Check this to restrict analysis to actively firing alarms'}
+                  </small>
+                </div>
+
+                {/* Full state dropdown — hidden when "Active Alarms Only" is on */}
+                {!config.activeAlarmsOnly && (
+                  <div className="config-field">
+                    <label htmlFor="alarm-state-filter">Alarm State Filter</label>
+                    <select
+                      id="alarm-state-filter"
+                      value={config.alarmStateFilter || ''}
+                      onChange={(e) => handleConfigChange('alarmStateFilter', e.target.value)}
+                    >
+                      <option value="">All states</option>
+                      <option value="ALARM">ALARM (firing)</option>
+                      <option value="OK">OK</option>
+                      <option value="INSUFFICIENT_DATA">Insufficient Data</option>
+                    </select>
+                  </div>
+                )}
+              </>
             )}
 
             <div className="config-field">
@@ -795,48 +838,177 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
 // Code Analyzer config sub-component
 // ─────────────────────────────────────────────────────────────────────────────
 
-function validateRepoPath(path) {
-  if (!path) return 'Path is required';
-  if (!path.startsWith('/') && !/^[A-Za-z]:[/\\]/.test(path))
-    return 'Must be an absolute path (starts with / or C:\\)';
-  if (path.includes('..'))
-    return 'Path must not contain ".." traversal segments';
-  return null;
+// Repository name/path validators were removed when the manual entry block
+// was dropped — repositories are now selected exclusively via the discovery
+// panel below, which sources name + container path + suggested language from
+// the backend's filesystem scan. There are no user-typed paths to validate.
+
+// ── Repository discovery cache (module scope) ──────────────────────────────
+// Survives open/close of the Configure CodeAnalyzer Node panel so re-opens
+// render instantly from cache instead of showing a spinner every time. A
+// background refresh runs after each render to keep the cache fresh
+// (stale-while-revalidate). Cleared on full page reload — fine for our
+// scale.
+const REPO_DISCOVERY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const _repoDiscoveryCache = {
+  data: null,        // { basePath, baseExists, repos[] }
+  fetchedAt: 0,      // performance.now() of last successful fetch
+  inflight: null,    // de-dupe concurrent fetches across multiple panel opens
+};
+
+function _isCacheFresh() {
+  return (
+    _repoDiscoveryCache.data !== null
+    && (performance.now() - _repoDiscoveryCache.fetchedAt) < REPO_DISCOVERY_CACHE_TTL_MS
+  );
 }
 
-function validateRepoName(name) {
-  if (!name) return 'Name is required';
-  if (!/^[a-z0-9][a-z0-9\-_]*$/.test(name))
-    return 'Name must be lowercase alphanumeric with hyphens/underscores';
-  return null;
+async function _fetchRepoDiscovery({ refresh = false } = {}) {
+  // De-dupe: if a fetch is already in flight, await the same promise instead
+  // of firing a second request (e.g. when the panel is opened twice quickly).
+  if (!refresh && _repoDiscoveryCache.inflight) {
+    return _repoDiscoveryCache.inflight;
+  }
+  const promise = (async () => {
+    const data = await agentApiClient.listCodeAnalyzerRepos({ refresh });
+    const normalised = {
+      basePath: data?.base_path || '',
+      baseExists: Boolean(data?.base_exists),
+      repos: Array.isArray(data?.repos) ? data.repos : [],
+    };
+    _repoDiscoveryCache.data = normalised;
+    _repoDiscoveryCache.fetchedAt = performance.now();
+    return normalised;
+  })();
+  _repoDiscoveryCache.inflight = promise;
+  try {
+    return await promise;
+  } finally {
+    _repoDiscoveryCache.inflight = null;
+  }
 }
 
 function CodeAnalyzerConfig({ config, handleConfigChange }) {
   const repos = config.repos || [];
-  const [fieldErrors, setFieldErrors] = useState({});
 
-  const updateRepo = (index, field, value) => {
-    const updated = repos.map((r, i) => (i === index ? { ...r, [field]: value } : r));
-    handleConfigChange('repos', updated);
+  // ── Filesystem discovery (GET /api/v1/code-analyzer/repos) ─────────────
+  // Stale-while-revalidate: render from the module cache immediately if any
+  // data is present, then fire a background refresh.
+  const [discovery, setDiscovery] = useState(() => {
+    if (_repoDiscoveryCache.data) {
+      return {
+        loading: false,
+        revalidating: !_isCacheFresh(),
+        error: null,
+        ..._repoDiscoveryCache.data,
+      };
+    }
+    return {
+      loading: true,
+      revalidating: false,
+      error: null,
+      basePath: '',
+      baseExists: true,
+      repos: [],
+    };
+  });
+
+  const refreshDiscovery = useCallback(async (force = false) => {
+    setDiscovery((prev) => ({
+      ...prev,
+      revalidating: prev.repos.length > 0 || force,
+      loading: prev.repos.length === 0 && !force,
+      error: null,
+    }));
+    try {
+      const data = await _fetchRepoDiscovery({ refresh: force });
+      setDiscovery({ loading: false, revalidating: false, error: null, ...data });
+    } catch (err) {
+      setDiscovery((prev) => ({
+        ...prev,
+        loading: false,
+        revalidating: false,
+        error: err?.response?.data?.detail || err?.message || 'Failed to load',
+      }));
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (_isCacheFresh()) return;
+      try {
+        const data = await _fetchRepoDiscovery();
+        if (cancelled) return;
+        setDiscovery({ loading: false, revalidating: false, error: null, ...data });
+      } catch (err) {
+        if (cancelled) return;
+        setDiscovery((prev) => ({
+          ...prev,
+          loading: false,
+          revalidating: false,
+          error: err?.response?.data?.detail || err?.message || 'Failed to load',
+        }));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── Indexed-repos picker (GET /api/v1/crawler/repos) ─────────────────────
+  // Mirrors the CloudWatch "Discover" pattern: click a button, results appear
+  // in a scrollable dropdown, click a repo name to add it to the selected list.
+  const [indexedRepos, setIndexedRepos] = useState([]);
+  const [indexedLoading, setIndexedLoading] = useState(false);
+  const [indexedError, setIndexedError] = useState(null);
+  const [showIndexed, setShowIndexed] = useState(false);
+
+  const handleDiscoverIndexed = async () => {
+    setIndexedLoading(true);
+    setIndexedError(null);
+    setIndexedRepos([]);
+    setShowIndexed(false);
+    try {
+      const data = await agentApiClient.listCrawlerRepos();
+      setIndexedRepos(Array.isArray(data?.repos) ? data.repos : []);
+      setShowIndexed(true);
+    } catch (err) {
+      setIndexedError(err?.response?.data?.detail || err?.message || 'Failed to load indexed repos');
+    } finally {
+      setIndexedLoading(false);
+    }
   };
 
-  const addRepo = () => {
+  const handleAddIndexedRepo = (indexedRepo) => {
+    const name = indexedRepo.repo_name;
+    if (repos.some((r) => r.name === name)) return;
     handleConfigChange('repos', [
       ...repos,
-      { name: '', path: '', language: 'python' },
+      { name, path: name, language: 'python' },
     ]);
   };
 
-  const removeRepo = (index) => {
-    handleConfigChange('repos', repos.filter((_, i) => i !== index));
+  // ── Shared helpers ────────────────────────────────────────────────────────
+  const addDiscoveredRepo = (discovered) => {
+    if (repos.some((r) => r.path === discovered.path)) return;
+    handleConfigChange('repos', [
+      ...repos,
+      {
+        name: discovered.name,
+        path: discovered.path,
+        language: discovered.suggested_language || 'python',
+      },
+    ]);
   };
 
-  const handleBlur = (key, value) => {
-    const err = key === 'path' ? validateRepoPath(value) : validateRepoName(value);
-    setFieldErrors((prev) => ({ ...prev, [key]: err }));
+  const removeRepo = (nameOrPath) => {
+    handleConfigChange(
+      'repos',
+      repos.filter((r) => r.path !== nameOrPath && r.name !== nameOrPath),
+    );
   };
 
-  const hasPathWarning = repos.some((r) => validateRepoPath(r.path));
+  const isAlreadyAdded = (nameOrPath) =>
+    repos.some((r) => r.path === nameOrPath || r.name === nameOrPath);
 
   return (
     <>
@@ -851,138 +1023,316 @@ function CodeAnalyzerConfig({ config, handleConfigChange }) {
         />
       </div>
 
+      {/* ── Available Repositories (indexed by crawler) ─────────────────── */}
       <div className="config-field">
-        <label>
-          Repositories
-          {hasPathWarning && (
-            <span style={{ marginLeft: 8, color: '#f57c00', fontSize: 11 }}>
-              ⚠ one or more repos have path issues
-            </span>
-          )}
-        </label>
-        {repos.map((repo, idx) => (
-          <div
-            key={idx}
+        <label>Available Repositories</label>
+        <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
+          <button
+            type="button"
+            onClick={handleDiscoverIndexed}
+            disabled={indexedLoading}
             style={{
-              border: '1px solid #e0e0e0',
-              borderRadius: 6,
-              padding: '10px 12px',
-              marginBottom: 8,
-              background: '#fafafa',
+              background: indexedLoading ? '#9e9e9e' : '#7b1fa2',
+              color: 'white',
+              border: 'none',
+              borderRadius: 4,
+              cursor: indexedLoading ? 'not-allowed' : 'pointer',
+              padding: '8px 12px',
+              flex: 1,
+              fontSize: 12,
             }}
           >
-            {/* Row 1: name + language + delete */}
-            <div style={{ display: 'flex', gap: 6, marginBottom: 6, alignItems: 'flex-start' }}>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <input
-                  type="text"
-                  value={repo.name || ''}
-                  onChange={(e) => updateRepo(idx, 'name', e.target.value)}
-                  onBlur={(e) => handleBlur(`name-${idx}`, e.target.value)}
-                  placeholder="repo-name"
-                  style={{
-                    width: '100%',
-                    fontSize: 12,
-                    padding: '4px 8px',
-                    border: '1px solid #d0d0d0',
-                    borderRadius: 4,
-                    background: '#fff',
-                    boxSizing: 'border-box',
-                  }}
-                />
-                {fieldErrors[`name-${idx}`] && (
-                  <span style={{ color: '#d32f2f', fontSize: 10 }}>
-                    {fieldErrors[`name-${idx}`]}
-                  </span>
-                )}
-              </div>
-              <select
-                value={repo.language || 'python'}
-                onChange={(e) => updateRepo(idx, 'language', e.target.value)}
-                style={{
-                  fontSize: 12,
-                  width: 130,
-                  flexShrink: 0,
-                  padding: '4px 6px',
-                  border: '1px solid #d0d0d0',
-                  borderRadius: 4,
-                  background: '#fff',
-                }}
-              >
-                <option value="python">Python</option>
-                <option value="typescript">TypeScript</option>
-                <option value="react">React / JSX</option>
-                <option value="csharp">C# / .NET</option>
-                <option value="java">Java</option>
-                <option value="kotlin">Kotlin</option>
-                <option value="go">Go</option>
-                <option value="rust">Rust</option>
-                <option value="ruby">Ruby</option>
-                <option value="mixed">Mixed (Py + TS)</option>
-              </select>
-              <button
-                type="button"
-                onClick={() => removeRepo(idx)}
-                style={{
-                  flexShrink: 0,
-                  background: '#ffebee',
-                  border: '1px solid #ef9a9a',
-                  borderRadius: 4,
-                  cursor: 'pointer',
-                  color: '#c62828',
-                  padding: '4px 10px',
-                  fontSize: 12,
-                }}
-              >
-                ✕
-              </button>
-            </div>
-            {/* Row 2: path */}
-            <div>
-              <input
-                type="text"
-                value={repo.path || ''}
-                onChange={(e) => updateRepo(idx, 'path', e.target.value)}
-                onBlur={(e) => handleBlur(`path-${idx}`, e.target.value)}
-                placeholder="/absolute/path/to/repo (as seen by server)"
-                style={{
-                  width: '100%',
-                  fontSize: 12,
-                  padding: '4px 8px',
-                  border: '1px solid #d0d0d0',
-                  borderRadius: 4,
-                  background: '#fff',
-                  boxSizing: 'border-box',
-                }}
-              />
-              {fieldErrors[`path-${idx}`] && (
-                <span style={{ color: '#d32f2f', fontSize: 10 }}>
-                  {fieldErrors[`path-${idx}`]}
-                </span>
-              )}
-            </div>
-          </div>
-        ))}
-        <button
-          type="button"
-          onClick={addRepo}
-          style={{
-            background: '#e8f5e9',
-            border: '1px solid #a5d6a7',
-            borderRadius: 4,
-            cursor: 'pointer',
-            color: '#2e7d32',
-            padding: '6px 12px',
+            {indexedLoading ? 'Loading…' : '🔍 Discover Indexed Repos'}
+          </button>
+        </div>
+
+        {indexedError && (
+          <div style={{
             fontSize: 12,
-            width: '100%',
-          }}
-        >
-          + Add Repository
-        </button>
-        <small style={{ color: '#666', fontSize: 11 }}>
-          Use the path as seen by the server (container path if running in Docker).
-        </small>
+            color: '#c62828',
+            background: '#ffebee',
+            border: '1px solid #ef9a9a',
+            borderRadius: 4,
+            padding: '6px 10px',
+            marginBottom: 6,
+          }}>
+            {indexedError}
+          </div>
+        )}
+
+        {showIndexed && indexedRepos.length === 0 && !indexedLoading && (
+          <div style={{ fontSize: 12, color: '#666', padding: '6px 8px' }}>
+            No indexed repositories found. Index a repo via the crawler first.
+          </div>
+        )}
+
+        {showIndexed && indexedRepos.length > 0 && (
+          <div style={{
+            marginTop: 4,
+            border: '1px solid #ccc',
+            borderRadius: 4,
+            maxHeight: 180,
+            overflowY: 'auto',
+            background: '#fff',
+          }}>
+            <div style={{ padding: '4px 8px', fontSize: 11, color: '#666', borderBottom: '1px solid #eee' }}>
+              Click to add to selected repositories
+            </div>
+            {indexedRepos.map((r) => {
+              const added = isAlreadyAdded(r.repo_name);
+              return (
+                <div
+                  key={r.repo_name}
+                  onClick={() => !added && handleAddIndexedRepo(r)}
+                  style={{
+                    padding: '6px 10px',
+                    cursor: added ? 'default' : 'pointer',
+                    fontSize: 12,
+                    borderBottom: '1px solid #f5f5f5',
+                    background: added ? '#f5f5f5' : '#fff',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 8,
+                  }}
+                  onMouseOver={(e) => { if (!added) e.currentTarget.style.background = '#e3f2fd'; }}
+                  onMouseOut={(e) => { if (!added) e.currentTarget.style.background = added ? '#f5f5f5' : '#fff'; }}
+                >
+                  <div style={{ minWidth: 0 }}>
+                    <span style={{ fontWeight: 500, color: added ? '#999' : '#222' }}>
+                      {r.repo_name}
+                    </span>
+                    {r.files_indexed != null && (
+                      <span style={{ marginLeft: 6, fontSize: 11, color: '#888' }}>
+                        {r.files_indexed} files
+                      </span>
+                    )}
+                    {r.generated_at && (
+                      <div style={{ fontSize: 10, color: '#aaa', marginTop: 1 }}>
+                        indexed {new Date(r.generated_at).toLocaleDateString()}
+                      </div>
+                    )}
+                  </div>
+                  {added ? (
+                    <span style={{ fontSize: 11, color: '#999' }}>✓ added</span>
+                  ) : (
+                    <span style={{ fontSize: 11, color: '#1565c0' }}>+ Add</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
+
+      {/* ── Filesystem repos (REPOS_BASE_PATH) ──────────────────────────── */}
+      <div className="config-field">
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span>Filesystem Repos</span>
+          <span style={{ color: '#666', fontWeight: 'normal', fontSize: 11, flex: 1 }}>
+            (under {discovery.basePath || 'REPOS_BASE_PATH'})
+          </span>
+          {discovery.revalidating && (
+            <span
+              title="Refreshing in the background…"
+              style={{ color: '#888', fontSize: 11, fontWeight: 'normal' }}
+            >
+              ⟳ syncing
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => refreshDiscovery(true)}
+            disabled={discovery.loading || discovery.revalidating}
+            style={{
+              background: '#f5f5f5',
+              border: '1px solid #d0d0d0',
+              borderRadius: 4,
+              cursor: discovery.loading || discovery.revalidating ? 'wait' : 'pointer',
+              color: '#444',
+              padding: '2px 8px',
+              fontSize: 11,
+              fontWeight: 'normal',
+            }}
+            title="Force a fresh scan (bypasses the 60s server cache)"
+          >
+            ↻ Refresh
+          </button>
+        </label>
+
+        {discovery.loading && (
+          <div style={{ fontSize: 12, color: '#666', padding: '6px 8px' }}>
+            Loading filesystem repositories…
+          </div>
+        )}
+
+        {!discovery.loading && discovery.error && (
+          <div style={{
+            fontSize: 12,
+            color: '#c62828',
+            background: '#ffebee',
+            border: '1px solid #ef9a9a',
+            borderRadius: 4,
+            padding: '6px 10px',
+          }}>
+            Could not load filesystem repos: {discovery.error}
+          </div>
+        )}
+
+        {!discovery.loading && !discovery.error && !discovery.baseExists && (
+          <div style={{
+            fontSize: 12,
+            color: '#6d4c41',
+            background: '#fff8e1',
+            border: '1px solid #ffe082',
+            borderRadius: 4,
+            padding: '6px 10px',
+          }}>
+            REPOS_BASE_PATH (<code>{discovery.basePath}</code>) is not mounted.
+          </div>
+        )}
+
+        {!discovery.loading && !discovery.error && discovery.baseExists && discovery.repos.length === 0 && (
+          <div style={{ fontSize: 12, color: '#666', padding: '6px 8px' }}>
+            No repositories found under <code>{discovery.basePath}</code>.
+          </div>
+        )}
+
+        {!discovery.loading && discovery.repos.length > 0 && (
+          <div style={{
+            maxHeight: 200,
+            overflowY: 'auto',
+            border: '1px solid #e0e0e0',
+            borderRadius: 4,
+            background: '#fff',
+          }}>
+            <div style={{ padding: '4px 8px', fontSize: 11, color: '#666', borderBottom: '1px solid #eee' }}>
+              Click to add to selected repositories
+            </div>
+            {discovery.repos.map((d) => {
+              const added = isAlreadyAdded(d.path);
+              return (
+                <div
+                  key={d.path}
+                  onClick={() => !added && addDiscoveredRepo(d)}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    padding: '6px 10px',
+                    borderBottom: '1px solid #f0f0f0',
+                    fontSize: 12,
+                    background: added ? '#f5f5f5' : '#fff',
+                    cursor: added ? 'default' : 'pointer',
+                  }}
+                  onMouseOver={(e) => { if (!added) e.currentTarget.style.background = '#e3f2fd'; }}
+                  onMouseOut={(e) => { if (!added) e.currentTarget.style.background = added ? '#f5f5f5' : '#fff'; }}
+                >
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 500, color: added ? '#999' : '#222' }}>
+                      {d.is_git && <span title="Git repository" style={{ marginRight: 4 }}>⌥</span>}
+                      {d.name}
+                    </div>
+                    <div style={{ color: '#888', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {d.path}
+                    </div>
+                    {d.detected_languages?.length > 0 && (
+                      <div style={{ marginTop: 2, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                        {d.detected_languages.map((lang) => (
+                          <span
+                            key={lang}
+                            style={{
+                              fontSize: 10,
+                              padding: '1px 6px',
+                              borderRadius: 8,
+                              background: lang === d.suggested_language ? '#e3f2fd' : '#f5f5f5',
+                              color: lang === d.suggested_language ? '#1565c0' : '#666',
+                              border: '1px solid ' + (lang === d.suggested_language ? '#90caf9' : '#e0e0e0'),
+                            }}
+                          >
+                            {lang}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {added ? (
+                    <span style={{ fontSize: 11, color: '#999', flexShrink: 0 }}>✓ added</span>
+                  ) : (
+                    <span style={{ fontSize: 11, color: '#1565c0', flexShrink: 0 }}>+ Add</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* ── Selected repositories ────────────────────────────────────────── */}
+      {repos.length > 0 && (
+        <div className="config-field">
+          <label>Selected Repositories</label>
+          <div style={{
+            border: '1px solid #e0e0e0',
+            borderRadius: 4,
+            background: '#f9f9f9',
+            maxHeight: 160,
+            overflowY: 'auto',
+          }}>
+            {repos.map((r) => (
+              <div
+                key={r.path || r.name}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  padding: '5px 10px',
+                  borderBottom: '1px solid #eee',
+                  fontSize: 12,
+                }}
+              >
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ fontWeight: 500 }}>{r.name}</span>
+                  {r.language && (
+                    <span style={{
+                      marginLeft: 6,
+                      fontSize: 10,
+                      padding: '1px 5px',
+                      borderRadius: 8,
+                      background: '#e3f2fd',
+                      color: '#1565c0',
+                      border: '1px solid #90caf9',
+                    }}>
+                      {r.language}
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => removeRepo(r.path || r.name)}
+                  style={{
+                    background: '#ffebee',
+                    border: '1px solid #ef9a9a',
+                    borderRadius: 4,
+                    cursor: 'pointer',
+                    color: '#c62828',
+                    padding: '2px 8px',
+                    fontSize: 11,
+                    flexShrink: 0,
+                  }}
+                  title="Remove from this analyzer"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <small style={{ color: '#666', fontSize: 11, display: 'block', marginBottom: 8 }}>
+        {repos.length} {repos.length === 1 ? 'repository' : 'repositories'} selected.
+      </small>
 
       <div className="config-field checkbox-field">
         <label className="checkbox-label">

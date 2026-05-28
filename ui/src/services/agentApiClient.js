@@ -303,14 +303,159 @@ export const agentApiClient = {
 
     /**
      * Discover CloudWatch log groups by name prefix or tags.
-     * @param {string|undefined} prefix  - Log group name prefix
-     * @param {string} region            - AWS region (default us-east-1)
-     * @param {number} limit             - Max groups to return (default 50)
+     * @param {string|undefined} prefix   - Log group name prefix
+     * @param {string} region             - AWS region (default us-east-1)
+     * @param {number} limit              - Max groups to return (default 50)
+     * @param {string|undefined} profile  - AWS CLI profile name (e.g. 'test-dev').
+     *   When provided the backend uses this profile instead of the default
+     *   Bedrock IAM user, matching the credentials used during workflow execution.
      */
-    async discoverCloudWatchLogGroups(prefix, region = 'us-east-1', limit = 50) {
+    async discoverCloudWatchLogGroups(prefix, region = 'us-east-1', limit = 50, profile) {
         const params = new URLSearchParams({ region, limit });
         if (prefix) params.append('prefix', prefix);
+        if (profile) params.append('profile', profile);
         const response = await client.get(`/api/v1/log-watch/discover-log-groups?${params}`);
+        return response.data;
+    },
+
+    /**
+     * List repositories discovered under REPOS_BASE_PATH (the read-only
+     * docker volume mount from the host's repo root). Used by the
+     * Configure CodeAnalyzer Node UI to populate a discovery picker.
+     *
+     * Returns:
+     *   {
+     *     base_path: string,
+     *     base_exists: boolean,
+     *     repos: [{
+     *       name: string,
+     *       path: string,                 // container path
+     *       is_git: boolean,
+     *       detected_languages: string[], // e.g. ["python","typescript"]
+     *       suggested_language: string,   // single best-default
+     *       file_count_sample: number,    // capped at 200
+     *     }]
+     *   }
+     *
+     * Never throws when the mount is missing — ``base_exists=false`` and
+     * ``repos=[]`` so the UI can render a configuration hint instead of
+     * an error.
+     *
+     * @param {Object} [opts]
+     * @param {boolean} [opts.refresh=false] - Bypass the backend's 60s
+     *   TTL cache and force a fresh filesystem walk. Use after the
+     *   user adds or removes a repo on the host.
+     */
+    async listCodeAnalyzerRepos({ refresh = false } = {}) {
+        const params = refresh ? { refresh: 'true' } : undefined;
+        const response = await client.get('/api/v1/code-analyzer/repos', { params });
+        return response.data;
+    },
+
+    /**
+     * List repositories that have already been indexed by the crawler
+     * (stored in the ``repo_abstractions`` table).
+     *
+     * Returns:
+     *   {
+     *     count: number,
+     *     repos: [{
+     *       repo_name: string,
+     *       files_indexed: number,
+     *       model_id: string | null,
+     *       generated_at: string | null,   // ISO-8601
+     *     }]
+     *   }
+     *
+     * Used by the "Code Analyzer" node config panel to let users select from
+     * repos that are already crawled without needing REPOS_BASE_PATH mounted.
+     */
+    async listCrawlerRepos() {
+        const response = await client.get('/api/v1/crawler/repos');
+        return response.data;
+    },
+
+    // ==================== Knowledge Graph & Codebase Explorer ====================
+
+    /**
+     * List all indexed files in a repository with parse stats.
+     */
+    async getRepoFiles(repo, language = null, withErrorsOnly = false, limit = 200) {
+        const params = { limit };
+        if (language) params.language = language;
+        if (withErrorsOnly) params.with_errors_only = withErrorsOnly;
+        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/files`, { params });
+        return response.data;
+    },
+
+    /**
+     * Fetch all nodes and edges defined in a specific file.
+     */
+    async getFileNodes(repo, filePath) {
+        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/nodes`, {
+            params: { file_path: filePath }
+        });
+        return response.data;
+    },
+
+    /**
+     * Fetch metadata for a single knowledge graph node.
+     */
+    async getKGNode(repo, qualifiedName) {
+        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/node`, {
+            params: { qualified_name: qualifiedName }
+        });
+        return response.data;
+    },
+
+    /**
+     * Find callers of a symbol transitively up to a depth.
+     */
+    async getKGCallers(repo, symbol, depth = 2) {
+        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/callers`, {
+            params: { symbol, depth }
+        });
+        return response.data;
+    },
+
+    /**
+     * Find callees of a symbol transitively up to a depth.
+     */
+    async getKGCallees(repo, symbol, depth = 2) {
+        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/callees`, {
+            params: { symbol, depth }
+        });
+        return response.data;
+    },
+
+    /**
+     * Perform impact analysis on a symbol.
+     */
+    async getKGImpact(repo, symbol) {
+        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/impact`, {
+            params: { symbol }
+        });
+        return response.data;
+    },
+
+    /**
+     * Find references to a symbol grouped by relation kind.
+     */
+    async getKGReferences(repo, symbol, limit = 20) {
+        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/references`, {
+            params: { symbol, limit }
+        });
+        return response.data;
+    },
+
+    /**
+     * Compute a deterministic impact tree for a list of modified files or symbols.
+     */
+    async getKGDiffImpact(repo, files = [], symbols = []) {
+        const response = await client.post(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/diff-impact`, {
+            files,
+            symbols
+        });
         return response.data;
     },
 };

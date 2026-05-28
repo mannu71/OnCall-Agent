@@ -104,35 +104,55 @@ class WorkflowRepository:
             await session.refresh(workflow)
             return self._workflow_to_dict(workflow)
     
-    async def delete(self, workflow_name: str) -> bool:
-        """Delete workflow.
-        
+    async def delete(self, workflow_identifier: str) -> bool:
+        """Delete workflow by name or numeric ID.
+
+        Accepts either a workflow name or a stringified integer ID for
+        backwards compatibility with the legacy ``app.repositories``
+        ``WorkflowRepository.delete`` signature.
+
         Args:
-            workflow_name: Name of workflow to delete
-            
+            workflow_identifier: Workflow name OR numeric ID as string.
+
         Returns:
-            True if deleted, False if not found
+            True if deleted, False if not found.
         """
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                delete(WorkflowModel).where(WorkflowModel.name == workflow_name).returning(WorkflowModel.id)
+                delete(WorkflowModel)
+                .where(WorkflowModel.name == workflow_identifier)
+                .returning(WorkflowModel.id)
             )
             deleted = result.scalar_one_or_none()
+            if deleted is None:
+                try:
+                    wid = int(workflow_identifier)
+                except (TypeError, ValueError):
+                    await session.commit()
+                    return False
+                result = await session.execute(
+                    delete(WorkflowModel)
+                    .where(WorkflowModel.id == wid)
+                    .returning(WorkflowModel.id)
+                )
+                deleted = result.scalar_one_or_none()
             await session.commit()
             return deleted is not None
-    
-    async def exists(self, workflow_name: str) -> bool:
-        """Check if workflow exists.
-        
-        Args:
-            workflow_name: Name to check
-            
-        Returns:
-            True if exists
-        """
+
+    async def exists(self, workflow_identifier: str) -> bool:
+        """Check if a workflow exists by name or numeric ID."""
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(WorkflowModel.id).where(WorkflowModel.name == workflow_name)
+                select(WorkflowModel.id).where(WorkflowModel.name == workflow_identifier)
+            )
+            if result.scalar_one_or_none() is not None:
+                return True
+            try:
+                wid = int(workflow_identifier)
+            except (TypeError, ValueError):
+                return False
+            result = await session.execute(
+                select(WorkflowModel.id).where(WorkflowModel.id == wid)
             )
             return result.scalar_one_or_none() is not None
     

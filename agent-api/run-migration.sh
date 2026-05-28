@@ -1,29 +1,56 @@
 #!/bin/bash
-# Run database migration to add use_for_embeddings column
+# Apply all database migrations in order.
+# Run this once on a fresh database, and again whenever a new migration is added.
+#
+# Usage:
+#   ./run-migration.sh
+#
+# Environment variables (all have defaults):
+#   DB_HOST       default: localhost
+#   DB_PORT       default: 5432
+#   DB_NAME       default: kycagent
+#   DB_USER       default: kycuser
+#   DB_PASSWORD   default: kycpassword
 
-# Load database connection from environment or use defaults
+set -euo pipefail
+
 DB_HOST="${DB_HOST:-localhost}"
 DB_PORT="${DB_PORT:-5432}"
 DB_NAME="${DB_NAME:-kycagent}"
 DB_USER="${DB_USER:-kycuser}"
+DB_PASSWORD="${DB_PASSWORD:-kycpassword}"
 
-echo "Running migration: add use_for_embeddings to llm_configs"
-echo "Database: $DB_NAME on $DB_HOST:$DB_PORT"
+PSQL="PGPASSWORD=${DB_PASSWORD} psql -h ${DB_HOST} -p ${DB_PORT} -U ${DB_USER} -d ${DB_NAME}"
+
+echo "Applying migrations to ${DB_NAME} on ${DB_HOST}:${DB_PORT}"
+echo "============================================================"
+
+MIGRATIONS=(
+  "migrations/001_initial_schema.sql"
+  "migrations/002_add_token_columns.sql"
+  "migrations/002_vector_indexes.sql"
+  "migrations/003_code_intelligence.sql"
+  "migrations/004_atropos.sql"
+  "migrations/005_code_analyzer_v1.sql"
+  "migrations/006_code_crawler_v1.sql"
+  "migrations/007_drop_v1_code_analyzer.sql"
+  "migrations/008_workflow_indexing_status.sql"
+  "migrations/009_knowledge_graph.sql"
+  "migrations/010_kg_domain_mapping.sql"
+)
+
+for migration in "${MIGRATIONS[@]}"; do
+  if [ -f "$migration" ]; then
+    echo ""
+    echo "→ $migration"
+    eval "$PSQL -f '$migration'"
+    echo "  ✅ done"
+  else
+    echo ""
+    echo "  ⚠️  $migration not found — skipping"
+  fi
+done
+
 echo ""
-
-# Run the migration
-PGPASSWORD="${DB_PASSWORD:-kycpassword}" psql \
-  -h "$DB_HOST" \
-  -p "$DB_PORT" \
-  -U "$DB_USER" \
-  -d "$DB_NAME" \
-  -f migrations/add_use_for_embeddings_to_llm_configs.sql
-
-if [ $? -eq 0 ]; then
-    echo ""
-    echo "✅ Migration completed successfully!"
-else
-    echo ""
-    echo "❌ Migration failed. Please check the error above."
-    exit 1
-fi
+echo "============================================================"
+echo "✅ All migrations applied."

@@ -1,14 +1,53 @@
 """Main FastAPI application."""
+import logging as _bootstrap_logging
 import os
-import ssl
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Disable SSL certificate verification globally when AWS_SSL_VERIFY=false.
-# Required in environments where a self-signed CA is in the certificate chain.
+# Scoped SSL trust override for AWS calls only.
+#
+# Historically this module mutated ``ssl._create_default_https_context`` to
+# bypass verification process-wide — that leaked the override to httpx
+# (Anthropic, Azure DevOps), urllib, and any other outbound stdlib HTTPS,
+# which is a serious security regression. We now apply the override only to
+# boto3's default session via ``AWS_CA_BUNDLE``, leaving all other HTTPS
+# traffic untouched.
+#
+# Preferred remediation: set ``AWS_CA_BUNDLE`` to a PEM bundle containing
+# your corporate / self-signed CA and leave verification enabled.
 if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
-    ssl._create_default_https_context = ssl._create_unverified_context
+    _bootstrap_logging.getLogger(__name__).warning(
+        "AWS_SSL_VERIFY=false set — disabling TLS verification for boto3 only. "
+        "Prefer AWS_CA_BUNDLE pointing at your CA bundle in production."
+    )
+    try:
+        # Scoped monkey-patch: inject verify=False default into boto3 client
+        # and resource factories so AWS calls skip cert validation while
+        # httpx (Anthropic), urllib (stdlib), and other HTTPS stacks remain
+        # untouched.
+        import boto3
+
+        def _wrap(factory):
+            def _patched(*args, **kwargs):
+                kwargs.setdefault("verify", False)
+                return factory(*args, **kwargs)
+            return _patched
+
+        boto3.client = _wrap(boto3.client)  # type: ignore[assignment]
+        boto3.resource = _wrap(boto3.resource)  # type: ignore[assignment]
+
+        # Also patch boto3.Session.client — transports that go through
+        # boto3.Session().client(...) (e.g. BedrockTransport) would otherwise
+        # bypass the verify=False override above.
+        _orig_session_client = boto3.Session.client
+        def _patched_session_client(self, *args, **kwargs):  # type: ignore[misc]
+            kwargs.setdefault("verify", False)
+            return _orig_session_client(self, *args, **kwargs)
+        boto3.Session.client = _patched_session_client  # type: ignore[assignment]
+
+    except Exception:  # pragma: no cover - boto3 missing in tooling envs
+        pass
     try:
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -44,7 +83,7 @@ async def lifespan(app: FastAPI):
         logger.info("Database initialized successfully")
     except Exception as e:
         logger.warning(f"Database initialization skipped (may already exist): {e}")
-    
+
     workflow_scheduler.start()
 
     # Start proactive alarm monitoring (non-blocking background task).

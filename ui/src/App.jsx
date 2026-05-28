@@ -16,6 +16,7 @@ import './App.css';
 const Workflow = lazy(() => import('./pages/workflow'));
 const Analytics = lazy(() => import('./pages/Analytics'));
 const Chat = lazy(() => import('./pages/Chat'));
+const CodebaseExplorer = lazy(() => import('./pages/CodebaseExplorer'));
 
 // Use HashRouter for Electron, BrowserRouter for web
 const Router = window.electronAPI ? HashRouter : BrowserRouter;
@@ -51,7 +52,7 @@ const AppRoutes = () => {
     <SidebarProvider>
       <AppSidebar />
       <SidebarInset>
-        <main className="w-full max-w-full min-h-screen overflow-x-hidden">
+        <main className="w-full max-w-full min-h-screen flex flex-col overflow-x-hidden">
           <Suspense fallback={<LoadingFallback />}>
             <Routes>
               <Route path="/" element={<Dashboard />} />
@@ -61,6 +62,7 @@ const AppRoutes = () => {
               {isDevelopment && <Route path="/chat" element={<Chat />} />}
               <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
               <Route path="/workflow" element={<Workflow />} />
+              <Route path="/explorer" element={<CodebaseExplorer />} />
               <Route path="/alerts" element={<PlaceholderPage title="Alerts" />} />
               {isDevelopment && <Route path="/analytics" element={<Analytics />} />}
               <Route path="/emergency" element={<PlaceholderPage title="Emergency Contact" />} />

@@ -42,6 +42,8 @@ ENV/
 .coverage
 htmlcov/
 .mypy_cache/
+.hypothesis/
+.ruff_cache/
 
 # Logs
 *.log

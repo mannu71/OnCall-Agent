@@ -8,11 +8,18 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Create async engine using settings
+# Create async engine using settings.
+# Pool sized for parallel DAG node execution (see plan §3.2).
+# Override via settings.db_pool_size / settings.db_max_overflow if defined.
 async_engine = create_async_engine(
     settings.async_database_url,
     echo=False,
-    future=True
+    future=True,
+    pool_size=getattr(settings, "db_pool_size", 20),
+    max_overflow=getattr(settings, "db_max_overflow", 40),
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_timeout=30,
 )
 
 # Create async session factory

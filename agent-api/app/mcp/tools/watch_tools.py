@@ -169,95 +169,271 @@ class CloudWatchLogWatcher:
         query_string: str,
         start_time: datetime,
         end_time: datetime,
-        limit: int = 1000
+        limit: int = 1000,
+        max_attempts: int = 3,
+        timeout_seconds: float = 90.0,
     ) -> Dict[str, Any]:
-        """Run CloudWatch Logs Insights query.
-        
+        """Run CloudWatch Logs Insights query with retry + sampling fallback.
+
+        Resilience strategy (Phase 4):
+          - Up to ``max_attempts`` attempts with exponential backoff (2s, 8s, 30s).
+          - Throttling / transient ClientErrors are retried automatically.
+          - If every attempt times out, fall back to a *sampled* query: shrink
+            the window to the last 25% of the original range and append a
+            ``| limit 1000`` clause. The response is flagged ``partial=True``
+            with the sampling_ratio so downstream consumers (and the agent)
+            know the result is degraded but non-empty.
+
         Args:
             log_group_names: List of log group names
             query_string: Insights query string
             start_time: Start time for query
             end_time: End time for query
             limit: Maximum results
-            
+            max_attempts: Number of full-window attempts before sampling.
+            timeout_seconds: Per-attempt timeout.
+
         Returns:
-            Query results
+            Query results dict. May include ``partial=True`` and ``sampling_ratio``.
         """
-        # Start query
-        start_query_response = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: self.client.start_query(
-                logGroupNames=log_group_names,
-                startTime=int(start_time.timestamp()),
-                endTime=int(end_time.timestamp()),
-                queryString=query_string,
-                limit=limit
+        backoffs = [2.0, 8.0, 30.0]
+        last_error: Optional[str] = None
+        last_query_id: Optional[str] = None
+
+        async def _execute_once(qs: str, qstart: datetime, qend: datetime, qlimit: int) -> Dict[str, Any]:
+            """Run a single Insights query and poll to completion or timeout."""
+            start_resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.client.start_query(
+                    logGroupNames=log_group_names,
+                    startTime=int(qstart.timestamp()),
+                    endTime=int(qend.timestamp()),
+                    queryString=qs,
+                    limit=qlimit,
+                ),
             )
-        )
-        
-        query_id = start_query_response['queryId']
+            qid = start_resp['queryId']
 
-        # Poll for results — guarded by a 90-second timeout to prevent
-        # indefinite blocking and unnecessary AWS charges on runaway queries.
-        async def _poll() -> Dict[str, Any]:
-            while True:
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.client.get_query_results(queryId=query_id)
-                )
+            async def _poll() -> Dict[str, Any]:
+                while True:
+                    response = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.client.get_query_results(queryId=qid),
+                    )
+                    status = response['status']
+                    if status == 'Complete':
+                        return {
+                            'query_id': qid,
+                            'status': status,
+                            'results': response.get('results', []),
+                            'statistics': response.get('statistics', {}),
+                        }
+                    if status in ('Failed', 'Cancelled'):
+                        return {
+                            'query_id': qid,
+                            'status': status,
+                            'error': response.get('statistics', {}).get('statusMessage', 'Query failed'),
+                        }
+                    await asyncio.sleep(1)
 
-                status = response['status']
-
-                if status == 'Complete':
-                    return {
-                        'query_id': query_id,
-                        'status': status,
-                        'results': response.get('results', []),
-                        'statistics': response.get('statistics', {})
-                    }
-                elif status in ['Failed', 'Cancelled']:
-                    return {
-                        'query_id': query_id,
-                        'status': status,
-                        'error': response.get('statistics', {}).get('statusMessage', 'Query failed')
-                    }
-
-                await asyncio.sleep(1)
-
-        try:
-            return await asyncio.wait_for(_poll(), timeout=90.0)
-        except asyncio.TimeoutError:
-            # Cancel the Insights query to avoid ongoing AWS charges.
             try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.client.stop_query(queryId=query_id)
-                )
-                logger.warning("query_with_insights: query %s stopped after 90s timeout", query_id)
-            except Exception as stop_err:
-                logger.warning("query_with_insights: could not stop query %s: %s", query_id, stop_err)
+                return await asyncio.wait_for(_poll(), timeout=timeout_seconds)
+            except asyncio.TimeoutError:
+                # Cancel the Insights query to avoid ongoing AWS charges.
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.client.stop_query(queryId=qid),
+                    )
+                except Exception as stop_err:  # pragma: no cover - best-effort
+                    logger.warning("query_with_insights: stop_query failed for %s: %s", qid, stop_err)
+                return {
+                    'query_id': qid,
+                    'status': 'Timeout',
+                    'error': f'Insights query exceeded {timeout_seconds:.0f}s and was stopped',
+                }
+
+        # Retry full-window attempts with exponential backoff.
+        for attempt in range(max_attempts):
+            try:
+                result = await _execute_once(query_string, start_time, end_time, limit)
+                last_query_id = result.get('query_id')
+                if result.get('status') == 'Complete':
+                    return result
+                last_error = result.get('error')
+                # Throttling / transient failures fall through to backoff+retry.
+                if result.get('status') == 'Failed' and last_error and 'throttl' not in last_error.lower():
+                    # Non-retriable failure — return immediately.
+                    return result
+            except ClientError as e:
+                code = e.response.get('Error', {}).get('Code', '')
+                last_error = f"{code}: {e.response.get('Error', {}).get('Message', str(e))}"
+                if code not in ('ThrottlingException', 'LimitExceededException', 'ServiceUnavailable'):
+                    raise
+
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+
+        # Sampling fallback: shrink window to last 25% and cap to 1000 rows.
+        window = end_time - start_time
+        sampled_start = end_time - (window / 4) if window.total_seconds() > 0 else start_time
+        sampled_query = query_string.rstrip()
+        if '| limit' not in sampled_query.lower():
+            sampled_query = sampled_query + "\n| limit 1000"
+        logger.warning(
+            "query_with_insights: full-window attempts exhausted, falling back to "
+            "sampled query (25%% window, limit 1000). last_error=%s", last_error,
+        )
+        try:
+            sampled = await _execute_once(sampled_query, sampled_start, end_time, min(limit, 1000))
+        except ClientError as e:
             return {
-                'query_id': query_id,
-                'status': 'Timeout',
-                'error': 'Insights query exceeded 90-second limit and was stopped'
+                'query_id': last_query_id,
+                'status': 'Failed',
+                'error': f'Sampling fallback failed: {e}',
+                'partial': True,
+                'sampling_ratio': 0.25,
             }
+        sampled['partial'] = True
+        sampled['sampling_ratio'] = 0.25
+        sampled['fallback_reason'] = last_error or 'timeout'
+        return sampled
+
+
+# ---------------------------------------------------------------------------
+# Severity taxonomy (Phase 1)
+# ---------------------------------------------------------------------------
+# Insights filter clauses keyed by canonical severity bucket. Each clause uses
+# CloudWatch Insights `like` regex syntax and covers:
+#   - plain text words (ERROR, Warning, etc.)
+#   - structured JSON ("level":"error", "severity":"critical")
+#   - syslog priority prefixes (<0> .. <7>)
+#   - Java/Python/UNIX vocabulary (SEVERE, EMERG, ALERT, FATAL, CRITICAL)
+SEVERITY_PATTERNS: Dict[str, str] = {
+    "critical": (
+        'level in ["CRITICAL", "FATAL", "EMERG", "ALERT", "SEVERE"] '
+        'OR @message like /(?i)\\b(critical|fatal|emerg(ency)?|alert|severe|panic)\\b/ '
+        'OR @message like /"(level|severity)"\\s*:\\s*"(?i)(critical|fatal|emergency|alert|severe)"/ '
+        'OR @message like /^<[0-2]>/'
+    ),
+    "error": (
+        'level in ["ERROR", "ERR"] '
+        'OR @message like /(?i)\\b(error|exception|err|failure|failed|traceback)\\b/ '
+        'OR @message like /"(level|severity)"\\s*:\\s*"(?i)(error|err)"/ '
+        'OR @message like /^<3>/'
+    ),
+    "warning": (
+        'level in ["WARN", "WARNING"] '
+        'OR @message like /(?i)\\b(warn|warning|deprecated)\\b/ '
+        'OR @message like /"(level|severity)"\\s*:\\s*"(?i)(warn|warning)"/ '
+        'OR @message like /^<4>/'
+    ),
+    "info": (
+        'level in ["INFO", "NOTICE"] '
+        'OR @message like /(?i)\\b(info|notice)\\b/ '
+        'OR @message like /"(level|severity)"\\s*:\\s*"(?i)(info|notice)"/ '
+        'OR @message like /^<[5-6]>/'
+    ),
+    "debug": (
+        'level in ["DEBUG", "TRACE"] '
+        'OR @message like /(?i)\\b(debug|trace)\\b/ '
+        'OR @message like /"(level|severity)"\\s*:\\s*"(?i)(debug|trace)"/ '
+        'OR @message like /^<7>/'
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Typed normalization tokens (Phase 2)
+# ---------------------------------------------------------------------------
+_UUID_RE = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+    re.IGNORECASE,
+)
+_TIMESTAMP_RE = re.compile(
+    r'[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9:.Z+\-]+'
+)
+_IP_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b')
+_HEX_RE = re.compile(r'0x[0-9a-fA-F]+')
+# Duration: number immediately followed by ms|s|m|h (no word boundary needed
+# before unit because digit-letter is a natural boundary).
+_DURATION_RE = re.compile(r'\b(\d+(?:\.\d+)?)(ms|us|ns|s|m|h)\b', re.IGNORECASE)
+# HTTP status: 3-digit number that looks like an HTTP code, typically preceded
+# by "status", "code", "HTTP", or appearing standalone in a range we care about.
+_HTTP_RE = re.compile(
+    r'\b(?:status[_\s-]?code\s*[:=]?\s*|status\s*[:=]?\s*|HTTP[/ ]?[0-9.]*\s+)?'
+    r'([1-5]\d{2})\b'
+)
+_NUM_RE = re.compile(r'\b\d+(?:\.\d+)?\b')
+
+
+def _bucket_duration(value: float, unit: str) -> str:
+    """Return a magnitude bucket for a duration in any unit.
+
+    Buckets are chosen to preserve operationally meaningful gradation:
+      - short:  < 100ms  (fast paths)
+      - med:    100ms..10s (typical request latencies)
+      - long:   10s..1min (slow requests / soft timeouts)
+      - xlong:  >= 1min   (hung or hard-timeout territory)
+    """
+    unit = unit.lower()
+    multipliers = {"ns": 1e-6, "us": 1e-3, "ms": 1.0, "s": 1000.0, "m": 60_000.0, "h": 3_600_000.0}
+    ms = value * multipliers.get(unit, 1.0)
+    if ms < 100.0:
+        return "<DURATION:short>"
+    if ms < 10_000.0:
+        return "<DURATION:med>"
+    if ms < 60_000.0:
+        return "<DURATION:long>"
+    return "<DURATION:xlong>"
+
+
+def _bucket_num(value_str: str) -> str:
+    try:
+        value = float(value_str)
+    except ValueError:
+        return "<NUM:med>"
+    if value < 10:
+        return "<NUM:small>"
+    if value < 1000:
+        return "<NUM:med>"
+    return "<NUM:large>"
+
+
+def _bucket_http(code_str: str) -> str:
+    cls = code_str[0]
+    if cls in ("4", "5"):
+        return f"<HTTP:{cls}xx>"
+    return f"<NUM:med>"
 
 
 def _normalize_message(msg: str) -> str:
     """Normalise a log message for semantic pattern grouping.
 
-    Strips variable tokens (UUIDs, timestamps, standalone numbers, hex
-    literals) so that messages that differ only in dynamic values collapse
-    into a single representative pattern.
+    Replaces dynamic tokens with *typed* placeholders so that pattern grouping
+    preserves severity gradation:
+      - UUIDs       -> <UUID>
+      - ISO timestamps -> <TIMESTAMP>
+      - IPv4[:port] -> <IP>
+      - hex literals -> <HEX>
+      - durations   -> <DURATION:short|long>
+      - HTTP codes  -> <HTTP:4xx|5xx>
+      - numbers     -> <NUM:small|med|large>
+
+    Ordering matters: high-specificity patterns run first so a UUID is not
+    chewed up by the generic number regex.
     """
-    _TOKEN_RE = re.compile(
-        r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'  # UUIDs
-        r'|[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9:.Z+\-]+'  # ISO timestamps
-        r'|\b\d+\b'                                                           # standalone numbers
-        r'|0x[0-9a-fA-F]+',                                                  # hex literals
-        re.IGNORECASE,
+    out = _UUID_RE.sub('<UUID>', msg)
+    out = _TIMESTAMP_RE.sub('<TIMESTAMP>', out)
+    out = _IP_RE.sub('<IP>', out)
+    out = _HEX_RE.sub('<HEX>', out)
+    out = _DURATION_RE.sub(
+        lambda m: _bucket_duration(float(m.group(1)), m.group(2)),
+        out,
     )
-    return _TOKEN_RE.sub('<VAR>', msg)[:150]
+    out = _HTTP_RE.sub(lambda m: _bucket_http(m.group(1)), out)
+    out = _NUM_RE.sub(lambda m: _bucket_num(m.group(0)), out)
+    return out[:150]
 
 
 def get_watcher(
@@ -470,12 +646,11 @@ async def analyze_log_patterns(
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=time_range_minutes)
     
-    # Build Insights query for pattern analysis
-    pattern_filters = {
-        "error": "level = ERROR OR message like /ERROR|Error|error|Exception|exception/",
-        "warning": "level = WARN OR message like /WARN|Warning|warning/",
-        "info": "level = INFO OR message like /INFO|Info|info/"
-    }
+    # Build Insights query for pattern analysis.
+    # Patterns cover plain text, structured JSON ("level":"error"),
+    # syslog priorities (<0>..<7>), Java logging (SEVERE/WARNING),
+    # and Python/standard severity vocabulary.
+    pattern_filters = SEVERITY_PATTERNS
     
     results = {}
     
@@ -671,21 +846,17 @@ async def detect_anomalies(
     # Global defaults
     threshold = _deviation_thresholds.get(sensitivity, 2.0)
     
-    # Query for error counts in current period
-    current_query = """
-    fields @timestamp, @message
-    | filter level = ERROR OR message like /ERROR|Error|Exception/
-    | stats count() as error_count by bin(5m)
-    | sort @timestamp desc
-    """
-    
+    # Query for error counts in current period (uses Phase 1 severity taxonomy)
+    _error_filter = SEVERITY_PATTERNS["error"]
+    current_query = (
+        "fields @timestamp, @message\n"
+        f"| filter {_error_filter}\n"
+        "| stats count() as error_count by bin(5m)\n"
+        "| sort @timestamp desc\n"
+    )
+
     # Query for baseline error counts
-    baseline_query = """
-    fields @timestamp, @message
-    | filter level = ERROR OR message like /ERROR|Error|Exception/
-    | stats count() as error_count by bin(5m)
-    | sort @timestamp desc
-    """
+    baseline_query = current_query
     
     anomalies = []
     
@@ -715,7 +886,7 @@ async def detect_anomalies(
                         baseline_counts.append(float(field.get("value", 0)))
                     except (ValueError, TypeError):
                         pass
-        
+
         baseline_avg = sum(baseline_counts) / len(baseline_counts) if baseline_counts else 0
 
         # Compute standard deviation for z-score based anomaly detection.
@@ -724,6 +895,38 @@ async def detect_anomalies(
             baseline_std = variance ** 0.5
         else:
             baseline_std = 0.0
+
+        # ------------------------------------------------------------------
+        # Adaptive baseline (Phase 3): EWMA + linear-regression trend slope.
+        # The stationary mean/std above misses slow-burn drift (e.g. memory
+        # leak doubling hourly), so we additionally compute:
+        #   - ewma_value: exponentially weighted moving average (alpha=0.3)
+        #     over the trailing baseline window
+        #   - trend_slope: least-squares slope of the last 6 baseline buckets
+        #   - trend_std:   stddev of bucket-to-bucket deltas, used to test
+        #                  whether the slope is statistically meaningful
+        # ------------------------------------------------------------------
+        ewma_alpha = 0.3
+        ewma_value: float = 0.0
+        if baseline_counts:
+            ewma_value = baseline_counts[0]
+            for v in baseline_counts[1:]:
+                ewma_value = ewma_alpha * v + (1 - ewma_alpha) * ewma_value
+
+        trend_slope = 0.0
+        trend_std = 0.0
+        trend_window = baseline_counts[-6:] if len(baseline_counts) >= 2 else []
+        if len(trend_window) >= 2:
+            n = len(trend_window)
+            mean_x = (n - 1) / 2.0
+            mean_y = sum(trend_window) / n
+            num = sum((i - mean_x) * (y - mean_y) for i, y in enumerate(trend_window))
+            den = sum((i - mean_x) ** 2 for i in range(n))
+            trend_slope = num / den if den else 0.0
+            deltas = [trend_window[i] - trend_window[i - 1] for i in range(1, n)]
+            if len(deltas) >= 2:
+                d_mean = sum(deltas) / len(deltas)
+                trend_std = (sum((d - d_mean) ** 2 for d in deltas) / len(deltas)) ** 0.5
 
         # Check current period for anomalies using z-score.
         for result in current_result.get("results", []):
@@ -757,21 +960,49 @@ async def detect_anomalies(
             is_anomaly = False
             z_score = 0.0
             deviation = 0.0
+            residual_z = 0.0
+            slope_z = 0.0
+            anomaly_reasons: List[str] = []
 
             if baseline_std > 0:
                 z_score = (count - baseline_avg) / baseline_std
-                is_anomaly = z_score > eff_z_threshold
+                if z_score > eff_z_threshold:
+                    is_anomaly = True
+                    anomaly_reasons.append("zscore")
             elif baseline_avg > 0:
                 deviation = count / baseline_avg
-                is_anomaly = deviation > eff_threshold
+                if deviation > eff_threshold:
+                    is_anomaly = True
+                    anomaly_reasons.append("deviation")
+
+            # Phase 3: EWMA residual catches drift the stationary baseline
+            # silently absorbs. Require BOTH residual_z above threshold AND
+            # absolute_z above half-threshold to avoid false positives.
+            if baseline_std > 0 and ewma_value:
+                residual = count - ewma_value
+                residual_z = residual / baseline_std
+                if (residual_z > eff_z_threshold) and (z_score > eff_z_threshold / 2):
+                    is_anomaly = True
+                    if "ewma" not in anomaly_reasons:
+                        anomaly_reasons.append("ewma")
+
+            # Phase 3: trend-slope alarm — fires even when the current point
+            # is benign relative to a rising mean, catching slow-burn drift.
+            if trend_std > 0:
+                slope_z = trend_slope / trend_std
+                if slope_z > 2.0:
+                    is_anomaly = True
+                    if "trend" not in anomaly_reasons:
+                        anomaly_reasons.append("trend")
 
             if is_anomaly:
-                # Classify severity from z-score ranges.
-                if z_score >= 4.0 or deviation >= 4.0:
+                # Classify severity from the strongest signal we observed.
+                strongest = max(abs(z_score), abs(residual_z), abs(deviation), abs(slope_z))
+                if strongest >= 4.0:
                     severity = "critical"
-                elif z_score >= 3.0 or deviation >= 3.0:
+                elif strongest >= 3.0:
                     severity = "high"
-                elif z_score >= 2.0 or deviation >= 2.0:
+                elif strongest >= 2.0:
                     severity = "medium"
                 else:
                     severity = "low"
@@ -781,9 +1012,14 @@ async def detect_anomalies(
                     "current_count": count,
                     "baseline_average": round(baseline_avg, 2),
                     "baseline_std_dev": round(baseline_std, 2),
+                    "ewma": round(ewma_value, 2),
+                    "trend_slope": round(trend_slope, 3),
                     "z_score": round(z_score, 2),
+                    "residual_z": round(residual_z, 2),
+                    "slope_z": round(slope_z, 2),
                     "deviation_factor": round(count / baseline_avg, 2) if baseline_avg > 0 else None,
                     "severity": severity,
+                    "reasons": anomaly_reasons,
                 })
     
     except Exception as e:

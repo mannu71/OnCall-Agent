@@ -53,10 +53,14 @@ class WorkflowEngine:
         # Import strategies here to avoid circular imports
         from app.workflow.strategies.orchestrator import OrchestratorStrategy
         from app.workflow.strategies.react import ReactStrategy
+        from app.workflow.strategies.batch_react import BatchReactStrategy
+        from app.workflow.strategies.router import RouterStrategy
         
         self.strategies = strategies or [
             OrchestratorStrategy(),
-            ReactStrategy()
+            RouterStrategy(),
+            BatchReactStrategy(),
+            ReactStrategy(),
         ]
         
         self.mcp_manager = mcp_manager or MCPClientManager()

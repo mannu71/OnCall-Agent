@@ -4,10 +4,69 @@ This module provides the MemoryProvider protocol and MemoryManager class
 for managing built-in and external memory providers with a single integration point.
 """
 
-from typing import Any, Dict, List, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Tuple
+import asyncio
+import hashlib
 import logging
+import os
+import time
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+class _TTLCache:
+    """Minimal TTL cache: dict[key] -> (expires_at, value) with lazy eviction."""
+
+    def __init__(self, maxsize: int, ttl: float):
+        self.maxsize = max(1, int(maxsize))
+        self.ttl = float(ttl)
+        self._data: Dict[Any, Tuple[float, Any]] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: Any) -> Tuple[bool, Any]:
+        entry = self._data.get(key)
+        now = time.monotonic()
+        if entry is None:
+            self.misses += 1
+            return False, None
+        expires_at, value = entry
+        if expires_at < now:
+            self._data.pop(key, None)
+            self.misses += 1
+            return False, None
+        self.hits += 1
+        return True, value
+
+    def set(self, key: Any, value: Any) -> None:
+        now = time.monotonic()
+        if len(self._data) >= self.maxsize and key not in self._data:
+            # Evict oldest (by insertion order); also sweep expired.
+            expired = [k for k, (exp, _) in self._data.items() if exp < now]
+            for k in expired:
+                self._data.pop(k, None)
+            if len(self._data) >= self.maxsize:
+                try:
+                    oldest = next(iter(self._data))
+                    self._data.pop(oldest, None)
+                except StopIteration:
+                    pass
+        self._data[key] = (now + self.ttl, value)
+
+    def invalidate_prefix(self, session_id: str) -> None:
+        keys = [k for k in self._data if isinstance(k, tuple) and k and k[0] == session_id]
+        for k in keys:
+            self._data.pop(k, None)
+
+    def __len__(self) -> int:
+        return len(self._data)
 
 
 class MemoryProvider(Protocol):
@@ -118,11 +177,26 @@ class MemoryManager:
     Requirements: 9.1-9.6
     """
     
-    def __init__(self):
-        """Initialize MemoryManager."""
+    def __init__(self, providers: Optional[List[MemoryProvider]] = None):
+        """Initialize MemoryManager.
+
+        Args:
+            providers: Optional list of providers to pre-register (all treated as external-safe;
+                first one becomes built-in if provided).
+        """
         self._providers: List[MemoryProvider] = []
         self._has_external: bool = False
         self._tool_provider_map: Dict[str, MemoryProvider] = {}
+
+        # TTL cache for hot-path reads (prefetch). Configurable via env.
+        maxsize = _env_int("MEMORY_CACHE_MAXSIZE", 512)
+        ttl = _env_int("MEMORY_CACHE_TTL_SECONDS", 60)
+        self._cache = _TTLCache(maxsize=maxsize, ttl=ttl)
+        self._cache_lock = asyncio.Lock()
+
+        if providers:
+            for i, p in enumerate(providers):
+                self.add_provider(p, is_builtin=(i == 0))
     
     def add_provider(self, provider: MemoryProvider, is_builtin: bool = False) -> None:
         """Register a memory provider.
@@ -208,8 +282,16 @@ class MemoryManager:
         Returns:
             Combined prefetch context
         """
+        query_hash = hashlib.sha256(str(query).encode("utf-8", errors="replace")).hexdigest()
+        cache_key = (session_id, query_hash)
+
+        async with self._cache_lock:
+            found, cached = self._cache.get(cache_key)
+            if found:
+                return cached
+
         contexts = []
-        
+
         for provider in self._providers:
             try:
                 context = await provider.prefetch(query, session_id)
@@ -220,8 +302,11 @@ class MemoryManager:
                 logger.error(
                     f"Failed to prefetch from provider '{provider.name}': {e}"
                 )
-        
-        return "\n\n".join(contexts)
+
+        result = "\n\n".join(contexts)
+        async with self._cache_lock:
+            self._cache.set(cache_key, result)
+        return result
     
     async def sync_all(
         self,
@@ -246,6 +331,9 @@ class MemoryManager:
                 logger.error(
                     f"Failed to sync turn to provider '{provider.name}': {e}"
                 )
+
+        # Write path: invalidate cached prefetches for this session.
+        self._invalidate_session(session_id)
     
     def get_all_tool_schemas(self) -> List[Dict[str, Any]]:
         """Collect tool schemas from all providers.
@@ -290,7 +378,19 @@ class MemoryManager:
             )
         
         try:
-            return provider.handle_tool_call(tool_name, args)
+            result = provider.handle_tool_call(tool_name, args)
+            # Write-ish tool calls may mutate state — invalidate cached prefetches.
+            mutating = any(
+                kw in tool_name.lower()
+                for kw in ("save", "store", "update", "write", "add", "set", "delete", "remove")
+            )
+            if mutating:
+                sid = args.get("session_id", "") if isinstance(args, dict) else ""
+                if sid:
+                    self._invalidate_session(sid)
+                else:
+                    self._invalidate_all()
+            return result
         except Exception as e:
             logger.error(
                 f"Failed to handle tool call '{tool_name}' "
@@ -366,6 +466,28 @@ class MemoryManager:
         """
         return len(self._providers) > 0
     
+    def _invalidate_session(self, session_id: str) -> None:
+        """Invalidate all cached entries for a given session_id."""
+        if session_id is None:
+            return
+        self._cache.invalidate_prefix(session_id)
+
+    def _invalidate_all(self) -> None:
+        """Drop the entire prefetch cache."""
+        self._cache._data.clear()
+
+    def cache_stats(self) -> Dict[str, int]:
+        """Return prefetch cache statistics.
+
+        Returns:
+            Dict with hits, misses, and current size.
+        """
+        return {
+            "hits": int(self._cache.hits),
+            "misses": int(self._cache.misses),
+            "size": len(self._cache),
+        }
+
     def get_provider_names(self) -> List[str]:
         """Get names of all registered providers.
         

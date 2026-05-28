@@ -131,18 +131,47 @@ class ToolRegistry:
         """
         return list(self._tools.keys())
     
-    def get_all_schemas(self) -> List[Dict[str, Any]]:
+    def get_all_schemas(
+        self,
+        query: Optional[str] = None,
+        router: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
         """Get all tool schemas for LLM binding.
-        
-        Only returns schemas for available tools.
-        
+
+        Only returns schemas for available tools. When ``query`` is supplied
+        (and ``router`` is None, the module-level ``default_router`` is used),
+        the catalog is pruned to top-K by relevance — a 15-25 K-token saving
+        per LLM call on rigs with many MCP servers. The router never excludes
+        pinned tools, so the agent always sees its core "final answer / ask
+        user / escalate" set regardless of score.
+
+        Args:
+            query: Optional task/turn text to rank tools against. When
+                ``None`` the full available catalog is returned (legacy
+                behaviour).
+            router: Optional ``ToolRouter`` to use; defaults to the
+                module-level ``default_router`` when ``query`` is given.
+
         Returns:
-            List of tool schemas
+            List of tool schemas (possibly pruned).
         """
-        schemas = []
+        schemas: List[Dict[str, Any]] = []
         for name, tool in self._tools.items():
             if self.is_available(name):
                 schemas.append(tool.schema)
+
+        if query:
+            # Late import to avoid a circular import at module load.
+            try:
+                from app.core.tools.router import ToolRouter, default_router
+                active = router if router is not None else default_router
+                if isinstance(active, ToolRouter):
+                    schemas = active.filter(schemas, query=query)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "tool_registry: tool_router unavailable (%s); "
+                    "returning full catalog.", exc,
+                )
         return schemas
     
     def clear(self) -> None:

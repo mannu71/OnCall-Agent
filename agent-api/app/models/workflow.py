@@ -60,7 +60,8 @@ class Workflow(BaseModel):
     type: Optional[Literal["workflow"]] = Field("workflow", description="Workflow type")
     schedule: Optional[str] = Field(None, description="Cron expression for scheduling")
     enabled: bool = Field(True, description="Whether the workflow is enabled")
-    
+    indexing_status: Optional[str] = Field(None, description="Set to 'indexing' while repos are being indexed; null when idle.")
+
     # Workflow structure (nodes and edges)
     nodes: Optional[List[Dict[str, Any]]] = Field(None, description="Workflow nodes")
     edges: Optional[List[Dict[str, Any]]] = Field(None, description="Workflow edges")
@@ -176,6 +177,7 @@ class WorkflowUpdate(BaseModel):
     type: Optional[Literal["workflow"]] = None
     schedule: Optional[str] = None
     enabled: Optional[bool] = None
+    indexing_status: Optional[str] = None
     tasks: Optional[List[Dict[str, Any]]] = None
     nodes: Optional[List[Dict[str, Any]]] = None
     edges: Optional[List[Dict[str, Any]]] = None
@@ -204,7 +206,9 @@ class WorkflowResponse(BaseModel):
     tasks: Optional[List[Dict[str, Any]]] = None
     max_retries: Optional[int] = None
     timeout: Optional[int] = None
-    
+
+    indexing_status: Optional[str] = None
+
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     createdAt: Optional[str] = None

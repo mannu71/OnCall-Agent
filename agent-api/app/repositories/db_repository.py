@@ -18,6 +18,26 @@ from app.core.redact import redact
 logger = logging.getLogger(__name__)
 
 
+# Matches the output shape of ``mask_value`` in
+# ``app/api/v1/endpoints/model_keys.py``: ``{4 chars}...{4 chars}`` or the
+# all-stars ``"********"`` fallback. We use this on the server side to refuse
+# overwriting a stored credential with what is obviously just its display
+# mask round-tripped by the UI.
+import re as _re
+_MASKED_RE = _re.compile(r"^[A-Za-z0-9_\-+/=]{1,8}\.\.\.[A-Za-z0-9_\-+/=]{1,8}$")
+
+
+def _looks_masked(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    if v in {"", "********"}:
+        return True
+    if "..." in v and _MASKED_RE.match(v):
+        return True
+    return False
+
+
 class DatabaseRepository:
     """Database-backed repository for all data access."""
 
@@ -345,7 +365,19 @@ class DatabaseRepository:
         Returns:
             Created configuration dict
         """
+        use_for_embeddings = bool(
+            config_data.get("use_for_embeddings")
+            or config_data.get("useForEmbeddings")
+        )
         async with AsyncSessionLocal() as session:
+            # Single-row exclusivity: only one config can be the active
+            # embedding model. Clear the flag on every other row before
+            # inserting the new one with true.
+            if use_for_embeddings:
+                await session.execute(
+                    update(LLMConfigModel).values(use_for_embeddings=False)
+                )
+
             config = LLMConfigModel(
                 name=config_data["name"],
                 provider=config_data["provider"],
@@ -358,6 +390,7 @@ class DatabaseRepository:
                 icon=config_data.get("icon"),
                 description=config_data.get("description"),
                 aws_profile=config_data.get("aws_profile"),
+                use_for_embeddings=use_for_embeddings,
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
             )
@@ -397,7 +430,23 @@ class DatabaseRepository:
                 "icon": "icon",
                 "description": "description",
                 "aws_profile": "aws_profile",
+                "use_for_embeddings": "use_for_embeddings",
+                "useForEmbeddings": "use_for_embeddings",
             }
+
+            # Single-row exclusivity for the embedding flag. If the caller is
+            # turning this row's flag on, clear it on every other row first.
+            wants_embedding = bool(
+                config_data.get("use_for_embeddings")
+                or config_data.get("useForEmbeddings")
+            )
+            if wants_embedding:
+                await session.execute(
+                    update(LLMConfigModel)
+                    .where(LLMConfigModel.name != name)
+                    .values(use_for_embeddings=False)
+                )
+
             for json_key, col_name in field_map.items():
                 if json_key in config_data:
                     setattr(config, col_name, config_data[json_key])
@@ -508,6 +557,9 @@ class DatabaseRepository:
             Dictionary representation with both snake_case and camelCase keys
             for backward compatibility with the frontend.
         """
+        # ORM may not have the column on older deployments — read defensively
+        # so this dict serializer doesn't blow up the GET endpoint.
+        use_for_embeddings = bool(getattr(config, "use_for_embeddings", False) or False)
         d = {
             "provider": config.provider,
             "model": config.model,
@@ -521,6 +573,9 @@ class DatabaseRepository:
             "icon": config.icon,
             "description": config.description,
             "aws_profile": config.aws_profile,
+            # Exposed under both casings so existing front-end paths work.
+            "use_for_embeddings": use_for_embeddings,
+            "useForEmbeddings": use_for_embeddings,
         }
         return d
 
@@ -691,11 +746,16 @@ class DatabaseRepository:
             return [self._model_key_to_dict(k, include_secrets) for k in keys]
 
     async def get_model_key(self, provider: str, include_secrets: bool = False) -> Optional[Dict[str, Any]]:
+        # Alias-aware lookup — discover-models sends the UI label ("AWS Bedrock")
+        # but the row may have been written with a legacy spelling ("bedrock").
+        # See ``app.infrastructure.persistence.model_key_repository._provider_aliases``.
+        from app.infrastructure.persistence.model_key_repository import _provider_aliases
+        aliases = _provider_aliases(provider)
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(ModelKeyModel).where(ModelKeyModel.provider == provider)
+                select(ModelKeyModel).where(ModelKeyModel.provider.in_(aliases))
             )
-            k = result.scalar_one_or_none()
+            k = result.scalars().first()
             return self._model_key_to_dict(k, include_secrets) if k else None
 
     async def create_model_key(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -719,9 +779,25 @@ class DatabaseRepository:
             return self._model_key_to_dict(key, include_secrets=True)
 
     async def update_model_key(self, provider: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # Defensive: drop any secret-field value that looks like the masked
+        # form returned by ``mask_value`` (e.g. ``sk-p...AAAA``). Without
+        # this, a UI list/edit round-trip overwrites the real credential
+        # with the displayed mask — the symptom we hit with the OpenAI key.
+        _SECRET_FIELDS = {
+            "api_key", "secret_key", "access_key_id", "secret_access_key",
+            "session_token",
+        }
+        data = {k: v for k, v in data.items()
+                if not (k in _SECRET_FIELDS and _looks_masked(v))}
+
+        existing = await self.get_model_key(provider, include_secrets=False)
+        if not existing:
+            return None
+        resolved_provider = existing["provider"]
+
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(ModelKeyModel).where(ModelKeyModel.provider == provider)
+                select(ModelKeyModel).where(ModelKeyModel.provider == resolved_provider)
             )
             key = result.scalar_one_or_none()
             if not key:
@@ -737,9 +813,21 @@ class DatabaseRepository:
             return self._model_key_to_dict(key, include_secrets=True)
 
     async def upsert_model_key(self, provider: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        # Same masked-value guard as ``update_model_key`` — prevents the UI
+        # round-trip mask from silently overwriting real credentials.
+        _SECRET_FIELDS = {
+            "api_key", "secret_key", "access_key_id", "secret_access_key",
+            "session_token",
+        }
+        data = {k: v for k, v in data.items()
+                if not (k in _SECRET_FIELDS and _looks_masked(v))}
+
+        existing = await self.get_model_key(provider, include_secrets=False)
+        resolved_provider = existing["provider"] if existing else provider
+
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(ModelKeyModel).where(ModelKeyModel.provider == provider)
+                select(ModelKeyModel).where(ModelKeyModel.provider == resolved_provider)
             )
             key = result.scalar_one_or_none()
             if key:
@@ -769,20 +857,23 @@ class DatabaseRepository:
             return self._model_key_to_dict(key, include_secrets=True)
 
     async def delete_model_key(self, provider: str) -> bool:
+        existing = await self.get_model_key(provider, include_secrets=False)
+        if not existing:
+            return False
+        resolved_provider = existing["provider"]
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                delete(ModelKeyModel).where(ModelKeyModel.provider == provider).returning(ModelKeyModel.id)
+                delete(ModelKeyModel)
+                .where(ModelKeyModel.provider == resolved_provider)
+                .returning(ModelKeyModel.id)
             )
             deleted = result.scalar_one_or_none()
             await session.commit()
             return deleted is not None
 
     async def model_key_exists(self, provider: str) -> bool:
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(ModelKeyModel.id).where(ModelKeyModel.provider == provider)
-            )
-            return result.scalar_one_or_none() is not None
+        row = await self.get_model_key(provider, include_secrets=False)
+        return row is not None
 
     def _model_key_to_dict(self, key: ModelKeyModel, include_secrets: bool = False) -> Dict[str, Any]:
         d = {

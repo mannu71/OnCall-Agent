@@ -294,3 +294,115 @@ def is_anthropic_provider(provider: str | None) -> bool:
     if not provider:
         return False
     return provider.lower() in {"anthropic", "bedrock", "vertex"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §2.7 hygiene helpers — stable-head / volatile-tail split, first-user anchor
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Separator the assembler uses between the cache-stable head (project,
+# role, safety, tool descriptions) and the per-task volatile tail.
+# Callers that build their system prompt can insert this delimiter so
+# this module can split deterministically; absent the delimiter we
+# fall back to "treat the whole prompt as stable head".
+SYSTEM_PROMPT_VOLATILE_DELIMITER = "\n<!--VOLATILE-->\n"
+
+
+def split_system_prompt(system: str | None) -> tuple[str, str]:
+    """Split *system* into (stable_head, volatile_tail) on the delimiter.
+
+    The stable head is what we want to cache aggressively — it is the
+    same across every turn of a long-running session. The volatile tail
+    (task vars, current timestamp, retry context) changes every turn
+    and must **not** be inside the cache boundary or the cache hit-rate
+    collapses.
+    """
+    if not system:
+        return "", ""
+    if SYSTEM_PROMPT_VOLATILE_DELIMITER in system:
+        head, tail = system.split(SYSTEM_PROMPT_VOLATILE_DELIMITER, 1)
+        return head, tail
+    # No delimiter — assume the caller hasn't adopted the split yet;
+    # treat the whole prompt as stable so we still get *some* caching.
+    return system, ""
+
+
+def apply_anthropic_cache_control_split(
+    messages: list[dict[str, Any]],
+    *,
+    system: str | None = None,
+    cache_ttl: CacheTTL = "5m",
+) -> tuple[list[dict[str, Any]], Any]:
+    """Hygiene-aware wire-format variant of ``apply_cache_control``.
+
+    Differences vs. the legacy ``apply_cache_control``:
+
+    - System prompt is split into stable head + volatile tail; only the
+      head gets a cache breakpoint. The tail is concatenated after it
+      with no cache_control marker so prompt-cache hits do not flush
+      every time the task-specific suffix changes.
+    - One of the three message breakpoints is anchored at the **first**
+      ``user`` message (long-lived task anchor) instead of the third-
+      to-last message. This keeps the long task brief in cache even as
+      the tool-call tail churns.
+
+    Returns the same tuple shape as ``apply_cache_control`` so callers
+    that already destructure ``(messages, system)`` can swap drop-in.
+    """
+    cc = _make_cache_control(cache_ttl)
+
+    head, tail = split_system_prompt(system)
+    annotated_system: Any = system  # fallback to original on short prompts
+
+    if head and len(head) >= _MIN_CACHE_CHARS:
+        head_block: dict[str, Any] = {
+            "type": "text", "text": head, "cache_control": cc,
+        }
+        blocks: list[dict[str, Any]] = [head_block]
+        if tail:
+            blocks.append({"type": "text", "text": tail})
+        annotated_system = blocks
+        logger.debug(
+            "prompt_caching.split: head=%d chars (cached), tail=%d chars (volatile)",
+            len(head), len(tail),
+        )
+        budget = _MAX_BREAKPOINTS - 1
+    else:
+        budget = _MAX_BREAKPOINTS
+
+    # First-user anchor (one slot) + last 2 user/assistant messages (two slots)
+    user_indices = [
+        i for i, m in enumerate(messages) if m.get("role") == "user"
+    ]
+    ua_indices = [
+        i for i, m in enumerate(messages)
+        if m.get("role") in {"user", "assistant"}
+    ]
+
+    anchor_targets: list[int] = []
+    if user_indices and budget > 0:
+        anchor_targets.append(user_indices[0])
+        budget -= 1
+    if budget > 0:
+        # Last min(budget, 2) user/assistant messages, excluding the
+        # first-user slot we already pinned above.
+        tail_anchors = [
+            i for i in ua_indices[-min(budget, 2):]
+            if i not in anchor_targets
+        ]
+        anchor_targets.extend(tail_anchors)
+
+    for i in anchor_targets:
+        msg = messages[i]
+        content = msg.get("content", "")
+        if isinstance(content, str) and len(content) >= _MIN_CACHE_CHARS:
+            messages[i] = {
+                **msg,
+                "content": [{"type": "text", "text": content, "cache_control": cc}],
+            }
+            logger.debug(
+                "prompt_caching.split: breakpoint on messages[%d] role=%s",
+                i, msg.get("role"),
+            )
+
+    return messages, annotated_system

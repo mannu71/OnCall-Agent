@@ -20,6 +20,11 @@ kyc-protect-oncall-agent/
 └── README.md
 ```
 
+## Documentation
+
+- [Code Analyzer Architecture (v1.0)](docs/CODE_ANALYZER_ARCHITECTURE.md) — end-to-end as-built reference for the 9-layer code analyzer (chunking → storage → Bedrock embedding → 5-signal retrieval → 7-stage RRF reranker → 6-tool surface → on-disk verification → compaction → workflow UI).
+- [Eval harness](agent-api/tests/eval/README.md) — `pytest -m eval` dual-metric merge gate (F1 per category + tokens-per-correct).
+
 ## How to Run Locally
 
 ### Prerequisites

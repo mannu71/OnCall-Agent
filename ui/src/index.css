@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
 @custom-variant dark (&:is(.dark *));
 
@@ -48,6 +49,49 @@
 
 :root {
   --radius: 0.625rem;
+
+  /* ── Brand red ramp ─────────────────────────────────────── */
+  --brand-red-50:  #fef2f2;
+  --brand-red-100: #fee2e2;
+  --brand-red-200: #fecaca;
+  --brand-red-400: #f87171;
+  --brand-red-500: #ef4444;
+  --brand-red-600: #dc2626;
+  --brand-red-700: #b91c1c;
+  --brand-red-900: #7f1d1d;
+
+  /* ── Semantic / status ───────────────────────────────────── */
+  --success-50:  #ecfdf5;
+  --success-100: #d1fae5;
+  --success-600: #059669;
+  --success-700: #047857;
+  --warning-50:  #fffbeb;
+  --warning-100: #fef3c7;
+  --warning-400: #fbbf24;
+  --warning-600: #d97706;
+  --warning-900: #78350f;
+  --info-50:   #eff6ff;
+  --info-100:  #dbeafe;
+  --info-600:  #2563eb;
+  --info-700:  #1d4ed8;
+  --violet-100: #ede9fe;
+  --violet-600: #7c3aed;
+  --violet-700: #6d28d9;
+
+  /* ── Type ────────────────────────────────────────────────── */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* ── Motion ──────────────────────────────────────────────── */
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --duration-fast:    150ms;
+  --duration-base:    200ms;
+  --duration-slow:    300ms;
+
+  /* ── Live status pulse ───────────────────────────────────── */
+  --pulse-red:   #f87171;
+  --pulse-amber: #fbbf24;
+
   --background: #f8fafc;
   --foreground: #1e293b;
   --card: #ffffff;
@@ -123,8 +167,11 @@
   }
   body {
     @apply bg-slate-50 text-slate-800;
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    -webkit-font-smoothing: antialiased;
   }
+  code, .mono { font-family: var(--font-mono); }
 }
 
 @layer utilities {

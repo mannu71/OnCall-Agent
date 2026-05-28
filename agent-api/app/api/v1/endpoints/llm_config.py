@@ -39,7 +39,20 @@ async def discover_provider_models(request: DiscoverModelsRequest):
 
     ssl_verify = os.environ.get("AWS_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
 
-    provider = request.provider
+    # Canonicalise the provider name so callers can pass either the UI label
+    # ("AWS Bedrock") or a legacy / short alias ("bedrock"). Both the model-
+    # keys lookup and the dispatch chain below need the canonical form.
+    _CANONICAL = {
+        "aws bedrock":  "AWS Bedrock", "bedrock": "AWS Bedrock", "aws-bedrock": "AWS Bedrock", "aws_bedrock": "AWS Bedrock",
+        "openai":       "OpenAI",      "open_ai":  "OpenAI",     "open-ai":     "OpenAI",
+        "anthropic":    "Anthropic",
+        "azure openai": "Azure OpenAI","azure":    "Azure OpenAI","azure_openai":"Azure OpenAI","azure-openai":"Azure OpenAI",
+        "google":       "Google",      "gemini":   "Google",     "google-genai":"Google",      "google_genai":"Google",
+        "groq":         "Groq",
+        "ollama":       "Ollama",
+    }
+    provider = _CANONICAL.get((request.provider or "").strip().lower(), request.provider)
+
     mk = await db_repository.get_model_key(provider, include_secrets=True)
     if not mk:
         raise HTTPException(
@@ -328,6 +341,11 @@ class AWSDiscoverRequest(BaseModel):
 
 
 class LLMConfigCreate(BaseModel):
+    # Tolerate both snake_case (use_for_embeddings) and camelCase
+    # (useForEmbeddings) so the UI can send either. populate_by_name lets
+    # Pydantic accept the field name in addition to the alias.
+    model_config = {"populate_by_name": True}
+
     name: str = Field(..., description="LLM configuration name")
     provider: str = Field(..., description="Provider name")
     model: Optional[str] = Field(None, description="Model name")
@@ -338,9 +356,16 @@ class LLMConfigCreate(BaseModel):
     region: Optional[str] = Field(None, description="AWS region")
     icon: Optional[str] = Field(None, description="Icon")
     description: Optional[str] = Field(None, description="Description")
+    use_for_embeddings: Optional[bool] = Field(
+        None,
+        alias="useForEmbeddings",
+        description="Flag this config as the active embedding model (single-row exclusive)",
+    )
 
 
 class LLMConfigUpdate(BaseModel):
+    model_config = {"populate_by_name": True}
+
     name: Optional[str] = Field(None, description="New name (for rename)")
     provider: Optional[str] = Field(None, description="Provider name")
     model: Optional[str] = Field(None, description="Model name")
@@ -351,6 +376,11 @@ class LLMConfigUpdate(BaseModel):
     region: Optional[str] = Field(None, description="AWS region")
     icon: Optional[str] = Field(None, description="Icon")
     description: Optional[str] = Field(None, description="Description")
+    use_for_embeddings: Optional[bool] = Field(
+        None,
+        alias="useForEmbeddings",
+        description="Flag this config as the active embedding model (single-row exclusive)",
+    )
 
 
 def mask_api_key(api_key: str) -> str:

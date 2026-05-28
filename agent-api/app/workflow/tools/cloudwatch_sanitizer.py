@@ -12,6 +12,46 @@ from typing import Dict, List, Any, Optional
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Token counting (Phase 5)
+# ---------------------------------------------------------------------------
+# Prefer tiktoken's `cl100k_base` encoding for accurate token counts. The
+# char/4 heuristic drifts 15-40% on JSON-heavy log payloads, causing silent
+# truncation or context overflow. Fall back gracefully if tiktoken is not
+# installed so the sanitizer path keeps working in minimal environments.
+_TIKTOKEN_ENCODER = None
+_TIKTOKEN_TRIED = False
+
+
+def _get_encoder():
+    """Lazily load the cl100k_base encoder. Returns None on failure."""
+    global _TIKTOKEN_ENCODER, _TIKTOKEN_TRIED
+    if _TIKTOKEN_TRIED:
+        return _TIKTOKEN_ENCODER
+    _TIKTOKEN_TRIED = True
+    try:
+        import tiktoken  # type: ignore
+        _TIKTOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+    except Exception as exc:  # pragma: no cover - import-time fallback
+        logger.info(
+            "cloudwatch_sanitizer: tiktoken unavailable (%s); "
+            "falling back to char/4 token estimation.", exc,
+        )
+        _TIKTOKEN_ENCODER = None
+    return _TIKTOKEN_ENCODER
+
+
+def _count_tokens(text: str) -> int:
+    """Return an accurate token count via tiktoken, or char/4 estimate."""
+    enc = _get_encoder()
+    if enc is not None:
+        try:
+            return len(enc.encode(text))
+        except Exception:  # pragma: no cover - encoder fault is non-fatal
+            pass
+    return len(text) // 4
+
+
 class CloudWatchToolSanitizer:
     """Sanitizes CloudWatch tool outputs to prevent token explosion.
     
@@ -71,9 +111,11 @@ class CloudWatchToolSanitizer:
         """
         context = context or {}
         
-        # Estimate raw token count (rough approximation: 1 token ≈ 4 chars)
+        # Use cheap char/4 heuristic for the *raw* (pre-sanitization) count.
+        # This value is telemetry-only; paying full tiktoken cost on a multi-MB
+        # payload before filtering would be wasteful and slow.
         raw_str = str(raw_result)
-        raw_tokens = self._estimate_tokens(raw_str)
+        raw_tokens = len(raw_str) // 4
         
         # Extract events from result
         events = self._extract_events(raw_result)
@@ -96,16 +138,29 @@ class CloudWatchToolSanitizer:
         
         # Format as compact text
         output = self._format_compact(events, total_events)
-        
-        # Enforce character limit
+
+        # Enforce character limit — emit a structured marker so downstream
+        # agents know exactly what was dropped (raw events count + chars
+        # discarded) and can decide whether to drill in via another tool call.
+        chars_dropped = 0
         if len(output) > self.MAX_OUTPUT_CHARS:
-            output = output[:self.MAX_OUTPUT_CHARS] + "\n...[output truncated to char limit]"
-        
-        # Enforce token budget
+            chars_dropped = len(output) - self.MAX_OUTPUT_CHARS
+            output = (
+                output[:self.MAX_OUTPUT_CHARS]
+                + f"\n...[truncated by sanitizer: dropped {chars_dropped} chars, "
+                f"{total_events - len(events)} of {total_events} raw events not shown]"
+            )
+
+        # Enforce token budget — same idea: leave a breadcrumb the agent can
+        # reason about instead of a silent cut.
         truncated = False
         final_tokens = self._estimate_tokens(output)
         if final_tokens > self.TOKEN_BUDGET:
             output = self._truncate_to_token_budget(output)
+            output += (
+                f"\n[token-budget cut at {self.TOKEN_BUDGET} tokens; "
+                f"original was ~{final_tokens} tokens, raw events={total_events}]"
+            )
             final_tokens = self.TOKEN_BUDGET
             truncated = True
         
@@ -173,8 +228,18 @@ class CloudWatchToolSanitizer:
         
         for event in events:
             msg = event.get("message", "")
-            # Normalize: replace numbers with 'N', take first 100 chars as key
-            key = re.sub(r'\d+', 'N', msg)[:100]
+            # Normalize: strip UUIDs, hex hashes, transaction IDs, and plain
+            # numbers before grouping so semantically identical log lines with
+            # different runtime IDs collapse to the same bucket.
+            # Key width is 250 chars (was 100) to avoid false-positive grouping
+            # of messages that share a long common prefix but differ later.
+            key = re.sub(
+                r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
+                r'|\b[0-9a-fA-F]{8,}\b'
+                r'|\d+',
+                'N',
+                msg,
+            )[:250]
             
             if key not in seen:
                 seen[key] = {"event": event.copy(), "count": 1}
@@ -216,16 +281,24 @@ class CloudWatchToolSanitizer:
         return "\n".join(lines)
     
     def _estimate_tokens(self, text: str) -> int:
-        """Estimate token count (rough approximation: 1 token ≈ 4 chars)."""
-        return len(text) // 4
-    
+        """Accurate token count via tiktoken cl100k_base, with safe fallback."""
+        return _count_tokens(text)
+
     def _truncate_to_token_budget(self, text: str) -> str:
-        """Truncate text to fit within token budget."""
-        # Rough approximation: 1 token ≈ 4 chars
-        max_chars = self.TOKEN_BUDGET * 4
-        if len(text) > max_chars:
-            return text[:max_chars] + "\n...[truncated to token budget]"
-        return text
+        """Truncate text to fit within token budget using accurate counting."""
+        if _count_tokens(text) <= self.TOKEN_BUDGET:
+            return text
+        # Binary-search for the longest prefix that fits the token budget.
+        lo, hi = 0, len(text)
+        best = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if _count_tokens(text[:mid]) <= self.TOKEN_BUDGET:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return text[:best] + "\n...[truncated to token budget]"
     
     def _record(
         self,

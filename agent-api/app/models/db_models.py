@@ -60,6 +60,7 @@ class WorkflowModel(Base):
     viewport = Column(JSON)
     enabled = Column(Boolean, default=True)
     schedule = Column(String(100))  # Cron expression
+    indexing_status = Column(String(50), nullable=True)  # None | 'indexing' | 'indexing_failed: [repo]'
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
 
@@ -276,11 +277,7 @@ class AlertModel(Base):
 
 
 # ---------------------------------------------------------------------------
-# SCIP code-intelligence tables (Phase 2)
-#
-# Populated by ``app.services.code_indexing.scip_loader.load_scip_index``.
-# Used by ``app.services.code_indexer._resolve_cross_file_call`` to replace
-# the legacy heuristic resolver with compiler-grade SCIP lookups.
+# (v1 SCIP code-intelligence tables removed — dropped in migration 007)
 # ---------------------------------------------------------------------------
 
 

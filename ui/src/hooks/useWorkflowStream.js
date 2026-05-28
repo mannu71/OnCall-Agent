@@ -21,6 +21,10 @@ export function useWorkflowStream(workflowName, enabled = true) {
     const [totalCost, setTotalCost] = useState(0);
     // agentCosts: per-agent USD spend { [nodeId]: number }
     const [agentCosts, setAgentCosts] = useState({});
+    // totalTokens: cumulative LLM token count (input + output) across all agent nodes
+    const [totalTokens, setTotalTokens] = useState(0);
+    // nodeTokens: per-node token counts { [nodeId]: number }
+    const [nodeTokens, setNodeTokens] = useState({});
     const eventSourceRef = useRef(null);
 
     const clearEvents = useCallback(() => {
@@ -32,6 +36,8 @@ export function useWorkflowStream(workflowName, enabled = true) {
         setNodeStatuses({});
         setTotalCost(0);
         setAgentCosts({});
+        setTotalTokens(0);
+        setNodeTokens({});
     }, []);
 
     useEffect(() => {
@@ -157,6 +163,13 @@ export function useWorkflowStream(workflowName, enabled = true) {
                     if (nodeId) {
                         setNodeStatuses(prev => ({ ...prev, [nodeId]: 'completed' }));
                     }
+                    const itok = data.data?.input_tokens  || 0;
+                    const otok = data.data?.output_tokens || 0;
+                    const ttok = data.data?.total_tokens  || (itok + otok);
+                    if (ttok > 0) {
+                        if (nodeId) setNodeTokens(prev => ({ ...prev, [nodeId]: ttok }));
+                        setTotalTokens(prev => prev + ttok);
+                    }
                     setEvents(prev => [...prev, { ...data, event_type: 'node_completed', timestamp: data.timestamp || new Date().toISOString() }]);
                 } catch (err) {
                     console.error('[SSE] Failed to parse node_completed event:', err);
@@ -230,6 +243,8 @@ export function useWorkflowStream(workflowName, enabled = true) {
                     const eventType = data.event_type || data.data?.event_type;
                     if (eventType === 'workflow_completed') {
                         setStatus('completed');
+                        const ttok = data.data?.total_tokens || 0;
+                        if (ttok > 0) setTotalTokens(ttok);
                     } else if (eventType === 'workflow_failed') {
                         setStatus('failed');
                         setError(data.data?.error || 'Workflow failed');
@@ -276,6 +291,8 @@ export function useWorkflowStream(workflowName, enabled = true) {
         nodeStatuses,
         totalCost,
         agentCosts,
+        totalTokens,
+        nodeTokens,
     };
 }
 

@@ -12,12 +12,32 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional, Type
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field, create_model
 
 logger = logging.getLogger(__name__)
+
+# Ceiling for a single MCP tool's text output. Unbounded outputs are a token
+# sink: the full result is replayed in the message history on every subsequent
+# ReAct iteration. Above this many chars we truncate and tell the model how to
+# get the rest (narrower args / pagination). Override via env.
+MCP_TOOL_OUTPUT_MAX_CHARS = int(os.environ.get("MCP_TOOL_OUTPUT_MAX_CHARS", "8000"))
+
+
+def _truncate_output(text: str, max_chars: int = MCP_TOOL_OUTPUT_MAX_CHARS) -> str:
+    """Cap a tool-output string, appending a hint when truncated."""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    total = len(text)
+    suffix = (
+        f"\n…[truncated; showing {max_chars} of {total} chars. "
+        f"Call again with narrower arguments / a more specific query "
+        f"to retrieve the rest.]"
+    )
+    return text[:max_chars] + suffix
 
 
 def _build_input_schema(tool_schema: Optional[Dict[str, Any]]) -> Type[BaseModel]:
@@ -130,9 +150,9 @@ class MCPToolWrapper(BaseTool):
                     parts.append(item.get("text", json.dumps(item)))
                 else:
                     parts.append(str(item))
-            return "\n".join(parts)
+            return _truncate_output("\n".join(parts))
 
-        return str(content) if content else "Tool executed successfully (no output)"
+        return _truncate_output(str(content)) if content else "Tool executed successfully (no output)"
 
 
 def build_langchain_tools(
