@@ -7,12 +7,14 @@ unchanged so any future caller can import it from the new path
 """
 import asyncio
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
 import boto3
 import httpx
 from botocore.exceptions import ClientError as BotoClientError
+
+from app.config import settings
+from app.core.thread_pools import run_in_aws_pool
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +54,7 @@ def _pick_icon(model_id: str) -> str:
 
 
 def _ssl_verify() -> bool:
-    return os.environ.get("AWS_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
+    return settings.aws_ssl_verify
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +100,21 @@ class LLMDiscoveryService:
             raise ValueError(f"Unsupported provider: {provider_lower}")
         return _handlers[provider_lower]
 
+    async def _finalize_discovered(
+        self,
+        provider: str,
+        discovered: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        from app.infrastructure.persistence import llm_config_repository
+
+        await llm_config_repository.mark_discovered_existing(discovered)
+        return {
+            "success": True,
+            "discovered": len(discovered),
+            "provider": provider,
+            "models": discovered,
+        }
+
     # -- Bedrock --
 
     async def _discover_bedrock(
@@ -116,16 +133,14 @@ class LLMDiscoveryService:
             kwargs["aws_secret_access_key"] = secret_access_key
             if session_token:
                 kwargs["aws_session_token"] = session_token
-        if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
+        if not settings.aws_ssl_verify:
             from botocore.config import Config as BotoConfig
 
             kwargs["config"] = BotoConfig(retries={"max_attempts": 3})
             kwargs["verify"] = False
 
         client = boto3.client("bedrock", **kwargs)
-        response = await asyncio.get_running_loop().run_in_executor(
-            None, client.list_foundation_models
-        )
+        response = await run_in_aws_pool(client.list_foundation_models)
         models = response.get("modelSummaries", [])
 
         discovered: List[Dict[str, Any]] = []
@@ -136,7 +151,6 @@ class LLMDiscoveryService:
             if not model_id:
                 continue
             display_name = model_name or (model_id.split(".")[-1] if "." in model_id else model_id)
-            exists = await already_exists(display_name) if already_exists else False
             discovered.append(
                 {
                     "name": display_name,
@@ -145,17 +159,10 @@ class LLMDiscoveryService:
                     "region": region,
                     "icon": _pick_icon(model_id),
                     "description": f"{provider_name} - {model_id}" if provider_name else model_id,
-                    "already_exists": exists,
                 }
             )
 
-        logger.info("Discovered %d Bedrock models in %s", len(discovered), region)
-        return {
-            "success": True,
-            "discovered": len(discovered),
-            "provider": "AWS Bedrock",
-            "models": discovered,
-        }
+        return await self._finalize_discovered("AWS Bedrock", discovered)
 
     # -- OpenAI --
 
@@ -182,7 +189,6 @@ class LLMDiscoveryService:
             model_id = m.get("id", "")
             if not model_id:
                 continue
-            exists = await already_exists(model_id) if already_exists else False
             discovered.append(
                 {
                     "name": model_id,
@@ -190,18 +196,11 @@ class LLMDiscoveryService:
                     "provider": "OpenAI",
                     "icon": _pick_icon(model_id),
                     "description": model_id,
-                    "already_exists": exists,
                 }
             )
 
         discovered.sort(key=lambda x: x["name"])
-        logger.info("Discovered %d OpenAI models", len(discovered))
-        return {
-            "success": True,
-            "discovered": len(discovered),
-            "provider": "OpenAI",
-            "models": discovered,
-        }
+        return await self._finalize_discovered("OpenAI", discovered)
 
     # -- Anthropic --
 
@@ -232,7 +231,6 @@ class LLMDiscoveryService:
             display_name = m.get("display_name", model_id)
             if not model_id:
                 continue
-            exists = await already_exists(display_name) if already_exists else False
             discovered.append(
                 {
                     "name": display_name,
@@ -240,18 +238,11 @@ class LLMDiscoveryService:
                     "provider": "Anthropic",
                     "icon": _pick_icon(model_id),
                     "description": display_name,
-                    "already_exists": exists,
                 }
             )
 
         discovered.sort(key=lambda x: x["name"])
-        logger.info("Discovered %d Anthropic models", len(discovered))
-        return {
-            "success": True,
-            "discovered": len(discovered),
-            "provider": "Anthropic",
-            "models": discovered,
-        }
+        return await self._finalize_discovered("Anthropic", discovered)
 
     # -- Google --
 
@@ -278,7 +269,6 @@ class LLMDiscoveryService:
             display_name = m.get("displayName", model_id)
             if not model_id:
                 continue
-            exists = await already_exists(display_name) if already_exists else False
             discovered.append(
                 {
                     "name": display_name,
@@ -286,18 +276,11 @@ class LLMDiscoveryService:
                     "provider": "Google",
                     "icon": _pick_icon(model_id),
                     "description": m.get("description", display_name),
-                    "already_exists": exists,
                 }
             )
 
         discovered.sort(key=lambda x: x["name"])
-        logger.info("Discovered %d Google models", len(discovered))
-        return {
-            "success": True,
-            "discovered": len(discovered),
-            "provider": "Google",
-            "models": discovered,
-        }
+        return await self._finalize_discovered("Google", discovered)
 
     # -- Groq --
 
@@ -324,7 +307,6 @@ class LLMDiscoveryService:
             model_id = m.get("id", "")
             if not model_id:
                 continue
-            exists = await already_exists(model_id) if already_exists else False
             discovered.append(
                 {
                     "name": model_id,
@@ -332,18 +314,11 @@ class LLMDiscoveryService:
                     "provider": "Groq",
                     "icon": _pick_icon(model_id),
                     "description": model_id,
-                    "already_exists": exists,
                 }
             )
 
         discovered.sort(key=lambda x: x["name"])
-        logger.info("Discovered %d Groq models", len(discovered))
-        return {
-            "success": True,
-            "discovered": len(discovered),
-            "provider": "Groq",
-            "models": discovered,
-        }
+        return await self._finalize_discovered("Groq", discovered)
 
     # -- Azure OpenAI --
 
@@ -373,7 +348,6 @@ class LLMDiscoveryService:
             model_id = m.get("id", "")
             if not model_id:
                 continue
-            exists = await already_exists(model_id) if already_exists else False
             discovered.append(
                 {
                     "name": model_id,
@@ -382,18 +356,11 @@ class LLMDiscoveryService:
                     "endpoint": endpoint,
                     "icon": _pick_icon(model_id),
                     "description": f"{model_id} @ {endpoint}",
-                    "already_exists": exists,
                 }
             )
 
         discovered.sort(key=lambda x: x["name"])
-        logger.info("Discovered %d Azure OpenAI models", len(discovered))
-        return {
-            "success": True,
-            "discovered": len(discovered),
-            "provider": "Azure OpenAI",
-            "models": discovered,
-        }
+        return await self._finalize_discovered("Azure OpenAI", discovered)
 
     # -- Ollama --
 
@@ -414,7 +381,6 @@ class LLMDiscoveryService:
             model_id = m.get("name", "")
             if not model_id:
                 continue
-            exists = await already_exists(model_id) if already_exists else False
             discovered.append(
                 {
                     "name": model_id,
@@ -424,18 +390,11 @@ class LLMDiscoveryService:
                     "baseUrl": ollama_url,
                     "icon": _pick_icon(model_id),
                     "description": f"{model_id} ({m.get('size', '')})" if m.get("size") else model_id,
-                    "already_exists": exists,
                 }
             )
 
         discovered.sort(key=lambda x: x["name"])
-        logger.info("Discovered %d Ollama models", len(discovered))
-        return {
-            "success": True,
-            "discovered": len(discovered),
-            "provider": "Ollama",
-            "models": discovered,
-        }
+        return await self._finalize_discovered("Ollama", discovered)
 
     # ------------------------------------------------------------------
     # Connection testing
@@ -575,14 +534,13 @@ class LLMDiscoveryService:
             kwargs["aws_secret_access_key"] = secret_access_key
             if session_token:
                 kwargs["aws_session_token"] = session_token
-        if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
+        if not settings.aws_ssl_verify:
             kwargs["verify"] = False
 
         try:
             bedrock = boto3.client("bedrock", **kwargs)
-            await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: bedrock.list_foundation_models(byProvider="anthropic"),
+            await run_in_aws_pool(
+                lambda: bedrock.list_foundation_models(byProvider="anthropic")
             )
             return {"success": True, "message": f"Connected to AWS Bedrock ({region})"}
         except BotoClientError as exc:

@@ -8,10 +8,15 @@ this coroutine re-enables the workflow and clears the status.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import List, Optional
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
+
+_INDEX_CONCURRENCY = settings.background_index_concurrency
 
 
 async def index_workflow_repos(
@@ -21,42 +26,45 @@ async def index_workflow_repos(
 ) -> None:
     """Index repos for a workflow, then re-enable it.
 
-    Parameters
-    ----------
-    workflow_name:
-        The workflow to re-enable once indexing completes.
-    repos:
-        Repository names (as stored in ``repo_abstractions.repo_name``)
-        that need indexing.  Only unindexed repos should be passed here.
-    model_id:
-        Optional Bedrock model ID (with inference-profile prefix already
-        applied) resolved from the workflow's LLM node at save time.
-        When omitted the indexer falls back to the first entry in
-        ``llm_configs``.
+    Repos are indexed in parallel with bounded concurrency
+    (``BACKGROUND_INDEX_CONCURRENCY``, default 2).
     """
-    from app.mcp.tools.crawler_tools import crawler_index_repo
+    from app.services.crawler_service import crawler_service
     from app.infrastructure.persistence.workflow_repository import WorkflowRepository
 
     workflow_repo = WorkflowRepository()
     errors: List[str] = []
+    sem = asyncio.Semaphore(_INDEX_CONCURRENCY)
 
-    for repo_name in repos:
-        logger.info("background_indexer: indexing repo=%s for workflow=%s (model=%s)",
-                    repo_name, workflow_name, model_id or "default")
-        try:
-            result = await crawler_index_repo(repo=repo_name, force=False, model_id=model_id)
-            if isinstance(result, dict) and "error" in result:
-                logger.warning(
-                    "background_indexer: repo=%s error: %s", repo_name, result["error"]
+    async def _index_one(repo_name: str) -> None:
+        async with sem:
+            logger.info(
+                "background_indexer: indexing repo=%s for workflow=%s (model=%s)",
+                repo_name,
+                workflow_name,
+                model_id or "default",
+            )
+            try:
+                result = await crawler_service.index_repo(
+                    repo=repo_name, force=False, model_id=model_id
+                )
+                if isinstance(result, dict) and "error" in result:
+                    logger.warning(
+                        "background_indexer: repo=%s error: %s",
+                        repo_name,
+                        result["error"],
+                    )
+                    errors.append(repo_name)
+                else:
+                    logger.info("background_indexer: repo=%s indexed OK", repo_name)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "background_indexer: repo=%s unhandled exception", repo_name
                 )
                 errors.append(repo_name)
-            else:
-                logger.info("background_indexer: repo=%s indexed OK", repo_name)
-        except Exception:  # noqa: BLE001
-            logger.exception("background_indexer: repo=%s unhandled exception", repo_name)
-            errors.append(repo_name)
 
-    # Re-enable the workflow regardless of partial errors
+    await asyncio.gather(*[_index_one(repo) for repo in repos])
+
     final_status: str | None = f"indexing_failed: {errors}" if errors else None
 
     try:
@@ -77,5 +85,6 @@ async def index_workflow_repos(
             )
     except Exception:  # noqa: BLE001
         logger.exception(
-            "background_indexer: failed to re-enable workflow=%s after indexing", workflow_name
+            "background_indexer: failed to re-enable workflow=%s after indexing",
+            workflow_name,
         )

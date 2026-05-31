@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import ssl
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -19,8 +18,11 @@ import boto3
 from botocore.config import Config as BotocoreConfig
 from botocore.exceptions import ClientError
 
+from app.config import settings
+from app.core.thread_pools import run_in_aws_pool
+
 # Honour the same SSL-bypass env var used by watch_tools.
-if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
+if not settings.aws_ssl_verify:
     ssl._create_default_https_context = ssl._create_unverified_context
     try:
         import urllib3
@@ -75,7 +77,7 @@ def _get_metrics_client(
         pass  # boto3 picks up env vars automatically
 
     session = boto3.Session(region_name=region, **session_kwargs)
-    ssl_verify = os.environ.get("AWS_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
+    ssl_verify = settings.aws_ssl_verify
     client_kwargs: Dict[str, Any] = {"region_name": region}
     if not ssl_verify:
         client_kwargs["verify"] = False
@@ -156,8 +158,7 @@ async def get_metric_data(
         if next_token:
             kwargs["NextToken"] = next_token
 
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
+        response = await run_in_aws_pool(
             lambda: client.get_metric_data(**kwargs),
         )
 
@@ -244,8 +245,7 @@ async def get_metric_statistics(
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=time_range_minutes)
 
-    response = await asyncio.get_event_loop().run_in_executor(
-        None,
+    response = await run_in_aws_pool(
         lambda: client.get_metric_statistics(
             Namespace=namespace,
             MetricName=metric_name,
@@ -342,8 +342,7 @@ async def list_metric_alarms(
         if next_token:
             kwargs["NextToken"] = next_token
 
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
+        response = await run_in_aws_pool(
             lambda: client.describe_alarms(**kwargs),
         )
 

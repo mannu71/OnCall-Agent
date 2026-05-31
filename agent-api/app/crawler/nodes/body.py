@@ -75,7 +75,8 @@ class ReadFile(AsyncNode):
         import asyncio
         from app.core.security import check_path, PathJailError
 
-        repos_root = os.getenv("REPOS_BASE_PATH", "/tmp/indexed_repos")
+        from app.config import settings
+        repos_root = settings.repos_base_path
         abs_path = os.path.join(repos_root, prep_res["repo"], prep_res["file"])
 
         def _read() -> List[str]:

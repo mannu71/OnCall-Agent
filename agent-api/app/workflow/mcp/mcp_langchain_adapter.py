@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from typing import Any, Dict, List, Optional, Type
+
+from app.config import settings
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field, create_model
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 # sink: the full result is replayed in the message history on every subsequent
 # ReAct iteration. Above this many chars we truncate and tell the model how to
 # get the rest (narrower args / pagination). Override via env.
-MCP_TOOL_OUTPUT_MAX_CHARS = int(os.environ.get("MCP_TOOL_OUTPUT_MAX_CHARS", "8000"))
+MCP_TOOL_OUTPUT_MAX_CHARS = settings.mcp_tool_output_max_chars
 
 
 def _truncate_output(text: str, max_chars: int = MCP_TOOL_OUTPUT_MAX_CHARS) -> str:

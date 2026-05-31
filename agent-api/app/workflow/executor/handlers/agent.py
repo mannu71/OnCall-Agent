@@ -3,6 +3,7 @@ import logging
 from typing import Any, Dict
 
 from app.services.mcp_client_manager import MCPClientManager
+from app.workflow.executor.code_correlation import correlate_anomalies_to_code
 from app.workflow.executor.streaming import _AgentStreamCallback
 
 from . import register
@@ -19,6 +20,7 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
     the investigation. The shared MCP manager for this execution is passed so the
     agent can reuse already-connected database servers from preceding tool nodes.
     """
+    from app.workflow.execution_port import ExecutionPort
     from app.workflow.strategies.react import ReactStrategy
 
     node_id = node.get('id')
@@ -66,6 +68,10 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
         'inputs': context.get('inputs', {}),
         'logger': logger,
         'stream_callback': stream_callback,
+        'execution_port': ExecutionPort(
+            executor.active_executions,
+            publish_event=executor._publish_event,
+        ),
     }
 
     # ------------------------------------------------------------------
@@ -78,13 +84,20 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
         # tool-provider stubs (cloudwatch_tool) carry analysis_type as config but
         # have tool_provider='cloudwatch' and no real output — exclude them.
         if isinstance(value, dict) and value.get('analysis_type') and not value.get('tool_provider'):
-            cw_results[key] = {
+            from app.workflow.tools.cloudwatch_summarizers import compact_context_snippet
+            entry = {
                 'analysis_type': value.get('analysis_type'),
                 'output': value.get('output'),
                 'log_groups_analyzed': value.get('log_groups_analyzed'),
                 'time_range': value.get('time_range'),
                 'alerts': value.get('alerts'),
             }
+            raw_data = value.get('data')
+            if isinstance(raw_data, dict):
+                entry['triage'] = compact_context_snippet(
+                    raw_data, value.get('analysis_type', ''),
+                )
+            cw_results[key] = entry
     if cw_results:
         strategy_context['cloudwatch_context'] = cw_results
         logger.info(
@@ -128,7 +141,7 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
                         log_group_to_repo[lg] = repo_cfg.get('name', '')
             if log_group_to_repo:
                 strategy_context['anomaly_code_correlation'] = \
-                    await executor._correlate_anomalies_to_code(
+                    await correlate_anomalies_to_code(
                         cw_results=cw_results,
                         code_results=code_results,
                         log_group_to_repo=log_group_to_repo,

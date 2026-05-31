@@ -8,10 +8,11 @@ from fastapi import APIRouter, HTTPException, status, Query, Depends, Body
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app.repositories import ExecutionRepository
+from app.infrastructure.persistence import ExecutionRepository
 from app.api.deps import get_execution_repo
 from app.services.workflow_output_extractor import extract_workflow_output
 from app.workflow.event_adapter import execution_event_stream
+from app.core.sse import SSE_HEADERS
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/executions", tags=["executions"])
@@ -65,64 +66,55 @@ async def list_executions(
 
 @router.get("/active", response_model=List[str])
 async def get_active_workflows():
-    """Get list of currently running workflow names."""
-    from app.services.visual_workflow_executor import visual_executor
-    
-    active = [
-        exec_data.get('workflow_name') 
-        for exec_data in visual_executor.active_executions.values() 
-        if exec_data.get('status') == 'running'
-    ]
-    # Filter out duplicates (if any) and None values
-    return list(set(filter(None, active)))
+    """Get list of currently running workflow names (DB-backed)."""
+    from app.services.execution_state import execution_state
+
+    return await execution_state.list_active_workflow_names()
 
 
 @router.delete("/active", status_code=status.HTTP_200_OK)
 async def clear_active_executions():
-    """Clear all stuck/running workflow executions from memory."""
+    """Clear all stuck/running workflow executions."""
+    from app.services.execution_state import execution_state
     from app.services.visual_workflow_executor import visual_executor
-    
-    cleared_count = len(visual_executor.active_executions)
-    cleared_names = [
-        exec_data.get('workflow_name') 
-        for exec_data in visual_executor.active_executions.values()
-    ]
-    
-    # Clean up all executions
-    for execution_id in list(visual_executor.active_executions.keys()):
+
+    active_before = await execution_state.list_active_records()
+    cleared_names = [r.get("workflow_name") for r in active_before]
+    cleared_count = await execution_state.cancel_all_active(
+        reason="Cleared by operator",
+    )
+
+    for execution_id in list(visual_executor.mcp_managers.keys()):
         await visual_executor.cleanup_execution(execution_id)
-    
+
     return {
         "message": f"Cleared {cleared_count} active executions",
         "cleared_count": cleared_count,
-        "cleared_workflows": list(filter(None, cleared_names))
+        "cleared_workflows": list(filter(None, cleared_names)),
     }
 
 
 @router.delete("/active/{workflow_name}", status_code=status.HTTP_200_OK)
 async def cancel_workflow_by_name(workflow_name: str):
     """Cancel/clear a specific workflow by name from active executions."""
+    from app.services.execution_state import execution_state
     from app.services.visual_workflow_executor import visual_executor
-    
-    # Find execution IDs matching the workflow name
-    execution_ids_to_clear = [
-        exec_id for exec_id, exec_data in visual_executor.active_executions.items()
-        if exec_data.get('workflow_name') == workflow_name
-    ]
-    
-    if not execution_ids_to_clear:
+
+    cancelled_count = await execution_state.cancel_by_workflow_name(workflow_name)
+    if cancelled_count == 0:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No active execution found for workflow '{workflow_name}'"
+            detail=f"No active execution found for workflow '{workflow_name}'",
         )
-    
-    # Clean up all matching executions
-    for execution_id in execution_ids_to_clear:
-        await visual_executor.cleanup_execution(execution_id)
-    
+
+    for execution_id in list(visual_executor.mcp_managers.keys()):
+        cached = execution_state.get_cache(execution_id)
+        if cached and cached.get("workflow_name") == workflow_name:
+            await visual_executor.cleanup_execution(execution_id)
+
     return {
-        "message": f"Cancelled {len(execution_ids_to_clear)} execution(s) for workflow '{workflow_name}'",
-        "cancelled_count": len(execution_ids_to_clear)
+        "message": f"Cancelled {cancelled_count} execution(s) for workflow '{workflow_name}'",
+        "cancelled_count": cancelled_count,
     }
 
 
@@ -183,17 +175,13 @@ async def stream_execution_events(execution_id: str):
     """
     from app.services.visual_workflow_executor import visual_executor
 
-    exec_data = visual_executor.get_execution_status(execution_id)
+    exec_data = await visual_executor.get_execution_status(execution_id)
     workflow_name = (exec_data or {}).get("workflow_name", execution_id)
 
     return StreamingResponse(
         execution_event_stream(execution_id, workflow_name),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers=SSE_HEADERS,
     )
 
 
@@ -218,7 +206,7 @@ async def approve_hitl_request(
     from app.services.visual_workflow_executor import visual_executor
     from app.workflow.event_schema import hitl_approved, hitl_rejected
 
-    exec_data = visual_executor.get_execution_status(execution_id)
+    exec_data = await visual_executor.get_execution_status(execution_id)
     if exec_data is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -284,7 +272,7 @@ async def steer_execution(
     """
     from app.services.visual_workflow_executor import visual_executor
 
-    exec_data = visual_executor.get_execution_status(execution_id)
+    exec_data = await visual_executor.get_execution_status(execution_id)
     if exec_data is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

@@ -184,10 +184,30 @@ class AsyncBatchNode(AsyncNode):
 class AsyncParallelBatchNode(AsyncNode):
     """Async node — processes each item returned by prep() in parallel."""
 
+    def __init__(
+        self,
+        max_retries: int = 1,
+        wait: float = 0.0,
+        concurrency: Optional[int] = None,
+    ):
+        super().__init__(max_retries=max_retries, wait=wait)
+        self.concurrency = concurrency
+
     async def exec(self, prep_res: Any) -> List[Any]:  # type: ignore[override]
-        return list(await asyncio.gather(
-            *(self._exec_item(item) for item in (prep_res or []))
-        ))
+        items = list(prep_res or [])
+        if not items:
+            return []
+
+        from app.config import settings
+
+        limit = max(1, self.concurrency or settings.index_parse_concurrency)
+        sem = asyncio.Semaphore(limit)
+
+        async def _run(item: Any) -> Any:
+            async with sem:
+                return await self._exec_item(item)
+
+        return list(await asyncio.gather(*(_run(item) for item in items)))
 
     async def _exec_item(self, item: Any) -> Any:
         raise NotImplementedError

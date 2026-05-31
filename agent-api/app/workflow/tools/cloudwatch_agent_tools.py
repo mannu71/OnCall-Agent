@@ -30,6 +30,21 @@ from app.workflow.tools.cloudwatch_sanitizer import (
     CloudWatchToolSanitizer,
     _count_tokens,
 )
+from app.workflow.tools.cloudwatch_summarizers import (
+    summarise_anomalies,
+    summarise_correlation,
+    summarise_patterns,
+)
+from app.workflow.tools.cloudwatch_drilldown import (
+    build_insights_query_for_anomaly,
+    build_insights_query_for_pattern,
+    cap_drill_preview,
+    pick_drill_target,
+    recall_kb_for_log_groups,
+    recall_kb_for_pattern,
+    should_auto_drill_down,
+)
+from app.workflow.tools.cloudwatch_metrics_fusion import attach_metrics_context
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +67,7 @@ def _has_events(raw: Any) -> bool:
     )
 
 
-def _budget_json(payload: Any, tool_name: str) -> str:
+def _budget_json(payload: Any, tool_name: str, token_budget: Optional[int] = None) -> str:
     """Serialize *payload* to JSON and enforce a per-call token budget.
 
     Uses a single encode → slice token IDs → decode pass (O(N)) when tiktoken
@@ -60,33 +75,34 @@ def _budget_json(payload: Any, tool_name: str) -> str:
     """
     import json
     from app.workflow.tools.cloudwatch_sanitizer import _get_encoder
+    budget = token_budget if token_budget is not None else _NON_EVENT_TOKEN_BUDGET
     text = json.dumps(payload, indent=2, default=str)
     enc = _get_encoder()
     if enc is not None:
         token_ids = enc.encode(text)
-        if len(token_ids) <= _NON_EVENT_TOKEN_BUDGET:
+        if len(token_ids) <= budget:
             return text
         logger.warning(
             "CW tool [%s]: response %d tokens exceeded budget %d — truncated.",
-            tool_name, len(token_ids), _NON_EVENT_TOKEN_BUDGET,
+            tool_name, len(token_ids), budget,
         )
-        truncated = enc.decode(token_ids[:_NON_EVENT_TOKEN_BUDGET])
+        truncated = enc.decode(token_ids[:budget])
         return (
             truncated
             + f"\n...[truncated by token budget: was ~{len(token_ids)} tokens, "
-            f"capped at {_NON_EVENT_TOKEN_BUDGET}]"
+            f"capped at {budget}]"
         )
     # tiktoken unavailable — fall back to char-based approximation
-    char_budget = _NON_EVENT_TOKEN_BUDGET * 4
+    char_budget = budget * 4
     if len(text) <= char_budget:
         return text
     logger.warning(
         "CW tool [%s]: response ~%d tokens exceeded budget %d — truncated (char heuristic).",
-        tool_name, len(text) // 4, _NON_EVENT_TOKEN_BUDGET,
+        tool_name, len(text) // 4, budget,
     )
     return (
         text[:char_budget]
-        + f"\n...[truncated by token budget: capped at ~{_NON_EVENT_TOKEN_BUDGET} tokens]"
+        + f"\n...[truncated by token budget: capped at ~{budget} tokens]"
     )
 
 
@@ -123,6 +139,13 @@ class WatchLogsInput(BaseModel):
             "Optional list of AWS regions to query in parallel, e.g. "
             "['us-east-1', 'eu-west-1']. Each group is queried in every "
             "region; results include a 'region' field on each event."
+        ),
+    )
+    drill_down: bool = Field(
+        default=False,
+        description=(
+            "When true, return up to 25 events with 480-char error tails "
+            "and a 2500-token budget. Use after triage, not as first call."
         ),
     )
 
@@ -199,6 +222,14 @@ class SearchLogsInput(BaseModel):
     hours: int = Field(
         default=24,
         description="Number of hours to look back (default 24).",
+    )
+    drill_down: bool = Field(
+        default=False,
+        description=(
+            "When true, use a larger token budget (2500 vs 1000) and preserve "
+            "error message tails (stack traces). Use only after triage tools "
+            "identify a suspect pattern — not on the first call."
+        ),
     )
 
 
@@ -307,6 +338,7 @@ def build_cloudwatch_agent_tools(
     region: str = "us-east-1",
     credentials: Optional[Dict[str, Any]] = None,
     log_groups: Optional[List[str]] = None,
+    severity_excludes: Optional[List[str]] = None,
 ) -> List[StructuredTool]:
     """Create LangChain tools that let the ReAct agent call CloudWatch functions.
 
@@ -336,6 +368,105 @@ def build_cloudwatch_agent_tools(
 
     _creds = credentials or {}
     _region = region
+    _severity_excludes = severity_excludes
+
+    async def _execute_insights_search(
+        log_group_names: List[str],
+        query: str,
+        time_range_minutes: int,
+        *,
+        drill_down: bool = True,
+    ) -> str:
+        """Run one Insights query and return sanitized event text."""
+        from datetime import datetime, timedelta, timezone as _tz
+        from app.mcp.tools.watch_tools import get_watcher, _extract_credentials
+
+        hours = max(1, min(int(_clamp(time_range_minutes) / 60) or 1, 24))
+        watcher = get_watcher(region=_region, **_extract_credentials(_creds))
+        end = datetime.now(_tz.utc)
+        start = end - timedelta(hours=hours)
+        result = await watcher.query_with_insights(
+            log_group_names=log_group_names,
+            query_string=query,
+            start_time=start,
+            end_time=end,
+            limit=500,
+        )
+        if _has_events(result):
+            return _sanitizer.sanitize(
+                result,
+                "cloudwatch_auto_drilldown",
+                {"log_groups": log_group_names, "query": query[:200]},
+                drill_down=drill_down,
+            )
+        import json
+        return json.dumps(result, default=str)[:2000]
+
+    async def _enrich_with_kb_and_drill(
+        summary: Dict[str, Any],
+        log_group_names: List[str],
+        time_range_minutes: int,
+        *,
+        tool_name: str,
+    ) -> Dict[str, Any]:
+        """Attach KB recall + optional auto drill-down preview to a triage summary."""
+        patterns = summary.get("unique_patterns") or []
+        if patterns:
+            top = patterns[0]
+            kb = await recall_kb_for_pattern(
+                top.get("normalized_pattern", ""),
+                top.get("example_message", ""),
+            )
+            if kb:
+                summary["known_patterns"] = kb
+        elif log_group_names:
+            kb = await recall_kb_for_log_groups(log_group_names)
+            if kb:
+                summary["known_patterns"] = kb
+
+        summary = await attach_metrics_context(
+            summary,
+            log_group_names,
+            time_range_minutes,
+            _region,
+            _creds if _creds else None,
+        )
+
+        if not should_auto_drill_down(summary):
+            return summary
+
+        target = pick_drill_target(summary)
+        if not target:
+            return summary
+
+        try:
+            if target.get("kind") == "pattern":
+                query = build_insights_query_for_pattern(
+                    target.get("normalized_pattern", ""),
+                    target.get("example_message", ""),
+                )
+            else:
+                query = build_insights_query_for_anomaly(
+                    target.get("log_group"),
+                )
+            preview = await _execute_insights_search(
+                log_group_names,
+                query,
+                time_range_minutes,
+                drill_down=True,
+            )
+            summary["auto_drill_down"] = {
+                "trigger": summary.get("evidence_grade"),
+                "target": target.get("normalized_pattern") or target.get("log_group"),
+                "preview": cap_drill_preview(preview),
+            }
+            logger.info(
+                "CW [%s]: auto drill-down attached (grade=%s)",
+                tool_name, summary.get("evidence_grade"),
+            )
+        except Exception as exc:
+            logger.warning("CW auto drill-down failed (non-fatal): %s", exc)
+        return summary
 
     log_group_hint = ""
     if log_groups:
@@ -435,64 +566,6 @@ def build_cloudwatch_agent_tools(
             "errors":        raw.get("errors") or [],
         }
 
-    def _summarise_patterns(raw: Dict[str, Any]) -> Dict[str, Any]:
-        """Strip per-pattern example arrays to a single example string each."""
-        if not isinstance(raw, dict):
-            return {"error": "unexpected_response", "raw_type": type(raw).__name__}
-        out = {k: v for k, v in raw.items() if k != "unique_patterns"}
-        compact: List[Dict[str, Any]] = []
-        for p in (raw.get("unique_patterns") or [])[:20]:
-            if not isinstance(p, dict):
-                continue
-            examples = p.get("examples") or []
-            example = examples[0] if examples else p.get("example", "")
-            compact.append({
-                "normalized": _truncate(p.get("normalized", ""), 200),
-                "count":      p.get("count"),
-                "severity":   p.get("severity"),
-                "example":    _truncate(example, 200),
-            })
-        out["unique_patterns"] = compact
-        return out
-
-    def _summarise_anomalies(raw: Dict[str, Any]) -> Dict[str, Any]:
-        """Keep critical/high/medium anomalies only, cap at 25, drop baseline details."""
-        if not isinstance(raw, dict):
-            return {"error": "unexpected_response", "raw_type": type(raw).__name__}
-        keep = {"critical", "high", "medium"}
-        kept: List[Dict[str, Any]] = []
-        for a in (raw.get("anomalies") or []):
-            if not isinstance(a, dict):
-                continue
-            if a.get("severity", "low") not in keep:
-                continue
-            kept.append({
-                "log_group":      a.get("log_group"),
-                "severity":       a.get("severity"),
-                "z_score":        a.get("z_score"),
-                "current_count":  a.get("current_count"),
-                "baseline_count": a.get("baseline_count"),
-                "message":        _truncate(a.get("message") or a.get("normalized", ""), 200),
-            })
-        kept.sort(key=lambda x: (x.get("z_score") or 0), reverse=True)
-        return {
-            "anomalies": kept[:25],
-            "summary":   raw.get("summary") or {},
-            "filtered_out_low_severity": True,
-        }
-
-    def _summarise_correlation(raw: Dict[str, Any]) -> Dict[str, Any]:
-        """Cap timeline to 100 events for token budget."""
-        if not isinstance(raw, dict):
-            return {"error": "unexpected_response", "raw_type": type(raw).__name__}
-        timeline = raw.get("timeline") or []
-        truncated = len(timeline) > 100
-        out = {k: v for k, v in raw.items() if k != "timeline"}
-        out["timeline"] = timeline[:100]
-        out["timeline_truncated"] = truncated
-        out["timeline_total"] = len(timeline)
-        return out
-
     def _summarise_alarms(raw: Dict[str, Any]) -> Dict[str, Any]:
         """Compress list_metric_alarms output to save tokens."""
         if not isinstance(raw, dict):
@@ -526,6 +599,7 @@ def build_cloudwatch_agent_tools(
         filter_pattern: Optional[str] = None,
         max_events_per_group: int = 100,
         regions: Optional[List[str]] = None,
+        drill_down: bool = False,
     ) -> str:
         import json
         result = await watch_log_groups(
@@ -542,6 +616,7 @@ def build_cloudwatch_agent_tools(
                 result,
                 "cloudwatch_watch_logs",
                 {"log_groups": log_group_names, "time_range_minutes": time_range_minutes},
+                drill_down=drill_down,
             )
         return _budget_json(_summarise_watch_logs(result), "cloudwatch_watch_logs")
 
@@ -558,8 +633,15 @@ def build_cloudwatch_agent_tools(
             pattern_types=pattern_types,
             region=_region,
             credentials=_creds if _creds else None,
+            severity_excludes=_severity_excludes,
         )
-        return _budget_json(_summarise_patterns(result), "cloudwatch_analyze_patterns")
+        summary = summarise_patterns(result)
+        summary = await _enrich_with_kb_and_drill(
+            summary, log_group_names, time_range_minutes,
+            tool_name="cloudwatch_analyze_patterns",
+        )
+        budget = 3200 if summary.get("auto_drill_down") else _NON_EVENT_TOKEN_BUDGET
+        return _budget_json(summary, "cloudwatch_analyze_patterns", token_budget=budget)
 
     # -- detect anomalies --
     async def _detect_anomalies(
@@ -579,7 +661,13 @@ def build_cloudwatch_agent_tools(
             region=_region,
             credentials=_creds if _creds else None,
         )
-        return _budget_json(_summarise_anomalies(result), "cloudwatch_detect_anomalies")
+        summary = summarise_anomalies(result)
+        summary = await _enrich_with_kb_and_drill(
+            summary, log_group_names, time_range_minutes,
+            tool_name="cloudwatch_detect_anomalies",
+        )
+        budget = 3200 if summary.get("auto_drill_down") else _NON_EVENT_TOKEN_BUDGET
+        return _budget_json(summary, "cloudwatch_detect_anomalies", token_budget=budget)
 
     # -- correlate logs --
     async def _correlate_logs(
@@ -597,15 +685,17 @@ def build_cloudwatch_agent_tools(
             region=_region,
             credentials=_creds if _creds else None,
         )
-        return _budget_json(_summarise_correlation(result), "cloudwatch_correlate_logs")
+        return _budget_json(summarise_correlation(result), "cloudwatch_correlate_logs")
 
     # -- search logs (Insights query) --
     async def _search_logs(
         log_group_names: List[str],
         query: str,
         hours: int = 24,
+        drill_down: bool = False,
     ) -> str:
         import json
+        budget = 2500 if drill_down else _NON_EVENT_TOKEN_BUDGET
         # Hard-cap to 24h to match the global window policy.
         hours = max(1, min(int(hours or 24), 24))
         try:
@@ -627,8 +717,9 @@ def build_cloudwatch_agent_tools(
                     result,
                     "cloudwatch_search_logs",
                     {"log_groups": log_group_names, "query": query, "hours": hours},
+                    drill_down=drill_down,
                 )
-            return _budget_json(result, "cloudwatch_search_logs")
+            return _budget_json(result, "cloudwatch_search_logs", token_budget=budget)
         search = CloudWatchLogsSearchTools(
             profile_name=_creds.get("aws_profile"),
             region_name=_region,
@@ -640,20 +731,21 @@ def build_cloudwatch_agent_tools(
         )
         if isinstance(result, str):
             tokens = _count_tokens(result)
-            if tokens <= _NON_EVENT_TOKEN_BUDGET:
+            if tokens <= budget:
                 return result
             logger.warning(
                 "CW tool [cloudwatch_search_logs]: string response %d tokens > %d budget — truncating.",
-                tokens, _NON_EVENT_TOKEN_BUDGET,
+                tokens, budget,
             )
-            return result[: _NON_EVENT_TOKEN_BUDGET * 4] + "\n...[truncated to token budget]"
+            return result[: budget * 4] + "\n...[truncated to token budget]"
         if _has_events(result):
             return _sanitizer.sanitize(
                 result,
                 "cloudwatch_search_logs",
                 {"log_groups": log_group_names, "query": query, "hours": hours},
+                drill_down=drill_down,
             )
-        return _budget_json(result, "cloudwatch_search_logs")
+        return _budget_json(result, "cloudwatch_search_logs", token_budget=budget)
 
     # -- discover log groups --
     async def _discover_log_groups(
@@ -732,7 +824,8 @@ def build_cloudwatch_agent_tools(
             description=(
                 "Fetch recent log events from one or more CloudWatch log groups. "
                 "Supports multi-region queries and configurable event limits. "
-                "Use this to retrieve raw log entries for inspection."
+                "Use for raw log inspection; set drill_down=true only after triage "
+                "to get longer error tails (2500-token budget)."
                 + log_group_hint
             ),
             args_schema=WatchLogsInput,
@@ -777,8 +870,8 @@ def build_cloudwatch_agent_tools(
             name="cloudwatch_search_logs",
             description=(
                 "Run a CloudWatch Logs Insights query across one or more log groups. "
-                "Use this for custom log queries with full Insights syntax "
-                "(fields, filter, stats, sort, etc.)."
+                "Use for custom queries after triage; set drill_down=true to preserve "
+                "error stack-trace tails (2500-token budget vs 1000 default)."
                 + log_group_hint
             ),
             args_schema=SearchLogsInput,

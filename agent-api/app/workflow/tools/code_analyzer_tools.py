@@ -14,8 +14,9 @@ workflow graph, the executor calls :func:`build_crawler_tools` to create
 from __future__ import annotations
 
 import logging
-import os
 from typing import Dict, List, Optional
+
+from app.config import settings
 
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field as PydanticField
@@ -25,9 +26,7 @@ logger = logging.getLogger(__name__)
 # Ceiling for a single crawler tool's serialized JSON output. Without a cap a
 # large find/trace/semantic result is replayed in the message history on every
 # subsequent ReAct iteration, inflating token cost. Override via env.
-CODE_ANALYZER_OUTPUT_MAX_CHARS = int(
-    os.environ.get("CODE_ANALYZER_OUTPUT_MAX_CHARS", "8000")
-)
+CODE_ANALYZER_OUTPUT_MAX_CHARS = settings.code_analyzer_output_max_chars
 
 
 def _cap(text: str, max_chars: int = CODE_ANALYZER_OUTPUT_MAX_CHARS) -> str:

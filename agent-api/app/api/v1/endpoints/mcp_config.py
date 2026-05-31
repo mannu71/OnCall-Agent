@@ -4,7 +4,7 @@ from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel, Field
 
-from app.repositories.db_repository import db_repository
+from app.infrastructure.persistence import mcp_config_repository
 from app.core.exceptions import NotFoundException
 
 router = APIRouter(prefix="/mcp-config", tags=["mcp-config"])
@@ -52,7 +52,7 @@ class MCPServerUpdate(BaseModel):
     disabled: Optional[bool] = Field(None, description=_DESC_DISABLED)
 
 
-# No dependency needed - using singleton db_repository directly
+# No dependency needed - using singleton mcp_config_repository directly
 
 
 @router.get("", response_model=Dict[str, Any])
@@ -62,7 +62,7 @@ async def get_mcp_config():
     Returns:
         Full MCP configuration with servers
     """
-    servers = await db_repository.list_mcp_servers(include_disabled=True)
+    servers = await mcp_config_repository.list_all(include_disabled=True)
     # Convert list to dict format for compatibility
     servers_dict = {server["name"]: {k: v for k, v in server.items() if k != "name"} for server in servers}
     return {"servers": servers_dict}
@@ -75,7 +75,7 @@ async def get_mcp_servers():
     Returns:
         Dictionary of server name -> configuration
     """
-    servers = await db_repository.list_mcp_servers(include_disabled=True)
+    servers = await mcp_config_repository.list_all(include_disabled=True)
     # Convert list to dict format for compatibility
     return {server["name"]: {k: v for k, v in server.items() if k != "name"} for server in servers}
 
@@ -103,7 +103,7 @@ async def test_mcp_server(
     if server_config:
         config = server_config.model_dump()
     else:
-        config = await db_repository.get_mcp_server_by_name(server_name)
+        config = await mcp_config_repository.get_by_name(server_name)
         if not config:
             raise NotFoundException(
                 message=f"MCP server '{server_name}' not found",
@@ -156,7 +156,7 @@ async def get_mcp_server(server_name: str):
     Returns:
         Server configuration
     """
-    server = await db_repository.get_mcp_server_by_name(server_name)
+    server = await mcp_config_repository.get_by_name(server_name)
     if not server:
         raise NotFoundException(
             message=f"MCP server '{server_name}' not found",
@@ -175,7 +175,7 @@ async def create_mcp_server(server_data: MCPServerCreate):
     Returns:
         Created server configuration
     """
-    if await db_repository.mcp_server_exists(server_data.name):
+    if await mcp_config_repository.exists(server_data.name):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"MCP server '{server_data.name}' already exists"
@@ -186,7 +186,7 @@ async def create_mcp_server(server_data: MCPServerCreate):
     if 'disabled' in server_dict:
         server_dict['enabled'] = not server_dict.pop('disabled')
     
-    saved = await db_repository.create_mcp_server(server_dict)
+    saved = await mcp_config_repository.create(server_dict)
     logger.info(f"Created MCP server: {server_data.name}")
     return saved
 
@@ -205,7 +205,7 @@ async def update_mcp_server(
     Returns:
         Updated server configuration
     """
-    existing = await db_repository.get_mcp_server_by_name(server_name)
+    existing = await mcp_config_repository.get_by_name(server_name)
     if not existing:
         raise NotFoundException(
             message=f"MCP server '{server_name}' not found",
@@ -222,13 +222,13 @@ async def update_mcp_server(
     new_name = update_data.get("name")
     if new_name and new_name != server_name:
         # Check if new name already exists
-        if await db_repository.mcp_server_exists(new_name):
+        if await mcp_config_repository.exists(new_name):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"MCP server '{new_name}' already exists"
             )
     
-    saved = await db_repository.update_mcp_server(server_name, update_data)
+    saved = await mcp_config_repository.update(server_name, update_data)
     logger.info(f"Updated MCP server: {server_name}")
     return saved
 
@@ -240,7 +240,7 @@ async def delete_mcp_server(server_name: str):
     Args:
         server_name: Name of the server to delete
     """
-    if not await db_repository.delete_mcp_server(server_name):
+    if not await mcp_config_repository.delete(server_name):
         raise NotFoundException(
             message=f"MCP server '{server_name}' not found",
             details={"server_name": server_name}
@@ -281,10 +281,10 @@ async def save_full_config(config: Dict[str, Any]):
             server_data['enabled'] = not server_data.pop('disabled')
         
         # Check if exists and update or create
-        if await db_repository.mcp_server_exists(server_name):
-            saved = await db_repository.update_mcp_server(server_name, server_data)
+        if await mcp_config_repository.exists(server_name):
+            saved = await mcp_config_repository.update(server_name, server_data)
         else:
-            saved = await db_repository.create_mcp_server(server_data)
+            saved = await mcp_config_repository.create(server_data)
         saved_servers.append(saved)
     
     logger.info(f"Saved full MCP configuration ({len(saved_servers)} servers)")

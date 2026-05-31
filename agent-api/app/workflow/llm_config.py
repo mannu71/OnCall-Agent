@@ -29,7 +29,7 @@ import logging
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, Sequence, Tuple
 
-from app.repositories.db_repository import db_repository
+from app.infrastructure.persistence import llm_config_repository, model_key_repository
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +241,7 @@ async def _resolve_named(cfg: LLMNodeConfig) -> Optional[ResolvedLLMConfig]:
     if not cfg.config_name:
         return None
     try:
-        db_cfg = await db_repository.get_llm_config(cfg.config_name)
+        db_cfg = await llm_config_repository.get_by_name(cfg.config_name)
     except Exception as e:
         logger.warning("Could not load LLM config '%s' from DB: %s", cfg.config_name, e)
         return None
@@ -257,7 +257,7 @@ async def _resolve_named(cfg: LLMNodeConfig) -> Optional[ResolvedLLMConfig]:
 
 async def _resolve_default(cfg: LLMNodeConfig) -> Optional[ResolvedLLMConfig]:
     try:
-        db_configs = await db_repository.list_llm_configs()
+        db_configs = await llm_config_repository.list_all()
     except Exception as e:
         logger.warning("Could not load LLM configs from DB: %s", e)
         return None
@@ -314,7 +314,7 @@ async def _enrich_api_key_credentials(resolved: ResolvedLLMConfig) -> None:
     if resolved.api_key:
         return
     try:
-        mk = await db_repository.get_model_key(resolved.provider, include_secrets=True)
+        mk = await model_key_repository.get_by_provider(resolved.provider, include_secrets=True)
     except Exception as e:
         logger.warning("Could not look up Model Key for provider '%s': %s",
                        resolved.provider, e)
@@ -331,7 +331,7 @@ async def _enrich_api_key_credentials(resolved: ResolvedLLMConfig) -> None:
 async def _enrich_bedrock_credentials(resolved: ResolvedLLMConfig) -> None:
     for alias in _BEDROCK_KEY_ALIASES:
         try:
-            mk = await db_repository.get_model_key(alias, include_secrets=True)
+            mk = await model_key_repository.get_by_provider(alias, include_secrets=True)
         except Exception as e:
             logger.warning("Could not look up Model Key '%s' for Bedrock: %s", alias, e)
             continue

@@ -1,10 +1,9 @@
 """FetchRepo node — crawls local repo files into shared state."""
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from app.engine.crawler_engine import AsyncNode
 
@@ -12,7 +11,10 @@ logger = logging.getLogger(__name__)
 
 
 class FetchRepo(AsyncNode):
-    """Crawl *repo* under REPOS_BASE_PATH and populate ``shared["files"]``.
+    """Crawl *repo* under REPOS_BASE_PATH and populate ``shared["file_paths"]``.
+
+    File bodies are **not** loaded into memory here — downstream nodes read
+    content on demand via :func:`app.crawler.files.read_repo_file`.
 
     Reads from shared:
         repo              (str) — repository name
@@ -21,8 +23,9 @@ class FetchRepo(AsyncNode):
         max_file_size     (int, optional)
 
     Writes to shared:
-        files             list[(relative_path, content)]
-        files_sha256      aggregate sha256 of all file paths+contents
+        file_paths        list[str] — relative paths only
+        files             [] — legacy key kept empty for backward compatibility
+        files_sha256      aggregate sha256 of path + content prefixes
         _trace            appends one entry
     """
 
@@ -34,38 +37,38 @@ class FetchRepo(AsyncNode):
             "max_size": shared.get("max_file_size", 100_000),
         }
 
-    async def exec(self, prep_res: Dict[str, Any]) -> List[Tuple[str, str]]:
-        from app.crawler.files import crawl_local_files
+    async def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
+        from app.crawler.files import compute_files_sha256, crawl_file_paths
 
         t0 = time.monotonic()
-        files = await crawl_local_files(
+        paths = await crawl_file_paths(
             repo_name=prep_res["repo"],
             include_patterns=prep_res["include"],
             exclude_patterns=prep_res["exclude"],
             max_file_size=prep_res["max_size"],
         )
+        files_sha256 = await compute_files_sha256(prep_res["repo"], paths)
         prep_res["_ms"] = int((time.monotonic() - t0) * 1000)
-        return files
+        return {"paths": paths, "files_sha256": files_sha256}
 
     async def post(
         self,
         shared: Dict[str, Any],
         prep_res: Dict[str, Any],
-        exec_res: List[Tuple[str, str]],
+        exec_res: Dict[str, Any],
     ) -> Optional[str]:
-        shared["files"] = exec_res
+        shared["file_paths"] = exec_res["paths"]
+        shared["files"] = []
+        shared["files_sha256"] = exec_res["files_sha256"]
 
-        # Aggregate hash for skip-if-unchanged in indexFlow
-        h = hashlib.sha256()
-        for path, content in exec_res:
-            h.update(path.encode())
-            h.update(content[:512].encode())
-        shared["files_sha256"] = h.hexdigest()
-
-        _append_trace(shared, "FetchRepo", len(exec_res), 0, 0, False,
-                      ms=prep_res.get("_ms", 0))
+        _append_trace(
+            shared, "FetchRepo", len(exec_res["paths"]), 0, 0, False,
+            ms=prep_res.get("_ms", 0),
+        )
         logger.info(
-            "FetchRepo: %d files (sha256=%s…)", len(exec_res), shared["files_sha256"][:8]
+            "FetchRepo: %d file paths (sha256=%s…)",
+            len(exec_res["paths"]),
+            shared["files_sha256"][:8],
         )
         return None
 

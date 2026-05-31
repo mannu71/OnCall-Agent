@@ -14,12 +14,8 @@ Two node types are registered here:
 import logging
 from typing import Any, Dict, List
 
-from app.mcp.tools.watch_tools import (
-    watch_log_groups,
-    analyze_log_patterns,
-    detect_anomalies,
-    correlate_logs,
-)
+from app.services.log_watch_service import log_watch_service
+from app.workflow.executor.sql_loader import parse_time_range_minutes
 
 from . import register
 
@@ -105,7 +101,21 @@ def _read_cw_config(node: Dict[str, Any]) -> Dict[str, Any]:
         "alarm_name_prefix":      data.get("alarmNamePrefix"),
         "alarm_state_filter":     alarm_state_filter,
         "custom_insights_query":  data.get("customInsightsQuery", ""),
+        "severity_excludes":      _parse_severity_excludes(
+            _pick("severity_excludes", "severityExcludes", None) or data.get("severityExcludes")
+        ),
     }
+
+
+def _parse_severity_excludes(raw: Any) -> List[str]:
+    """Normalise severity exclude list from CSV string or JSON list."""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if isinstance(raw, str):
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    return []
 
 
 @register("cloudwatch_tool")
@@ -162,10 +172,7 @@ async def execute_tool_provider(executor, node: Dict[str, Any], context: Dict[st
 
 @register("cloudwatchAnalyzer")
 async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-    """Execute CloudWatch Analyzer node by running log analysis."""
-    from app.core.aws_credentials import resolve_aws_credentials
-    from app.core.retry import with_retry
-
+    """Execute CloudWatch Analyzer node via ``LogWatchService``."""
     node_data = node.get('data', {})
     log_groups = node_data.get('logGroups', [])
     analysis_type = node_data.get('analysisType', 'error-patterns')
@@ -178,159 +185,32 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
     if not log_groups:
         return {
             "status": "failed",
-            "error": "No log groups configured for CloudWatch Analyzer"
+            "error": "No log groups configured for CloudWatch Analyzer",
         }
 
     log_groups = [lg for lg in log_groups if lg]
     if not log_groups:
         return {
             "status": "failed",
-            "error": "All configured log groups are empty"
+            "error": "All configured log groups are empty",
         }
 
-    time_range_minutes = executor._parse_time_range_minutes(time_range)
-
-    # Use shared credential resolver instead of inline duplication.
-    credentials, aws_region = await resolve_aws_credentials(
+    credentials, aws_region = await log_watch_service.resolve_credentials(
+        None,
+        aws_region,
         aws_profile=aws_profile,
-        aws_region=aws_region,
     )
 
-    async def _run_analysis() -> Dict[str, Any]:
-        """Inner coroutine wrapped by with_retry for transient AWS errors."""
-        if analysis_type == 'error-patterns':
-            return await analyze_log_patterns(
-                log_group_names=log_groups,
-                time_range_minutes=time_range_minutes,
-                pattern_types=["error", "warning"],
-                region=aws_region,
-                credentials=credentials if credentials else None,
-            )
-        elif analysis_type == 'activity-summary':
-            return await watch_log_groups(
-                log_group_names=log_groups,
-                time_range_minutes=time_range_minutes,
-                region=aws_region,
-                credentials=credentials if credentials else None,
-            )
-        elif analysis_type == 'anomaly-detection':
-            return await detect_anomalies(
-                log_group_names=log_groups,
-                time_range_minutes=time_range_minutes,
-                sensitivity="medium",
-                region=aws_region,
-                credentials=credentials if credentials else None,
-            )
-        elif analysis_type == 'correlation':
-            return await correlate_logs(
-                log_group_names=log_groups,
-                time_range_minutes=time_range_minutes,
-                region=aws_region,
-                credentials=credentials if credentials else None,
-            )
-        elif analysis_type == 'metrics':
-            from app.mcp.tools.metrics_tools import get_metric_data
-            metric_queries = node_data.get('metricQueries', [])
-            if not metric_queries:
-                return {
-                    "status": "failed",
-                    "error": "No metricQueries configured for 'metrics' analysis type"
-                }
-            return await get_metric_data(
-                metric_queries=metric_queries,
-                time_range_minutes=time_range_minutes,
-                region=aws_region,
-                credentials=credentials if credentials else None,
-            )
-        elif analysis_type == 'alarms':
-            from app.mcp.tools.metrics_tools import list_metric_alarms
-            return await list_metric_alarms(
-                alarm_name_prefix=node_data.get('alarmNamePrefix'),
-                state_value=node_data.get('alarmStateFilter'),
-                region=aws_region,
-                credentials=credentials if credentials else None,
-            )
-        elif analysis_type == 'custom-query':
-            from app.mcp.tools.watch_tools import get_watcher, _extract_credentials
-            from datetime import datetime, timedelta, timezone as _tz
-            custom_query = node_data.get('customInsightsQuery', '').strip()
-            if not custom_query:
-                return {
-                    "status": "failed",
-                    "error": "No customInsightsQuery set for 'custom-query' analysis type"
-                }
-            watcher = get_watcher(
-                region=aws_region,
-                **_extract_credentials(credentials if credentials else {}),
-            )
-            end_time = datetime.now(_tz.utc)
-            start_time = end_time - timedelta(minutes=time_range_minutes)
-            return await watcher.query_with_insights(
-                log_group_names=log_groups,
-                query_string=custom_query,
-                start_time=start_time,
-                end_time=end_time,
-            )
-        else:
-            return {
-                "status": "failed",
-                "error": f"Unknown analysis type: {analysis_type}"
-            }
-
-    try:
-        result = await with_retry(_run_analysis, max_retries=2)
-
-        if isinstance(result, dict) and result.get('error'):
-            return {
-                "status": "failed",
-                "error": result.get('message', str(result.get('error')))
-            }
-
-        output_summary = executor._build_cloudwatch_summary(result, analysis_type, log_groups)
-
-        alerts = []
-        if enable_alerts and isinstance(result, dict):
-            alerts = executor._check_cloudwatch_alerts(result, analysis_type, error_threshold)
-
-        # Use the workflow's LLM to produce an agent-style analysis.
-        # _analyze_cloudwatch_with_llm returns a 3-tuple
-        # (text, model_name, structured_dict); the structured_dict may be
-        # None for providers that don't support structured output.
-        llm_result = await executor._analyze_cloudwatch_with_llm(
-            raw_result=result,
-            analysis_type=analysis_type,
-            log_groups=log_groups,
-            time_range=time_range,
-            alerts=alerts,
-            execution_id=context.get('execution_id'),
-        )
-        if llm_result and len(llm_result) >= 5:
-            llm_analysis, model_used, structured_analysis, llm_input_tokens, llm_output_tokens = llm_result[:5]
-        elif llm_result and len(llm_result) == 3:
-            llm_analysis, model_used, structured_analysis = llm_result
-            llm_input_tokens = llm_output_tokens = 0
-        else:
-            llm_analysis = model_used = structured_analysis = None
-            llm_input_tokens = llm_output_tokens = 0
-
-        return {
-            "status": "success",
-            "output": llm_analysis or output_summary,
-            "analysis_type": analysis_type,
-            "log_groups_analyzed": log_groups,
-            "time_range": time_range,
-            "data": result,
-            "alerts": alerts if alerts else None,
-            "model": model_used,
-            "structured_analysis": structured_analysis,
-            "input_tokens":  llm_input_tokens,
-            "output_tokens": llm_output_tokens,
-            "total_tokens":  llm_input_tokens + llm_output_tokens,
-        }
-
-    except Exception as e:
-        logger.error(f"CloudWatch Analyzer execution failed: {e}")
-        return {
-            "status": "failed",
-            "error": str(e)
-        }
+    return await log_watch_service.execute_analyzer_node(
+        analysis_type=analysis_type,
+        log_groups=log_groups,
+        time_range=time_range,
+        time_range_minutes=parse_time_range_minutes(time_range),
+        error_threshold=error_threshold,
+        enable_alerts=enable_alerts,
+        region=aws_region,
+        credentials=credentials,
+        node_data=node_data,
+        active_executions=executor.active_executions,
+        execution_id=context.get('execution_id'),
+    )

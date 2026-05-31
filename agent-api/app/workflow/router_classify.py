@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
+from app.config import settings
 from app.core.model_router import NodeRole, explain, model_for
 from app.workflow.llm_config import find_llm_node_for_consumer, resolve_llm_config_for_node
+from app.workflow.strategies.react.llm_factory import build_llm
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +21,8 @@ Available category routes:
 
 Output ONLY the exact category name key matching the selected route. Do not output markdown, preambles, or quotes. Just output the matching key."""
 
-ROUTER_QUERY_MAX_CHARS = int(os.environ.get("ROUTER_QUERY_MAX_CHARS", "2000"))
-ROUTER_CLASSIFY_MAX_OUTPUT = int(os.environ.get("ROUTER_CLASSIFY_MAX_OUTPUT", "32"))
+ROUTER_QUERY_MAX_CHARS = settings.router_query_max_chars
+ROUTER_CLASSIFY_MAX_OUTPUT = settings.router_classify_max_output
 
 
 @dataclass
@@ -147,10 +148,7 @@ async def classify_route(
         HumanMessage(content=f"Query to classify: {classify_query}"),
     ]
 
-    from app.workflow.strategies.react import ReactStrategy
-
-    react = ReactStrategy()
-    llm = react._build_llm(llm_config)
+    llm = build_llm(llm_config)
     response = await llm.ainvoke(messages)
     selected_key = (response.content or "").strip().strip("`'\"")
 

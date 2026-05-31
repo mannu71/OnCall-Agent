@@ -52,16 +52,14 @@ class EmbeddingService:
         Returns:
             Embedding vector (1536 dimensions for Titan)
         """
-        import asyncio
-        
-        # Truncate text if too long
+        from app.core.thread_pools import run_in_aws_pool
+
         max_tokens = 8000
         if len(text) > max_tokens:
             text = text[:max_tokens]
-        
+
         # Call Bedrock API
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
+        response = await run_in_aws_pool(
             lambda: self.client.invoke_model(
                 modelId='amazon.titan-embed-text-v1',
                 body=json.dumps({'inputText': text})
@@ -72,19 +70,19 @@ class EmbeddingService:
         return result.get('embedding', [])
     
     async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for multiple texts.
-        
-        Args:
-            texts: List of texts to embed
-            
-        Returns:
-            List of embedding vectors
-        """
-        embeddings = []
-        for text in texts:
-            embedding = await self.generate_embedding(text)
-            embeddings.append(embedding)
-        return embeddings
+        """Generate embeddings for multiple texts (bounded parallel)."""
+        if not texts:
+            return []
+
+        from app.config import settings
+
+        sem = asyncio.Semaphore(settings.embedding_concurrency)
+
+        async def _one(text: str) -> List[float]:
+            async with sem:
+                return await self.generate_embedding(text)
+
+        return list(await asyncio.gather(*[_one(t) for t in texts]))
 
 
 class KnowledgeBaseService:

@@ -4,11 +4,31 @@ from typing import Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
-from app.repositories.db_repository import db_repository
+from app.infrastructure.persistence import llm_config_repository, model_key_repository
 from app.core.redact import redact
+from app.core.thread_pools import run_in_aws_pool
 
 router = APIRouter(prefix="/llm-config", tags=["llm-config"])
 logger = logging.getLogger(__name__)
+
+
+async def _discovered_models_response(
+    provider: str,
+    discovered: list,
+    *,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Batch-mark ``already_exists`` and build the standard discovery payload."""
+    await llm_config_repository.mark_discovered_existing(discovered)
+    payload: Dict[str, Any] = {
+        "success": True,
+        "discovered": len(discovered),
+        "provider": provider,
+        "models": discovered,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 class LLMProviderConfig(BaseModel):
@@ -53,7 +73,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
     }
     provider = _CANONICAL.get((request.provider or "").strip().lower(), request.provider)
 
-    mk = await db_repository.get_model_key(provider, include_secrets=True)
+    mk = await model_key_repository.get_by_provider(provider, include_secrets=True)
     if not mk:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -113,7 +133,7 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 kwargs["verify"] = False
             try:
                 client = boto3.client("bedrock", **kwargs)
-                response = client.list_foundation_models()
+                response = await run_in_aws_pool(client.list_foundation_models)
             except BotoClientError as e:
                 raise HTTPException(status_code=502, detail=f"Failed to query AWS Bedrock: {e}")
             models = response.get("modelSummaries", [])
@@ -125,7 +145,6 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 if not model_id:
                     continue
                 display_name = model_name or (model_id.split(".")[-1] if "." in model_id else model_id)
-                existing = await db_repository.get_llm_config(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
@@ -133,10 +152,9 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                     "region": bedrock_region,
                     "icon": pick_icon(model_id),
                     "description": f"{provider_name} - {model_id}" if provider_name else model_id,
-                    "already_exists": existing is not None,
                 })
             logger.info("Discovered %d Bedrock models in %s", len(discovered), bedrock_region)
-            return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
+            return await _discovered_models_response(provider, discovered)
 
         elif provider == "OpenAI":
             if not api_key:
@@ -155,18 +173,16 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 if not model_id:
                     continue
                 display_name = model_id
-                existing = await db_repository.get_llm_config(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
                     "provider": "OpenAI",
                     "icon": pick_icon(model_id),
                     "description": model_id,
-                    "already_exists": existing is not None,
                 })
             discovered.sort(key=lambda x: x["name"])
             logger.info("Discovered %d OpenAI models", len(discovered))
-            return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
+            return await _discovered_models_response(provider, discovered)
 
         elif provider == "Anthropic":
             if not api_key:
@@ -188,18 +204,16 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 display_name = m.get("display_name", model_id)
                 if not model_id:
                     continue
-                existing = await db_repository.get_llm_config(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
                     "provider": "Anthropic",
                     "icon": pick_icon(model_id),
                     "description": display_name,
-                    "already_exists": existing is not None,
                 })
             discovered.sort(key=lambda x: x["name"])
             logger.info("Discovered %d Anthropic models", len(discovered))
-            return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
+            return await _discovered_models_response(provider, discovered)
 
         elif provider == "Google":
             if not api_key:
@@ -217,18 +231,16 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 display_name = m.get("displayName", model_id)
                 if not model_id:
                     continue
-                existing = await db_repository.get_llm_config(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
                     "provider": "Google",
                     "icon": pick_icon(model_id),
                     "description": m.get("description", display_name),
-                    "already_exists": existing is not None,
                 })
             discovered.sort(key=lambda x: x["name"])
             logger.info("Discovered %d Google models", len(discovered))
-            return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
+            return await _discovered_models_response(provider, discovered)
 
         elif provider == "Groq":
             if not api_key:
@@ -247,18 +259,16 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 if not model_id:
                     continue
                 display_name = model_id
-                existing = await db_repository.get_llm_config(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
                     "provider": "Groq",
                     "icon": pick_icon(model_id),
                     "description": model_id,
-                    "already_exists": existing is not None,
                 })
             discovered.sort(key=lambda x: x["name"])
             logger.info("Discovered %d Groq models", len(discovered))
-            return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
+            return await _discovered_models_response(provider, discovered)
 
         elif provider == "Azure OpenAI":
             if not api_key:
@@ -279,7 +289,6 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 display_name = m.get("id", model_id)
                 if not model_id:
                     continue
-                existing = await db_repository.get_llm_config(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
@@ -287,11 +296,10 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                     "endpoint": endpoint,
                     "icon": pick_icon(model_id),
                     "description": f"{model_id} @ {endpoint}",
-                    "already_exists": existing is not None,
                 })
             discovered.sort(key=lambda x: x["name"])
             logger.info("Discovered %d Azure OpenAI models", len(discovered))
-            return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
+            return await _discovered_models_response(provider, discovered)
 
         elif provider == "Ollama":
             ollama_url = endpoint or "http://localhost:11434"
@@ -306,7 +314,6 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                 if not model_id:
                     continue
                 display_name = model_id
-                existing = await db_repository.get_llm_config(display_name)
                 discovered.append({
                     "name": display_name,
                     "model": model_id,
@@ -314,11 +321,10 @@ async def discover_provider_models(request: DiscoverModelsRequest):
                     "baseUrl": ollama_url,
                     "icon": pick_icon(model_id),
                     "description": f"{model_id} ({m.get('size', '')})" if m.get("size") else model_id,
-                    "already_exists": existing is not None,
                 })
             discovered.sort(key=lambda x: x["name"])
             logger.info("Discovered %d Ollama models", len(discovered))
-            return {"success": True, "discovered": len(discovered), "provider": provider, "models": discovered}
+            return await _discovered_models_response(provider, discovered)
 
         else:
             raise HTTPException(
@@ -425,7 +431,7 @@ async def discover_bedrock_models(request: Optional[AWSDiscoverRequest] = None):
 
     try:
         client = boto3.client("bedrock", **kwargs)
-        response = client.list_foundation_models()
+        response = await run_in_aws_pool(client.list_foundation_models)
     except ClientError as e:
         logger.error("Failed to list Bedrock models: %s", redact(str(e)))
         raise HTTPException(
@@ -461,7 +467,6 @@ async def discover_bedrock_models(request: Optional[AWSDiscoverRequest] = None):
 
         display_name = model_name or model_id.split(".")[-1] if "." in model_id else model_id
 
-        existing = await db_repository.get_llm_config(display_name)
         discovered.append({
             "name": display_name,
             "model": model_id,
@@ -469,16 +474,14 @@ async def discover_bedrock_models(request: Optional[AWSDiscoverRequest] = None):
             "region": region,
             "icon": icon,
             "description": f"{provider_name} - {model_id}" if provider_name else model_id,
-            "already_exists": existing is not None,
         })
 
     logger.info("Discovered %d Bedrock models in %s", len(discovered), region)
-    return {
-        "success": True,
-        "discovered": len(discovered),
-        "region": region,
-        "models": discovered,
-    }
+    return await _discovered_models_response(
+        "AWS Bedrock",
+        discovered,
+        extra={"region": region},
+    )
 
 
 class AddDiscoveredModelsRequest(BaseModel):
@@ -495,7 +498,7 @@ async def add_discovered_models(request: AddDiscoveredModelsRequest):
         name = model.get("name")
         if not name:
             continue
-        if await db_repository.llm_config_exists(name):
+        if await llm_config_repository.exists(name):
             skipped.append(name)
             continue
         config_data = {
@@ -507,7 +510,7 @@ async def add_discovered_models(request: AddDiscoveredModelsRequest):
             "temperature": 0.1,
             "max_tokens": 4096,
         }
-        await db_repository.create_llm_config({**config_data, "name": name})
+        await llm_config_repository.create({**config_data, "name": name})
         added.append(name)
 
     logger.info("Added %d discovered models, skipped %d existing", len(added), len(skipped))
@@ -522,7 +525,7 @@ async def add_discovered_models(request: AddDiscoveredModelsRequest):
 
 @router.get("", response_model=Dict[str, Any])
 async def get_llm_config():
-    configs = await db_repository.list_llm_configs()
+    configs = await llm_config_repository.list_all()
     masked_llms = {}
     for name, cfg in configs.items():
         masked = {**cfg}
@@ -538,7 +541,7 @@ async def get_llm_config():
 
 @router.get("/{llm_name}", response_model=Dict[str, Any])
 async def get_llm_by_name(llm_name: str):
-    cfg = await db_repository.get_llm_config(llm_name)
+    cfg = await llm_config_repository.get_by_name(llm_name)
     if not cfg:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -555,12 +558,12 @@ async def get_llm_by_name(llm_name: str):
 
 @router.post("", response_model=Dict[str, Any], status_code=status.HTTP_201_CREATED)
 async def create_llm_config(llm_data: LLMConfigCreate):
-    if await db_repository.llm_config_exists(llm_data.name):
+    if await llm_config_repository.exists(llm_data.name):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"LLM configuration '{llm_data.name}' already exists"
         )
-    created = await db_repository.create_llm_config(llm_data.model_dump())
+    created = await llm_config_repository.create(llm_data.model_dump())
     logger.info("Created LLM configuration: %s", llm_data.name)
     return {"name": llm_data.name, **created}
 
@@ -569,12 +572,12 @@ async def create_llm_config(llm_data: LLMConfigCreate):
 async def update_llm_config(llm_name: str, llm_update: LLMConfigUpdate):
     update_data = llm_update.model_dump(exclude_unset=True)
     new_name = update_data.get("name") or llm_name
-    if new_name != llm_name and await db_repository.llm_config_exists(new_name):
+    if new_name != llm_name and await llm_config_repository.exists(new_name):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"LLM configuration '{new_name}' already exists"
         )
-    updated = await db_repository.update_llm_config(llm_name, update_data)
+    updated = await llm_config_repository.update(llm_name, update_data)
     if not updated:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -586,7 +589,7 @@ async def update_llm_config(llm_name: str, llm_update: LLMConfigUpdate):
 
 @router.delete("/{llm_name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_llm_config(llm_name: str):
-    deleted = await db_repository.delete_llm_config(llm_name)
+    deleted = await llm_config_repository.delete(llm_name)
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -606,7 +609,7 @@ async def bulk_delete_llm_configs(request: BulkDeleteRequest):
     deleted = []
     not_found = []
     for name in request.names:
-        if await db_repository.delete_llm_config(name):
+        if await llm_config_repository.delete(name):
             deleted.append(name)
         else:
             not_found.append(name)
@@ -636,7 +639,7 @@ class LLMTestRequest(BaseModel):
 async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] = None):
     import httpx
 
-    cfg = await db_repository.get_llm_config(llm_name)
+    cfg = await llm_config_repository.get_by_name(llm_name)
     if not cfg:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -671,7 +674,7 @@ async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] =
     api_key = ""
 
     if not api_key and provider not in ("AWS Bedrock", "Bedrock", "bedrock", "Ollama"):
-        mk = await db_repository.get_model_key(provider, include_secrets=True)
+        mk = await model_key_repository.get_by_provider(provider, include_secrets=True)
         if mk:
             if mk.get("api_key") and not api_key:
                 api_key = mk["api_key"]
@@ -765,7 +768,7 @@ async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] =
                 secret_access_key = test_config.get("secret_access_key")
                 session_token = test_config.get("session_token")
 
-                mk = await db_repository.get_model_key("AWS Bedrock", include_secrets=True)
+                mk = await model_key_repository.get_by_provider("AWS Bedrock", include_secrets=True)
                 if mk:
                     if not access_key_id and mk.get("access_key_id"):
                         access_key_id = mk["access_key_id"]
@@ -787,7 +790,9 @@ async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] =
 
                 try:
                     bedrock = boto3.client("bedrock", **boto_kwargs)
-                    bedrock.list_foundation_models(byProvider="anthropic")
+                    await run_in_aws_pool(
+                        lambda: bedrock.list_foundation_models(byProvider="anthropic")
+                    )
                     return {"success": True, "message": f"Connected to AWS Bedrock ({region})"}
                 except BotoClientError as e:
                     error_code = e.response.get("Error", {}).get("Code", "")

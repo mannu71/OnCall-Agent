@@ -76,9 +76,3 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-filterwarnings = [
-    "ignore::DeprecationWarning:app.repositories.execution_repository",
-    "ignore::DeprecationWarning:app.repositories.workflow_repository",
-    "ignore::DeprecationWarning:app.repositories.mcp_config_repository",
-    "ignore::DeprecationWarning:app.repositories.db_repository",
-]

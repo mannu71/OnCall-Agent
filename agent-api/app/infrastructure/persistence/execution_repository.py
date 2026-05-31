@@ -10,6 +10,9 @@ from app.models.db_models import ExecutionModel
 
 logger = logging.getLogger(__name__)
 
+ACTIVE_STATUSES = ("running", "pending")
+TERMINAL_STATUSES = ("success", "failed", "cancelled", "partial", "completed")
+
 
 class ExecutionRepository:
     """Repository for execution history data access."""
@@ -18,6 +21,110 @@ class ExecutionRepository:
         """Initialize execution repository."""
         logger.info("ExecutionRepository initialized")
     
+    async def create_running(
+        self,
+        workflow_name: str,
+        *,
+        workflow_id: Optional[int] = None,
+        inputs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Insert a new execution row with ``status='running'``."""
+        async with AsyncSessionLocal() as session:
+            execution = ExecutionModel(
+                workflow_id=workflow_id,
+                workflow_name=workflow_name,
+                status="running",
+                started_at=datetime.now(timezone.utc),
+                input=inputs,
+            )
+            session.add(execution)
+            await session.commit()
+            await session.refresh(execution)
+            return self._execution_to_dict(execution)
+
+    async def find_running_by_workflow(
+        self, workflow_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recent running execution for a workflow, if any."""
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(ExecutionModel)
+                .where(
+                    ExecutionModel.workflow_name == workflow_name,
+                    ExecutionModel.status.in_(ACTIVE_STATUSES),
+                )
+                .order_by(ExecutionModel.started_at.desc())
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+            return self._execution_to_dict(row) if row else None
+
+    async def list_active(self) -> List[Dict[str, Any]]:
+        """List all executions currently marked as running or pending."""
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(ExecutionModel)
+                .where(ExecutionModel.status.in_(ACTIVE_STATUSES))
+                .order_by(ExecutionModel.started_at.desc())
+            )
+            return [self._execution_to_dict(row) for row in result.scalars().all()]
+
+    async def mark_cancelled(
+        self,
+        execution_id: str,
+        *,
+        reason: Optional[str] = None,
+    ) -> bool:
+        """Mark an execution as cancelled and set ``completed_at``."""
+        try:
+            eid = int(execution_id)
+        except (TypeError, ValueError):
+            return False
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(ExecutionModel).where(ExecutionModel.id == eid)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return False
+            row.status = "cancelled"
+            row.completed_at = datetime.now(timezone.utc)
+            if reason:
+                row.error = reason
+            if row.started_at and row.completed_at:
+                row.duration_ms = int(
+                    (row.completed_at - row.started_at).total_seconds() * 1000
+                )
+            await session.commit()
+            return True
+
+    async def cancel_all_active(
+        self,
+        *,
+        workflow_name: Optional[str] = None,
+        reason: str = "Cancelled by operator",
+    ) -> int:
+        """Cancel running executions, optionally scoped to one workflow."""
+        async with AsyncSessionLocal() as session:
+            query = select(ExecutionModel).where(
+                ExecutionModel.status.in_(ACTIVE_STATUSES)
+            )
+            if workflow_name:
+                query = query.where(ExecutionModel.workflow_name == workflow_name)
+            result = await session.execute(query)
+            rows = result.scalars().all()
+            now = datetime.now(timezone.utc)
+            for row in rows:
+                row.status = "cancelled"
+                row.completed_at = now
+                row.error = reason
+                if row.started_at:
+                    row.duration_ms = int((now - row.started_at).total_seconds() * 1000)
+            if rows:
+                await session.commit()
+            return len(rows)
+
     async def get_by_id(self, execution_id: str) -> Optional[Dict[str, Any]]:
         """Get execution by ID.
         

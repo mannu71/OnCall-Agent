@@ -22,13 +22,18 @@ function writeSession(list) {
   try { sessionStorage.setItem(SS_KEY, JSON.stringify(list)); } catch { /* ignore */ }
 }
 
+function sameWorkflowList(a, b) {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((name, i) => name === sortedB[i]);
+}
+
 export const WorkflowStatusProvider = ({ children }) => {
-  // Initialise from sessionStorage → monitor visible immediately after refresh
   const [runningWorkflows, setRunningWorkflowsRaw] = useState(readSession);
   const [pendingWorkflows, setPendingWorkflows] = useState([]);
-  const [lastCheck, setLastCheck] = useState(0);
+  const activeStreamsRef = useRef(new Map());
 
-  // Keep sessionStorage in sync on every update
   const setRunningWorkflows = useCallback((updater) => {
     setRunningWorkflowsRaw(prev => {
       const next = typeof updater === 'function' ? updater(prev) : updater;
@@ -36,29 +41,36 @@ export const WorkflowStatusProvider = ({ children }) => {
       return next;
     });
   }, []);
-  const activeStreamsRef = useRef(new Map());
 
   const checkRunningWorkflows = useCallback(async () => {
+    if (document.hidden) return;
+
     try {
       const active = await agentApiClient.listActiveWorkflows();
-      setRunningWorkflows(active || []);
-      setLastCheck(Date.now());
+      const next = active || [];
+      setRunningWorkflows(prev => (sameWorkflowList(prev, next) ? prev : next));
     } catch (error) {
       console.error('Error checking running workflows:', error);
     }
-  }, []);
+  }, [setRunningWorkflows]);
 
   useEffect(() => {
     checkRunningWorkflows();
 
-    const interval = setInterval(checkRunningWorkflows, 10000);
+    const interval = setInterval(checkRunningWorkflows, 15000);
 
     const handleFocus = () => checkRunningWorkflows();
+    const handleVisibility = () => {
+      if (!document.hidden) checkRunningWorkflows();
+    };
+
     window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
 
     return () => {
       clearInterval(interval);
       window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, [checkRunningWorkflows]);
 
@@ -132,8 +144,7 @@ export const WorkflowStatusProvider = ({ children }) => {
     subscribeToWorkflow,
     unsubscribeFromWorkflow,
     count: allRunningWorkflows.length,
-    lastCheck
-  }), [allRunningWorkflows, isWorkflowRunning, markWorkflowPending, clearWorkflowPending, subscribeToWorkflow, unsubscribeFromWorkflow, lastCheck]);
+  }), [allRunningWorkflows, isWorkflowRunning, markWorkflowPending, clearWorkflowPending, subscribeToWorkflow, unsubscribeFromWorkflow]);
 
   return (
     <WorkflowStatusContext.Provider value={value}>

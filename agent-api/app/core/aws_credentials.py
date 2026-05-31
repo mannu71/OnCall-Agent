@@ -51,10 +51,10 @@ async def resolve_aws_credentials(
         return credentials, aws_region
 
     try:
-        from app.repositories import db_repository
+        from app.infrastructure.persistence import model_key_repository
 
         for key_name in _AWS_KEY_ALIASES:
-            mk = await db_repository.get_model_key(key_name, include_secrets=True)
+            mk = await model_key_repository.get_by_provider(key_name, include_secrets=True)
             if mk and mk.get("access_key_id"):
                 credentials["access_key_id"] = mk["access_key_id"]
                 if mk.get("secret_access_key"):

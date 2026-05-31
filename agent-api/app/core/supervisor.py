@@ -24,11 +24,12 @@ adjusted without a deploy.
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -103,26 +104,34 @@ class SupervisorConfig:
     """
 
     # Score >= this → PASS immediately.
-    # Lowered from 0.72 → 0.60 for token efficiency: most well-formed answers
-    # score in the 0.60–0.72 band; sending them through a supervisor retry
-    # doubles input-token cost for marginal quality gain. Override per-env via
-    # SUPERVISOR_PASS_THRESHOLD to restore strict mode.
-    pass_threshold: float = float(os.getenv("SUPERVISOR_PASS_THRESHOLD", "0.60"))
+    pass_threshold: float = 0.60
 
     # Score >= this (but < pass_threshold) → HITL when hitl_enabled=True.
-    hitl_threshold: float = float(os.getenv("SUPERVISOR_HITL_THRESHOLD", "0.50"))
+    hitl_threshold: float = 0.50
 
     # Maximum number of automatic retries before escalating.
-    max_retries: int = int(os.getenv("SUPERVISOR_MAX_RETRIES", "1"))
+    max_retries: int = 1
 
     # Whether HITL is a valid route (False → scores in hitl band go to RETRY).
-    hitl_enabled: bool = os.getenv("SUPERVISOR_HITL_ENABLED", "true").lower() == "true"
+    hitl_enabled: bool = True
 
     # Whether to run an LLM quality check in addition to heuristics.
-    # Adds one LLM call per investigation; disabled by default to save cost.
-    llm_scoring_enabled: bool = (
-        os.getenv("SUPERVISOR_LLM_SCORING", "false").lower() == "true"
-    )
+    llm_scoring_enabled: bool = False
+
+    # Total input+output tokens allowed across supervisor retry loops.
+    token_budget: int = 100_000
+
+    @classmethod
+    def from_settings(cls) -> "SupervisorConfig":
+        """Build config from the canonical :class:`app.config.Settings` object."""
+        return cls(
+            pass_threshold=settings.supervisor_pass_threshold,
+            hitl_threshold=settings.supervisor_hitl_threshold,
+            max_retries=settings.supervisor_max_retries,
+            hitl_enabled=settings.supervisor_hitl_enabled,
+            llm_scoring_enabled=settings.supervisor_llm_scoring,
+            token_budget=settings.supervisor_token_budget,
+        )
 
 
 # ---------------------------------------------------------------------------

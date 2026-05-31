@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Any, Dict, List, Optional
+
+from app.config import settings
 
 from .graph import CircularReferenceError, build_waves
 from .parser import parse
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Same env var used elsewhere in the codebase for concurrent task fan-out, so
 # operators only need to learn one knob. Falls back to 5 if unset.
-_DEFAULT_CONCURRENCY = int(os.getenv("PARALLEL_FLOW_CONCURRENCY", "5"))
+_DEFAULT_CONCURRENCY = settings.parallel_flow_concurrency
 
 
 async def run_pipeline(

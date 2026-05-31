@@ -27,13 +27,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.config import settings
+from app.core.thread_pools import run_in_aws_pool
+
 logger = logging.getLogger(__name__)
+
+_SEEN_TTL = timedelta(hours=settings.heartbeat_seen_ttl_hours)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -65,41 +69,26 @@ class AlarmRule:
 
 @dataclass
 class HeartbeatConfig:
-    """Runtime configuration for the heartbeat monitor.
+    """Runtime configuration for the heartbeat monitor."""
 
-    All values read from environment variables so they can be changed
-    without a code deploy.
-    """
-
-    # Seconds between alarm polls.
-    poll_interval_seconds: int = int(
-        os.getenv("HEARTBEAT_POLL_INTERVAL", "60")
-    )
-
-    # Don't re-trigger the same alarm within this window (seconds).
-    cooldown_seconds: int = int(
-        os.getenv("HEARTBEAT_COOLDOWN", "300")
-    )
-
-    # Maximum parallel workflow triggers per poll cycle.
-    max_concurrent_triggers: int = int(
-        os.getenv("HEARTBEAT_MAX_CONCURRENT", "3")
-    )
-
-    # AWS region for CloudWatch describe_alarms.
-    aws_region: str = os.getenv("HEARTBEAT_AWS_REGION", "us-east-1")
-
-    # Optional AWS profile name.
-    aws_profile: Optional[str] = os.getenv("HEARTBEAT_AWS_PROFILE")
-
-    # Alarm rules — populated programmatically or from DB at startup.
+    poll_interval_seconds: int = 60
+    cooldown_seconds: int = 300
+    max_concurrent_triggers: int = 3
+    aws_region: str = "us-east-1"
+    aws_profile: Optional[str] = None
     alarm_rules: List[AlarmRule] = field(default_factory=list)
+    db_fallback_enabled: bool = True
 
-    # Fall back to polling the local DB alerts table when True.
-    # Auto-enabled when CloudWatch credentials cannot be resolved.
-    db_fallback_enabled: bool = (
-        os.getenv("HEARTBEAT_DB_FALLBACK", "true").lower() == "true"
-    )
+    @classmethod
+    def from_settings(cls) -> "HeartbeatConfig":
+        return cls(
+            poll_interval_seconds=settings.heartbeat_poll_interval,
+            cooldown_seconds=settings.heartbeat_cooldown,
+            max_concurrent_triggers=settings.heartbeat_max_concurrent,
+            aws_region=settings.heartbeat_aws_region,
+            aws_profile=settings.heartbeat_aws_profile,
+            db_fallback_enabled=settings.heartbeat_db_fallback,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -117,12 +106,13 @@ class HeartbeatMonitor:
     """
 
     def __init__(self, config: Optional[HeartbeatConfig] = None) -> None:
-        self._cfg   = config or HeartbeatConfig()
+        self._cfg   = config or HeartbeatConfig.from_settings()
         self._task: Optional[asyncio.Task] = None
         self._stop  = asyncio.Event()
 
         # alarm_arn → datetime of first trigger (or last cooldown reset).
         self._seen:  Dict[str, datetime] = {}
+        self._deferred: List[Dict[str, Any]] = []
 
         # Cache CloudWatch boto3 client (created lazily on first poll).
         self._cw_client: Optional[Any] = None
@@ -189,9 +179,9 @@ class HeartbeatMonitor:
         Non-fatal — any error is silently ignored.
         """
         try:
-            from app.repositories.db_repository import db_repository
+            from app.infrastructure.persistence import workflow_repository
 
-            workflows = await db_repository.list_workflows()
+            workflows = await workflow_repository.list_all()
             count = 0
             for wf in workflows or []:
                 metadata = wf.get("metadata") or {}
@@ -253,6 +243,9 @@ class HeartbeatMonitor:
     async def _poll_and_act(self) -> None:
         """Fetch active alarms, find new ones, trigger workflows."""
         alarms = await self._fetch_active_alarms()
+        if self._deferred:
+            alarms = self._deferred + (alarms or [])
+            self._deferred = []
         if not alarms:
             return
 
@@ -262,7 +255,7 @@ class HeartbeatMonitor:
 
         trigger_tasks: List[asyncio.Task] = []
 
-        for alarm in alarms:
+        for idx, alarm in enumerate(alarms):
             alarm_arn    = alarm.get("AlarmArn", alarm.get("AlarmName", ""))
             alarm_name   = alarm.get("AlarmName", "")
             alarm_reason = alarm.get("StateReason", "")
@@ -287,9 +280,11 @@ class HeartbeatMonitor:
             if triggered >= self._cfg.max_concurrent_triggers:
                 logger.info(
                     "HeartbeatMonitor: max_concurrent_triggers=%d reached; "
-                    "deferring remaining alarms to next tick",
+                    "queuing %d alarm(s) for next tick",
                     self._cfg.max_concurrent_triggers,
+                    len(alarms) - idx,
                 )
+                self._deferred.extend(alarms[idx:])
                 break
 
             query = matched_rule.query_template.format(
@@ -308,6 +303,15 @@ class HeartbeatMonitor:
 
         if trigger_tasks:
             await asyncio.gather(*trigger_tasks, return_exceptions=True)
+
+        self._prune_seen(now)
+
+    def _prune_seen(self, now: datetime) -> None:
+        """Drop alarm ARNs not referenced within the TTL window."""
+        cutoff = now - _SEEN_TTL
+        expired = [arn for arn, seen_at in self._seen.items() if seen_at < cutoff]
+        for arn in expired:
+            del self._seen[arn]
 
     async def _fetch_active_alarms(self) -> List[Dict[str, Any]]:
         """Return all CloudWatch alarms in ALARM state.
@@ -336,9 +340,7 @@ class HeartbeatMonitor:
         if client is None:
             raise RuntimeError("CloudWatch client unavailable")
 
-        loop    = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
+        response = await run_in_aws_pool(
             lambda: client.describe_alarms(StateValue="ALARM", MaxRecords=50),
         )
 
@@ -400,10 +402,10 @@ class HeartbeatMonitor:
     ) -> None:
         """Look up and execute the named workflow via the visual executor."""
         try:
-            from app.services.visual_workflow_executor import visual_executor
-            from app.repositories.db_repository import db_repository
+            from app.infrastructure.persistence import workflow_repository
+            from app.workflow.routing import execute_visual_workflow
 
-            workflow_data = await db_repository.get_workflow(workflow_name)
+            workflow_data = await workflow_repository.get_by_name(workflow_name)
             if not workflow_data:
                 logger.warning(
                     "HeartbeatMonitor: workflow '%s' not found in DB; "
@@ -425,9 +427,7 @@ class HeartbeatMonitor:
                 workflow_name, alarm.get("AlarmName"),
             )
 
-            result = await visual_executor.execute_workflow(
-                workflow_data, inputs=inputs
-            )
+            result = await execute_visual_workflow(workflow_data, inputs=inputs)
 
             status = (result or {}).get("status", "unknown")
             logger.info(
@@ -480,8 +480,7 @@ class HeartbeatMonitor:
                 "cloudwatch",
                 region_name = region,
                 config      = boto_cfg,
-                verify      = os.environ.get("AWS_SSL_VERIFY", "true").lower()
-                              not in ("false", "0", "no"),
+                verify=settings.aws_ssl_verify,
             )
             logger.info(
                 "HeartbeatMonitor: CloudWatch client ready (region=%s)", region

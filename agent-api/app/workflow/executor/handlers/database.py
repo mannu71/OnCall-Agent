@@ -90,12 +90,9 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
 
     # Use the DB-backed repository (app.infrastructure.persistence) not the
     # file-backed one (app.repositories) so we read the servers saved in Postgres.
-    from app.infrastructure.persistence.mcp_config_repository import (
-        MCPConfigRepository as DBMCPConfigRepository,
-    )
+    from app.infrastructure.persistence import mcp_config_repository
 
-    mcp_repo = DBMCPConfigRepository()
-    server_list = await mcp_repo.list_all(include_disabled=False)
+    server_list = await mcp_config_repository.list_all(include_disabled=False)
     # Build name → config mapping
     all_server_configs: Dict[str, Any] = {s['name']: s for s in server_list}
 

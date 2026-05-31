@@ -7,7 +7,7 @@
  * Ref:   getWorkflowData() → { nodes, edges }
  */
 import React, {
-  useState, useMemo, useRef, useEffect, useCallback,
+  useState, useMemo, useRef, useEffect, useCallback, memo,
   forwardRef, useImperativeHandle,
 } from 'react';
 import { getLLMs } from '../../services/llmService.js';
@@ -824,7 +824,7 @@ function NodeFooter({ slots }) {
   );
 }
 
-function WfNode({ node, selected, dragging, drawingSourceSlot, onClick, onPointerDown, onDelete, onPortPointerDown, liveStatus }) {
+const WfNode = memo(function WfNode({ node, selected, dragging, drawingSourceSlot, onClick, onPointerDown, onDelete, onPortPointerDown, liveStatus }) {
   const def = NODE_TYPES[node.type];
   if (!def) return null;
   const tint = CAT_TINT[def.category] || CAT_TINT.Tools;
@@ -933,7 +933,7 @@ function WfNode({ node, selected, dragging, drawingSourceSlot, onClick, onPointe
       })}
     </div>
   );
-}
+});
 
 // ─────────────────────────────────────────────────────────────────
 // 7. CANVAS  (from wf-canvas.jsx)
@@ -982,10 +982,10 @@ function GhostEdge({ from, to }) {
   );
 }
 
-function DotGrid({ view }) {
+function DotGrid({ view, gridRef }) {
   const sz = 24 * view.zoom;
   return (
-    <div data-canvas-bg style={{ position: 'absolute', inset: 0,
+    <div ref={gridRef} data-canvas-bg style={{ position: 'absolute', inset: 0,
       backgroundImage: 'radial-gradient(circle,#cbd5e1 1px,transparent 1px)',
       backgroundSize: `${sz}px ${sz}px`,
       backgroundPosition: `${view.x}px ${view.y}px`,
@@ -1037,7 +1037,21 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
   const isLive = workflowName ? isWorkflowRunning(workflowName) : false;
   const panRef  = useRef(null);
   const viewRef = useRef(view);
+  const transformLayerRef = useRef(null);
+  const dotGridRef = useRef(null);
   useEffect(() => { viewRef.current = view; }, [view]);
+
+  const applyViewTransform = useCallback((v) => {
+    if (transformLayerRef.current) {
+      transformLayerRef.current.style.transform =
+        `translate(${v.x}px,${v.y}px) scale(${v.zoom})`;
+    }
+    if (dotGridRef.current) {
+      const sz = 24 * v.zoom;
+      dotGridRef.current.style.backgroundSize = `${sz}px ${sz}px`;
+      dotGridRef.current.style.backgroundPosition = `${v.x}px ${v.y}px`;
+    }
+  }, []);
 
   // ── Per-node status from latest execution ─────────────────────
   const [nodeStatusMap, setNodeStatusMap] = useState({});
@@ -1183,10 +1197,20 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
   const onPM = e => {
     if (panRef.current) {
       const p = panRef.current;
-      setView(v => ({ ...v, x: p.vx + (e.clientX - p.sx), y: p.vy + (e.clientY - p.sy) }));
+      const next = {
+        ...viewRef.current,
+        x: p.vx + (e.clientX - p.sx),
+        y: p.vy + (e.clientY - p.sy),
+      };
+      viewRef.current = next;
+      applyViewTransform(next);
     }
   };
-  const onPU = () => { setPanning(false); panRef.current = null; };
+  const onPU = () => {
+    setPanning(false);
+    panRef.current = null;
+    setView({ ...viewRef.current });
+  };
 
   // ── Node drag via window listeners ────────────────────────────
   const startDrag = (n, e) => {
@@ -1194,19 +1218,24 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
     nodeDraggedRef.current = false;
     const sx = e.clientX, sy = e.clientY;
     const ox = n.x, oy = n.y, id = n.id;
+    let dragRaf = null;
     const onMove = ev => {
       const dx = ev.clientX - sx, dy = ev.clientY - sy;
       if (!nodeDraggedRef.current && Math.sqrt(dx*dx + dy*dy) < 4) return;
       nodeDraggedRef.current = true;
-      const v = viewRef.current;
-      setNodes(ns => ns.map(m =>
-        m.id === id ? { ...m, x: ox + dx/v.zoom, y: oy + dy/v.zoom } : m
-      ));
+      if (dragRaf) return;
+      dragRaf = requestAnimationFrame(() => {
+        dragRaf = null;
+        const v = viewRef.current;
+        setNodes(ns => ns.map(m =>
+          m.id === id ? { ...m, x: ox + dx/v.zoom, y: oy + dy/v.zoom } : m
+        ));
+      });
     };
     const onUp = () => {
+      if (dragRaf) cancelAnimationFrame(dragRaf);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
-      // click event fires next — nodeDraggedRef.current tells it whether to select
     };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
@@ -1242,6 +1271,14 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
   const resetZoom = () => setView(v => ({ ...v, zoom: 1 }));
 
   const nodeById = useMemo(() => { const m = new Map(); nodes.forEach(n => m.set(n.id, n)); return m; }, [nodes]);
+  const connectedNodeIds = useMemo(() => {
+    const ids = new Set();
+    for (const e of edges) {
+      ids.add(e.source);
+      ids.add(e.target);
+    }
+    return ids;
+  }, [edges]);
   const edgePaths = useMemo(() => edges.map(e => {
     const src = nodeById.get(e.source), dst = nodeById.get(e.target);
     if (!src || !dst) return null;
@@ -1263,7 +1300,7 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
       style={{ position: 'relative', width: '100%', height: '100%', background: '#f8fafc',
                overflow: 'hidden', cursor: drawEdge ? 'crosshair' : panning ? 'grabbing' : 'grab' }}>
 
-      <DotGrid view={view} />
+      <DotGrid view={view} gridRef={dotGridRef} />
 
       {dropError && (
         <div style={{ position: 'absolute', top: 12, left: '50%', transform: 'translateX(-50%)',
@@ -1275,7 +1312,7 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
         </div>
       )}
 
-      <div data-canvas-bg style={{ position: 'absolute', left: 0, top: 0, width: '100%', height: '100%',
+      <div ref={transformLayerRef} data-canvas-bg style={{ position: 'absolute', left: 0, top: 0, width: '100%', height: '100%',
                                     transformOrigin: '0 0',
                                     transform: `translate(${view.x}px,${view.y}px) scale(${view.zoom})` }}>
         {/* SVG layer: real edges + ghost edge */}
@@ -1330,7 +1367,7 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
             onPointerDown={e => startDrag(n, e)}
             onDelete={onDelete}
             onPortPointerDown={startPortDrag}
-            liveStatus={isLive ? 'running' : (nodeStatusMap[n.id] ?? (edges.some(e => e.source === n.id || e.target === n.id) ? 'success' : null))}
+            liveStatus={isLive ? 'running' : (nodeStatusMap[n.id] ?? (connectedNodeIds.has(n.id) ? 'success' : null))}
           />
         ))}
       </div>

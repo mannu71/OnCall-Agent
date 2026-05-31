@@ -5,6 +5,7 @@ import logging
 from functools import lru_cache
 from typing import Optional
 
+from app.config import settings
 from app.core.transport.provider import ProviderTransport
 
 logger = logging.getLogger(__name__)
@@ -24,11 +25,11 @@ def get_transport(provider: Optional[str] = None) -> ProviderTransport:
     Raises:
         ValueError: For unknown provider names.
     """
-    import os
-    name = (provider or os.getenv("PROVIDER_TRANSPORT", "anthropic")).lower()
+    name = (provider or settings.provider_transport).lower()
 
     if name == "anthropic":
         from app.core.transport.anthropic_transport import AnthropicTransport
+        import os
         api_key = os.getenv("ANTHROPIC_API_KEY") or ""
         if not api_key:
             logger.warning("ANTHROPIC_API_KEY is not set — AnthropicTransport will fail on first call")
@@ -37,8 +38,8 @@ def get_transport(provider: Optional[str] = None) -> ProviderTransport:
 
     if name in {"bedrock", "aws_bedrock"}:
         from app.core.transport.bedrock_transport import BedrockTransport
-        region  = os.getenv("BEDROCK_REGION", os.getenv("AWS_REGION", "us-east-1"))
-        profile = os.getenv("AWS_PROFILE")
+        region  = settings.effective_bedrock_region
+        profile = settings.aws_profile
         logger.info("ProviderTransport: using AWS Bedrock (region=%s)", region)
         return BedrockTransport(region=region, profile=profile)
 

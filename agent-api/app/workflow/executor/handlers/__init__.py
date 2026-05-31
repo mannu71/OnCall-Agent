@@ -29,3 +29,4 @@ from . import cloudwatch  # noqa: E402,F401
 from . import language_model  # noqa: E402,F401  — new LangflowEditor 'language_model' node type
 from . import router  # noqa: E402,F401  — new LangflowEditor 'router' node type
 from . import wiki  # noqa: E402,F401  — new Wiki output node type
+from . import code_analyzer  # noqa: E402,F401

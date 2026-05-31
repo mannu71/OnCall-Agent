@@ -5,10 +5,13 @@ Falls back gracefully when boto3 is not available.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import threading
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
+from app.core.thread_pools import run_in_aws_pool
 from app.core.transport.provider import (
     ProviderTransport,
     TransportMessage,
@@ -73,8 +76,6 @@ class BedrockTransport(ProviderTransport):
         system: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> TransportResponse:
-        import asyncio
-
         model_id = model or self.default_model
         body = self._build_body(messages, max_tokens=max_tokens, temperature=temperature, system=system)
         if tools:
@@ -88,8 +89,7 @@ class BedrockTransport(ProviderTransport):
                 accept="application/json",
             )
 
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, _invoke)
+        response = await run_in_aws_pool(_invoke)
         result = json.loads(response["body"].read())
 
         content = "".join(
@@ -117,8 +117,6 @@ class BedrockTransport(ProviderTransport):
         system: Optional[str] = None,
         on_usage: Optional[UsageCallback] = None,
     ) -> AsyncGenerator[str, None]:
-        import asyncio
-
         model_id = model or self.default_model
         body = self._build_body(messages, max_tokens=max_tokens, temperature=temperature, system=system)
 
@@ -130,23 +128,48 @@ class BedrockTransport(ProviderTransport):
                 accept="application/json",
             )
 
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, _invoke_stream)
+        response = await run_in_aws_pool(_invoke_stream)
 
-        # Bedrock streams usage data in a terminal message_stop / metadata chunk.
-        # Capture it so the optional on_usage callback can record per-execution
-        # token spend (parity with the non-streaming path).
+        # Read the blocking boto3 stream body in a background thread so token
+        # deltas can be yielded without stalling the asyncio event loop.
+        loop = asyncio.get_running_loop()
+        chunk_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+        def _read_body() -> None:
+            try:
+                for event in response.get("body"):
+                    chunk = json.loads(event["chunk"]["bytes"])
+                    asyncio.run_coroutine_threadsafe(
+                        chunk_queue.put(("chunk", chunk)), loop
+                    ).result(timeout=120)
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(
+                    chunk_queue.put(("error", exc)), loop
+                ).result(timeout=5)
+            finally:
+                asyncio.run_coroutine_threadsafe(
+                    chunk_queue.put(("done", None)), loop
+                ).result(timeout=5)
+
+        threading.Thread(target=_read_body, daemon=True, name="bedrock-stream").start()
+
         in_tok = 0
         out_tok = 0
-        for event in response.get("body"):
-            chunk = json.loads(event["chunk"]["bytes"])
+        while True:
+            kind, payload = await chunk_queue.get()
+            if kind == "done":
+                break
+            if kind == "error":
+                logger.warning("Bedrock stream read failed: %s", payload)
+                break
+
+            chunk = payload
             ctype = chunk.get("type")
             if ctype == "content_block_delta":
                 delta = chunk.get("delta", {})
                 if delta.get("type") == "text_delta":
                     yield delta.get("text", "")
             elif ctype == "message_delta":
-                # invocation usage is reported here for Anthropic-on-Bedrock
                 usage = chunk.get("usage") or {}
                 in_tok = usage.get("input_tokens", in_tok) or in_tok
                 out_tok = usage.get("output_tokens", out_tok) or out_tok

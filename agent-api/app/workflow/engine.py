@@ -1,9 +1,14 @@
 """
 Workflow Engine for Python
 
-This is the main facade for workflow execution, ported from the Node.js WorkflowEngine.
-It provides a single entry point for executing any type of workflow by delegating
-to the appropriate strategy.
+.. deprecated::
+    Do **not** use this class as the entry point for node-based (visual) workflows.
+    Visual workflows must be executed via ``app.workflow.routing.execute_workflow``
+    which delegates to ``VisualWorkflowExecutor`` and ``workflow/executor/handlers``.
+
+    ``WorkflowEngine`` remains for internal strategy orchestration only.  Calling
+    ``execute()`` with a workflow that contains ``nodes`` raises
+    ``WorkflowExecutionError``.
 """
 
 from typing import Dict, Any, List, Optional
@@ -28,10 +33,10 @@ class WorkflowExecutionError(Exception):
 
 class WorkflowEngine:
     """
-    Unified Workflow Engine for executing different types of workflows.
-    
-    This engine uses the strategy pattern to delegate execution to the
-    appropriate strategy based on the workflow type.
+    Strategy orchestrator — **not** the canonical workflow entry point.
+
+    Visual workflows are executed by ``VisualWorkflowExecutor``; this engine
+    must not be used to run workflows that contain ``nodes``.
     """
     
     def __init__(
@@ -50,14 +55,14 @@ class WorkflowEngine:
             max_execution_time: Maximum execution time in milliseconds
             enable_metrics: Whether to enable metrics collection
         """
-        # Import strategies here to avoid circular imports
-        from app.workflow.strategies.orchestrator import OrchestratorStrategy
+        # Import strategies here to avoid circular imports.
+        # SQL orchestration is handled by workflow/executor/handlers/orchestrator.py
+        # + sql_pipeline — not a WorkflowEngine strategy.
         from app.workflow.strategies.react import ReactStrategy
         from app.workflow.strategies.batch_react import BatchReactStrategy
         from app.workflow.strategies.router import RouterStrategy
-        
+
         self.strategies = strategies or [
-            OrchestratorStrategy(),
             RouterStrategy(),
             BatchReactStrategy(),
             ReactStrategy(),
@@ -96,7 +101,21 @@ class WorkflowEngine:
         context = context or {}
         execution_id = context.get("execution_id") or self._generate_execution_id()
         start_time = time.time()
-        
+
+        from app.workflow.routing import is_visual_workflow
+
+        if is_visual_workflow(workflow):
+            raise WorkflowExecutionError(
+                "Visual (node-based) workflows must be executed via "
+                "app.workflow.routing.execute_workflow(), not WorkflowEngine. "
+                "WorkflowEngine is reserved for internal strategy use.",
+                {
+                    "execution_id": execution_id,
+                    "workflow_id": workflow.get("id"),
+                    "workflow_name": workflow.get("name"),
+                },
+            )
+
         logger.info(
             "Workflow execution started",
             extra={
@@ -197,10 +216,12 @@ class WorkflowEngine:
         Select the appropriate strategy for a workflow.
 
         Uses a two-pass approach:
-        1. Node-type matching (orchestrator nodes → OrchestratorStrategy,
-           agent+llm nodes → ReactStrategy)
+        1. Node-type matching (agent/llm nodes → ReactStrategy, etc.)
         2. Intent classification fallback — if a user_query is present in context
-           and no explicit orchestrator nodes exist, route to ReactStrategy.
+           and no explicit agent nodes exist, route to ReactStrategy.
+
+        SQL orchestrator nodes are executed by ``VisualWorkflowExecutor`` via
+        ``workflow/executor/handlers/orchestrator.py``, not WorkflowEngine.
 
         Args:
             workflow: The workflow definition

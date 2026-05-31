@@ -428,8 +428,20 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadExecutions();
-    const interval = setInterval(loadExecutions, 30000);
-    return () => clearInterval(interval);
+
+    const interval = setInterval(() => {
+      if (!document.hidden) loadExecutions();
+    }, 30000);
+
+    const handleVisibility = () => {
+      if (!document.hidden) loadExecutions();
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
   }, [loadExecutions]);
 
   const stats = useMemo(() => {

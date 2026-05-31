@@ -79,53 +79,63 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
     const [suggestionsOpen, setSuggestionsOpen] = useState(true);
     const [showPermConfig, setShowPermConfig] = useState(false);
     const autoHandledRef = useRef(false);
+    const lastScannedIndexRef = useRef(0);
 
     const { getPermission, setPermission } = useToolPermissions();
 
-    // Watch for hitl_pause events
+    // Watch for hitl_pause events (only scan newly appended events)
     useEffect(() => {
         if (!events || events.length === 0) return;
+        if (events.length <= lastScannedIndexRef.current) return;
 
-        const last = events[events.length - 1];
-        if ((last.event_type || last.type) === 'hitl_pause') {
-            const data = last.data || last.payload || last;
-            const toolName = data.tool_name || null;
-            const newRequest = {
-                requestId: data.request_id,
-                executionId: data.execution_id || executionId,
-                rootCause: data.root_cause || data.draft_answer || 'Root cause analysis complete.',
-                suggestions: Array.isArray(data.suggestions) ? data.suggestions : [],
-                toolName,
-                toolParams: data.tool_params || null,
-            };
-            setHitlRequest(newRequest);
-            setDecision(null);
-            setError(null);
-            autoHandledRef.current = false;
+        const newEvents = events.slice(lastScannedIndexRef.current);
+        lastScannedIndexRef.current = events.length;
 
-            // Auto-handle based on per-tool permission level
-            if (toolName) {
-                const perm = getPermission(toolName);
-                if (perm === 'always_allow') {
-                    autoHandledRef.current = true;
-                    // Fire async; update state immediately so UI shows outcome
-                    setDecision('approved');
-                    agentApiClient.approveHITL(
-                        newRequest.executionId || executionId,
-                        newRequest.requestId,
-                        true,
-                    ).catch(() => {});
-                    onDecision?.(true);
-                } else if (perm === 'deny') {
-                    autoHandledRef.current = true;
-                    setDecision('rejected');
-                    agentApiClient.approveHITL(
-                        newRequest.executionId || executionId,
-                        newRequest.requestId,
-                        false,
-                    ).catch(() => {});
-                    onDecision?.(false);
-                }
+        let last = null;
+        for (let i = newEvents.length - 1; i >= 0; i--) {
+            if ((newEvents[i].event_type || newEvents[i].type) === 'hitl_pause') {
+                last = newEvents[i];
+                break;
+            }
+        }
+        if (!last) return;
+
+        const data = last.data || last.payload || last;
+        const toolName = data.tool_name || null;
+        const newRequest = {
+            requestId: data.request_id,
+            executionId: data.execution_id || executionId,
+            rootCause: data.root_cause || data.draft_answer || 'Root cause analysis complete.',
+            suggestions: Array.isArray(data.suggestions) ? data.suggestions : [],
+            toolName,
+            toolParams: data.tool_params || null,
+        };
+        setHitlRequest(newRequest);
+        setDecision(null);
+        setError(null);
+        autoHandledRef.current = false;
+
+        // Auto-handle based on per-tool permission level
+        if (toolName) {
+            const perm = getPermission(toolName);
+            if (perm === 'always_allow') {
+                autoHandledRef.current = true;
+                setDecision('approved');
+                agentApiClient.approveHITL(
+                    newRequest.executionId || executionId,
+                    newRequest.requestId,
+                    true,
+                ).catch(() => {});
+                onDecision?.(true);
+            } else if (perm === 'deny') {
+                autoHandledRef.current = true;
+                setDecision('rejected');
+                agentApiClient.approveHITL(
+                    newRequest.executionId || executionId,
+                    newRequest.requestId,
+                    false,
+                ).catch(() => {});
+                onDecision?.(false);
             }
         }
     }, [events, executionId, getPermission, onDecision]);

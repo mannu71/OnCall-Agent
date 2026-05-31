@@ -1,15 +1,19 @@
-"""Task executor for running workflow tasks."""
+"""Task executor for running workflow tasks.
+
+Legacy shell/python tasks run here.  Python scripts are executed in an isolated
+subprocess — never via in-process ``exec()`` — so scheduled YAML tasks cannot
+mutate the API process.  Visual node-based workflows route through
+:mod:`app.workflow.routing` instead.
+"""
 import asyncio
-import subprocess
+import os
 import sys
-import io
-import traceback
+import tempfile
 from datetime import datetime, timezone
 from typing import Optional
 
-from app.models.workflow import Task, TaskResult, TaskStatus, TaskType
-from app.workflow.engine import WorkflowEngine
-from app.repositories import WorkflowRepository
+from app.models.workflow import Task, TaskResult, TaskStatus, TaskType, WorkflowStatus
+from app.infrastructure.persistence import WorkflowRepository
 
 
 class TaskExecutor:
@@ -94,98 +98,104 @@ class TaskExecutor:
             return None, f"Shell execution error: {str(e)}"
 
     async def _execute_python(self, task: Task) -> tuple[Optional[str], Optional[str]]:
-        """Execute a Python script."""
+        """Execute a Python script in an isolated subprocess."""
+        script_path: Optional[str] = None
         try:
-            # Capture stdout and stderr
-            old_stdout = sys.stdout
-            old_stderr = sys.stderr
-            
-            stdout_buffer = io.StringIO()
-            stderr_buffer = io.StringIO()
-            
-            sys.stdout = stdout_buffer
-            sys.stderr = stderr_buffer
-            
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".py",
+                delete=False,
+                encoding="utf-8",
+            ) as handle:
+                handle.write(task.script or "")
+                script_path = handle.name
+
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                script_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
             try:
-                # Execute the script with timeout
-                def run_script():
-                    exec(task.script, {'__builtins__': __builtins__})
-                
-                await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(None, run_script),
-                    timeout=task.timeout
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=task.timeout,
                 )
-                
-                # Get output
-                stdout_str = stdout_buffer.getvalue()
-                stderr_str = stderr_buffer.getvalue()
-                
-                # Check for errors
-                if stderr_str:
-                    return stdout_str or None, stderr_str
-                
-                return stdout_str or None, None
-            
             except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
                 return None, f"Task timed out after {task.timeout} seconds"
-            
-            except Exception as e:
-                error_trace = traceback.format_exc()
-                return None, error_trace
-            
-            finally:
-                # Restore stdout and stderr
-                sys.stdout = old_stdout
-                sys.stderr = old_stderr
-        
+
+            stdout_str = stdout.decode("utf-8", errors="replace") if stdout else None
+            stderr_str = stderr.decode("utf-8", errors="replace") if stderr else None
+
+            if process.returncode != 0:
+                return stdout_str, stderr_str or f"Script exited with code {process.returncode}"
+
+            if stderr_str:
+                return stdout_str or None, stderr_str
+
+            return stdout_str or None, None
+
         except Exception as e:
             return None, f"Python execution error: {str(e)}"
+
+        finally:
+            if script_path and os.path.exists(script_path):
+                try:
+                    os.unlink(script_path)
+                except OSError:
+                    pass
     
     async def _execute_workflow(self, task: Task) -> tuple[Optional[str], Optional[str]]:
-        """Execute a workflow using WorkflowEngine."""
+        """Execute a nested workflow reference via the canonical routing layer."""
         try:
-            # Get workflow name from task
             workflow_name = getattr(task, 'workflow_name', None)
             workflow_file = getattr(task, 'workflow_file', None)
-            
+
             if not workflow_name and not workflow_file:
                 return None, "Workflow task must specify workflow_name or workflow_file"
-            
-            # Extract workflow name from file if provided
+
             if workflow_file and not workflow_name:
                 from pathlib import Path
                 workflow_name = Path(workflow_file).stem
-            
-            # Load workflow definition from repository
+
             workflow_repo = WorkflowRepository()
             workflow_def = await workflow_repo.get_by_name(workflow_name)
-            
+
             if not workflow_def:
                 return None, f"Workflow '{workflow_name}' not found"
-            
-            # Prepare execution context
+
+            from app.workflow.routing import execute_workflow, is_visual_workflow
+
             context = {
                 "user_query": getattr(task, 'user_query', None),
                 "variables": getattr(task, 'variables', {}),
-                "timeout": task.timeout
+                "timeout": task.timeout,
             }
-            
-            # Execute workflow
-            engine = WorkflowEngine()
-            result = await engine.execute(workflow_def, context)
-            
-            # Cleanup
-            await engine.cleanup()
-            
-            # Format output
-            import json
-            output_str = json.dumps(result, indent=2)
-            
-            if result.get("success"):
-                return output_str, None
+
+            if is_visual_workflow(workflow_def):
+                result = await execute_workflow(
+                    workflow_def,
+                    inputs=context.get("variables"),
+                )
             else:
-                return output_str, result.get("error", "Workflow execution failed")
-        
+                result = await execute_workflow(workflow_def, manual=True)
+
+            import json
+            if isinstance(result, dict):
+                output_str = json.dumps(result, indent=2)
+                failed = result.get("status") in ("failed", "error", "skipped")
+                if not failed and result.get("success", True):
+                    return output_str, None
+                return output_str, result.get("error") or result.get("message", "Workflow execution failed")
+
+            output_str = json.dumps(result.model_dump(mode="json"), indent=2, default=str)
+            if result.status == WorkflowStatus.SUCCESS:
+                return output_str, None
+            return output_str, result.error or "Workflow execution failed"
+
         except Exception as e:
             return None, f"Workflow execution error: {str(e)}"
 

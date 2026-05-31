@@ -20,10 +20,10 @@ import json
 import logging
 from typing import AsyncGenerator
 
+from app.core.sse import HEARTBEAT_INTERVAL_SECONDS, SSE_HEADERS, STREAM_TIMEOUT_SECONDS
+
 logger = logging.getLogger(__name__)
 
-_STREAM_TIMEOUT_SECONDS = 600   # hard ceiling — prevents zombie SSE connections
-_HEARTBEAT_INTERVAL_SECONDS = 15  # keep-alive ping cadence
 _TERMINAL_EVENTS = frozenset({"workflow_completed", "workflow_failed"})
 
 
@@ -53,7 +53,7 @@ async def execution_event_stream(
             f"data: {json.dumps({'execution_id': execution_id, 'workflow_name': workflow_name})}\n\n"
         )
 
-        deadline = loop.time() + _STREAM_TIMEOUT_SECONDS
+        deadline = loop.time() + STREAM_TIMEOUT_SECONDS
         last_heartbeat = loop.time()
 
         while True:
@@ -62,19 +62,19 @@ async def execution_event_stream(
             if now >= deadline:
                 logger.warning(
                     "SSE stream timed out after %ds for execution %s",
-                    _STREAM_TIMEOUT_SECONDS,
+                    STREAM_TIMEOUT_SECONDS,
                     execution_id,
                 )
                 break
 
             # Heartbeat so the connection stays alive through idle stretches
-            if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
                 yield ": heartbeat\n\n"
                 last_heartbeat = now
 
             try:
                 event = await asyncio.wait_for(
-                    queue.get(), timeout=_HEARTBEAT_INTERVAL_SECONDS
+                    queue.get(), timeout=HEARTBEAT_INTERVAL_SECONDS
                 )
             except asyncio.TimeoutError:
                 continue  # loop around → emit heartbeat if needed
@@ -105,15 +105,15 @@ async def workflow_name_event_stream(
     Polls active_executions until a matching execution appears (up to 10 s),
     then delegates to execution_event_stream.
     """
-    from app.services.visual_workflow_executor import visual_executor
+    # Wait up to 10 s for the execution to be registered (DB-backed).
+    from app.services.execution_state import execution_state
 
-    # Wait up to 10 s for the execution to be registered
     for _ in range(20):
-        for exec_id, exec_data in visual_executor.active_executions.items():
-            if exec_data.get("workflow_name") == workflow_name:
-                async for chunk in execution_event_stream(exec_id, workflow_name):
-                    yield chunk
-                return
+        exec_id = await execution_state.find_running_id(workflow_name)
+        if exec_id:
+            async for chunk in execution_event_stream(exec_id, workflow_name):
+                yield chunk
+            return
         await asyncio.sleep(0.5)
 
     # No execution found — emit a single error event and close

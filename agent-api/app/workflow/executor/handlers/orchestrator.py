@@ -1,6 +1,13 @@
-"""Orchestrator node handler — executes SQL via the ``sql_pipeline`` package."""
+"""Orchestrator node handler — canonical SQL orchestration path.
+
+Delegates to ``app.services.sql_pipeline.run_pipeline``.  The legacy
+``OrchestratorStrategy`` class was removed; do not reintroduce a parallel
+WorkflowEngine strategy for SQL workflows.
+"""
 import logging
 from typing import Any, Dict, List
+
+from app.workflow.executor.sql_loader import load_sql_content
 
 from . import register
 
@@ -20,7 +27,7 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
     workflow_name = context.get('workflow_name')
 
     try:
-        sql_content = executor._load_sql_content(node_data, workflow_name)
+        sql_content = load_sql_content(node_data, workflow_name)
         if not sql_content:
             sql_file = node_data.get('sqlFile') or node_data.get('fileName')
             error_msg = f"SQL file not found: {sql_file}" if sql_file else "No SQL content provided"

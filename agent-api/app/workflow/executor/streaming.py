@@ -7,15 +7,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import TYPE_CHECKING
 
+from app.config import settings
 from app.core.redact import redact
 
 logger = logging.getLogger(__name__)
 
 # SSE event queue backpressure settings
-_SSE_QUEUE_MAXSIZE = int(os.environ.get("SSE_QUEUE_MAXSIZE", "1000"))
+_SSE_QUEUE_MAXSIZE = settings.sse_queue_maxsize
 _DROPPED_EVENTS = 0
 
 

@@ -42,6 +42,11 @@ from typing import Any, Dict, List, Optional
 
 from app.workflow.strategies.base import BaseStrategy
 from app.workflow.strategies.react import ReactStrategy
+from app.workflow.strategies.react.llm_factory import build_llm
+from app.workflow.strategies.react.workflow_config import (
+    extract_cloudwatch_config,
+    resolve_llm_config_for_workflow,
+)
 from app.core.map_reduce import MapReduceEngine, MapReduceConfig, MapResult
 from app.core.parallel_flow import ParallelFlowRunner, ParallelFlowConfig
 from app.core.redact import redact
@@ -174,8 +179,8 @@ class BatchReactStrategy(BaseStrategy):
 
         # ── 1. Resolve LLM (needed for decompose + reduce) ────────────────
         react = ReactStrategy()
-        llm_config  = await react._resolve_llm_config(workflow)
-        llm         = react._build_llm(llm_config)
+        llm_config = await resolve_llm_config_for_workflow(workflow)
+        llm = build_llm(llm_config)
 
         # ── 2. Build investigation targets ────────────────────────────────
         targets = await self._build_targets(
@@ -359,8 +364,7 @@ class BatchReactStrategy(BaseStrategy):
             return targets
 
         # ── Priority 2: CloudWatch log groups from connected CW nodes ──────
-        react = ReactStrategy()
-        cw_cfg = react._extract_cloudwatch_config(workflow)
+        cw_cfg = extract_cloudwatch_config(workflow)
         if cw_cfg:
             log_groups = cw_cfg.get("log_groups") or []
             if len(log_groups) >= 2:

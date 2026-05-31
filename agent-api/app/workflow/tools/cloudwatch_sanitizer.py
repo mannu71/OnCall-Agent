@@ -69,6 +69,11 @@ class CloudWatchToolSanitizer:
     MAX_MESSAGE_LEN = 300
     MAX_OUTPUT_CHARS = 3000
     TOKEN_BUDGET = 1000  # Max tokens any single tool call can contribute
+
+    # Drill-down mode (cloudwatch_search_logs / watch_logs with drill_down=True)
+    DRILL_DOWN_MAX_EVENTS = 25
+    DRILL_DOWN_MESSAGE_LEN = 480
+    DRILL_DOWN_TOKEN_BUDGET = 2500
     
     # Noise patterns to filter out
     NOISE_PATTERNS = (
@@ -97,7 +102,9 @@ class CloudWatchToolSanitizer:
         self,
         raw_result: Dict[str, Any],
         tool_name: str,
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
+        *,
+        drill_down: bool = False,
     ) -> str:
         """Sanitize CloudWatch tool output through the full pipeline.
         
@@ -110,6 +117,9 @@ class CloudWatchToolSanitizer:
             Sanitized, compact text output ready for agent consumption
         """
         context = context or {}
+        max_events = self.DRILL_DOWN_MAX_EVENTS if drill_down else self.MAX_EVENTS
+        max_msg = self.DRILL_DOWN_MESSAGE_LEN if drill_down else self.MAX_MESSAGE_LEN
+        token_budget = self.DRILL_DOWN_TOKEN_BUDGET if drill_down else self.TOKEN_BUDGET
         
         # Use cheap char/4 heuristic for the *raw* (pre-sanitization) count.
         # This value is telemetry-only; paying full tiktoken cost on a multi-MB
@@ -125,16 +135,19 @@ class CloudWatchToolSanitizer:
         original_count = len(events)
         events = self._filter_noise(events)
         filtered_count = original_count - len(events)
-        
+
+        events.sort(key=lambda e: self._severity_rank(e.get("message", "")))
+
         original_count = len(events)
         events = self._deduplicate(events)
         deduplicated_count = original_count - len(events)
         
-        events = events[:self.MAX_EVENTS]
+        events = events[:max_events]
         
         for event in events:
-            if len(event.get("message", "")) > self.MAX_MESSAGE_LEN:
-                event["message"] = event["message"][:self.MAX_MESSAGE_LEN] + "...[truncated]"
+            msg = event.get("message", "")
+            if len(msg) > max_msg:
+                event["message"] = self._truncate_message(msg, max_msg)
         
         # Format as compact text
         output = self._format_compact(events, total_events)
@@ -155,13 +168,13 @@ class CloudWatchToolSanitizer:
         # reason about instead of a silent cut.
         truncated = False
         final_tokens = self._estimate_tokens(output)
-        if final_tokens > self.TOKEN_BUDGET:
-            output = self._truncate_to_token_budget(output)
+        if final_tokens > token_budget:
+            output = self._truncate_to_token_budget(output, token_budget)
             output += (
-                f"\n[token-budget cut at {self.TOKEN_BUDGET} tokens; "
+                f"\n[token-budget cut at {token_budget} tokens; "
                 f"original was ~{final_tokens} tokens, raw events={total_events}]"
             )
-            final_tokens = self.TOKEN_BUDGET
+            final_tokens = token_budget
             truncated = True
         
         # Record metrics
@@ -209,6 +222,34 @@ class CloudWatchToolSanitizer:
         
         return []
     
+    @staticmethod
+    def _truncate_message(message: str, max_len: int) -> str:
+        """Keep message tail for errors (stack traces) else head."""
+        if len(message) <= max_len:
+            return message
+        low = message.lower()
+        if any(x in low for x in ("error", "exception", "fatal", "traceback", "failed")):
+            return "…" + message[-(max_len - 12):] + " [tail]"
+        return message[: max_len - 12] + "...[truncated]"
+
+    @staticmethod
+    def _severity_rank(message: str) -> int:
+        """Lower rank = higher priority when capping events under token budget."""
+        low = (message or "").lower()
+        # Structured JSON level field (common in Lambda / app logs)
+        if '"level"' in low or '"severity"' in low:
+            if any(x in low for x in ('"error"', '"critical"', '"fatal"', '"severe"')):
+                return 0
+            if '"warn' in low:
+                return 2
+        if any(x in low for x in ("fatal", "critical", "panic", "exception", "traceback")):
+            return 0
+        if "error" in low or "failed" in low:
+            return 1
+        if "warn" in low:
+            return 2
+        return 3
+
     def _filter_noise(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Filter out routine/noise events (health checks, 200s, etc.)."""
         filtered = []
@@ -284,16 +325,16 @@ class CloudWatchToolSanitizer:
         """Accurate token count via tiktoken cl100k_base, with safe fallback."""
         return _count_tokens(text)
 
-    def _truncate_to_token_budget(self, text: str) -> str:
+    def _truncate_to_token_budget(self, text: str, budget: Optional[int] = None) -> str:
         """Truncate text to fit within token budget using accurate counting."""
-        if _count_tokens(text) <= self.TOKEN_BUDGET:
+        budget = budget if budget is not None else self.TOKEN_BUDGET
+        if _count_tokens(text) <= budget:
             return text
-        # Binary-search for the longest prefix that fits the token budget.
         lo, hi = 0, len(text)
         best = 0
         while lo <= hi:
             mid = (lo + hi) // 2
-            if _count_tokens(text[:mid]) <= self.TOKEN_BUDGET:
+            if _count_tokens(text[:mid]) <= budget:
                 best = mid
                 lo = mid + 1
             else:

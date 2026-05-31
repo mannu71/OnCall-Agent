@@ -187,6 +187,26 @@ class LLMConfigRepository:
                 select(LLMConfigModel.id).where(LLMConfigModel.name == name)
             )
             return result.scalar_one_or_none() is not None
+
+    async def find_existing_names(self, names: List[str]) -> set[str]:
+        """Return the subset of *names* that already exist in the DB."""
+        if not names:
+            return set()
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(LLMConfigModel.name).where(LLMConfigModel.name.in_(names))
+            )
+            return set(result.scalars().all())
+
+    async def mark_discovered_existing(
+        self, discovered: List[Dict[str, Any]], *, key: str = "name"
+    ) -> List[Dict[str, Any]]:
+        """Set ``already_exists`` on discovery rows with one batched query."""
+        names = [d[key] for d in discovered if d.get(key)]
+        existing = await self.find_existing_names(names)
+        for item in discovered:
+            item["already_exists"] = item.get(key) in existing
+        return discovered
     
     def _llm_config_to_dict(self, config: LLMConfigModel) -> Dict[str, Any]:
         """Convert LLM config model to dictionary."""

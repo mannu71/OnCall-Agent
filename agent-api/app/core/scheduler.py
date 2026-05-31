@@ -1,6 +1,5 @@
 """APScheduler integration for workflow scheduling."""
 import asyncio
-import uuid
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Optional, Set, List
@@ -16,9 +15,10 @@ from app.models.workflow import (
     TaskStatus,
     WorkflowExecutionEvent
 )
-from app.repositories import WorkflowRepository
+from app.infrastructure.persistence import WorkflowRepository
 from app.core.executor import task_executor
-from app.services.visual_workflow_executor import visual_executor
+from app.workflow.routing import execute_visual_workflow, is_visual_workflow
+from app.infrastructure.persistence import ExecutionRepository
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -75,29 +75,33 @@ class WorkflowScheduler:
     async def reload_workflows(self):
         """Load all workflows from storage and schedule them."""
         logger.info("Loading workflows from storage...")
-        
-        # Remove all existing jobs
-        self.scheduler.remove_all_jobs()
-        
-        # Load and schedule workflows
+
         workflows = await self.workflow_repo.list_all()
+        desired_ids: set[str] = set()
         enabled_count = 0
-        
+
         for workflow_data in workflows:
             try:
-                # Ensure we have a Workflow object
                 if isinstance(workflow_data, dict):
                     workflow = Workflow(**workflow_data)
                 else:
                     workflow = workflow_data
-                
+
                 if workflow.enabled and workflow.schedule:
                     self.schedule_workflow(workflow)
+                    desired_ids.add(workflow.name)
                     enabled_count += 1
             except Exception as e:
                 name = workflow_data.get('name') if isinstance(workflow_data, dict) else getattr(workflow_data, 'name', 'unknown')
                 logger.error(f"Failed to process workflow '{name}': {e}")
-        
+
+        for job in self.scheduler.get_jobs():
+            if job.id not in desired_ids:
+                try:
+                    self.scheduler.remove_job(job.id)
+                except Exception as exc:
+                    logger.debug("Could not remove stale job %s: %s", job.id, exc)
+
         logger.info(f"Loaded {len(workflows)} workflows ({enabled_count} enabled for scheduling)")
 
     def schedule_workflow(self, workflow: Workflow):
@@ -146,16 +150,25 @@ class WorkflowScheduler:
             logger.error(f"Workflow '{workflow_name}' not found")
             return None
         
-        # Visual Workflows (Node-based)
-        if workflow_data.get('nodes'):
-            logger.info(f"Delegating visual workflow '{workflow_name}' to visual_executor")
-            result = await visual_executor.execute_workflow(workflow_data)
-            # visual_executor handles its own persistence and events
-            return None # Or convert result to WorkflowExecution if needed
-            
-        # Legacy Workflows (Task-based)
+        # Visual workflows (node-based) — canonical path via routing layer
+        if is_visual_workflow(workflow_data):
+            await execute_visual_workflow(workflow_data)
+            return None
+
+        # Legacy workflows (task-based)
         workflow = Workflow(**workflow_data)
-        execution_id = str(uuid.uuid4())
+        execution_repo = ExecutionRepository()
+        workflow_id: Optional[int] = None
+        if workflow.id is not None:
+            try:
+                workflow_id = int(workflow.id)
+            except (TypeError, ValueError):
+                workflow_id = None
+        running_record = await execution_repo.create_running(
+            workflow_name,
+            workflow_id=workflow_id,
+        )
+        execution_id = str(running_record["execution_id"])
         execution = WorkflowExecution(
             workflow_name=workflow_name,
             execution_id=execution_id,
@@ -163,7 +176,8 @@ class WorkflowScheduler:
             start_time=datetime.now(timezone.utc),
             task_results=[]
         )
-        
+
+        # In-process tracking for scheduler SSE subscribers only.
         self.active_executions[execution_id] = execution
         
         await self._emit_event(workflow_name, WorkflowExecutionEvent(
@@ -229,11 +243,26 @@ class WorkflowScheduler:
             execution.end_time = datetime.now(timezone.utc)
             execution.duration_seconds = (execution.end_time - execution.start_time).total_seconds()
             
-            # Save legacy execution (visual executor has its own storage logic)
-            # Re-using workflow_repo.save_execution if it expects WorkflowExecution
-            if hasattr(self.workflow_repo, 'save_execution'):
-                 await self.workflow_repo.save_execution(execution)
-            
+            # Persist legacy execution to the executions table.
+            status_map = {
+                WorkflowStatus.SUCCESS: "success",
+                WorkflowStatus.FAILED: "failed",
+                WorkflowStatus.PARTIAL: "partial",
+                WorkflowStatus.RUNNING: "running",
+                WorkflowStatus.PENDING: "pending",
+            }
+            await execution_repo.save({
+                "execution_id": execution_id,
+                "workflow_name": workflow_name,
+                "workflow_id": workflow.id,
+                "status": status_map.get(execution.status, str(execution.status)),
+                "start_time": execution.start_time,
+                "end_time": execution.end_time,
+                "duration": execution.duration_seconds,
+                "output": [r.model_dump(mode="json") for r in execution.task_results],
+                "error": execution.error,
+            })
+
             self.active_executions.pop(execution_id, None)
             
             await self._emit_event(workflow_name, WorkflowExecutionEvent(
@@ -257,20 +286,22 @@ class WorkflowScheduler:
         """Emit an event to all subscribed queues."""
         if workflow_name not in self.event_queues:
             return
-        
+
         dead_queues = set()
         for queue in self.event_queues[workflow_name]:
             try:
-                await queue.put(event)
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
             except Exception:
                 dead_queues.add(queue)
-        
+
         if dead_queues:
             self.event_queues[workflow_name] -= dead_queues
 
     def subscribe_to_events(self, workflow_name: str) -> asyncio.Queue:
         """Subscribe to workflow execution events."""
-        queue = asyncio.Queue()
+        queue = asyncio.Queue(maxsize=settings.sse_queue_maxsize)
         if workflow_name not in self.event_queues:
             self.event_queues[workflow_name] = set()
         self.event_queues[workflow_name].add(queue)

@@ -1,6 +1,5 @@
 """Database configuration and connection management."""
 import logging
-from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import text
@@ -58,14 +57,8 @@ async def init_db():
 
     Tables are NOT created here.  All DDL lives in the numbered migration
     scripts under ``migrations/`` and must be applied before starting the
-    application::
-
-        psql -f migrations/001_initial_schema.sql
-        psql -f migrations/002_add_token_columns.sql
-        psql -f migrations/002_vector_indexes.sql
-        psql -f migrations/003_code_intelligence.sql
-        psql -f migrations/004_atropos.sql
-        psql -f migrations/005_code_analyzer_v1.sql
+    application (see ``migrations/001_initial_schema.sql`` through the latest
+    numbered file in that directory).
 
     This function only checks that the database is reachable.  A failed
     connectivity check logs a warning and lets the application continue so

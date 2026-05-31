@@ -1,7 +1,7 @@
 """Knowledge-graph flow nodes — chained after PersistOverview in indexFlow.
 
-The four nodes here turn the in-memory ``shared["files"]`` list (already
-populated by :class:`~app.crawler.nodes.fetch.FetchRepo`) into rows in the
+The four nodes here turn ``shared["file_paths"]`` (populated by
+:class:`~app.crawler.nodes.fetch.FetchRepo`) into rows in the
 ``kg_*`` tables created by migration 009.
 
 Pipeline::
@@ -27,7 +27,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.engine.crawler_engine import AsyncNode
+from app.engine.crawler_engine import AsyncNode, AsyncParallelBatchNode
 from app.crawler.nodes.fetch import _append_trace
 
 logger = logging.getLogger(__name__)
@@ -86,11 +86,11 @@ def _extract_domain(file_path: str, qname: str) -> Optional[str]:
 
 
 class FilterChangedFiles(AsyncNode):
-    """Diff ``shared["files"]`` against ``kg_files`` and find what changed.
+    """Diff ``shared["file_paths"]`` against ``kg_files`` and find what changed.
 
     Reads from shared:
-        repo   (str)
-        files  (list[(relative_path, content)])
+        repo        (str)
+        file_paths  (list[str]) — or legacy ``files`` list of tuples
 
     Writes to shared:
         _kg_changed_files   list[(relative_path, content, sha256)]  — needs re-parse
@@ -101,25 +101,29 @@ class FilterChangedFiles(AsyncNode):
     """
 
     async def prep(self, shared: Dict[str, Any]) -> Dict[str, Any]:
+        paths = shared.get("file_paths")
+        if paths is None:
+            paths = [p for p, _c in shared.get("files", [])]
         return {
-            "repo":  shared["repo"],
-            "files": shared.get("files", []),
+            "repo": shared["repo"],
+            "paths": paths,
         }
 
     async def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
+        from app.crawler.files import read_repo_file
         from app.crawler.kg.parser import detect_language
         from app.core.database import AsyncSessionLocal
         from sqlalchemy import text
 
         t0 = time.monotonic()
-        repo  = prep_res["repo"]
-        files = prep_res["files"]
+        repo = prep_res["repo"]
+        paths: List[str] = prep_res["paths"]
 
-        # 1. Compute current SHA256 per file and filter to parseable languages.
-        current: Dict[str, Tuple[str, str]] = {}  # file_path -> (sha256, content)
-        for path, content in files:
+        current: Dict[str, Tuple[str, str]] = {}
+        for path in paths:
             if detect_language(path) is None:
-                continue  # skip files we can't parse
+                continue
+            content = await read_repo_file(repo, path)
             sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
             current[path] = (sha, content)
 
@@ -186,44 +190,37 @@ class FilterChangedFiles(AsyncNode):
 # ───────────────────────────────────────────────────────────────────────────
 
 
-class ParseFilesAST(AsyncNode):
-    """Run tree-sitter against each changed file (parallel via thread pool).
+class ParseFilesAST(AsyncParallelBatchNode):
+    """Run tree-sitter against each changed file (bounded parallel batch)."""
 
-    Reads from shared:
-        _kg_changed_files   list[(path, content, sha)]
+    def __init__(self, max_retries: int = 1, wait: float = 0.0, concurrency: Optional[int] = None):
+        super().__init__(max_retries=max_retries, wait=wait, concurrency=concurrency)
 
-    Writes to shared:
-        _kg_nodes           list[NodeRecord]
-        _kg_edges           list[EdgeRecord]
-        _kg_parse_errors    dict[str, str]   — path -> error message
-        _kg_per_file        dict[str, (node_count, edge_count)]
-        _trace              appends one entry
-    """
+    async def prep(self, shared: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+        return list(shared.get("_kg_changed_files", []))
 
-    async def prep(self, shared: Dict[str, Any]) -> Dict[str, Any]:
-        return {"changed": shared.get("_kg_changed_files", [])}
-
-    async def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
+    async def _exec_item(self, item: Tuple[str, str, str]) -> Tuple[str, list, list, Optional[str]]:
         from app.crawler.kg.parser import parse_file
 
-        t0 = time.monotonic()
-        changed: List[Tuple[str, str, str]] = prep_res["changed"]
+        path, content, _sha = item
 
-        if not changed:
-            prep_res["_ms"] = int((time.monotonic() - t0) * 1000)
-            return {"nodes": [], "edges": [], "errors": {}, "per_file": {}}
-
-        # Parse files concurrently in a thread pool — tree-sitter releases the GIL.
-        def _parse_one(path: str, content: str):
+        def _parse() -> Tuple[str, list, list, Optional[str]]:
             try:
                 ns, es = parse_file(path, content)
                 return path, ns, es, None
             except Exception as exc:  # noqa: BLE001
                 return path, [], [], str(exc)
 
-        results = await asyncio.gather(*[
-            asyncio.to_thread(_parse_one, p, c) for (p, c, _sha) in changed
-        ])
+        return await asyncio.to_thread(_parse)
+
+    async def exec(self, prep_res: List[Tuple[str, str, str]]) -> Dict[str, Any]:
+        t0 = time.monotonic()
+        changed = prep_res or []
+
+        if not changed:
+            return {"nodes": [], "edges": [], "errors": {}, "per_file": {}, "ms": 0}
+
+        results = await super().exec(changed)
 
         all_nodes: List = []
         all_edges: List = []
@@ -239,37 +236,37 @@ class ParseFilesAST(AsyncNode):
                 all_edges.extend(es)
                 per_file[path] = (len(ns), len(es))
 
-        prep_res["_ms"] = int((time.monotonic() - t0) * 1000)
         return {
-            "nodes":    all_nodes,
-            "edges":    all_edges,
-            "errors":   errors,
+            "nodes": all_nodes,
+            "edges": all_edges,
+            "errors": errors,
             "per_file": per_file,
+            "ms": int((time.monotonic() - t0) * 1000),
         }
 
     async def post(
         self,
         shared: Dict[str, Any],
-        prep_res: Dict[str, Any],
+        prep_res: List[Tuple[str, str, str]],
         exec_res: Dict[str, Any],
     ) -> Optional[str]:
-        shared["_kg_nodes"]        = exec_res["nodes"]
-        shared["_kg_edges"]        = exec_res["edges"]
+        shared["_kg_nodes"] = exec_res["nodes"]
+        shared["_kg_edges"] = exec_res["edges"]
         shared["_kg_parse_errors"] = exec_res["errors"]
-        shared["_kg_per_file"]     = exec_res["per_file"]
+        shared["_kg_per_file"] = exec_res["per_file"]
 
         _append_trace(
             shared, "ParseFilesAST",
             result_count=len(exec_res["nodes"]),
             tokens_in=0, tokens_out=0, cached=False,
-            ms=prep_res.get("_ms", 0),
+            ms=exec_res.get("ms", 0),
         )
         logger.info(
             "ParseFilesAST: %d nodes, %d edges across %d files (%d errors) in %dms",
             len(exec_res["nodes"]), len(exec_res["edges"]),
             len(exec_res["per_file"]),
             len(exec_res["errors"]),
-            prep_res.get("_ms", 0),
+            exec_res.get("ms", 0),
         )
         return None
 

@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Dict, Generic, List, Optional, TypeVar
+
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -43,16 +44,16 @@ class MapReduceConfig:
     """
 
     # Maximum number of map tasks running at the same time.
-    concurrency_limit: int = int(os.getenv("MAP_REDUCE_CONCURRENCY", "5"))
+    concurrency_limit: int = settings.parallel_flow_concurrency
 
     # Per-item wall-clock timeout (seconds).  0 = no timeout.
-    item_timeout_seconds: float = float(os.getenv("MAP_REDUCE_ITEM_TIMEOUT", "180.0"))
+    item_timeout_seconds: float = settings.parallel_flow_item_timeout
 
     # If True, cancel all pending tasks when the first failure is recorded.
-    fail_fast: bool = os.getenv("MAP_REDUCE_FAIL_FAST", "false").lower() == "true"
+    fail_fast: bool = settings.parallel_flow_fail_fast
 
     # Reduce phase is skipped when fewer than this fraction of items succeeded.
-    min_success_rate: float = float(os.getenv("MAP_REDUCE_MIN_SUCCESS_RATE", "0.5"))
+    min_success_rate: float = settings.parallel_flow_min_success_rate
 
 
 # ---------------------------------------------------------------------------

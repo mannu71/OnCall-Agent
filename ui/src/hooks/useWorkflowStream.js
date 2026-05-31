@@ -1,9 +1,18 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import agentApiClient from '../services/agentApiClient';
 
+/** Max structural events kept in memory (tokens are tracked separately). */
+const MAX_EVENTS = 500;
+
+function capEvents(prev, event) {
+    const next = [...prev, event];
+    if (next.length <= MAX_EVENTS) return next;
+    return next.slice(next.length - MAX_EVENTS);
+}
+
 /**
  * Custom hook for streaming workflow execution events via SSE
- * 
+ *
  * @param {string} workflowName - Name of the workflow to monitor
  * @param {boolean} enabled - Whether to enable streaming
  * @returns {Object} - { status, events, error, isConnected, clearEvents, agentTokens, agentToolCalls }
@@ -15,17 +24,15 @@ export function useWorkflowStream(workflowName, enabled = true) {
     const [isConnected, setIsConnected] = useState(false);
     const [agentTokens, setAgentTokens] = useState({});
     const [agentToolCalls, setAgentToolCalls] = useState([]);
-    // nodeStatuses: { [nodeId]: 'running' | 'completed' | 'failed' }
     const [nodeStatuses, setNodeStatuses] = useState({});
-    // totalCost: cumulative USD cost from cost_update events
     const [totalCost, setTotalCost] = useState(0);
-    // agentCosts: per-agent USD spend { [nodeId]: number }
     const [agentCosts, setAgentCosts] = useState({});
-    // totalTokens: cumulative LLM token count (input + output) across all agent nodes
     const [totalTokens, setTotalTokens] = useState(0);
-    // nodeTokens: per-node token counts { [nodeId]: number }
     const [nodeTokens, setNodeTokens] = useState({});
     const eventSourceRef = useRef(null);
+    const tokenBufferRef = useRef({});
+    const tokenFlushRef = useRef(null);
+    const appendEventRef = useRef(null);
 
     const clearEvents = useCallback(() => {
         setEvents([]);
@@ -38,12 +45,47 @@ export function useWorkflowStream(workflowName, enabled = true) {
         setAgentCosts({});
         setTotalTokens(0);
         setNodeTokens({});
+        tokenBufferRef.current = {};
+        if (tokenFlushRef.current) {
+            cancelAnimationFrame(tokenFlushRef.current);
+            tokenFlushRef.current = null;
+        }
     }, []);
 
     useEffect(() => {
         if (!enabled || !workflowName) {
             return;
         }
+
+        const flushTokens = () => {
+            tokenFlushRef.current = null;
+            const buffer = tokenBufferRef.current;
+            const keys = Object.keys(buffer);
+            if (keys.length === 0) return;
+
+            const snapshot = { ...buffer };
+            tokenBufferRef.current = {};
+
+            setAgentTokens(prev => {
+                const next = { ...prev };
+                for (const nodeId of keys) {
+                    next[nodeId] = (next[nodeId] || '') + snapshot[nodeId];
+                }
+                return next;
+            });
+        };
+
+        const appendEvent = (event) => {
+            setEvents(prev => capEvents(prev, event));
+        };
+        appendEventRef.current = appendEvent;
+
+        const queueToken = (nodeId, token) => {
+            tokenBufferRef.current[nodeId] = (tokenBufferRef.current[nodeId] || '') + token;
+            if (!tokenFlushRef.current) {
+                tokenFlushRef.current = requestAnimationFrame(flushTokens);
+            }
+        };
 
         try {
             const eventSource = agentApiClient.streamWorkflowExecution(workflowName);
@@ -59,17 +101,7 @@ export function useWorkflowStream(workflowName, enabled = true) {
                     const data = JSON.parse(event.data);
                     const nodeId = data.data?.node_id || 'default';
                     const token = data.data?.token || '';
-
-                    setAgentTokens(prev => ({
-                        ...prev,
-                        [nodeId]: (prev[nodeId] || '') + token,
-                    }));
-
-                    setEvents(prev => [...prev, {
-                        ...data,
-                        event_type: 'llm_token',
-                        timestamp: data.timestamp || new Date().toISOString()
-                    }]);
+                    if (token) queueToken(nodeId, token);
                 } catch (err) {
                     console.error('[SSE] Failed to parse llm_token event:', err);
                 }
@@ -86,11 +118,11 @@ export function useWorkflowStream(workflowName, enabled = true) {
                         timestamp: data.timestamp || new Date().toISOString()
                     }]);
 
-                    setEvents(prev => [...prev, {
+                    appendEvent({
                         ...data,
                         event_type: 'tool_call',
                         timestamp: data.timestamp || new Date().toISOString()
-                    }]);
+                    });
                 } catch (err) {
                     console.error('[SSE] Failed to parse tool_call event:', err);
                 }
@@ -107,11 +139,11 @@ export function useWorkflowStream(workflowName, enabled = true) {
                         timestamp: data.timestamp || new Date().toISOString()
                     }]);
 
-                    setEvents(prev => [...prev, {
+                    appendEvent({
                         ...data,
                         event_type: 'tool_result',
                         timestamp: data.timestamp || new Date().toISOString()
-                    }]);
+                    });
                 } catch (err) {
                     console.error('[SSE] Failed to parse tool_result event:', err);
                 }
@@ -120,11 +152,11 @@ export function useWorkflowStream(workflowName, enabled = true) {
             const handleAgentError = (event) => {
                 try {
                     const data = JSON.parse(event.data);
-                    setEvents(prev => [...prev, {
+                    appendEvent({
                         ...data,
                         event_type: 'agent_error',
                         timestamp: data.timestamp || new Date().toISOString()
-                    }]);
+                    });
                 } catch (err) {
                     console.error('[SSE] Failed to parse agent_error event:', err);
                 }
@@ -133,11 +165,11 @@ export function useWorkflowStream(workflowName, enabled = true) {
             const handleAgentComplete = (event) => {
                 try {
                     const data = JSON.parse(event.data);
-                    setEvents(prev => [...prev, {
+                    appendEvent({
                         ...data,
                         event_type: 'agent_complete',
                         timestamp: data.timestamp || new Date().toISOString()
-                    }]);
+                    });
                 } catch (err) {
                     console.error('[SSE] Failed to parse agent_complete event:', err);
                 }
@@ -150,7 +182,7 @@ export function useWorkflowStream(workflowName, enabled = true) {
                     if (nodeId) {
                         setNodeStatuses(prev => ({ ...prev, [nodeId]: 'running' }));
                     }
-                    setEvents(prev => [...prev, { ...data, event_type: 'node_started', timestamp: data.timestamp || new Date().toISOString() }]);
+                    appendEvent({ ...data, event_type: 'node_started', timestamp: data.timestamp || new Date().toISOString() });
                 } catch (err) {
                     console.error('[SSE] Failed to parse node_started event:', err);
                 }
@@ -170,7 +202,7 @@ export function useWorkflowStream(workflowName, enabled = true) {
                         if (nodeId) setNodeTokens(prev => ({ ...prev, [nodeId]: ttok }));
                         setTotalTokens(prev => prev + ttok);
                     }
-                    setEvents(prev => [...prev, { ...data, event_type: 'node_completed', timestamp: data.timestamp || new Date().toISOString() }]);
+                    appendEvent({ ...data, event_type: 'node_completed', timestamp: data.timestamp || new Date().toISOString() });
                 } catch (err) {
                     console.error('[SSE] Failed to parse node_completed event:', err);
                 }
@@ -183,7 +215,7 @@ export function useWorkflowStream(workflowName, enabled = true) {
                     if (nodeId) {
                         setNodeStatuses(prev => ({ ...prev, [nodeId]: 'failed' }));
                     }
-                    setEvents(prev => [...prev, { ...data, event_type: 'node_failed', timestamp: data.timestamp || new Date().toISOString() }]);
+                    appendEvent({ ...data, event_type: 'node_failed', timestamp: data.timestamp || new Date().toISOString() });
                 } catch (err) {
                     console.error('[SSE] Failed to parse node_failed event:', err);
                 }
@@ -196,8 +228,6 @@ export function useWorkflowStream(workflowName, enabled = true) {
                     if (delta > 0) {
                         setTotalCost(prev => Math.round((prev + delta) * 1e6) / 1e6);
 
-                        // Per-agent cost tracking — cost_update events may include
-                        // a node_id to attribute spend to a specific agent.
                         const nodeId = data.data?.node_id;
                         if (nodeId) {
                             setAgentCosts(prev => ({
@@ -206,7 +236,6 @@ export function useWorkflowStream(workflowName, enabled = true) {
                             }));
                         }
                     }
-                    setEvents(prev => [...prev, { ...data, event_type: 'cost_update', timestamp: data.timestamp || new Date().toISOString() }]);
                 } catch (err) {
                     console.error('[SSE] Failed to parse cost_update event:', err);
                 }
@@ -225,11 +254,17 @@ export function useWorkflowStream(workflowName, enabled = true) {
             eventSource.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
+                    const eventType = data.event_type || data.type || data.data?.event_type;
 
-                    setEvents(prev => [...prev, {
+                    // Tokens and cost deltas are tracked in dedicated state — skip the events log.
+                    if (eventType === 'llm_token' || eventType === 'cost_update') {
+                        return;
+                    }
+
+                    appendEvent({
                         ...data,
                         timestamp: data.timestamp || new Date().toISOString()
-                    }]);
+                    });
 
                     if (data.type === 'status') {
                         setStatus(data.status);
@@ -240,7 +275,6 @@ export function useWorkflowStream(workflowName, enabled = true) {
                         setError(data.error || 'Unknown error');
                     }
 
-                    const eventType = data.event_type || data.data?.event_type;
                     if (eventType === 'workflow_completed') {
                         setStatus('completed');
                         const ttok = data.data?.total_tokens || 0;
@@ -272,6 +306,12 @@ export function useWorkflowStream(workflowName, enabled = true) {
         }
 
         return () => {
+            if (tokenFlushRef.current) {
+                cancelAnimationFrame(tokenFlushRef.current);
+                tokenFlushRef.current = null;
+            }
+            tokenBufferRef.current = {};
+            appendEventRef.current = null;
             if (eventSourceRef.current) {
                 eventSourceRef.current.close();
                 eventSourceRef.current = null;

@@ -37,12 +37,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import string
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ Resolution: {resolution}
 """
 
 # Minimum tool calls before distillation is attempted
-_MIN_TOOL_CALLS = int(os.getenv("SKILL_MIN_TOOL_CALLS", "3"))
+_MIN_TOOL_CALLS = settings.skill_min_tool_calls
 
 
 # ---------------------------------------------------------------------------

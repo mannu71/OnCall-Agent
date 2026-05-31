@@ -6,13 +6,13 @@ import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Loader2 } from 'lucide-react';
 import { AppSidebar } from './components/sidebar/AppSidebar';
-import Dashboard from './pages/Dashboard';
-import Scheduler from './pages/Scheduler';
-import Settings from './pages/Settings';
-import LogWatchConfig from './components/logwatch/LogWatchConfig';
 import './App.css';
 
-// Lazy load heavy components
+// Lazy load route pages — keeps initial bundle small
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Scheduler = lazy(() => import('./pages/Scheduler'));
+const Settings = lazy(() => import('./pages/Settings'));
+const LogWatchConfig = lazy(() => import('./components/logwatch/LogWatchConfig'));
 const Workflow = lazy(() => import('./pages/workflow'));
 const Analytics = lazy(() => import('./pages/Analytics'));
 const Chat = lazy(() => import('./pages/Chat'));
@@ -51,8 +51,8 @@ const AppRoutes = () => {
   return (
     <SidebarProvider>
       <AppSidebar />
-      <SidebarInset>
-        <main className="w-full max-w-full min-h-screen flex flex-col overflow-x-hidden">
+      <SidebarInset className="min-w-0">
+        <div className="flex min-h-0 w-full max-w-full flex-1 flex-col overflow-x-hidden">
           <Suspense fallback={<LoadingFallback />}>
             <Routes>
               <Route path="/" element={<Dashboard />} />
@@ -70,7 +70,7 @@ const AppRoutes = () => {
               <Route path="*" element={<Dashboard />} />
             </Routes>
           </Suspense>
-        </main>
+        </div>
       </SidebarInset>
     </SidebarProvider>
   );

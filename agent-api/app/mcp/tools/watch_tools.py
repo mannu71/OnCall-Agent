@@ -6,15 +6,18 @@ analyzing patterns, detecting anomalies, and correlating logs across services.
 import asyncio
 import logging
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Callable
 from functools import wraps
 
-import os
 import ssl
 
+from app.config import settings
+from app.core.thread_pools import run_in_aws_pool
+
 # Disable SSL certificate verification when AWS_SSL_VERIFY=false.
-if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
+if not settings.aws_ssl_verify:
     ssl._create_default_https_context = ssl._create_unverified_context
     try:
         import urllib3
@@ -100,7 +103,7 @@ class CloudWatchLogWatcher:
         else:
             session = boto3.Session(region_name=region)
         
-        ssl_verify = os.environ.get("AWS_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
+        ssl_verify = settings.aws_ssl_verify
         client_kwargs: Dict[str, Any] = {"region_name": region}
         if not ssl_verify:
             client_kwargs["verify"] = False
@@ -149,8 +152,7 @@ class CloudWatchLogWatcher:
                 params['nextToken'] = next_token
             
             # Run sync operation in executor
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
+            response = await run_in_aws_pool(
                 lambda: self.client.filter_log_events(**params)
             )
             
@@ -202,8 +204,7 @@ class CloudWatchLogWatcher:
 
         async def _execute_once(qs: str, qstart: datetime, qend: datetime, qlimit: int) -> Dict[str, Any]:
             """Run a single Insights query and poll to completion or timeout."""
-            start_resp = await asyncio.get_event_loop().run_in_executor(
-                None,
+            start_resp = await run_in_aws_pool(
                 lambda: self.client.start_query(
                     logGroupNames=log_group_names,
                     startTime=int(qstart.timestamp()),
@@ -216,8 +217,7 @@ class CloudWatchLogWatcher:
 
             async def _poll() -> Dict[str, Any]:
                 while True:
-                    response = await asyncio.get_event_loop().run_in_executor(
-                        None,
+                    response = await run_in_aws_pool(
                         lambda: self.client.get_query_results(queryId=qid),
                     )
                     status = response['status']
@@ -241,8 +241,7 @@ class CloudWatchLogWatcher:
             except asyncio.TimeoutError:
                 # Cancel the Insights query to avoid ongoing AWS charges.
                 try:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None,
+                    await run_in_aws_pool(
                         lambda: self.client.stop_query(queryId=qid),
                     )
                 except Exception as stop_err:  # pragma: no cover - best-effort
@@ -405,6 +404,148 @@ def _bucket_http(code_str: str) -> str:
     if cls in ("4", "5"):
         return f"<HTTP:{cls}xx>"
     return f"<NUM:med>"
+
+
+def _parse_insights_row(row: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Flatten one CloudWatch Insights result row to a field→value dict."""
+    return {
+        f.get("field", ""): f.get("value", "")
+        for f in row
+        if isinstance(f, dict) and f.get("field")
+    }
+
+
+def _insights_quality_meta(*query_results: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build a compact data_quality block from one or more Insights responses."""
+    partial = False
+    min_ratio = 1.0
+    for qr in query_results:
+        if not isinstance(qr, dict):
+            continue
+        if qr.get("partial"):
+            partial = True
+            try:
+                min_ratio = min(min_ratio, float(qr.get("sampling_ratio", 0.25)))
+            except (TypeError, ValueError):
+                min_ratio = 0.25
+    if not partial:
+        return {}
+    return {"partial": True, "sampling_ratio": min_ratio}
+
+
+def _compute_baseline_profile(counts: List[float]) -> Dict[str, float]:
+    """Mean/std/EWMA/trend profile for a series of bucket error counts."""
+    if not counts:
+        return {
+            "baseline_avg": 0.0,
+            "baseline_std": 0.0,
+            "ewma": 0.0,
+            "trend_slope": 0.0,
+            "trend_std": 0.0,
+        }
+
+    baseline_avg = sum(counts) / len(counts)
+    if len(counts) >= 2:
+        variance = sum((x - baseline_avg) ** 2 for x in counts) / len(counts)
+        baseline_std = variance ** 0.5
+    else:
+        baseline_std = 0.0
+
+    ewma_alpha = 0.3
+    ewma_value = counts[0]
+    for v in counts[1:]:
+        ewma_value = ewma_alpha * v + (1 - ewma_alpha) * ewma_value
+
+    trend_slope = 0.0
+    trend_std = 0.0
+    trend_window = counts[-6:] if len(counts) >= 2 else []
+    if len(trend_window) >= 2:
+        n = len(trend_window)
+        mean_x = (n - 1) / 2.0
+        mean_y = sum(trend_window) / n
+        num = sum((i - mean_x) * (y - mean_y) for i, y in enumerate(trend_window))
+        den = sum((i - mean_x) ** 2 for i in range(n))
+        trend_slope = num / den if den else 0.0
+        deltas = [trend_window[i] - trend_window[i - 1] for i in range(1, n)]
+        if len(deltas) >= 2:
+            d_mean = sum(deltas) / len(deltas)
+            trend_std = (sum((d - d_mean) ** 2 for d in deltas) / len(deltas)) ** 0.5
+
+    return {
+        "baseline_avg": baseline_avg,
+        "baseline_std": baseline_std,
+        "ewma": ewma_value,
+        "trend_slope": trend_slope,
+        "trend_std": trend_std,
+    }
+
+
+def _score_error_bucket(
+    count: float,
+    profile: Dict[str, float],
+    eff_z_threshold: float,
+    eff_threshold: float,
+) -> Optional[Dict[str, Any]]:
+    """Return anomaly scoring fields when *count* exceeds baseline thresholds."""
+    baseline_avg = profile["baseline_avg"]
+    baseline_std = profile["baseline_std"]
+    ewma_value = profile["ewma"]
+    trend_slope = profile["trend_slope"]
+    trend_std = profile["trend_std"]
+
+    is_anomaly = False
+    z_score = 0.0
+    deviation = 0.0
+    residual_z = 0.0
+    slope_z = 0.0
+    anomaly_reasons: List[str] = []
+
+    if baseline_std > 0:
+        z_score = (count - baseline_avg) / baseline_std
+        if z_score > eff_z_threshold:
+            is_anomaly = True
+            anomaly_reasons.append("zscore")
+    elif baseline_avg > 0:
+        deviation = count / baseline_avg
+        if deviation > eff_threshold:
+            is_anomaly = True
+            anomaly_reasons.append("deviation")
+
+    if baseline_std > 0 and ewma_value:
+        residual = count - ewma_value
+        residual_z = residual / baseline_std
+        if (residual_z > eff_z_threshold) and (z_score > eff_z_threshold / 2):
+            is_anomaly = True
+            if "ewma" not in anomaly_reasons:
+                anomaly_reasons.append("ewma")
+
+    if trend_std > 0:
+        slope_z = trend_slope / trend_std
+        if slope_z > 2.0:
+            is_anomaly = True
+            if "trend" not in anomaly_reasons:
+                anomaly_reasons.append("trend")
+
+    if not is_anomaly:
+        return None
+
+    strongest = max(abs(z_score), abs(residual_z), abs(deviation), abs(slope_z))
+    if strongest >= 4.0:
+        severity = "critical"
+    elif strongest >= 3.0:
+        severity = "high"
+    elif strongest >= 2.0:
+        severity = "medium"
+    else:
+        severity = "low"
+
+    return {
+        "current_count": count,
+        "baseline_average": round(baseline_avg, 2),
+        "z_score": round(z_score, 2),
+        "severity": severity,
+        "reasons": anomaly_reasons,
+    }
 
 
 def _normalize_message(msg: str) -> str:
@@ -613,7 +754,8 @@ async def analyze_log_patterns(
     time_range_minutes: int = 60,
     pattern_types: Optional[List[str]] = None,
     region: str = "us-east-1",
-    credentials: Optional[Dict[str, Any]] = None
+    credentials: Optional[Dict[str, Any]] = None,
+    severity_excludes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Analyze log patterns across multiple log groups.
     
@@ -639,6 +781,8 @@ async def analyze_log_patterns(
         ```
     """
     watcher = get_watcher(region=region, **_extract_credentials(credentials))
+
+    from app.workflow.tools.cloudwatch_drilldown import apply_severity_excludes
     
     if pattern_types is None:
         pattern_types = ["error", "warning", "info"]
@@ -653,9 +797,12 @@ async def analyze_log_patterns(
     pattern_filters = SEVERITY_PATTERNS
     
     results = {}
-    
+    quality_sources: List[Dict[str, Any]] = []
+
     for pattern_type in pattern_types:
-        filter_clause = pattern_filters.get(pattern_type, "")
+        filter_clause = apply_severity_excludes(
+            pattern_filters.get(pattern_type, ""), severity_excludes,
+        )
         query_string = f"""
         fields @timestamp, @message, @logStream
         | filter {filter_clause}
@@ -670,12 +817,17 @@ async def analyze_log_patterns(
                 start_time=start_time,
                 end_time=end_time
             )
-            
-            results[pattern_type] = {
+            quality_sources.append(query_result)
+
+            entry: Dict[str, Any] = {
                 "status": query_result.get("status"),
                 "data": query_result.get("results", [])[:20],
-                "statistics": query_result.get("statistics")
+                "statistics": query_result.get("statistics"),
             }
+            if query_result.get("partial"):
+                entry["partial"] = True
+                entry["sampling_ratio"] = query_result.get("sampling_ratio")
+            results[pattern_type] = entry
         except Exception as e:
             results[pattern_type] = {
                 "status": "error",
@@ -688,9 +840,12 @@ async def analyze_log_patterns(
     # -------------------------------------------------------------------
     unique_patterns = []
     try:
-        unique_query = """
+        _error_filter = apply_severity_excludes(
+            SEVERITY_PATTERNS["error"], severity_excludes,
+        )
+        unique_query = f"""
         fields @timestamp, @message, @logStream
-        | filter level = "ERROR" OR @message like /(?i)(error|exception|fail)/
+        | filter {_error_filter}
         | stats count() as occurrence_count,
                 count_distinct(@logStream) as affected_streams,
                 min(@timestamp) as first_seen,
@@ -705,6 +860,7 @@ async def analyze_log_patterns(
             start_time=start_time,
             end_time=end_time,
         )
+        quality_sources.append(unique_result)
         raw_unique = unique_result.get("results", [])
         # Post-process: semantically group near-duplicate patterns by
         # normalising dynamic tokens (IDs, timestamps, numbers).
@@ -751,39 +907,25 @@ async def analyze_log_patterns(
                     "first_seen": first_seen,
                     "last_seen": last_seen,
                 }
-        unique_patterns = sorted(grouped.values(), key=lambda x: x["occurrence_count"], reverse=True)[:50]
+        unique_patterns = sorted(
+            grouped.values(), key=lambda x: x["occurrence_count"], reverse=True
+        )[:15]
     except Exception as e:
         logger.warning("analyze_log_patterns: unique_patterns query failed: %s", e)
 
-    # Get overall statistics
-    stats_query = """
-    fields @timestamp, @message
-    | stats count() as total_events,
-            min(@timestamp) as first_event,
-            max(@timestamp) as last_event
-    """
-    
-    try:
-        stats_result = await watcher.query_with_insights(
-            log_group_names=log_group_names,
-            query_string=stats_query,
-            start_time=start_time,
-            end_time=end_time
-        )
-    except Exception as e:
-        stats_result = {"error": str(e)}
-    
+    data_quality = _insights_quality_meta(*quality_sources)
+
     return {
         "success": True,
         "patterns": results,
         "unique_patterns": unique_patterns,
-        "statistics": stats_result,
         "time_range": {
             "start": start_time.isoformat(),
             "end": end_time.isoformat(),
             "minutes": time_range_minutes
         },
-        "log_groups_analyzed": log_group_names
+        "log_groups_analyzed": log_group_names,
+        "data_quality": data_quality,
     }
 
 
@@ -846,188 +988,103 @@ async def detect_anomalies(
     # Global defaults
     threshold = _deviation_thresholds.get(sensitivity, 2.0)
     
-    # Query for error counts in current period (uses Phase 1 severity taxonomy)
+    # Query for error counts in current period (uses Phase 1 severity taxonomy).
+    # Group by @log so multi-group investigations stay attributed without extra queries.
     _error_filter = SEVERITY_PATTERNS["error"]
-    current_query = (
-        "fields @timestamp, @message\n"
+    bucket_query = (
+        "fields @timestamp, @message, @log\n"
         f"| filter {_error_filter}\n"
-        "| stats count() as error_count by bin(5m)\n"
+        "| stats count() as error_count by bin(5m), @log\n"
         "| sort @timestamp desc\n"
     )
 
-    # Query for baseline error counts
-    baseline_query = current_query
-    
-    anomalies = []
-    
+    anomalies: List[Dict[str, Any]] = []
+    baseline_avg = 0.0
+    baseline_std = 0.0
+    data_quality: Dict[str, Any] = {}
+
     try:
-        # Get current period data
         current_result = await watcher.query_with_insights(
             log_group_names=log_group_names,
-            query_string=current_query,
+            query_string=bucket_query,
             start_time=current_start,
-            end_time=end_time
+            end_time=end_time,
         )
-        
-        # Get baseline data
+
         baseline_result = await watcher.query_with_insights(
             log_group_names=log_group_names,
-            query_string=baseline_query,
+            query_string=bucket_query,
             start_time=baseline_start,
-            end_time=baseline_end
+            end_time=baseline_end,
         )
-        
-        # Calculate baseline statistics for z-score analysis.
-        baseline_counts = []
-        for result in baseline_result.get("results", []):
-            for field in result:
-                if field.get("field") == "error_count":
-                    try:
-                        baseline_counts.append(float(field.get("value", 0)))
-                    except (ValueError, TypeError):
-                        pass
 
-        baseline_avg = sum(baseline_counts) / len(baseline_counts) if baseline_counts else 0
+        data_quality = _insights_quality_meta(current_result, baseline_result)
 
-        # Compute standard deviation for z-score based anomaly detection.
-        if len(baseline_counts) >= 2:
-            variance = sum((x - baseline_avg) ** 2 for x in baseline_counts) / len(baseline_counts)
+        # Per-log-group baseline profiles from the baseline window.
+        group_counts: Dict[str, List[float]] = defaultdict(list)
+        all_baseline_counts: List[float] = []
+        for row in baseline_result.get("results", []):
+            parsed = _parse_insights_row(row)
+            lg = parsed.get("@log") or "_all"
+            try:
+                val = float(parsed.get("error_count", 0))
+            except (ValueError, TypeError):
+                val = 0.0
+            group_counts[lg].append(val)
+            all_baseline_counts.append(val)
+
+        profiles = {lg: _compute_baseline_profile(vals) for lg, vals in group_counts.items()}
+        if not profiles:
+            profiles["_all"] = _compute_baseline_profile(all_baseline_counts)
+
+        baseline_avg = (
+            sum(all_baseline_counts) / len(all_baseline_counts) if all_baseline_counts else 0.0
+        )
+        if len(all_baseline_counts) >= 2:
+            variance = sum((x - baseline_avg) ** 2 for x in all_baseline_counts) / len(
+                all_baseline_counts
+            )
             baseline_std = variance ** 0.5
-        else:
-            baseline_std = 0.0
 
-        # ------------------------------------------------------------------
-        # Adaptive baseline (Phase 3): EWMA + linear-regression trend slope.
-        # The stationary mean/std above misses slow-burn drift (e.g. memory
-        # leak doubling hourly), so we additionally compute:
-        #   - ewma_value: exponentially weighted moving average (alpha=0.3)
-        #     over the trailing baseline window
-        #   - trend_slope: least-squares slope of the last 6 baseline buckets
-        #   - trend_std:   stddev of bucket-to-bucket deltas, used to test
-        #                  whether the slope is statistically meaningful
-        # ------------------------------------------------------------------
-        ewma_alpha = 0.3
-        ewma_value: float = 0.0
-        if baseline_counts:
-            ewma_value = baseline_counts[0]
-            for v in baseline_counts[1:]:
-                ewma_value = ewma_alpha * v + (1 - ewma_alpha) * ewma_value
+        for row in current_result.get("results", []):
+            parsed = _parse_insights_row(row)
+            timestamp = parsed.get("@timestamp")
+            log_group = parsed.get("@log")
+            if not log_group and len(log_group_names) == 1:
+                log_group = log_group_names[0]
+            try:
+                count = float(parsed.get("error_count", 0))
+            except (ValueError, TypeError):
+                count = 0.0
 
-        trend_slope = 0.0
-        trend_std = 0.0
-        trend_window = baseline_counts[-6:] if len(baseline_counts) >= 2 else []
-        if len(trend_window) >= 2:
-            n = len(trend_window)
-            mean_x = (n - 1) / 2.0
-            mean_y = sum(trend_window) / n
-            num = sum((i - mean_x) * (y - mean_y) for i, y in enumerate(trend_window))
-            den = sum((i - mean_x) ** 2 for i in range(n))
-            trend_slope = num / den if den else 0.0
-            deltas = [trend_window[i] - trend_window[i - 1] for i in range(1, n)]
-            if len(deltas) >= 2:
-                d_mean = sum(deltas) / len(deltas)
-                trend_std = (sum((d - d_mean) ** 2 for d in deltas) / len(deltas)) ** 0.5
+            profile_key = log_group if log_group and log_group in profiles else "_all"
+            profile = profiles.get(profile_key) or profiles.get("_all") or _compute_baseline_profile([])
 
-        # Check current period for anomalies using z-score.
-        for result in current_result.get("results", []):
-            timestamp = None
-            count = 0
-            
-            for field in result:
-                if field.get("field") == "@timestamp":
-                    timestamp = field.get("value")
-                elif field.get("field") == "error_count":
-                    try:
-                        count = float(field.get("value", 0))
-                    except (ValueError, TypeError):
-                        pass
-            
-            # Resolve effective sensitivity for this log group.  Since the
-            # current Insights query aggregates across all groups we apply the
-            # global sensitivity here; per_group_sensitivity is advisory for
-            # callers who run single-group queries.
             eff_sensitivity = sensitivity
-            if per_group_sensitivity and log_group_names:
-                # When only one group is queried use its override if present.
-                if len(log_group_names) == 1:
-                    eff_sensitivity = per_group_sensitivity.get(log_group_names[0], sensitivity)
+            if per_group_sensitivity and log_group:
+                eff_sensitivity = per_group_sensitivity.get(log_group, sensitivity)
+            elif per_group_sensitivity and len(log_group_names) == 1:
+                eff_sensitivity = per_group_sensitivity.get(log_group_names[0], sensitivity)
 
             eff_z_threshold = _z_thresholds.get(eff_sensitivity, 2.0)
             eff_threshold = _deviation_thresholds.get(eff_sensitivity, 2.0)
 
-            # Use z-score when we have enough baseline data; fall back to the
-            # simple deviation multiplier otherwise.
-            is_anomaly = False
-            z_score = 0.0
-            deviation = 0.0
-            residual_z = 0.0
-            slope_z = 0.0
-            anomaly_reasons: List[str] = []
+            scored = _score_error_bucket(count, profile, eff_z_threshold, eff_threshold)
+            if scored is None:
+                continue
 
-            if baseline_std > 0:
-                z_score = (count - baseline_avg) / baseline_std
-                if z_score > eff_z_threshold:
-                    is_anomaly = True
-                    anomaly_reasons.append("zscore")
-            elif baseline_avg > 0:
-                deviation = count / baseline_avg
-                if deviation > eff_threshold:
-                    is_anomaly = True
-                    anomaly_reasons.append("deviation")
+            anomalies.append({
+                "timestamp": timestamp,
+                "log_group": log_group,
+                **scored,
+            })
 
-            # Phase 3: EWMA residual catches drift the stationary baseline
-            # silently absorbs. Require BOTH residual_z above threshold AND
-            # absolute_z above half-threshold to avoid false positives.
-            if baseline_std > 0 and ewma_value:
-                residual = count - ewma_value
-                residual_z = residual / baseline_std
-                if (residual_z > eff_z_threshold) and (z_score > eff_z_threshold / 2):
-                    is_anomaly = True
-                    if "ewma" not in anomaly_reasons:
-                        anomaly_reasons.append("ewma")
-
-            # Phase 3: trend-slope alarm — fires even when the current point
-            # is benign relative to a rising mean, catching slow-burn drift.
-            if trend_std > 0:
-                slope_z = trend_slope / trend_std
-                if slope_z > 2.0:
-                    is_anomaly = True
-                    if "trend" not in anomaly_reasons:
-                        anomaly_reasons.append("trend")
-
-            if is_anomaly:
-                # Classify severity from the strongest signal we observed.
-                strongest = max(abs(z_score), abs(residual_z), abs(deviation), abs(slope_z))
-                if strongest >= 4.0:
-                    severity = "critical"
-                elif strongest >= 3.0:
-                    severity = "high"
-                elif strongest >= 2.0:
-                    severity = "medium"
-                else:
-                    severity = "low"
-
-                anomalies.append({
-                    "timestamp": timestamp,
-                    "current_count": count,
-                    "baseline_average": round(baseline_avg, 2),
-                    "baseline_std_dev": round(baseline_std, 2),
-                    "ewma": round(ewma_value, 2),
-                    "trend_slope": round(trend_slope, 3),
-                    "z_score": round(z_score, 2),
-                    "residual_z": round(residual_z, 2),
-                    "slope_z": round(slope_z, 2),
-                    "deviation_factor": round(count / baseline_avg, 2) if baseline_avg > 0 else None,
-                    "severity": severity,
-                    "reasons": anomaly_reasons,
-                })
-    
     except Exception as e:
         return {
             "success": False,
             "error": str(e)
         }
-    
+
     return {
         "success": True,
         "anomalies": anomalies,
@@ -1043,7 +1100,8 @@ async def detect_anomalies(
             "baseline_average": round(baseline_avg, 2),
             "baseline_std_dev": round(baseline_std, 2) if baseline_std else None,
         },
-        "log_groups_analyzed": log_group_names
+        "log_groups_analyzed": log_group_names,
+        "data_quality": data_quality,
     }
 
 
@@ -1084,73 +1142,100 @@ async def correlate_logs(
     
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=time_range_minutes)
-    
-    # Build filter pattern
-    filter_parts = []
-    if correlation_id:
-        filter_parts.append(f'message like "{correlation_id}"')
-    if trace_id:
-        filter_parts.append(f'message like "{trace_id}"')
-    
-    filter_pattern = " OR ".join(filter_parts) if filter_parts else None
-    
-    # Fetch logs from all groups
-    all_events = []
-    
-    for log_group in log_group_names:
+
+    timeline: List[Dict[str, Any]] = []
+    data_quality: Dict[str, Any] = {}
+
+    if correlation_id or trace_id:
+        # One cross-group Insights query — correct substring match syntax.
+        filters: List[str] = []
+        if correlation_id:
+            filters.append(f"@message like /{re.escape(correlation_id)}/")
+        if trace_id:
+            filters.append(f"@message like /{re.escape(trace_id)}/")
+        filter_clause = " or ".join(filters)
+        query_string = (
+            "fields @timestamp, @message, @logStream, @log\n"
+            f"| filter {filter_clause}\n"
+            "| sort @timestamp asc\n"
+            "| limit 500\n"
+        )
         try:
-            logs = await watcher.fetch_logs(
-                log_group_name=log_group,
+            query_result = await watcher.query_with_insights(
+                log_group_names=log_group_names,
+                query_string=query_string,
                 start_time=start_time,
                 end_time=end_time,
-                filter_pattern=filter_pattern
+                limit=500,
             )
-            
-            for event in logs:
-                event["log_group"] = log_group
-                all_events.append(event)
+            data_quality = _insights_quality_meta(query_result)
+            for row in query_result.get("results", []):
+                parsed = _parse_insights_row(row)
+                timeline.append({
+                    "timestamp": parsed.get("@timestamp", ""),
+                    "log_group": parsed.get("@log"),
+                    "log_stream": parsed.get("@logStream"),
+                    "message": (parsed.get("@message") or "")[:500],
+                })
         except Exception as e:
-            logger.warning(f"Error fetching logs from {log_group}: {e}")
-    
-    # Sort by timestamp
-    all_events.sort(key=lambda x: x.get("timestamp", 0))
-    
-    # Build timeline
-    timeline = []
-    for event in all_events:
-        timestamp_ms = event.get("timestamp", 0)
-        timestamp = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
-        
-        timeline.append({
-            "timestamp": timestamp.isoformat(),
-            "timestamp_ms": timestamp_ms,
-            "log_group": event.get("log_group"),
-            "log_stream": event.get("logStreamName"),
-            "message": event.get("message", "")[:500],  # Truncate long messages
-            "event_id": event.get("eventId")
-        })
-    
-    # Identify service flow
-    service_flow = []
-    seen_groups = set()
+            logger.warning("correlate_logs Insights query failed: %s", e)
+            return {"success": False, "error": str(e)}
+    else:
+        # No ID — fetch recent events per group (no broken filter syntax).
+        all_events: List[Dict[str, Any]] = []
+        for log_group in log_group_names:
+            try:
+                logs = await watcher.fetch_logs(
+                    log_group_name=log_group,
+                    start_time=start_time,
+                    end_time=end_time,
+                    filter_pattern=None,
+                    limit=200,
+                )
+                for event in logs:
+                    event["log_group"] = log_group
+                    all_events.append(event)
+            except Exception as e:
+                logger.warning("Error fetching logs from %s: %s", log_group, e)
+
+        all_events.sort(key=lambda x: x.get("timestamp", 0))
+        for event in all_events:
+            timestamp_ms = event.get("timestamp", 0)
+            timestamp = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+            timeline.append({
+                "timestamp": timestamp.isoformat(),
+                "timestamp_ms": timestamp_ms,
+                "log_group": event.get("log_group"),
+                "log_stream": event.get("logStreamName"),
+                "message": event.get("message", "")[:500],
+                "event_id": event.get("eventId"),
+            })
+        if len(timeline) >= 200 * len(log_group_names):
+            data_quality = {"truncated": True, "hint": "pass correlation_id or trace_id to narrow"}
+
+    seen_groups: set = set()
+    service_flow: List[str] = []
     for event in timeline:
-        group = event["log_group"]
-        if group not in seen_groups:
+        group = event.get("log_group")
+        if group and group not in seen_groups:
             service_flow.append(group)
             seen_groups.add(group)
-    
-    return {
+
+    result: Dict[str, Any] = {
         "success": True,
         "timeline": timeline,
         "summary": {
             "total_events": len(timeline),
             "services_involved": list(seen_groups),
             "service_flow": service_flow,
-            "time_range_minutes": time_range_minutes
+            "time_range_minutes": time_range_minutes,
         },
         "correlation_id": correlation_id,
-        "trace_id": trace_id
+        "trace_id": trace_id,
     }
+    if data_quality:
+        result["data_quality"] = data_quality
+    return result
 
 
 @handle_exceptions
@@ -1197,8 +1282,7 @@ async def discover_log_groups(
         if next_token:
             describe_kwargs["nextToken"] = next_token
 
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
+        response = await run_in_aws_pool(
             lambda: client.describe_log_groups(**describe_kwargs),
         )
 
@@ -1228,8 +1312,7 @@ async def discover_log_groups(
             if not arn:
                 continue
             try:
-                tags_resp = await asyncio.get_event_loop().run_in_executor(
-                    None,
+                tags_resp = await run_in_aws_pool(
                     lambda: client.list_tags_for_resource(resourceArn=arn),
                 )
                 tags = tags_resp.get("tags", {})

@@ -38,6 +38,37 @@ def _build_file_context(files: List[Tuple[str, str]]) -> Tuple[str, str]:
     return "".join(parts), "\n".join(listing)
 
 
+async def _build_file_context_from_paths(
+    repo: str,
+    file_paths: List[str],
+) -> Tuple[str, str, int]:
+    """Load files on demand (bounded parallel) until context cap is reached."""
+    from app.crawler.files import read_repo_files_bounded
+
+    parts: List[str] = []
+    listing: List[str] = []
+    total = 0
+    loaded = 0
+
+    batch_size = 32
+    for start in range(0, len(file_paths), batch_size):
+        chunk_paths = file_paths[start:start + batch_size]
+        for i, (path, content) in enumerate(
+            await read_repo_files_bounded(repo, chunk_paths),
+            start=start,
+        ):
+            truncated = content[:_MAX_FILE_CHARS]
+            entry = f"--- File Index {i}: {path} ---\n{truncated}\n\n"
+            if total + len(entry) > _MAX_CONTEXT_CHARS:
+                return "".join(parts), "\n".join(listing), loaded
+            parts.append(entry)
+            listing.append(f"- {i} # {path}")
+            total += len(entry)
+            loaded += 1
+
+    return "".join(parts), "\n".join(listing), loaded
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Node 1 of indexFlow: ExtractAbstractions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -49,13 +80,18 @@ class ExtractAbstractions(AsyncNode):
         super().__init__(max_retries=max_retries, wait=wait)
 
     async def prep(self, shared: Dict[str, Any]) -> Dict[str, Any]:
-        files = shared["files"]
-        context, file_listing = _build_file_context(files)
+        file_paths = shared.get("file_paths")
+        if file_paths is None:
+            file_paths = [p for p, _c in shared.get("files", [])]
+
+        context, file_listing, loaded_count = await _build_file_context_from_paths(
+            shared["repo"], file_paths,
+        )
         return {
             "repo": shared["repo"],
             "context": context,
             "file_listing": file_listing,
-            "file_count": len(files),
+            "file_count": loaded_count,
             "model": shared.get("model_id"),
         }
 
@@ -237,28 +273,31 @@ class BuildFileMap(AsyncNode):
     """
 
     async def prep(self, shared: Dict[str, Any]) -> Dict[str, Any]:
+        file_paths = shared.get("file_paths")
+        if file_paths is None:
+            file_paths = [p for p, _c in shared.get("files", [])]
         return {
             "abstractions": shared["abstractions"],
-            "files": shared["files"],
+            "file_paths": file_paths,
             "relationships": shared.get("relationships", []),
         }
 
     async def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
         t0 = time.monotonic()
-        files = prep_res["files"]
+        file_paths: List[str] = prep_res["file_paths"]
         file_map: Dict[str, List[str]] = {}
 
         for abstraction in prep_res["abstractions"]:
             name = abstraction["name"]
             paths: List[str] = []
             for idx in abstraction.get("file_indices", []):
-                if isinstance(idx, int) and 0 <= idx < len(files):
-                    paths.append(files[idx][0])
+                if isinstance(idx, int) and 0 <= idx < len(file_paths):
+                    paths.append(file_paths[idx])
                 elif isinstance(idx, str):
                     try:
                         i = int(idx.split("#")[0].strip())
-                        if 0 <= i < len(files):
-                            paths.append(files[i][0])
+                        if 0 <= i < len(file_paths):
+                            paths.append(file_paths[i])
                     except (ValueError, IndexError):
                         pass
             file_map[name] = paths
@@ -305,7 +344,7 @@ class PersistOverview(AsyncNode):
         tokens_out = sum(t.get("tokens_out", 0) for t in trace)
         return {
             "repo": shared["repo"],
-            "files_count": len(shared["files"]),
+            "files_count": len(shared.get("file_paths") or shared.get("files", [])),
             "files_sha256": shared["files_sha256"],
             "overview": {
                 "abstractions": shared["abstractions"],

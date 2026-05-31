@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Dict, Generic, List, Optional, TypeVar
+
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -37,23 +38,21 @@ _R  = TypeVar("_R")  # result type
 
 @dataclass
 class ParallelFlowConfig:
-    """Tunables for parallel flow execution.
+    """Tunables for parallel flow execution."""
 
-    All values read from environment variables so they can be adjusted
-    at runtime without a code deploy.
-    """
+    concurrency: int = 5
+    item_timeout_seconds: float = 180.0
+    batch_timeout_seconds: float = 0.0
+    fail_fast: bool = False
 
-    # Maximum number of flow instances running at the same time.
-    concurrency: int = int(os.getenv("PARALLEL_FLOW_CONCURRENCY", "5"))
-
-    # Per-item timeout in seconds.  0 = no per-item timeout.
-    item_timeout_seconds: float = float(os.getenv("PARALLEL_FLOW_ITEM_TIMEOUT", "180.0"))
-
-    # Wall-clock budget for the *entire batch*.  0 = no batch timeout.
-    batch_timeout_seconds: float = float(os.getenv("PARALLEL_FLOW_BATCH_TIMEOUT", "0"))
-
-    # When True, the first item failure cancels all remaining tasks.
-    fail_fast: bool = os.getenv("PARALLEL_FLOW_FAIL_FAST", "false").lower() == "true"
+    @classmethod
+    def from_settings(cls) -> "ParallelFlowConfig":
+        return cls(
+            concurrency=settings.parallel_flow_concurrency,
+            item_timeout_seconds=settings.parallel_flow_item_timeout,
+            batch_timeout_seconds=settings.parallel_flow_batch_timeout,
+            fail_fast=settings.parallel_flow_fail_fast,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +96,7 @@ class ParallelFlowRunner:
     """
 
     def __init__(self, config: Optional[ParallelFlowConfig] = None) -> None:
-        self._cfg = config or ParallelFlowConfig()
+        self._cfg = config or ParallelFlowConfig.from_settings()
 
     # ------------------------------------------------------------------
     # Public API

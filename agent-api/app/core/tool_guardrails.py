@@ -128,11 +128,8 @@ class ToolCallGuardrailConfig:
     @classmethod
     def from_env(cls) -> "ToolCallGuardrailConfig":
         """Build config from environment variables (production override)."""
-        import os
-        hard_stop = os.getenv("GUARDRAIL_HARD_STOP", "false").lower() in {
-            "1", "true", "yes", "on",
-        }
-        return cls(hard_stop_enabled=hard_stop)
+        from app.config import settings
+        return cls(hard_stop_enabled=settings.guardrail_hard_stop)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,176 @@
+"""Post-execution learning and graceful fallback for ReAct agents."""
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from app.core.redact import redact
+from app.workflow.strategies.react.helpers import collect_failed_tools, estimate_confidence
+
+logger = logging.getLogger(__name__)
+
+async def auto_learn(
+    user_query: str,
+    result: Dict[str, Any],
+    execution_id: Optional[str],
+    execution_start: "datetime",
+    recall_hits: int,
+    logger_instance: Any,
+) -> None:
+    """Persist what this execution found to the knowledge base.
+
+    Phase 1 — record_analysis (lightweight, always runs).
+    Phase 2 — AutoLearnService.learn() (closed learning loop):
+        • auto-approve gate (confidence threshold)
+        • KB upsert + pattern bump
+        • trajectory JSONL
+        • skill distillation via LLM when enough tool calls exist
+
+    Any failure in either phase is caught and logged as a warning —
+    it must never propagate to the caller.
+    """
+    final_answer = result.get("final_answer") or ""
+    execution_end = datetime.now(timezone.utc)
+
+    # ── Phase 1: lightweight record_analysis ─────────────────────────
+    try:
+        from app.services.knowledge_base import knowledge_base as _kb
+        await _kb.record_analysis(
+            log_group=str(execution_id or "unknown"),
+            analysis_type="react_agent",
+            start_time=execution_start,
+            end_time=execution_end,
+            summary=final_answer[:2000],
+            anomalies_found=0,
+            patterns_matched=recall_hits,
+        )
+    except Exception as _rec_err:
+        logger_instance.warning(
+            "ReactStrategy: record_analysis failed (non-fatal): %s",
+            redact(str(_rec_err)),
+            extra={"execution_id": execution_id},
+        )
+
+    # ── Phase 2: closed learning loop (AutoLearnService) ─────────────
+    try:
+        from app.core.auto_learn import AutoLearnService, AutoLearnConfig
+
+        _config = AutoLearnConfig()
+        _svc = AutoLearnService(config=_config)
+
+        # Derive a rough confidence score: high when a resolution keyword
+        # was found, moderate otherwise.  The AutoLearnService gate uses
+        # this to decide whether to auto-approve.
+        _confidence = estimate_confidence(final_answer, result.get("tool_calls", []))
+
+        # Build the state dict AutoLearnService expects.
+        _learn_state = {
+            "execution_id": execution_id,
+            "user_query": user_query,
+            "final_answer": final_answer,
+            "tool_calls": result.get("tool_calls", []),
+            "confidence_score": _confidence,
+            "recall_hits": recall_hits,
+            "execution_start": execution_start.isoformat(),
+            "execution_end": execution_end.isoformat(),
+        }
+
+        _learn_result = await _svc.learn(
+            execution_id=str(execution_id or "unknown"),
+            state=_learn_state,
+        )
+
+        logger_instance.info(
+            "ReactStrategy: AutoLearnService completed — "
+            "kb=%s pattern=%s trajectory=%s skill=%s skipped=%s",
+            _learn_result.kb_upserted,
+            _learn_result.pattern_bumped,
+            _learn_result.trajectory_saved,
+            _learn_result.skill_distilled,
+            _learn_result.skipped_reason or "none",
+            extra={"execution_id": execution_id},
+        )
+
+    except Exception as _learn_err:
+        logger_instance.warning(
+            "ReactStrategy: AutoLearnService.learn failed (non-fatal): %s",
+            redact(str(_learn_err)),
+            extra={"execution_id": execution_id},
+        )
+
+    # ── Phase 3: log failed tools (diagnostic only) ──────────────────
+    try:
+        failed_tools = collect_failed_tools(result)
+        if failed_tools:
+            logger_instance.debug(
+                "ReactStrategy: tool failures detected in execution: %s",
+                failed_tools,
+                extra={"execution_id": execution_id},
+            )
+    except Exception:
+        pass
+
+# ------------------------------------------------------------------
+# Exec fallback — graceful degradation when all retries are exhausted
+# ------------------------------------------------------------------
+
+def exec_fallback(
+    exc:             Exception,
+    user_query:      str,
+    execution_id:    Optional[str],
+    logger_instance: Any,
+) -> Optional[Dict[str, Any]]:
+    """Return a structured partial result when the agent fails unrecoverably.
+
+    Instead of propagating an exception to the caller, returns a well-formed
+    result dict that the UI can render as a degraded-mode response.
+
+    Returns ``None`` for exception types that should still propagate
+    (e.g. ``ValueError`` from bad config — those are programmer errors,
+    not runtime failures worth swallowing).
+    """
+    # Don't swallow configuration/validation errors — those should surface.
+    if isinstance(exc, (ValueError, TypeError, ImportError)):
+        return None
+
+    err_str = redact(str(exc))
+    logger_instance.warning(
+        "ReactStrategy: exec_fallback triggered — returning partial result. "
+        "error=%s execution_id=%s",
+        err_str, execution_id,
+    )
+
+    # Build a user-facing degraded answer.
+    if "timeout" in err_str.lower():
+        answer = (
+            "The investigation could not be completed within the time limit. "
+            "This may indicate the query requires too many tool calls or the "
+            "target services are slow to respond. Please try a more specific "
+            "query or retry during off-peak hours."
+        )
+    elif "context" in err_str.lower() and "window" in err_str.lower():
+        answer = (
+            "The investigation accumulated more information than the model "
+            "context window can hold. Please narrow the query scope — for "
+            "example, target a specific service or shorter time window."
+        )
+    else:
+        answer = (
+            f"The investigation could not be completed due to an unexpected error. "
+            f"The on-call system recorded the failure for review. "
+            f"Error reference: {err_str[:200]}"
+        )
+
+    return {
+        "type":           "react",
+        "user_query":     user_query,
+        "final_answer":   answer,
+        "messages":       [],
+        "message_count":  0,
+        "tool_calls":     [],
+        "model":          "unknown",
+        "provider":       "unknown",
+        "fallback":       True,
+        "fallback_error": err_str,
+    }

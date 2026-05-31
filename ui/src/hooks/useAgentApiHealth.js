@@ -17,16 +17,22 @@ export function useAgentApiHealth(options = {}) {
 
   const checkHealth = useCallback(async ({ showSpinner = false } = {}) => {
     if (showSpinner) setLoading(true);
+    const startedAt = performance.now();
     try {
       const health = await agentApiClient.getHealth();
+      const latencyMs = Math.round(performance.now() - startedAt);
+      const isHealthy = health?.status === 'healthy';
 
       setApiHealth({
-        status: 'healthy',
         ...health,
+        status: isHealthy ? 'healthy' : 'error',
+        latencyMs,
+        message: isHealthy ? undefined : health?.status || 'API reported unhealthy',
       });
     } catch (error) {
       setApiHealth({
         status: 'error',
+        latencyMs: Math.round(performance.now() - startedAt),
         message: error.message || 'Failed to connect to API',
       });
     } finally {
@@ -42,7 +48,7 @@ export function useAgentApiHealth(options = {}) {
     }
 
     const id = setInterval(() => {
-      checkHealth({ showSpinner: false });
+      if (!document.hidden) checkHealth({ showSpinner: false });
     }, pollIntervalMs);
 
     return () => clearInterval(id);

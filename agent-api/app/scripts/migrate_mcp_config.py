@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 from typing import Dict, Any
 
-from app.repositories.db_repository import db_repository
+from app.infrastructure.persistence import mcp_config_repository
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -74,7 +74,7 @@ async def migrate_mcp_servers_to_db(config_file: str = "data/config/mcp-servers.
     for server_name, server_config in servers.items():
         try:
             # Check if server already exists
-            existing = await db_repository.get_mcp_server_by_name(server_name)
+            existing = await mcp_config_repository.get_by_name(server_name)
             
             if existing:
                 logger.info(f"Server '{server_name}' already exists in database, skipping")
@@ -92,7 +92,7 @@ async def migrate_mcp_servers_to_db(config_file: str = "data/config/mcp-servers.
             }
             
             # Create in database
-            await db_repository.create_mcp_server(server_data)
+            await mcp_config_repository.create(server_data)
             logger.info(f"Migrated server: {server_name}")
             migrated += 1
             
@@ -129,7 +129,7 @@ async def export_db_to_file(output_file: str = "data/config/mcp-servers-export.j
     """
     try:
         # Get all servers from database
-        servers = await db_repository.list_mcp_servers(include_disabled=True)
+        servers = await mcp_config_repository.list_all(include_disabled=True)
         
         # Convert to file format
         servers_dict = {}

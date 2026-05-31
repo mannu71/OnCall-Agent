@@ -18,8 +18,9 @@ Usage::
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict, Optional, Tuple
+
+from app.config import settings
 
 from app.core.transport.provider import TransportMessage
 from app.crawler.cache import get_cached, put_cached
@@ -38,10 +39,10 @@ async def _resolve_llm_config() -> Dict[str, Any]:
     2. Enriches Bedrock configs with AWS credentials from model_keys table
     3. Falls back to env vars (CRAWLER_MODEL + PROVIDER_TRANSPORT) if DB is empty
     """
-    from app.repositories.db_repository import db_repository
+    from app.infrastructure.persistence import llm_config_repository, model_key_repository
 
     try:
-        db_configs = await db_repository.list_llm_configs()
+        db_configs = await llm_config_repository.list_all()
         if db_configs:
             _name, cfg = next(iter(db_configs.items()))
             resolved: Dict[str, Any] = {
@@ -57,7 +58,7 @@ async def _resolve_llm_config() -> Dict[str, Any]:
             if resolved["provider"].lower() in ("bedrock", "aws", "aws_bedrock", "aws bedrock"):
                 try:
                     for key_name in ("AWS Bedrock", "bedrock", "aws bedrock", "aws"):
-                        mk = await db_repository.get_model_key(key_name, include_secrets=True)
+                        mk = await model_key_repository.get_by_provider(key_name, include_secrets=True)
                         if mk:
                             for field in ("access_key_id", "secret_access_key", "session_token"):
                                 if mk.get(field):
@@ -90,7 +91,7 @@ async def _resolve_llm_config() -> Dict[str, Any]:
             # Non-Bedrock providers: pull api_key from model_keys table
             else:
                 try:
-                    mk = await db_repository.get_model_key(resolved["provider"], include_secrets=True)
+                    mk = await model_key_repository.get_by_provider(resolved["provider"], include_secrets=True)
                     if mk and mk.get("api_key"):
                         resolved["api_key"] = mk["api_key"]
                 except Exception as exc:
@@ -105,8 +106,8 @@ async def _resolve_llm_config() -> Dict[str, Any]:
         logger.warning("call_llm: DB config lookup failed, falling back to env vars: %s", exc)
 
     # ── Env-var fallback ──────────────────────────────────────────────────
-    provider = os.getenv("PROVIDER_TRANSPORT", "bedrock").lower()
-    model    = os.getenv("CRAWLER_MODEL", "anthropic.claude-3-5-haiku-20241022-v1:0")
+    provider = settings.provider_transport.lower()
+    model    = settings.crawler_model
     logger.info("call_llm: no DB config found, using env fallback provider=%s model=%s",
                 provider, model)
     return {
@@ -114,7 +115,7 @@ async def _resolve_llm_config() -> Dict[str, Any]:
         "model":       model,
         "temperature": _TEMPERATURE,
         "max_tokens":  _MAX_TOKENS,
-        "region":      os.getenv("BEDROCK_REGION", os.getenv("AWS_REGION", "us-east-1")),
+        "region":      settings.effective_bedrock_region,
     }
 
 

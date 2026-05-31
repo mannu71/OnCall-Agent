@@ -162,6 +162,23 @@ def invalidate(fn_name: Optional[str] = None) -> int:
 # Secondary index: fn_name -> set of cache keys.  Populated in cached_call.
 _fn_index: Dict[str, set] = {}
 
+_SWEEP_COUNTER = 0
+_SWEEP_EVERY = 50
+
+
+def _sweep_expired() -> int:
+    """Remove expired store entries and orphaned lock/index metadata."""
+    now = time.monotonic()
+    expired_keys = [k for k, (_, exp) in _store.items() if exp <= now]
+    for k in expired_keys:
+        _store.pop(k, None)
+        _locks.pop(k, None)
+    for fn_name, keys in list(_fn_index.items()):
+        keys -= set(expired_keys)
+        if not keys:
+            _fn_index.pop(fn_name, None)
+    return len(expired_keys)
+
 
 async def cached_call(  # noqa: F811  — intentional redefinition with index tracking
     fn_name: str,
@@ -199,6 +216,12 @@ async def cached_call(  # noqa: F811  — intentional redefinition with index tr
                 return result
 
         logger.debug("cloudwatch_cache: MISS %s — calling AWS API", fn_name)
+        global _SWEEP_COUNTER
+        _SWEEP_COUNTER += 1
+        if _SWEEP_COUNTER % _SWEEP_EVERY == 0:
+            removed = _sweep_expired()
+            if removed:
+                logger.debug("cloudwatch_cache: swept %d expired entries", removed)
         result = await fn(**kwargs)
         _store[key] = (result, time.monotonic() + ttl_seconds)
         logger.debug("cloudwatch_cache: SET %s ttl=%ds", fn_name, ttl_seconds)

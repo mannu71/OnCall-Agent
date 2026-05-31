@@ -13,13 +13,16 @@ from app.models.workflow import (
     WorkflowUpdate,
     WorkflowResponse
 )
-from app.repositories import WorkflowRepository, ExecutionRepository
+from app.infrastructure.persistence import WorkflowRepository, ExecutionRepository
 from app.api.deps import get_workflow_repo, get_execution_repo, verify_workflow_exists
 from app.core.scheduler import workflow_scheduler
 from app.services.visual_workflow_executor import visual_executor
+from app.workflow.routing import execute_workflow, is_workflow_running, is_visual_workflow
 from app.services.workflow_output_extractor import extract_workflow_output
 from app.core.exceptions import NotFoundException
 from app.config import settings
+from app.core.sse import SSE_HEADERS
+from app.workflow.event_adapter import workflow_name_event_stream
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 logger = logging.getLogger(__name__)
@@ -375,14 +378,8 @@ async def update_workflow(
 
 
 async def _extract_unindexed_repos(workflow_dict: dict) -> list:
-    """Return repo names from codeAnalyzer nodes not yet in repo_abstractions.
-
-    Only repos missing from the ``repo_abstractions`` table are returned so
-    that re-saving a workflow with already-indexed repos does not trigger a
-    redundant background index run.
-    """
-    from app.core.database import AsyncSessionLocal
-    from sqlalchemy import text
+    """Return repo names from codeAnalyzer nodes not yet in repo_abstractions."""
+    from app.services.crawler_service import crawler_service
 
     repo_names: list = []
     for node in workflow_dict.get("nodes") or []:
@@ -392,17 +389,7 @@ async def _extract_unindexed_repos(workflow_dict: dict) -> list:
                 if name:
                     repo_names.append(name)
 
-    if not repo_names:
-        return []
-
-    async with AsyncSessionLocal() as session:
-        rows = await session.execute(
-            text("SELECT repo_name FROM repo_abstractions WHERE repo_name = ANY(:names)"),
-            {"names": repo_names},
-        )
-        already_indexed = {r[0] for r in rows.fetchall()}
-
-    return [n for n in repo_names if n not in already_indexed]
+    return await crawler_service.filter_unindexed_repos(repo_names)
 
 
 async def _resolve_workflow_model_id(workflow_dict: dict) -> "Optional[str]":
@@ -415,7 +402,7 @@ async def _resolve_workflow_model_id(workflow_dict: dict) -> "Optional[str]":
     Falls back to None when no llm node is found or the config cannot be
     resolved — call_llm will then use the first entry from llm_configs as usual.
     """
-    from app.repositories.db_repository import db_repository
+    from app.infrastructure.persistence import llm_config_repository
 
     # Find the llm node
     llm_node = next(
@@ -431,7 +418,7 @@ async def _resolve_workflow_model_id(workflow_dict: dict) -> "Optional[str]":
         return None
 
     try:
-        db_configs = await db_repository.list_llm_configs()
+        db_configs = await llm_config_repository.list_all()
         cfg = db_configs.get(config_name) or next(iter(db_configs.values()), None)
         if not cfg:
             return None
@@ -462,19 +449,14 @@ async def _resolve_workflow_model_id(workflow_dict: dict) -> "Optional[str]":
         return None
 
 
-def _cleanup_active_executions(workflow_name: str) -> None:
-    """Cancel and cleanup any active executions for a workflow.
-    
-    Args:
-        workflow_name: Name of the workflow
-    """
-    execution_ids_to_clear = [
-        eid for eid, data in visual_executor.active_executions.items()
-        if data.get('workflow_name') == workflow_name
-    ]
-    
-    for execution_id in execution_ids_to_clear:
-        visual_executor.cleanup_execution(execution_id)
+async def _cleanup_active_executions(workflow_name: str) -> None:
+    """Cancel and cleanup any active executions for a workflow."""
+    from app.services.execution_state import execution_state
+
+    await execution_state.cancel_by_workflow_name(workflow_name)
+    for execution_id in list(visual_executor.event_queues.keys()):
+        if execution_id not in execution_state.runtime_cache:
+            visual_executor.event_queues.pop(execution_id, None)
 
 
 async def _cleanup_legacy_sql_files(
@@ -544,7 +526,7 @@ async def delete_workflow(
         )
     
     # Cancel and cleanup any active executions
-    _cleanup_active_executions(workflow_name)
+    await _cleanup_active_executions(workflow_name)
     
     # Delete all execution history for this workflow
     deleted_count = await execution_repo.delete_by_workflow(workflow_name)
@@ -580,80 +562,42 @@ async def execute_workflow(
         )
     
     # Check if already running (prevents duplicate executions)
-    if visual_executor._is_workflow_running(workflow_name):
+    if await is_workflow_running(workflow_name):
         return {
             "status": "already_running",
             "workflow_name": workflow_name,
             "message": f"Workflow '{workflow_name}' is already running"
         }
-    
+
     if background:
-        task = asyncio.create_task(visual_executor.execute_workflow(workflow, inputs=inputs))
-        visual_executor.background_tasks.add(task)
-        task.add_done_callback(visual_executor.background_tasks.discard)
-        # Keep a local reference to prevent premature garbage collection
-        _ = task  # noqa: F841
+        task = asyncio.create_task(
+            execute_workflow(workflow, inputs=inputs, manual=True)
+        )
+        if is_visual_workflow(workflow):
+            visual_executor.background_tasks.add(task)
+            task.add_done_callback(visual_executor.background_tasks.discard)
         return {
             "status": "started",
             "workflow_name": workflow_name,
             "message": f"Workflow '{workflow_name}' execution started in background"
         }
-    
-    return await visual_executor.execute_workflow(workflow, inputs=inputs)
+
+    result = await execute_workflow(workflow, inputs=inputs, manual=True)
+    if isinstance(result, dict):
+        return result
+    return result.model_dump(mode="json")
 
 
 @router.get("/{workflow_name}/stream")
 async def stream_workflow_execution(
     workflow_name: str = Depends(verify_workflow_exists),
 ):
-    """Stream events for an already-running workflow execution via SSE.
-    
-    Monitors an existing execution. Does NOT start a new one.
-    
-    Event types emitted:
-    - workflow_started, workflow_completed, workflow_failed
-    - node_started, node_completed, node_failed
-    - llm_token:   real-time LLM output token
-    - tool_call:   agent invoking a tool
-    - tool_result: tool execution result
-    - agent_error: error from agent execution
-    - agent_complete: agent finished
-    - keepalive:   connection keep-alive
-    """
-    
-    async def event_generator():
-        exec_id = visual_executor._is_workflow_running(workflow_name)
-        
-        if not exec_id:
-            yield f"data: {json.dumps({'event': 'no_execution', 'message': 'No active execution found'})}\n\n"
-            return
-        
-        queue = visual_executor.subscribe_to_events(exec_id)
-        try:
-            yield f"data: {json.dumps({'event': 'connected', 'execution_id': exec_id})}\n\n"
-            
-            while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=60.0)
-                    
-                    event_type = event.event_type
-                    event_data = event.dict()
-                    
-                    if event_type in ("llm_token", "tool_call", "tool_result", "agent_error", "agent_complete"):
-                        yield f"event: {event_type}\ndata: {json.dumps(event_data)}\n\n"
-                    else:
-                        yield f"data: {json.dumps(event_data)}\n\n"
-                    
-                    if event_type in ("workflow_completed", "workflow_failed"):
-                        break
-                except asyncio.TimeoutError:
-                    if exec_id not in visual_executor.active_executions:
-                        break
-                    yield f"data: {json.dumps({'event': 'keepalive'})}\n\n"
-        finally:
-            visual_executor.unsubscribe_from_events(exec_id, queue)
-    
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    """Stream events for an already-running workflow execution via SSE."""
+    return StreamingResponse(
+        workflow_name_event_stream(workflow_name),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 
 @router.get("/{workflow_name}/executions", response_model=List[dict])

@@ -26,6 +26,26 @@ const formatTime = (timeString) => {
   }
 };
 
+function schedulesMetadataEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (
+      x.name !== y.name ||
+      x.enabled !== y.enabled ||
+      x.schedule !== y.schedule ||
+      x.updatedAt !== y.updatedAt ||
+      x.startTime !== y.startTime ||
+      x.recurrence !== y.recurrence ||
+      x.type !== y.type
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 const fromApi = (wf) => {
   let startTime;
   let recurrence;
@@ -68,7 +88,10 @@ export const SchedulerProvider = ({ children }) => {
       setError(null);
       const apiWorkflows = await agentApiClient.listWorkflows();
       const normalized = Array.isArray(apiWorkflows) ? apiWorkflows.map(fromApi) : [];
-      setSchedules(normalized);
+      setSchedules(prev => {
+        if (silent && schedulesMetadataEqual(prev, normalized)) return prev;
+        return normalized;
+      });
     } catch (err) {
       console.error('Failed to load schedules:', err);
       if (!silent) setError('Failed to connect to agent-api');
@@ -82,7 +105,9 @@ export const SchedulerProvider = ({ children }) => {
     loadSchedules(false);
 
     // Background polling every 30 seconds (increased from 15s to reduce load)
-    const interval = setInterval(() => loadSchedules(true), 30000);
+    const interval = setInterval(() => {
+      if (!document.hidden) loadSchedules(true);
+    }, 30000);
 
     const handleVisibilityChange = () => {
       if (!document.hidden) loadSchedules(true);

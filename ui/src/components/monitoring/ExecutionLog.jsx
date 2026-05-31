@@ -8,10 +8,16 @@ import { Badge } from '@/components/ui/badge';
  */
 const ExecutionLog = ({ events, maxHeight = 400 }) => {
     const logEndRef = useRef(null);
+    const logContainerRef = useRef(null);
 
-    // Auto-scroll to bottom when new events arrive
+    // Auto-scroll only when the user is already near the bottom
     useEffect(() => {
-        logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+        const el = logContainerRef.current;
+        if (!el) return;
+        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        if (nearBottom) {
+            logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+        }
     }, [events]);
 
     const getEventColor = (type) => {
@@ -52,13 +58,18 @@ const ExecutionLog = ({ events, maxHeight = 400 }) => {
 
     return (
         <div
+            ref={logContainerRef}
             className="overflow-auto bg-[#1e1e1e] text-[#d4d4d4] font-mono text-sm rounded-lg"
             style={{ maxHeight: `${maxHeight}px` }}
         >
             <div className="divide-y divide-[#333]">
-                {events.map((event, index) => (
+                {events.map((event, index) => {
+                    const rowKey = event.timestamp
+                        ? `${event.timestamp}-${event.type || event.event_type || index}`
+                        : `event-${index}`;
+                    return (
                     <div
-                        key={index}
+                        key={rowKey}
                         className="px-3 py-2 hover:bg-[#2d2d2d] transition-colors"
                     >
                         <div className="flex items-center gap-2 flex-wrap">
@@ -69,7 +80,7 @@ const ExecutionLog = ({ events, maxHeight = 400 }) => {
                                 variant="outline"
                                 className={`min-w-[80px] justify-center ${getEventColor(event.type)}`}
                             >
-                                {event.type}
+                                {event.type || event.event_type}
                             </Badge>
                             <span className="text-[#d4d4d4]">
                                 {event.message || event.step || JSON.stringify(event.data || {})}
@@ -81,7 +92,8 @@ const ExecutionLog = ({ events, maxHeight = 400 }) => {
                             </div>
                         )}
                     </div>
-                ))}
+                    );
+                })}
                 <div ref={logEndRef} />
             </div>
         </div>

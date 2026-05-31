@@ -1,7 +1,8 @@
 """Main FastAPI application."""
 import logging as _bootstrap_logging
-import os
 from contextlib import asynccontextmanager
+
+from app.config import settings
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -16,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 #
 # Preferred remediation: set ``AWS_CA_BUNDLE`` to a PEM bundle containing
 # your corporate / self-signed CA and leave verification enabled.
-if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
+if not settings.aws_ssl_verify:
     _bootstrap_logging.getLogger(__name__).warning(
         "AWS_SSL_VERIFY=false set — disabling TLS verification for boto3 only. "
         "Prefer AWS_CA_BUNDLE pointing at your CA bundle in production."

@@ -131,6 +131,22 @@ export const agentApiClient = {
     },
 
     /**
+     * Detailed system status (scheduler, jobs, executions)
+     */
+    async getStatus() {
+        const response = await client.get('/api/v1/status');
+        return response.data;
+    },
+
+    /**
+     * Application settings (timeouts, embedding config, etc.)
+     */
+    async getSettings() {
+        const response = await client.get('/api/v1/settings');
+        return response.data;
+    },
+
+    /**
      * Stream execution events by execution ID (SSE)
      */
     streamExecution(executionId) {
