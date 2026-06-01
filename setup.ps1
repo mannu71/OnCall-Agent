@@ -75,9 +75,15 @@ function Test-CommandExists {
 }
 
 function Test-PythonVersion {
-    param([string]$PythonCommand)
+    param([string[]]$PythonCommand)
 
-    $versionText = & $PythonCommand -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+    $exe = $PythonCommand[0]
+    $pythonArgs = @()
+    if ($PythonCommand.Length -gt 1) {
+        $pythonArgs = $PythonCommand[1..($PythonCommand.Length - 1)]
+    }
+
+    $versionText = & $exe @pythonArgs -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
     if ($LASTEXITCODE -ne 0) {
         return $false
     }
@@ -99,16 +105,16 @@ function Resolve-PythonCommand {
         }
 
         if ($candidate -eq "py") {
-            if (Test-PythonVersion "py -3.12") {
+            if (Test-PythonVersion @("py", "-3.12")) {
                 return @("py", "-3.12")
             }
-            if (Test-PythonVersion "py -3") {
+            if (Test-PythonVersion @("py", "-3")) {
                 return @("py", "-3")
             }
             continue
         }
 
-        if (Test-PythonVersion "python") {
+        if (Test-PythonVersion @("python")) {
             return @("python")
         }
     }
