@@ -17,7 +17,7 @@ from app.infrastructure.persistence import WorkflowRepository, ExecutionReposito
 from app.api.deps import get_workflow_repo, get_execution_repo, verify_workflow_exists
 from app.core.scheduler import workflow_scheduler
 from app.services.visual_workflow_executor import visual_executor
-from app.workflow.routing import execute_workflow, is_workflow_running, is_visual_workflow
+from app.workflow.routing import execute_workflow as run_workflow, is_workflow_running, is_visual_workflow
 from app.services.workflow_output_extractor import extract_workflow_output
 from app.core.exceptions import NotFoundException
 from app.config import settings
@@ -53,9 +53,13 @@ def _params_to_cron(params: Dict[str, Any]) -> Optional[str]:
     New Schedule node stores: ``params.frequency``, ``params.time`` (HH:MM local),
     ``params.tz`` (IANA timezone), ``params.days`` (unused for now).
     """
+    from app.core.app_timezone import get_global_timezone_name
+
     frequency = (params.get('frequency') or 'Daily').strip()
     time_str = params.get('time') or '09:00'
-    tz_str = params.get('tz') or 'UTC'
+    # Fall back to the operator-configured global timezone when the Schedule
+    # node doesn't pin its own tz, instead of assuming UTC.
+    tz_str = params.get('tz') or get_global_timezone_name()
 
     freq_lower = frequency.lower()
 
@@ -571,7 +575,7 @@ async def execute_workflow(
 
     if background:
         task = asyncio.create_task(
-            execute_workflow(workflow, inputs=inputs, manual=True)
+            run_workflow(workflow, inputs=inputs, manual=True)
         )
         if is_visual_workflow(workflow):
             visual_executor.background_tasks.add(task)
@@ -582,7 +586,7 @@ async def execute_workflow(
             "message": f"Workflow '{workflow_name}' execution started in background"
         }
 
-    result = await execute_workflow(workflow, inputs=inputs, manual=True)
+    result = await run_workflow(workflow, inputs=inputs, manual=True)
     if isinstance(result, dict):
         return result
     return result.model_dump(mode="json")

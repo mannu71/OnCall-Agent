@@ -3,8 +3,10 @@ import { useNavigate } from 'react-router-dom';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { cn } from '@/lib/utils';
 import { 
   Loader2, 
   Send, 
@@ -42,15 +44,15 @@ const MESSAGE_TYPES = {
 };
 
 // Premium IconChip component for visual wow factor
-function IconChip({ tint = "violet", children }) {
+function IconChip({ tint = "red", children }) {
   const styles = {
-    violet: "bg-violet-50 text-violet-600 border-violet-100/60 dark:bg-violet-500/10 dark:text-violet-400 dark:border-violet-500/20",
+    red: "bg-red-50 text-primary border-red-100/60 dark:bg-primary/10 dark:text-red-400 dark:border-primary/20",
     blue: "bg-blue-50 text-blue-600 border-blue-100/60 dark:bg-blue-500/10 dark:text-blue-400 dark:border-blue-500/20",
     emerald: "bg-emerald-50 text-emerald-600 border-emerald-100/60 dark:bg-emerald-500/10 dark:text-emerald-400 dark:border-emerald-500/20",
     rose: "bg-rose-50 text-rose-600 border-rose-100/60 dark:bg-rose-500/10 dark:text-rose-400 dark:border-rose-500/20",
   };
   return (
-    <div className={`w-9 h-9 rounded-xl border flex items-center justify-center flex-shrink-0 transition-all duration-300 shadow-sm ${styles[tint] || styles.violet}`}>
+    <div className={cn("size-9 rounded-xl border flex items-center justify-center flex-shrink-0 transition-all duration-300 shadow-sm", styles[tint] || styles.red)}>
       {children}
     </div>
   );
@@ -68,7 +70,7 @@ function FormattedText({ text, isUser }) {
           return (
             <strong 
               key={index} 
-              className={isUser ? "text-white font-bold" : "text-red-600 font-bold"}
+              className={isUser ? "text-white font-bold" : "text-primary font-bold"}
             >
               {part.slice(2, -2)}
             </strong>
@@ -206,16 +208,12 @@ function Chat() {
 
   // Load agent-type workflows
   useEffect(() => {
-    if (DEV_MODE) {
-      loadAgents();
-    }
+    loadAgents();
   }, []);
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
-    if (DEV_MODE) {
-      scrollToBottom();
-    }
+    scrollToBottom();
   }, [messages]);
 
   const scrollToBottom = () => {
@@ -503,7 +501,7 @@ function Chat() {
       return (
         <div key={message.id} className="flex justify-center my-4 animate-in fade-in duration-300">
           <div className="bg-slate-100/80 backdrop-blur-sm border border-slate-200/50 rounded-full px-4 py-1.5 max-w-xl text-center shadow-sm flex items-center gap-2">
-            <Info className="w-3.5 h-3.5 text-slate-500" />
+            <Info className="size-3.5 text-slate-500" />
             <span className="text-slate-600 font-sans text-xs leading-none">
               <FormattedText text={textContent} isUser={false} />
             </span>
@@ -544,7 +542,7 @@ function Chat() {
                     className="inline-flex items-center gap-1.5 font-mono text-[10.5px] font-medium text-slate-600 bg-slate-50 border border-slate-200/60 px-2 py-0.5 rounded-lg hover:bg-slate-100/80 hover:text-slate-800 transition-colors shadow-sm cursor-help select-all"
                     title={`Tool run: ${t.name}`}
                   >
-                    <Terminal className="w-3.5 h-3.5 text-slate-400" />
+                    <Terminal className="size-3.5 text-slate-400" />
                     {t.name}
                     <span className="text-slate-300">·</span>
                     <span className="text-slate-400 font-normal">{t.t || t.duration || "0s"}</span>
@@ -580,7 +578,7 @@ function Chat() {
                           status.type === 'tool' 
                             ? 'border-blue-500 text-blue-600 bg-blue-50/20' 
                             : status.type === 'thinking' 
-                            ? 'border-violet-500 text-violet-600 bg-violet-50/20' 
+                            ? 'border-primary text-primary bg-red-50/20' 
                             : status.type === 'error' 
                             ? 'border-red-500 text-red-600 bg-red-50/20' 
                             : 'border-slate-400 text-slate-600'
@@ -593,7 +591,7 @@ function Chat() {
                   </div>
                 )}
                 <div className="flex items-center gap-2 bg-slate-50 border border-slate-100 rounded-lg p-2.5">
-                  <Loader2 className="w-4 h-4 animate-spin text-violet-500" />
+                  <Loader2 className="size-4 animate-spin text-primary" />
                   <span className="text-xs text-slate-500 font-medium">
                     {message.currentStatus?.message || 'Executing agent workflows...'}
                   </span>
@@ -613,42 +611,7 @@ function Chat() {
     );
   };
 
-  // Under development view (beautifully redesigned)
-  if (!DEV_MODE) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full p-8 text-center bg-slate-50/40">
-        <div className="relative mb-6">
-          <div className="absolute inset-0 bg-amber-400/20 rounded-full blur-xl animate-pulse" />
-          <div className="relative bg-white border border-slate-100 p-5 rounded-2xl shadow-md">
-            <Construction className="w-10 h-10 text-amber-500" />
-          </div>
-        </div>
-        <h1 className="text-2xl font-bold text-slate-900 mb-2">Agent Chat Redesign</h1>
-        <p className="text-sm text-slate-500 max-w-md mb-6 leading-relaxed">
-          The agent chat interface is optimized for local environments to enable direct CloudWatch and database integration.
-        </p>
-        <Card className="max-w-md bg-white border border-slate-200 rounded-2xl p-5 shadow-sm text-left">
-          <div className="flex gap-3">
-            <div className="w-5 h-5 rounded-full bg-violet-50 flex items-center justify-center text-violet-600 flex-shrink-0 mt-0.5">
-              <Info className="w-3.5 h-3.5" />
-            </div>
-            <div>
-              <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider mb-1">Local Development</h3>
-              <p className="text-xs text-slate-500 leading-relaxed mb-3">
-                Launch the local dev workflow to enable Electron container tracing and tool executions:
-              </p>
-              <code className="block bg-slate-50 border border-slate-100 p-2 rounded-lg font-mono text-[11px] text-slate-700 select-all mb-3">
-                npm run dev
-              </code>
-              <p className="text-[11px] text-slate-400 leading-relaxed">
-                You can also design complex templates via the <span className="font-semibold text-slate-600">Workflow</span> designer screen.
-              </p>
-            </div>
-          </div>
-        </Card>
-      </div>
-    );
-  }
+
 
   // Filter agents by search query
   const filteredAgents = agents.filter(agent => 
@@ -659,7 +622,7 @@ function Chat() {
     <div className="flex h-screen bg-slate-50 select-none overflow-hidden w-full max-w-full">
       
       {/* Sub-Sidebar: Left - Agent List */}
-      <Card className="w-[280px] border-r border-slate-200 rounded-none flex flex-col h-full bg-white flex-shrink-0">
+      <aside className="w-[280px] border-r border-slate-200 flex flex-col h-full bg-white flex-shrink-0">
         <div className="p-4 border-b border-slate-100 h-20 flex flex-col justify-center gap-0.5">
           <div className="flex items-center justify-between">
             <h2 className="font-bold text-slate-800 text-sm tracking-wide">Incident Agents</h2>
@@ -669,9 +632,9 @@ function Chat() {
               onClick={loadAgents} 
               disabled={isLoading}
               title="Refresh Agents List"
-              className="w-8 h-8 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-50"
+              className="size-8 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-50"
             >
-              <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin' : ''}`} />
+              <RefreshCw className={isLoading ? 'animate-spin' : ''} data-icon="inline-start" />
             </Button>
           </div>
           <p className="text-[11px] text-slate-400 font-medium">
@@ -682,12 +645,12 @@ function Chat() {
         {/* Sub-Sidebar Search */}
         <div className="px-4 py-2.5 border-b border-slate-100">
           <div className="relative">
-            <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" />
+            <Search className="absolute left-2.5 top-2.5 size-3.5 text-slate-400" />
             <Input 
               placeholder="Search agents..." 
               value={searchQuery}
               onChange={e => setSearchQuery(e.target.value)}
-              className="pl-8 h-8 text-xs bg-slate-50/50 border-slate-200 focus-visible:bg-white focus:border-violet-300 focus:ring-0 hover:bg-slate-50/80 transition-all rounded-lg"
+              className="pl-8 h-8 text-xs bg-slate-50/50 border-slate-200 focus-visible:bg-white focus:border-primary focus:ring-0 hover:bg-slate-50/80 transition-all rounded-lg"
             />
           </div>
         </div>
@@ -709,19 +672,22 @@ function Chat() {
                 <div key={agent.id} className="px-2 mb-1 relative group">
                   <div
                     onClick={() => !isLoading && handleSelectAgent(agent)}
-                    className={`w-full flex items-center justify-between px-3 py-3 rounded-xl transition-all duration-300 cursor-pointer border ${
+                    className={cn(
+                      "w-full flex items-center justify-between px-3 py-3 rounded-xl transition-all duration-300 cursor-pointer border",
                       isSelected 
-                        ? 'bg-violet-50/40 text-slate-800 border-violet-100 shadow-sm' 
-                        : 'text-slate-600 border-transparent hover:bg-slate-50/80'
-                    } ${isLoading ? 'opacity-65 cursor-not-allowed' : ''}`}
+                        ? 'bg-red-50/40 text-slate-800 border-red-100/50 shadow-sm' 
+                        : 'text-slate-600 border-transparent hover:bg-slate-50/80',
+                      isLoading && 'opacity-65 cursor-not-allowed'
+                    )}
                   >
                     <div className="flex items-center gap-3 flex-1 min-w-0">
-                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 transition-colors ${
+                      <div className={cn(
+                        "size-8 rounded-lg flex items-center justify-center flex-shrink-0 transition-colors",
                         isSelected 
-                          ? 'bg-violet-600 text-white shadow-md shadow-violet-100' 
+                          ? 'bg-primary text-white shadow-md shadow-red-100' 
                           : 'bg-slate-100 text-slate-500'
-                      }`}>
-                        <Bot className="w-4 h-4" />
+                      )}>
+                        <Bot className="size-4" />
                       </div>
                       <div className="flex-1 text-left min-w-0">
                         <div className="font-semibold text-xs text-slate-700 truncate">{agent.name}</div>
@@ -740,26 +706,29 @@ function Chat() {
                       <Button
                         size="icon"
                         variant="ghost"
-                        className={`w-7 h-7 rounded-md opacity-0 group-hover:opacity-100 transition-opacity hover:bg-slate-100 hover:text-slate-800 ${isSelected ? 'opacity-100' : ''}`}
+                        className={cn(
+                          "size-7 rounded-md opacity-0 group-hover:opacity-100 transition-opacity hover:bg-slate-100 hover:text-slate-800",
+                          isSelected && 'opacity-100'
+                        )}
                         onClick={(e) => { e.stopPropagation(); triggerAgent(agent); }}
                         disabled={isLoading}
                         title="Run Agent Workflow"
                       >
-                        <Play className="w-3.5 h-3.5 text-violet-600 fill-violet-600/10" />
+                        <Play className="text-primary fill-primary/10" data-icon="inline-start" />
                       </Button>
                     </div>
                   </div>
                   
                   {/* Sidebar indicator bar */}
                   {isSelected && (
-                    <div className="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-7 bg-violet-600 rounded-r-full shadow-md" />
+                    <div className="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-7 bg-primary rounded-r-full shadow-md" />
                   )}
                 </div>
               )
             })
           )}
         </div>
-      </Card>
+      </aside>
 
       {/* Main Column: Chat Panel */}
       <div className="flex-grow flex flex-col h-full bg-[#fafbfc] min-w-0 relative">
@@ -767,8 +736,8 @@ function Chat() {
         {/* Top Header Bar */}
         <header className="h-20 px-8 border-b border-slate-200/80 bg-white flex items-center justify-between flex-shrink-0 z-10 shadow-[0_1px_2px_0_rgba(15,23,42,0.01)]">
           <div className="flex items-center gap-3 min-w-0">
-            <IconChip tint="violet">
-              <Brain className="w-5 h-5" />
+            <IconChip tint="red">
+              <Brain className="size-5" />
             </IconChip>
             <div className="min-w-0">
               <h1 className="font-bold text-sm text-slate-800 tracking-wide truncate">
@@ -786,9 +755,9 @@ function Chat() {
             variant="success" 
             className="px-2.5 py-0.5 rounded-full flex items-center gap-1.5 text-[11px] font-semibold transition-all duration-300"
           >
-            <span className="relative flex h-1.5 w-1.5">
+            <span className="relative flex size-1.5">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500"></span>
+              <span className="relative inline-flex rounded-full size-1.5 bg-emerald-500"></span>
             </span>
             Online
           </Badge>
@@ -805,23 +774,23 @@ function Chat() {
           <div className="absolute bottom-28 left-8 z-20 w-80 bg-white border border-slate-200 rounded-2xl shadow-xl p-4 animate-in fade-in slide-in-from-bottom-3 duration-300">
             <div className="flex items-center justify-between border-b pb-2 mb-2">
               <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
-                <Wrench className="w-3.5 h-3.5 text-violet-500" />
+                <Wrench className="size-3.5 text-primary" />
                 Connected Tools ({toolsCount})
               </h3>
               <Button 
                 variant="ghost" 
                 size="icon" 
-                className="w-5 h-5 rounded-full hover:bg-slate-100" 
+                className="size-5 rounded-full hover:bg-slate-100" 
                 onClick={() => setShowToolsList(false)}
               >
-                <XCircle className="w-3.5 h-3.5 text-slate-400" />
+                <XCircle className="text-slate-400" data-icon="inline-start" />
               </Button>
             </div>
             <div className="space-y-1.5 max-h-52 overflow-auto pr-1">
               {toolsList.map(t => (
                 <div key={t} className="flex items-center gap-2.5 p-2 hover:bg-slate-50 rounded-xl text-xs transition-colors border border-transparent hover:border-slate-100">
-                  <div className="w-6 h-6 rounded-md bg-slate-50 flex items-center justify-center flex-shrink-0 text-slate-500">
-                    <Terminal className="w-3.5 h-3.5" />
+                  <div className="size-6 rounded-md bg-slate-50 flex items-center justify-center flex-shrink-0 text-slate-500">
+                    <Terminal className="size-3.5" />
                   </div>
                   <span className="font-mono text-slate-700 font-semibold truncate">{t}</span>
                 </div>
@@ -832,10 +801,10 @@ function Chat() {
 
         {/* Input tray panel */}
         <div className="p-8 pt-0 bg-transparent flex-shrink-0 z-10">
-          <div className="bg-white border border-slate-200 rounded-2xl p-3 flex flex-col gap-3 shadow-md hover:border-slate-300/80 transition-colors focus-within:border-violet-300 focus-within:ring-2 focus-within:ring-violet-500/10">
+          <div className="bg-white border border-slate-200 rounded-2xl p-3 flex flex-col gap-3 shadow-md hover:border-slate-300/80 transition-colors focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
             
             {/* Multi-line chat Textarea */}
-            <textarea 
+            <Textarea 
               ref={inputRef}
               value={inputValue} 
               onChange={e => setInputValue(e.target.value)} 
@@ -843,7 +812,7 @@ function Chat() {
               placeholder="Ask the agent to investigate, summarize, or run a workflow…"
               disabled={isLoading}
               rows={2}
-              className="w-full min-h-[44px] max-h-48 border-none outline-none resize-none font-sans text-sm text-slate-800 bg-transparent placeholder-slate-400 focus:ring-0 p-1"
+              className="w-full min-h-[44px] max-h-48 border-none outline-none resize-none bg-transparent placeholder:text-muted-foreground focus-visible:ring-0 focus-visible:ring-offset-0 p-1"
             />
             
             {/* Input Footer row */}
@@ -853,7 +822,10 @@ function Chat() {
                   variant="ghost" 
                   size="sm" 
                   onClick={() => setShowToolsList(!showToolsList)}
-                  className={`h-8 rounded-lg text-xs font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-700 ${showToolsList ? 'bg-violet-50 text-violet-600 hover:bg-violet-50 hover:text-violet-700' : ''}`}
+                  className={cn(
+                    "h-8 rounded-lg text-xs font-semibold text-muted-foreground",
+                    showToolsList && "bg-red-50 text-primary hover:bg-red-50"
+                  )}
                 >
                   @ tools
                 </Button>
@@ -864,7 +836,7 @@ function Chat() {
                   onClick={() => navigate('/scheduler')}
                   className="h-8 rounded-lg text-xs font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-700"
                 >
-                  <Calendar className="w-3.5 h-3.5 mr-1.5" />
+                  <Calendar data-icon="inline-start" />
                   Schedule
                 </Button>
                 
@@ -876,12 +848,12 @@ function Chat() {
               <Button 
                 onClick={handleSendMessage}
                 disabled={!inputValue.trim() || isLoading}
-                className="h-8 px-4 rounded-xl text-xs font-semibold bg-violet-600 hover:bg-violet-700 text-white flex items-center gap-1.5 shadow-md shadow-violet-600/10 cursor-pointer disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none"
+                className="h-8 px-4 rounded-xl text-xs font-semibold shadow-md shadow-primary/10 cursor-pointer"
               >
                 {isLoading ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <Loader2 className="animate-spin" data-icon="inline-start" />
                 ) : (
-                  <Send className="w-3.5 h-3.5" />
+                  <Send data-icon="inline-start" />
                 )}
                 Send
               </Button>
@@ -898,11 +870,11 @@ function Chat() {
         {/* Header */}
         <div className="p-4 border-b border-slate-100 flex items-center h-20 justify-between">
           <div className="font-bold text-xs text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
-            <Activity className="w-4 h-4 text-violet-500" />
+            <Activity className="size-4 text-primary" />
             Trace · this turn
           </div>
           {isLoading && (
-            <Badge variant="outline" className="px-2 py-0 text-[9px] uppercase tracking-wider text-violet-600 bg-violet-50 border-violet-100 border font-bold animate-pulse">
+            <Badge variant="outline" className="px-2 py-0 text-[9px] uppercase tracking-wider text-primary bg-red-50/20 border-red-100/50 font-bold animate-pulse">
               Live Running
             </Badge>
           )}
@@ -910,10 +882,10 @@ function Chat() {
         
         {/* Timeline container */}
         <div className="flex-1 overflow-auto p-5 relative">
-          <div className="flex flex-col gap-0 position-relative pl-5">
+          <div className="relative flex flex-col gap-0">
             
             {/* Connecting Timeline Thread */}
-            <div className="absolute left-7 top-7 bottom-7 w-[1.5px] bg-slate-100" />
+            <div className="absolute left-[5px] top-2 bottom-2 w-0.5 bg-slate-100" />
             
             {traceSteps.map((s, i) => {
               // Color styles for step dot types
@@ -932,9 +904,9 @@ function Chat() {
               }
 
               return (
-                <div key={i} className="relative pb-6 last:pb-2 group animate-in fade-in slide-in-from-bottom-2 duration-300">
+                <div key={i} className="relative pl-8 pb-6 last:pb-2 group animate-in fade-in slide-in-from-bottom-2 duration-300">
                   {/* Dot icon indicator */}
-                  <span className={`absolute -left-[19px] top-1.5 w-2.5 h-2.5 rounded-full border-2 border-white transition-all duration-300 ${colorClasses}`} />
+                  <span className={cn("absolute left-0 top-1.5 size-3 rounded-full border-2 border-white transition-all duration-300", colorClasses)} />
                   
                   <div className="flex justify-between items-baseline gap-2">
                     <span className={`font-bold text-[10px] uppercase tracking-wider ${s.l === 'tool' ? 'text-blue-600' : s.l === 'answer' ? 'text-rose-600' : 'text-slate-500'}`}>{s.l}</span>

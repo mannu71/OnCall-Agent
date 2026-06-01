@@ -325,3 +325,16 @@ class CodeReference(Base):
     __table_args__ = (
         Index("ix_code_refs_lookup", "repo_name", "symbol_id", "role"),
     )
+
+
+class AppSettingModel(Base):
+    """Application-wide key/value settings (e.g. ``global_timezone``).
+
+    A small generic store for runtime-editable scalar settings configured from
+    the Settings page. See migration ``011_app_settings.sql``.
+    """
+    __tablename__ = "app_settings"
+
+    key = Column(String(128), primary_key=True)
+    value = Column(Text)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)

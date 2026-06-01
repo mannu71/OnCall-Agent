@@ -59,7 +59,7 @@ const AppRoutes = () => {
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/scheduler" element={<Scheduler />} />
               <Route path="/log-watch" element={<LogWatchConfig />} />
-              {isDevelopment && <Route path="/chat" element={<Chat />} />}
+              <Route path="/chat" element={<Chat />} />
               <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
               <Route path="/workflow" element={<Workflow />} />
               <Route path="/explorer" element={<CodebaseExplorer />} />

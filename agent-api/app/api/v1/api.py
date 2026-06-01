@@ -14,6 +14,7 @@ from app.api.v1.endpoints import (
     log_watch,
     mcp_config,
     model_keys,
+    settings,
     trajectories,
     workflows,
 )
@@ -33,3 +34,4 @@ api_router.include_router(curator.router)
 api_router.include_router(code_analyzer.router)
 api_router.include_router(crawler.router)
 api_router.include_router(trajectories.router)
+api_router.include_router(settings.router)

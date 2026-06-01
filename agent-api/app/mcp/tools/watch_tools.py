@@ -49,6 +49,17 @@ def handle_exceptions(func: Callable) -> Callable:
             error_code = e.response.get('Error', {}).get('Code', 'Unknown')
             error_msg = e.response.get('Error', {}).get('Message', str(e))
             logger.error(f"AWS ClientError [{error_code}]: {error_msg}")
+            if error_code == "ExpiredTokenException" or "ExpiredToken" in str(e):
+                return {
+                    "error": True,
+                    "error_code": error_code,
+                    "message": (
+                        "[EXPIRED_CREDENTIALS] AWS session token has expired. "
+                        "No further CloudWatch tool calls will succeed until credentials are refreshed. "
+                        "Stop all tool use immediately and report this finding: "
+                        "AWS credentials must be renewed in the LLM configuration settings before retrying."
+                    ),
+                }
             return {
                 "error": True,
                 "error_code": error_code,
@@ -699,39 +710,45 @@ async def watch_log_groups(
             )
             fetch_tasks.append((reg, log_group, coro))
 
-    # Execute all fetches concurrently.
-    for reg, log_group, task in fetch_tasks:
+    # Execute all fetches concurrently. asyncio.gather schedules every coroutine
+    # at once so the boto3 calls run in parallel across the AWS thread pool;
+    # return_exceptions keeps one failing group from cancelling the rest.
+    fetched = await asyncio.gather(
+        *(coro for _, _, coro in fetch_tasks),
+        return_exceptions=True,
+    )
+
+    for (reg, log_group, _), logs in zip(fetch_tasks, fetched):
         result_key = f"{log_group}[{reg}]" if multi_region else log_group
-        try:
-            logs = await task
-            # Tag each event with its origin region when doing multi-region.
-            if multi_region:
-                for ev in logs:
-                    ev["region"] = reg
-            total_fetched = len(logs)
-            capped = logs[:max_events_per_group]
-            results[result_key] = {
-                "event_count": total_fetched,
-                "total_fetched": total_fetched,
-                "truncated": total_fetched > max_events_per_group,
-                "events": capped,
-                "region": reg,
-                "time_range": {
-                    "start": start_time.isoformat(),
-                    "end": end_time.isoformat(),
-                },
-            }
-            total_events += total_fetched
-        except Exception as e:
-            errors.append({"log_group": result_key, "region": reg, "error": str(e)})
+        if isinstance(logs, Exception):
+            errors.append({"log_group": result_key, "region": reg, "error": str(logs)})
             results[result_key] = {
                 "event_count": 0,
                 "total_fetched": 0,
                 "truncated": False,
                 "events": [],
                 "region": reg,
-                "error": str(e),
+                "error": str(logs),
             }
+            continue
+        # Tag each event with its origin region when doing multi-region.
+        if multi_region:
+            for ev in logs:
+                ev["region"] = reg
+        total_fetched = len(logs)
+        capped = logs[:max_events_per_group]
+        results[result_key] = {
+            "event_count": total_fetched,
+            "total_fetched": total_fetched,
+            "truncated": total_fetched > max_events_per_group,
+            "events": capped,
+            "region": reg,
+            "time_range": {
+                "start": start_time.isoformat(),
+                "end": end_time.isoformat(),
+            },
+        }
+        total_events += total_fetched
 
     return {
         "success": True,
@@ -799,6 +816,8 @@ async def analyze_log_patterns(
     results = {}
     quality_sources: List[Dict[str, Any]] = []
 
+    # Build one Insights bucket query per requested pattern type.
+    pattern_queries: List[tuple] = []
     for pattern_type in pattern_types:
         filter_clause = apply_severity_excludes(
             pattern_filters.get(pattern_type, ""), severity_excludes,
@@ -809,57 +828,71 @@ async def analyze_log_patterns(
         | stats count() by bin(5m)
         | sort @timestamp desc
         """
-        
-        try:
-            query_result = await watcher.query_with_insights(
-                log_group_names=log_group_names,
-                query_string=query_string,
-                start_time=start_time,
-                end_time=end_time
-            )
-            quality_sources.append(query_result)
+        pattern_queries.append((pattern_type, query_string))
 
-            entry: Dict[str, Any] = {
-                "status": query_result.get("status"),
-                "data": query_result.get("results", [])[:20],
-                "statistics": query_result.get("statistics"),
-            }
-            if query_result.get("partial"):
-                entry["partial"] = True
-                entry["sampling_ratio"] = query_result.get("sampling_ratio")
-            results[pattern_type] = entry
-        except Exception as e:
-            results[pattern_type] = {
-                "status": "error",
-                "error": str(e)
-            }
-    
+    # Unique-pattern query (distinct errors grouped by message). Built here so
+    # it can run concurrently with the per-type bucket queries.
+    _error_filter = apply_severity_excludes(
+        SEVERITY_PATTERNS["error"], severity_excludes,
+    )
+    unique_query = f"""
+    fields @timestamp, @message, @logStream
+    | filter {_error_filter}
+    | stats count() as occurrence_count,
+            count_distinct(@logStream) as affected_streams,
+            min(@timestamp) as first_seen,
+            max(@timestamp) as last_seen
+      by substr(@message, 0, 200) as error_pattern
+    | sort occurrence_count desc
+    | limit 50
+    """
+
+    # Fire every Insights query at once — they are independent and each one
+    # otherwise blocks on its own start_query + poll loop (seconds each).
+    _gathered = await asyncio.gather(
+        *(
+            watcher.query_with_insights(
+                log_group_names=log_group_names,
+                query_string=qs,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            for _, qs in pattern_queries
+        ),
+        watcher.query_with_insights(
+            log_group_names=log_group_names,
+            query_string=unique_query,
+            start_time=start_time,
+            end_time=end_time,
+        ),
+        return_exceptions=True,
+    )
+    *_pattern_query_results, _unique_outcome = _gathered
+
+    for (pattern_type, _), query_result in zip(pattern_queries, _pattern_query_results):
+        if isinstance(query_result, Exception):
+            results[pattern_type] = {"status": "error", "error": str(query_result)}
+            continue
+        quality_sources.append(query_result)
+        entry: Dict[str, Any] = {
+            "status": query_result.get("status"),
+            "data": query_result.get("results", [])[:20],
+            "statistics": query_result.get("statistics"),
+        }
+        if query_result.get("partial"):
+            entry["partial"] = True
+            entry["sampling_ratio"] = query_result.get("sampling_ratio")
+        results[pattern_type] = entry
+
     # -------------------------------------------------------------------
     # Unique patterns: group errors by message to identify distinct issues
     # instead of just counting them in 5-minute buckets.
     # -------------------------------------------------------------------
     unique_patterns = []
     try:
-        _error_filter = apply_severity_excludes(
-            SEVERITY_PATTERNS["error"], severity_excludes,
-        )
-        unique_query = f"""
-        fields @timestamp, @message, @logStream
-        | filter {_error_filter}
-        | stats count() as occurrence_count,
-                count_distinct(@logStream) as affected_streams,
-                min(@timestamp) as first_seen,
-                max(@timestamp) as last_seen
-          by substr(@message, 0, 200) as error_pattern
-        | sort occurrence_count desc
-        | limit 50
-        """
-        unique_result = await watcher.query_with_insights(
-            log_group_names=log_group_names,
-            query_string=unique_query,
-            start_time=start_time,
-            end_time=end_time,
-        )
+        if isinstance(_unique_outcome, Exception):
+            raise _unique_outcome
+        unique_result = _unique_outcome
         quality_sources.append(unique_result)
         raw_unique = unique_result.get("results", [])
         # Post-process: semantically group near-duplicate patterns by
@@ -1004,18 +1037,20 @@ async def detect_anomalies(
     data_quality: Dict[str, Any] = {}
 
     try:
-        current_result = await watcher.query_with_insights(
-            log_group_names=log_group_names,
-            query_string=bucket_query,
-            start_time=current_start,
-            end_time=end_time,
-        )
-
-        baseline_result = await watcher.query_with_insights(
-            log_group_names=log_group_names,
-            query_string=bucket_query,
-            start_time=baseline_start,
-            end_time=baseline_end,
+        # Current and baseline windows are independent — run them concurrently.
+        current_result, baseline_result = await asyncio.gather(
+            watcher.query_with_insights(
+                log_group_names=log_group_names,
+                query_string=bucket_query,
+                start_time=current_start,
+                end_time=end_time,
+            ),
+            watcher.query_with_insights(
+                log_group_names=log_group_names,
+                query_string=bucket_query,
+                start_time=baseline_start,
+                end_time=baseline_end,
+            ),
         )
 
         data_quality = _insights_quality_meta(current_result, baseline_result)
@@ -1181,22 +1216,29 @@ async def correlate_logs(
             logger.warning("correlate_logs Insights query failed: %s", e)
             return {"success": False, "error": str(e)}
     else:
-        # No ID — fetch recent events per group (no broken filter syntax).
+        # No ID — fetch recent events per group concurrently (no broken filter
+        # syntax). Independent per-group fetches run in parallel via gather.
         all_events: List[Dict[str, Any]] = []
-        for log_group in log_group_names:
-            try:
-                logs = await watcher.fetch_logs(
+        _group_logs = await asyncio.gather(
+            *(
+                watcher.fetch_logs(
                     log_group_name=log_group,
                     start_time=start_time,
                     end_time=end_time,
                     filter_pattern=None,
                     limit=200,
                 )
-                for event in logs:
-                    event["log_group"] = log_group
-                    all_events.append(event)
-            except Exception as e:
-                logger.warning("Error fetching logs from %s: %s", log_group, e)
+                for log_group in log_group_names
+            ),
+            return_exceptions=True,
+        )
+        for log_group, logs in zip(log_group_names, _group_logs):
+            if isinstance(logs, Exception):
+                logger.warning("Error fetching logs from %s: %s", log_group, logs)
+                continue
+            for event in logs:
+                event["log_group"] = log_group
+                all_events.append(event)
 
         all_events.sort(key=lambda x: x.get("timestamp", 0))
         for event in all_events:
@@ -1304,27 +1346,33 @@ async def discover_log_groups(
     # Optional tag filtering (applied after prefix discovery).
     if tag_key and log_groups:
         search_method = "tag" if not prefix else "prefix+tag"
-        filtered: List[Dict[str, Any]] = []
         # Cap at 200 groups to avoid excessive list_tags_for_resource calls.
         sample = log_groups[:200]
-        for grp in sample:
+        # Run tag lookups concurrently but bounded so we don't flood the API
+        # or the AWS thread pool with up to 200 simultaneous calls.
+        _tag_sem = asyncio.Semaphore(10)
+
+        async def _check_tags(grp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             arn = grp.get("arn")
             if not arn:
-                continue
-            try:
-                tags_resp = await run_in_aws_pool(
-                    lambda: client.list_tags_for_resource(resourceArn=arn),
-                )
-                tags = tags_resp.get("tags", {})
-                if tag_value:
-                    if tags.get(tag_key) == tag_value:
-                        filtered.append(grp)
-                else:
-                    if tag_key in tags:
-                        filtered.append(grp)
-            except Exception as tag_err:
-                logger.debug("discover_log_groups: skipping tag check for %s: %s", arn, tag_err)
-        log_groups = filtered
+                return None
+            async with _tag_sem:
+                try:
+                    tags_resp = await run_in_aws_pool(
+                        lambda a=arn: client.list_tags_for_resource(resourceArn=a),
+                    )
+                except Exception as tag_err:
+                    logger.debug(
+                        "discover_log_groups: skipping tag check for %s: %s", arn, tag_err
+                    )
+                    return None
+            tags = tags_resp.get("tags", {})
+            if tag_value:
+                return grp if tags.get(tag_key) == tag_value else None
+            return grp if tag_key in tags else None
+
+        _checked = await asyncio.gather(*(_check_tags(g) for g in sample))
+        log_groups = [g for g in _checked if g is not None]
 
     return {
         "success": True,

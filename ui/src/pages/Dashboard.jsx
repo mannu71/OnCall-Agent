@@ -511,18 +511,18 @@ export default function Dashboard() {
     return [
       {
         eyebrow: 'Active workflows',
-        value: totalSchedules,
+        value: enabledSchedules,
         icon: LayoutDashboard,
-        tint: 'red',
+        tint: 'emerald',
         hint: disabledSchedules > 0 ? `${disabledSchedules} disabled` : 'All enabled',
         trend: null
       },
       {
-        eyebrow: 'Enabled schedules',
-        value: enabledSchedules,
+        eyebrow: 'Total workflows',
+        value: totalSchedules,
         icon: Calendar,
-        tint: 'emerald',
-        hint: `${Math.round((enabledSchedules / Math.max(totalSchedules, 1)) * 100)}% of total`,
+        tint: 'slate',
+        hint: `${Math.round((enabledSchedules / Math.max(totalSchedules, 1)) * 100)}% active`,
         trend: null
       },
       {
@@ -618,7 +618,15 @@ export default function Dashboard() {
   const liveActivityFeed = useMemo(() => {
     const max = 5;
     const active = [...new Set((runningWorkflows || []).filter(Boolean))];
-    const synthetic = active.slice(0, max).map((name) => ({
+    // Avoid duplicating workflows that are already present in 'executions' as running/pending
+    const filteredActive = active.filter((name) => {
+      return !executions.some((e) => {
+        if (e.workflow_name !== name) return false;
+        const st = (e.status || '').toLowerCase();
+        return st === 'in_progress' || st === 'running' || st === 'pending';
+      });
+    });
+    const synthetic = filteredActive.slice(0, max).map((name) => ({
       execution_id: `__running__:${encodeURIComponent(name)}`,
       workflow_name: name,
       status: 'running',

@@ -16,13 +16,42 @@ export const TIMEZONE_LABELS = {
     'Asia/Singapore': 'Asia / Singapore',
 };
 
-export const TIMEZONE_OPTIONS = [
-    { value: 'Europe/London', label: 'Europe / London (UTC+00)' },
-    { value: 'Europe/Berlin', label: 'Europe / Berlin (UTC+01)' },
-    { value: 'America/New_York', label: 'America / New York (UTC−05)' },
-    { value: 'America/Los_Angeles', label: 'America / Los Angeles (UTC−08)' },
-    { value: 'Asia/Singapore', label: 'Asia / Singapore (UTC+08)' },
-];
+/** Current UTC-offset label for a zone, e.g. "GMT+8". Empty string on failure. */
+function tzOffsetLabel(tz) {
+    try {
+        const part = new Intl.DateTimeFormat('en-US', {
+            timeZone: tz,
+            timeZoneName: 'shortOffset',
+        })
+            .formatToParts(new Date())
+            .find((p) => p.type === 'timeZoneName');
+        return part ? part.value : '';
+    } catch {
+        return '';
+    }
+}
+
+/** Build the full IANA timezone option list (value + human label with offset). */
+function buildTimezoneOptions() {
+    let zones;
+    try {
+        zones = Intl.supportedValuesOf('timeZone');
+    } catch {
+        // Older runtimes without supportedValuesOf — fall back to a small set.
+        zones = [
+            'Europe/London', 'Europe/Berlin', 'America/New_York',
+            'America/Los_Angeles', 'Asia/Singapore', 'Asia/Kolkata', 'Asia/Tokyo',
+        ];
+    }
+    if (!zones.includes('UTC')) zones = ['UTC', ...zones];
+    return zones.map((tz) => {
+        const offset = tzOffsetLabel(tz);
+        const pretty = tz.replace(/_/g, ' ').replace(/\//g, ' / ');
+        return { value: tz, label: offset ? `${pretty} (${offset})` : pretty };
+    });
+}
+
+export const TIMEZONE_OPTIONS = buildTimezoneOptions();
 
 export const EMPTY_MCP_FORM = {
     name: '',
@@ -96,7 +125,6 @@ export function buildGauges({ apiHealth, systemStatus, llmCount, connectedLlms }
     const activeExec = systemStatus?.active_executions ?? apiHealth?.active_workflows ?? 0;
     const testedLlms = connectedLlms || 0;
     const idleLlms = Math.max(0, llmCount - testedLlms);
-    const modelsLive = testedLlms > 0 ? testedLlms : llmCount;
 
     return [
         {
@@ -125,7 +153,7 @@ export function buildGauges({ apiHealth, systemStatus, llmCount, connectedLlms }
         },
         {
             label: 'Models',
-            value: testedLlms > 0 ? `${testedLlms} live` : llmCount ? `${llmCount} configured` : 'None',
+            value: testedLlms > 0 ? `${testedLlms} live` : llmCount ? `${llmCount}\u00A0configured` : 'None',
             meta: llmCount
                 ? `${idleLlms} idle · ${llmCount} total`
                 : 'None configured',
@@ -135,7 +163,7 @@ export function buildGauges({ apiHealth, systemStatus, llmCount, connectedLlms }
                     : 0)
                 : 0,
             c: '#7c3aed',
-            num: llmCount ? `${modelsLive}/${llmCount}` : '0',
+            num: llmCount ? `${testedLlms}/${llmCount}` : '0',
         },
         {
             label: 'Executions',

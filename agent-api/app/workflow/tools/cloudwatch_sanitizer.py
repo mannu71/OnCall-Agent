@@ -121,15 +121,23 @@ class CloudWatchToolSanitizer:
         max_msg = self.DRILL_DOWN_MESSAGE_LEN if drill_down else self.MAX_MESSAGE_LEN
         token_budget = self.DRILL_DOWN_TOKEN_BUDGET if drill_down else self.TOKEN_BUDGET
         
-        # Use cheap char/4 heuristic for the *raw* (pre-sanitization) count.
-        # This value is telemetry-only; paying full tiktoken cost on a multi-MB
-        # payload before filtering would be wasteful and slow.
-        raw_str = str(raw_result)
-        raw_tokens = len(raw_str) // 4
-        
-        # Extract events from result
+        # Extract events first so the raw-size estimate below can be derived
+        # from message lengths instead of stringifying the (possibly multi-MB)
+        # raw payload — that str() was pure CPU/memory cost on every call.
         events = self._extract_events(raw_result)
         total_events = len(events)
+
+        # Telemetry-only raw-token estimate (char/4 heuristic). Log messages
+        # dominate payload size; add a small per-event overhead for the
+        # timestamp/keys. Fall back to a *bounded* string slice only when no
+        # events were extracted, so we never materialize a huge dict to a string.
+        if events:
+            raw_chars = (
+                sum(len(str(e.get("message", ""))) for e in events) + total_events * 40
+            )
+        else:
+            raw_chars = len(str(raw_result)[:4000])
+        raw_tokens = raw_chars // 4
         
         # Pipeline stages
         original_count = len(events)

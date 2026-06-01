@@ -276,6 +276,14 @@ class GetMetricDataInput(BaseModel):
         default=60,
         description="How far back to query (default 60 minutes).",
     )
+    include_series: bool = Field(
+        default=False,
+        description=(
+            "When false (default), return only the per-metric summary "
+            "(count/total/average/max/min/latest) to stay token-compact. "
+            "Set true only when you need the full timestamp/value arrays."
+        ),
+    )
 
 
 class GetMetricStatisticsInput(BaseModel):
@@ -769,6 +777,7 @@ def build_cloudwatch_agent_tools(
     async def _get_metric_data(
         metric_queries: List[Dict[str, Any]],
         time_range_minutes: int = 60,
+        include_series: bool = False,
     ) -> str:
         import json
         result = await get_metric_data(
@@ -776,6 +785,7 @@ def build_cloudwatch_agent_tools(
             time_range_minutes=_clamp(time_range_minutes),
             region=_region,
             credentials=_creds if _creds else None,
+            include_series=include_series,
         )
         return _budget_json(result, "cloudwatch_get_metric_data")
 

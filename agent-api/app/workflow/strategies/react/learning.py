@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from app.core.redact import redact
@@ -31,10 +31,11 @@ async def auto_learn(
     it must never propagate to the caller.
     """
     final_answer = result.get("final_answer") or ""
-    execution_end = datetime.now(timezone.utc)
+    execution_end: Optional["datetime"] = None
 
     # ── Phase 1: lightweight record_analysis ─────────────────────────
     try:
+        execution_end = datetime.now(timezone.utc)
         from app.services.knowledge_base import knowledge_base as _kb
         await _kb.record_analysis(
             log_group=str(execution_id or "unknown"),

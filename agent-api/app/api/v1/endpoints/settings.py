@@ -1,10 +1,17 @@
 """Settings API endpoints."""
 from typing import Dict, Any
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.api.deps import get_llm_config_repo
+from app.core.app_timezone import (
+    SETTING_KEY as TZ_SETTING_KEY,
+    get_global_timezone_name,
+    is_valid_timezone,
+    set_cached_timezone,
+)
+from app.infrastructure.persistence import app_settings_repository
 
 router = APIRouter()
 
@@ -27,6 +34,18 @@ class SettingsResponse(BaseModel):
     rate_limit_tracking_enabled: bool
     agent_recursion_limit: int
     agent_timeout_seconds: int
+    global_timezone: str = Field(
+        default="UTC",
+        description="Application-wide IANA timezone for scheduling and timestamp display.",
+    )
+
+
+class GeneralSettingsUpdate(BaseModel):
+    """Writable general settings."""
+
+    global_timezone: str = Field(
+        description="IANA timezone name, e.g. 'UTC' or 'Asia/Singapore'.",
+    )
 
 
 @router.get("/settings", response_model=SettingsResponse)
@@ -47,36 +66,67 @@ async def get_settings(llm_repo=Depends(get_llm_config_repo)) -> SettingsRespons
     except Exception:
         pass
 
+    # Resolve the persisted global timezone (falls back to the cached/default).
+    global_tz = await app_settings_repository.get(
+        TZ_SETTING_KEY, default=get_global_timezone_name()
+    )
+
+    # embedding_provider/model/region are optional config fields; guard with
+    # getattr so the endpoint doesn't crash on deployments that don't set them.
+    _emb_provider = getattr(settings, 'embedding_provider', 'bedrock')
+    _emb_model    = getattr(settings, 'embedding_model', 'amazon.titan-embed-text-v2:0')
+    _emb_region   = getattr(settings, 'embedding_region', 'us-east-1')
+
     # If an LLM is marked for embeddings, use its config
     if embedding_llm:
         return SettingsResponse(
             embedding=EmbeddingSettings(
-                provider=embedding_llm.get('provider', settings.embedding_provider),
-                model=embedding_llm.get('model', settings.embedding_model),
-                region=embedding_llm.get('region', settings.embedding_region),
-                dimensions=1024,  # Titan v2 uses 1024 dimensions
+                provider=embedding_llm.get('provider', _emb_provider),
+                model=embedding_llm.get('model', _emb_model),
+                region=embedding_llm.get('region', _emb_region),
+                dimensions=1024,
             ),
-            context_compression_enabled=settings.context_compression_enabled,
-            context_threshold_percent=settings.context_threshold_percent,
-            rate_limit_tracking_enabled=settings.rate_limit_tracking_enabled,
-            agent_recursion_limit=settings.agent_recursion_limit,
-            agent_timeout_seconds=settings.agent_timeout_seconds,
+            context_compression_enabled=getattr(settings, 'context_compression_enabled', False),
+            context_threshold_percent=getattr(settings, 'context_threshold_percent', 80.0),
+            rate_limit_tracking_enabled=getattr(settings, 'rate_limit_tracking_enabled', False),
+            agent_recursion_limit=getattr(settings, 'agent_recursion_limit', 12),
+            agent_timeout_seconds=getattr(settings, 'agent_timeout_seconds', 180),
+            global_timezone=global_tz,
         )
-    
+
     # Otherwise use default settings
     return SettingsResponse(
         embedding=EmbeddingSettings(
-            provider=settings.embedding_provider,
-            model=settings.embedding_model,
-            region=settings.embedding_region,
-            dimensions=1024,  # Titan v2 uses 1024 dimensions
+            provider=_emb_provider,
+            model=_emb_model,
+            region=_emb_region,
+            dimensions=1024,
         ),
-        context_compression_enabled=settings.context_compression_enabled,
-        context_threshold_percent=settings.context_threshold_percent,
-        rate_limit_tracking_enabled=settings.rate_limit_tracking_enabled,
-        agent_recursion_limit=settings.agent_recursion_limit,
-        agent_timeout_seconds=settings.agent_timeout_seconds,
+        context_compression_enabled=getattr(settings, 'context_compression_enabled', False),
+        context_threshold_percent=getattr(settings, 'context_threshold_percent', 80.0),
+        rate_limit_tracking_enabled=getattr(settings, 'rate_limit_tracking_enabled', False),
+        agent_recursion_limit=getattr(settings, 'agent_recursion_limit', 12),
+        agent_timeout_seconds=getattr(settings, 'agent_timeout_seconds', 180),
+        global_timezone=global_tz,
     )
+
+
+@router.put("/settings/general")
+async def update_general_settings(payload: GeneralSettingsUpdate) -> Dict[str, Any]:
+    """Persist editable general settings (currently the global timezone).
+
+    Validates the IANA timezone, stores it in ``app_settings``, and refreshes
+    the in-process cache so scheduling picks it up without a restart.
+    """
+    tz = (payload.global_timezone or "").strip()
+    if not is_valid_timezone(tz):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid IANA timezone: {payload.global_timezone!r}",
+        )
+    await app_settings_repository.set(TZ_SETTING_KEY, tz)
+    set_cached_timezone(tz)
+    return {"success": True, "global_timezone": tz}
 
 
 @router.get("/settings/embedding/models")

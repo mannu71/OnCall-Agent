@@ -69,6 +69,21 @@ export async function getStatus() {
 }
 
 // ============================================
+// Application Settings APIs
+// ============================================
+
+export async function getAppSettings() {
+    return apiRequest('/settings');
+}
+
+export async function updateGeneralSettings(generalSettings) {
+    return apiRequest('/settings/general', {
+        method: 'PUT',
+        body: JSON.stringify(generalSettings),
+    });
+}
+
+// ============================================
 // Workflow APIs
 // ============================================
 

@@ -55,7 +55,6 @@ const navigationItems = [
     title: 'Agent Chat',
     path: '/chat',
     icon: MessageSquare,
-    devOnly: true,
   },
   {
     id: 'workflow',

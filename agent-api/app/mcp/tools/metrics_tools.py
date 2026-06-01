@@ -97,6 +97,7 @@ async def get_metric_data(
     region: str = "us-east-1",
     credentials: Optional[Dict[str, Any]] = None,
     cache_ttl_seconds: int = 60,
+    include_series: bool = True,
 ) -> Dict[str, Any]:
     """Query CloudWatch Metrics using the GetMetricData API.
 
@@ -190,13 +191,24 @@ async def get_metric_data(
                 "average": round(sum(values) / len(values), 4),
                 "maximum": round(max(values), 4),
                 "minimum": round(min(values), 4),
+                "latest": round(values[-1], 4),
             }
         else:
             data["summary"] = {"count": 0, "total": 0}
 
+        # Token efficiency: the summary already captures the signal. Unless the
+        # caller explicitly wants the raw series, drop the per-datapoint arrays
+        # (which dominate the payload and otherwise get truncated mid-array by
+        # the agent token budget).
+        if not include_series:
+            data["points"] = len(values)
+            data.pop("timestamps", None)
+            data.pop("values", None)
+
     return {
         "success": True,
         "metrics": all_results,
+        "series_included": include_series,
         "time_range": {
             "start": start_time.isoformat(),
             "end": end_time.isoformat(),

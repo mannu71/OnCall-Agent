@@ -122,7 +122,32 @@
       "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\\\\agent-api\" -Recurse -File | Where-Object { $_.Extension -in @\\('.py', '.txt', '.toml', '.yml', '.yaml'\\) -or $_.Name -in @\\('Dockerfile', 'requirements.txt', 'pyproject.toml'\\) } | Select-Object -ExpandProperty FullName | Sort-Object)",
       "PowerShell(head -100)",
       "Bash(git log *)",
-      "Bash(grep \"\\\\.py$\")"
+      "Bash(grep \"\\\\.py$\")",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\csinvmmn\\\\source\\\\repos\\\\kyc-protect-oncall-agent\" -Directory)",
+      "Bash(xargs -I {} sh -c 'echo \"=== {} ===\" && head -20 {}')",
+      "Bash(python -m py_compile app/workflow/strategies/react/learning.py app/workflow/strategies/react/strategy.py)",
+      "Bash(python -m py_compile app/mcp/tools/watch_tools.py)",
+      "Bash(python -m py_compile app/workflow/tools/cloudwatch_sanitizer.py app/mcp/tools/metrics_tools.py app/workflow/tools/cloudwatch_agent_tools.py)",
+      "Bash(cd /c/Users/csinvmmn/source/repos/kyc-protect-oncall-agent/agent-api)",
+      "Bash(python -m py_compile app/core/app_timezone.py app/infrastructure/persistence/app_settings_repository.py app/infrastructure/persistence/__init__.py app/models/db_models.py app/api/v1/endpoints/settings.py app/api/v1/api.py app/core/scheduler.py app/api/v1/endpoints/workflows.py app/main.py)",
+      "Bash(python -m pytest -k \"cloudwatch or watch_tools or react or learning or timezone or settings\" -q)",
+      "Bash(python -m py_compile app/workflow/strategies/react/learning.py app/workflow/strategies/react/strategy.py app/mcp/tools/watch_tools.py app/mcp/tools/metrics_tools.py app/workflow/tools/cloudwatch_sanitizer.py app/workflow/tools/cloudwatch_agent_tools.py app/models/db_models.py app/infrastructure/persistence/app_settings_repository.py app/infrastructure/persistence/__init__.py app/api/deps.py app/api/v1/endpoints/settings.py app/api/v1/api.py app/api/v1/endpoints/workflows.py app/core/app_timezone.py app/core/scheduler.py app/main.py)",
+      "Bash(npx --no-install eslint src/components/settings/settingsConstants.js)",
+      "Bash(echo \"eslint exit: $?\")",
+      "Bash(cmd //c run-migration.bat)",
+      "Bash(python -c \"import psycopg2; print\\('psycopg2 available'\\)\")",
+      "Bash(python -c \"import asyncpg; print\\('asyncpg available'\\)\")",
+      "Bash(echo \"exit: $?\")",
+      "Bash(curl -s http://localhost:8000/api/v1/settings)",
+      "Bash(curl -s -X PUT http://localhost:8000/api/v1/settings/general -H \"Content-Type: application/json\" -d '{\"global_timezone\":\"Asia/Kolkata\"}')",
+      "Bash(curl -s http://localhost:8000/api/v1/health)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('global_timezone:', d.get\\('global_timezone'\\)\\)\")",
+      "Bash(curl -s -X PUT http://localhost:8000/api/v1/settings/general -H \"Content-Type: application/json\" -d '{\"global_timezone\":\"Bad/Zone\"}')",
+      "Bash(curl -s -X PUT http://localhost:8000/api/v1/settings/general -H \"Content-Type: application/json\" -d '{\"global_timezone\":\"Not/AZone\"}')",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('health:', d.get\\('status'\\)\\)\")",
+      "Bash(curl -s -w \"\\\\nHTTP %{http_code}\" -X PUT http://localhost:8000/api/v1/settings/general -H \"Content-Type: application/json\" -d '{\"global_timezone\":\"Bad/Zone\"}')",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('timezone now:', d.get\\('global_timezone'\\)\\)\")",
+      "Bash(curl -s -w \" HTTP %{http_code}\" -X PUT http://localhost:8000/api/v1/settings/general -H \"Content-Type: application/json\" -d '{\"global_timezone\":\"Bad/Zone\"}')"
     ]
   }
 }

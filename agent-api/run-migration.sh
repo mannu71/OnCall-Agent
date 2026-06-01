@@ -37,6 +37,7 @@ MIGRATIONS=(
   "migrations/008_workflow_indexing_status.sql"
   "migrations/009_knowledge_graph.sql"
   "migrations/010_kg_domain_mapping.sql"
+  "migrations/011_app_settings.sql"
 )
 
 for migration in "${MIGRATIONS[@]}"; do

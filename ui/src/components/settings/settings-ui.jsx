@@ -8,6 +8,28 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
+// Import official Shadcn UI components
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from '@/components/ui/select';
+import {
+    Dialog,
+    DialogContent,
+    DialogHeader,
+    DialogTitle,
+    DialogDescription,
+    DialogFooter,
+} from '@/components/ui/dialog';
+
 export { cn };
 export const sClasses = cn;
 
@@ -61,10 +83,12 @@ const BADGE_VARIANTS = {
     outline: 'border border-border bg-transparent text-slate-500',
 };
 
+// Use Shadcn Badge under the hood
 export const SBadge = ({ variant = 'default', dot, icon, children, className, title }) => (
-    <span
+    <Badge
+        variant="outline"
         className={cn(
-            'inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-semibold tracking-wide',
+            'inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-semibold tracking-wide border-0 shadow-none',
             BADGE_VARIANTS[variant] || BADGE_VARIANTS.default,
             className,
         )}
@@ -73,24 +97,10 @@ export const SBadge = ({ variant = 'default', dot, icon, children, className, ti
         {dot && <span className="size-1.5 rounded-full bg-current" />}
         {icon}
         {children}
-    </span>
+    </Badge>
 );
 
-const BUTTON_VARIANTS = {
-    primary:
-        'border-red-700 bg-gradient-to-b from-red-500 to-red-600 text-white shadow-[0_4px_10px_-3px_rgb(220_38_38/0.45)] hover:from-red-600 hover:to-red-700',
-    outline:
-        'border-border bg-background text-slate-700 shadow-sm hover:border-slate-300 hover:text-foreground',
-    ghost: 'text-slate-500 hover:bg-slate-100 hover:text-foreground',
-};
-
-const BUTTON_SIZES = {
-    md: 'px-3.5 py-2 text-[13px]',
-    sm: 'px-2.5 py-1.5 text-xs',
-    xs: 'px-2 py-1 text-xs',
-    icon: 'size-8 p-0',
-};
-
+// Use Shadcn Button under the hood
 export const SButton = ({
     variant = 'outline',
     size = 'md',
@@ -98,23 +108,32 @@ export const SButton = ({
     children,
     className,
     ...rest
-}) => (
-    <button
-        type="button"
-        className={cn(
-            'inline-flex items-center justify-center gap-1.5 rounded-lg border border-transparent font-medium whitespace-nowrap transition-all active:translate-y-px disabled:pointer-events-none disabled:opacity-50',
-            BUTTON_VARIANTS[variant] || BUTTON_VARIANTS.outline,
-            BUTTON_SIZES[size] || BUTTON_SIZES.md,
-            '[&_svg]:size-3.5',
-            size === 'icon' && '[&_svg]:size-4',
-            className,
-        )}
-        {...rest}
-    >
-        {icon}
-        {children}
-    </button>
-);
+}) => {
+    let shadcnVariant = variant;
+    if (variant === 'primary') {
+        shadcnVariant = 'default';
+    }
+
+    let shadcnSize = size;
+    if (size === 'md') {
+        shadcnSize = 'default';
+    }
+
+    return (
+        <Button
+            variant={shadcnVariant}
+            size={shadcnSize}
+            className={cn(
+                'font-medium whitespace-nowrap transition-all active:translate-y-px disabled:pointer-events-none disabled:opacity-50',
+                className
+            )}
+            {...rest}
+        >
+            {icon && <span className="inline-flex shrink-0 items-center justify-center [&_svg]:size-3.5">{icon}</span>}
+            {children}
+        </Button>
+    );
+};
 
 export const SToggle = ({ checked, onChange, className, ...rest }) => (
     <button
@@ -171,32 +190,67 @@ export const SField = ({ label, help, children }) => (
     </div>
 );
 
+// Use Shadcn Input under the hood
 export const SInput = ({ mono, suffix, className, ...rest }) => {
-    const inputClass = cn(INPUT, mono && 'font-mono text-xs', className);
+    const inputClass = cn(
+        "h-8 text-[13.5px]",
+        mono && 'font-mono text-xs',
+        className
+    );
 
     if (suffix) {
         return (
-            <div className="flex overflow-hidden rounded-lg border border-border bg-background focus-within:border-slate-400 focus-within:ring-[3px] focus-within:ring-slate-400/20">
-                <input className={cn(inputClass, 'border-0 shadow-none focus:ring-0')} {...rest} />
-                {suffix}
+            <div className="flex w-full items-stretch overflow-hidden rounded-lg border border-input bg-background focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
+                <input
+                    className={cn(
+                        "h-8 w-full min-w-0 bg-transparent px-2.5 py-1 text-base md:text-sm outline-none border-0 shadow-none focus:ring-0 focus-visible:ring-0 focus-visible:border-0",
+                        mono && 'font-mono text-xs',
+                        className
+                    )}
+                    {...rest}
+                />
+                <div className="flex shrink-0 items-center justify-center border-l border-input">
+                    {suffix}
+                </div>
             </div>
         );
     }
-    return <input className={inputClass} {...rest} />;
+    return <Input className={inputClass} {...rest} />;
 };
 
-export const SSelect = ({ options, className, ...rest }) => (
-    <select className={cn(SELECT, className)} {...rest}>
-        {options.map((o) => (
-            <option key={o.value} value={o.value}>
-                {o.label}
-            </option>
-        ))}
-    </select>
-);
+// Use Shadcn Select under the hood
+export const SSelect = ({ options, value, onChange, className, disabled, ...rest }) => {
+    return (
+        <Select
+            value={value}
+            onValueChange={(val) => onChange?.({ target: { value: val } })}
+            disabled={disabled}
+            {...rest}
+        >
+            <SelectTrigger className={cn("h-8 text-[13.5px] bg-background border-input", className)}>
+                <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+                {options.map((o) => (
+                    <SelectItem key={o.value} value={o.value}>
+                        {o.label}
+                    </SelectItem>
+                ))}
+            </SelectContent>
+        </Select>
+    );
+};
 
-export const STextarea = ({ className, ...props }) => (
-    <textarea className={cn(INPUT, 'min-h-[84px] resize-y', className)} {...props} />
+// Use Shadcn Textarea under the hood
+export const STextarea = ({ className, mono, ...props }) => (
+    <Textarea
+        className={cn(
+            'min-h-[84px] resize-y text-[13.5px]',
+            mono && 'font-mono text-xs',
+            className
+        )}
+        {...props}
+    />
 );
 
 export const SSection = ({ id, title, desc, actions, icon, children }) => (
@@ -252,69 +306,38 @@ export const SStatusBadge = ({ status, message }) => {
     );
 };
 
+// Use Shadcn Dialog components under the hood
 export const SDialog = ({ open, onClose, title, desc, children, footer, maxWidth }) => {
-    useEffect(() => {
-        if (!open) return undefined;
-        const onKey = (e) => {
-            if (e.key === 'Escape') onClose();
-        };
-        document.addEventListener('keydown', onKey);
-        return () => document.removeEventListener('keydown', onKey);
-    }, [open, onClose]);
-
-    if (!open) return null;
-
     return (
-        <div
-            className="fixed inset-0 z-[60] grid place-items-center bg-slate-950/55 p-4 backdrop-blur-[2px] animate-in fade-in duration-150 sm:p-5"
-            onMouseDown={(e) => {
-                if (e.target === e.currentTarget) onClose();
-            }}
-            role="presentation"
-        >
-            <div
-                className={cn(
-                    'relative flex max-h-[calc(100dvh-2rem)] w-full max-w-[540px] flex-col overflow-hidden rounded-[18px] border border-border bg-card shadow-2xl animate-in zoom-in-95 duration-150 sm:max-h-[calc(100vh-40px)]',
-                )}
-                style={maxWidth ? { maxWidth } : undefined}
-                role="dialog"
-                aria-modal="true"
+        <Dialog open={open} onOpenChange={(openState) => {
+            if (!openState) onClose?.();
+        }}>
+            <DialogContent
+                className="max-h-[calc(100dvh-2rem)] overflow-hidden flex flex-col p-0 border border-border bg-card shadow-2xl sm:max-h-[calc(100vh-40px)] gap-0"
+                style={maxWidth ? { maxWidth, width: '100%' } : undefined}
             >
                 {title && (
-                    <div className="border-b border-border px-4 pb-4 pt-5 sm:px-6">
-                        <div className="flex items-start justify-between gap-3">
-                            <div className="min-w-0">
-                                <h3 className="m-0 break-words text-base font-semibold text-foreground">{title}</h3>
-                                {desc && <p className="m-0 mt-1 text-[13px] text-slate-500">{desc}</p>}
-                            </div>
-                            <SButton
-                                variant="ghost"
-                                size="icon"
-                                onClick={onClose}
-                                icon={<X className={ICON_SM} />}
-                                aria-label="Close"
-                            />
-                        </div>
-                    </div>
+                    <DialogHeader className="border-b border-border px-4 pb-4 pt-5 sm:px-6 flex flex-col space-y-1.5 text-left">
+                        <DialogTitle className="text-base font-semibold text-foreground leading-none tracking-tight">
+                            {title}
+                        </DialogTitle>
+                        {desc && (
+                            <DialogDescription className="text-[13px] text-slate-500 mt-1">
+                                {desc}
+                            </DialogDescription>
+                        )}
+                    </DialogHeader>
                 )}
-                {!title && (
-                    <SButton
-                        variant="ghost"
-                        size="icon"
-                        onClick={onClose}
-                        aria-label="Close"
-                        className="absolute right-3.5 top-3.5 z-10"
-                        icon={<X className={ICON_SM} />}
-                    />
-                )}
-                <div className="flex flex-col gap-4 overflow-y-auto px-4 py-5 sm:px-6">{children}</div>
+                <div className="flex-1 overflow-y-auto px-4 py-5 sm:px-6 flex flex-col gap-4">
+                    {children}
+                </div>
                 {footer && (
-                    <div className="flex flex-col-reverse gap-2 border-t border-border bg-slate-50 px-4 py-4 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end sm:px-6 [&>button]:w-full [&>button]:sm:w-auto">
+                    <DialogFooter className="flex flex-col-reverse gap-2 border-t border-border bg-slate-50 px-4 py-4 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end sm:px-6 [&>button]:w-full [&>button]:sm:w-auto">
                         {footer}
-                    </div>
+                    </DialogFooter>
                 )}
-            </div>
-        </div>
+            </DialogContent>
+        </Dialog>
     );
 };
 
@@ -328,19 +351,24 @@ export const SDlgField = ({ label, hint, children }) => (
     </div>
 );
 
-export const DlgAlert = ({ variant = 'info', children, className }) => (
-    <div
-        className={cn(
-            'rounded-lg px-3 py-2.5 text-xs leading-relaxed',
-            variant === 'info' && 'border border-border bg-slate-50 text-slate-600',
-            variant === 'success' && 'border border-emerald-200 bg-emerald-50 text-emerald-800',
-            variant === 'warning' && 'border border-amber-300 bg-amber-50 text-amber-900',
-            className,
-        )}
-    >
-        {children}
-    </div>
-);
+// Use Shadcn Alert components under the hood
+export const DlgAlert = ({ variant = 'info', children, className }) => {
+    return (
+        <Alert
+            className={cn(
+                'rounded-lg px-3 py-2.5 text-xs leading-relaxed border',
+                variant === 'info' && 'border-border bg-slate-50 text-slate-600',
+                variant === 'success' && 'border-emerald-200 bg-emerald-50 text-emerald-800',
+                variant === 'warning' && 'border-amber-300 bg-amber-50 text-amber-900',
+                className
+            )}
+        >
+            <AlertDescription className="text-xs text-inherit">
+                {children}
+            </AlertDescription>
+        </Alert>
+    );
+};
 
 export const SToast = ({ message }) => (
     <div className="fixed bottom-7 left-1/2 z-[70] flex -translate-x-1/2 items-center gap-2.5 rounded-[10px] bg-slate-900 px-4 py-3 text-[13px] text-white shadow-lg animate-in slide-in-from-bottom-2 duration-200">
@@ -348,3 +376,4 @@ export const SToast = ({ message }) => (
         <span>{message}</span>
     </div>
 );
+

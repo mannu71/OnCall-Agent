@@ -118,6 +118,8 @@ class ReactStrategy(BaseStrategy):
 
             tools = await setup_tools(tools_config, mcp_manager, execution_id)
 
+            _expired_creds_msg: Optional[str] = None
+
             if cloudwatch_config:
                 try:
                     from app.core.aws_credentials import resolve_aws_credentials
@@ -127,20 +129,79 @@ class ReactStrategy(BaseStrategy):
                         aws_profile=cloudwatch_config.get("aws_profile"),
                         aws_region=cloudwatch_config.get("aws_region", "us-east-1"),
                     )
-                    tools.extend(
-                        build_cloudwatch_agent_tools(
-                            region=cw_region,
-                            credentials=cw_creds,
-                            log_groups=cloudwatch_config.get("log_groups"),
-                            severity_excludes=cloudwatch_config.get("severity_excludes"),
+
+                    # Pre-flight: validate credentials before invoking the LLM.
+                    # A cheap STS call costs nothing vs. a full agent loop.
+                    try:
+                        import boto3
+                        from botocore.exceptions import ClientError as _BotoClientError
+                        from app.core.thread_pools import run_in_aws_pool
+
+                        _sts_kwargs: Dict[str, Any] = {"region_name": cw_region}
+                        if cw_creds.get("aws_profile"):
+                            _sts_session = boto3.Session(
+                                profile_name=cw_creds["aws_profile"], region_name=cw_region
+                            )
+                            _sts_client = _sts_session.client("sts")
+                        else:
+                            if cw_creds.get("access_key_id"):
+                                _sts_kwargs["aws_access_key_id"] = cw_creds["access_key_id"]
+                                _sts_kwargs["aws_secret_access_key"] = cw_creds.get("secret_access_key", "")
+                                if cw_creds.get("session_token"):
+                                    _sts_kwargs["aws_session_token"] = cw_creds["session_token"]
+                            _sts_client = boto3.client("sts", **_sts_kwargs)
+                        await run_in_aws_pool(_sts_client.get_caller_identity)
+                    except _BotoClientError as _sts_err:
+                        _ec = _sts_err.response.get("Error", {}).get("Code", "")
+                        if _ec == "ExpiredTokenException" or "ExpiredToken" in str(_sts_err):
+                            _expired_creds_msg = (
+                                "AWS credentials are expired. Please refresh your AWS session token "
+                                "in the LLM configuration settings and retry the workflow."
+                            )
+                            logger_instance.warning(
+                                "ReactStrategy: AWS credentials expired — aborting before LLM invocation (exec=%s)",
+                                execution_id,
+                                extra={"execution_id": execution_id},
+                            )
+                    except Exception as _sts_probe_err:
+                        logger_instance.debug(
+                            "ReactStrategy: STS credential pre-flight skipped (%s)",
+                            redact(str(_sts_probe_err)),
+                            extra={"execution_id": execution_id},
                         )
-                    )
+
+                    if not _expired_creds_msg:
+                        tools.extend(
+                            build_cloudwatch_agent_tools(
+                                region=cw_region,
+                                credentials=cw_creds,
+                                log_groups=cloudwatch_config.get("log_groups"),
+                                severity_excludes=cloudwatch_config.get("severity_excludes"),
+                            )
+                        )
                 except Exception as _cw_err:
                     logger_instance.warning(
                         "ReactStrategy: failed to build CloudWatch tools (non-fatal): %s",
                         redact(str(_cw_err)),
                         extra={"execution_id": execution_id},
                     )
+
+            if _expired_creds_msg:
+                return {
+                    "type": "react",
+                    "user_query": user_query,
+                    "final_answer": _expired_creds_msg,
+                    "messages": [],
+                    "message_count": 0,
+                    "tool_calls": [],
+                    "model": "none",
+                    "provider": "none",
+                    "supervisor_escalated": False,
+                    "supervisor_reason": None,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                }
 
             if code_analyzer_config:
                 try:
@@ -307,9 +368,18 @@ class ReactStrategy(BaseStrategy):
                     break
                 break
 
-            await auto_learn(
-                user_query, result, execution_id, execution_start, recall_hits, logger_instance
-            )
+            # Post-run learning is best-effort and must never sink a successful
+            # investigation. Any failure here is logged and swallowed.
+            try:
+                await auto_learn(
+                    user_query, result, execution_id, execution_start, recall_hits, logger_instance
+                )
+            except Exception as _learn_call_err:
+                logger_instance.warning(
+                    "ReactStrategy: auto_learn failed (non-fatal): %s",
+                    redact(str(_learn_call_err)),
+                    extra={"execution_id": execution_id},
+                )
 
             if execution_id is not None:
                 try:

@@ -21,11 +21,21 @@ def get_workflow_repo() -> WorkflowRepository:
 
 def get_execution_repo() -> ExecutionRepository:
     """Get execution repository dependency.
-    
+
     Returns:
         ExecutionRepository instance
     """
     return get_execution_repository()
+
+
+def get_llm_config_repo():
+    """Get LLM configuration repository dependency.
+
+    Returns:
+        Shared ``LLMConfigRepository`` singleton.
+    """
+    from app.infrastructure.persistence import llm_config_repository
+    return llm_config_repository
 
 
 # Service dependencies

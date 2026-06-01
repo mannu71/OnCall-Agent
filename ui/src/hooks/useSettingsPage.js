@@ -16,6 +16,7 @@ import {
     updateMCPInputValue,
 } from '../services/mcpService';
 import { deleteModelKey, getModelKeys, upsertModelKey } from '../services/modelKeyService';
+import { getAppSettings, updateGeneralSettings } from '../services/apiClient';
 import agentApiClient from '../services/agentApiClient';
 import { useAgentApiHealth } from './useAgentApiHealth';
 import { usePersistedState, useSettingsToast } from './usePersistedState';
@@ -59,6 +60,29 @@ export function useSettingsPage() {
     const [confirmDestructive, setConfirmDestructive] = usePersistedState(LS_CONFIRM_DESTRUCTIVE, true);
     const [agentTimeout, setAgentTimeout] = useState('180');
     const [systemStatus, setSystemStatus] = useState(null);
+
+    // Load the persisted global timezone from the backend on mount. The backend
+    // is the source of truth for scheduling; localStorage is just a fast cache.
+    useEffect(() => {
+        let cancelled = false;
+        getAppSettings()
+            .then((data) => {
+                if (!cancelled && data?.global_timezone) {
+                    setTimezone(data.global_timezone);
+                }
+            })
+            .catch(() => { /* offline: keep cached localStorage value */ });
+        return () => { cancelled = true; };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // Persist timezone changes to the backend (and keep the localStorage cache).
+    const handleTimezoneChange = useCallback((tz) => {
+        setTimezone(tz);
+        updateGeneralSettings({ global_timezone: tz })
+            .then(() => showToast('Timezone updated'))
+            .catch((err) => showToast(err?.message || 'Failed to update timezone', 'error'));
+    }, [setTimezone, showToast]);
 
     const { apiHealth, loading: healthLoading, recheckWithSpinner } = useAgentApiHealth({
         initialShowSpinner: true,
@@ -250,6 +274,18 @@ export function useSettingsPage() {
             setConnectionError(setLLMConnectionStatus, llmName, error);
         }
     }, []);
+
+    // Automatically test LLM connections once when they are loaded on mount
+    const autoTestedRef = useRef(false);
+    useEffect(() => {
+        const names = Object.keys(llms);
+        if (names.length > 0 && !autoTestedRef.current) {
+            autoTestedRef.current = true;
+            names.forEach((name) => {
+                testLLMConnectionHandler(name);
+            });
+        }
+    }, [llms, testLLMConnectionHandler]);
 
     const openMcpDialog = useCallback(async (serverName = null) => {
         const currentInputValues = await getMCPInputValues();
@@ -570,7 +606,7 @@ export function useSettingsPage() {
             workspaceName,
             setWorkspaceName,
             timezone,
-            setTimezone,
+            setTimezone: handleTimezoneChange,
             agentTimeout,
             setAgentTimeout,
             confirmDestructive,

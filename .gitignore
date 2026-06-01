@@ -58,5 +58,3 @@ agent-api/data/
 tmp/
 temp/
 *.tmp
-.claude/worktrees/
-mlflow-master/

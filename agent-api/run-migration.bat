@@ -33,6 +33,7 @@ CALL :run_migration "migrations\007_drop_v1_code_analyzer.sql"
 CALL :run_migration "migrations\008_workflow_indexing_status.sql"
 CALL :run_migration "migrations\009_knowledge_graph.sql"
 CALL :run_migration "migrations\010_kg_domain_mapping.sql"
+CALL :run_migration "migrations\011_app_settings.sql"
 
 echo.
 echo ============================================================

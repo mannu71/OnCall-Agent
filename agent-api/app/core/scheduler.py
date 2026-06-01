@@ -20,6 +20,7 @@ from app.core.executor import task_executor
 from app.workflow.routing import execute_visual_workflow, is_visual_workflow
 from app.infrastructure.persistence import ExecutionRepository
 from app.config import settings
+from app.core.app_timezone import get_global_timezone_name
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ class WorkflowScheduler:
         Args:
             workflow_repo: Workflow repository instance
         """
-        self.scheduler = AsyncIOScheduler(timezone=settings.scheduler_timezone)
+        self.scheduler = AsyncIOScheduler(timezone=get_global_timezone_name())
         self.workflow_repo = workflow_repo or WorkflowRepository()
         self.active_executions: Dict[str, WorkflowExecution] = {}
         self.event_queues: Dict[str, Set[asyncio.Queue]] = {}
@@ -110,9 +111,13 @@ class WorkflowScheduler:
             return
         
         try:
+            # workflow.schedule is already a UTC cron (the local HH:MM is
+            # converted to UTC at save time in _params_to_cron using the global
+            # timezone), so the trigger must be interpreted in UTC. Applying a
+            # non-UTC tz here would double-apply the offset.
             trigger = CronTrigger.from_crontab(
-                workflow.schedule, 
-                timezone=pytz.timezone(settings.scheduler_timezone)
+                workflow.schedule,
+                timezone=pytz.utc,
             )
             
             self.scheduler.add_job(

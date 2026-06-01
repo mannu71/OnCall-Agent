@@ -85,6 +85,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Database initialization skipped (may already exist): {e}")
 
+    # Load the operator-configured global timezone into the in-process cache so
+    # scheduling reflects it without waiting for the first settings write.
+    try:
+        from app.core.app_timezone import refresh_global_timezone
+
+        tz_name = await refresh_global_timezone()
+        logger.info("Global timezone loaded: %s", tz_name)
+    except Exception as e:
+        logger.warning(f"Global timezone load skipped: {e}")
+
     workflow_scheduler.start()
 
     # Start proactive alarm monitoring (non-blocking background task).
