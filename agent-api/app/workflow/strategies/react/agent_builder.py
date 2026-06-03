@@ -89,22 +89,26 @@ def build_agent(
             "Use WHERE clauses, date ranges, and LIMIT to avoid expensive full scans."
         )
 
-    # ── CloudWatch instructions (compact; tool descriptions carry detail) ─
+    # ── CloudWatch instructions (refine, don't redo) ──────────────────────
     if has_cloudwatch:
         system_parts.append(
-            "CloudWatch tools available. Start with cloudwatch_list_alarms "
-            "(state_value='ALARM') for what AWS already flagged, then "
-            "cloudwatch_detect_anomalies for log-volume spikes (focus severity=critical/high, z_score>2), then "
-            "cloudwatch_analyze_patterns for recurring errors (sort by occurrence_count). "
-            "Use cloudwatch_watch_logs / cloudwatch_correlate_logs / cloudwatch_search_logs for raw events; "
-            "cloudwatch_discover_log_groups when names are unknown. "
-            "Cite log_group, timestamp, z_score/occurrence_count, and normalized_pattern in findings. "
-            "Respect evidence_grade: high=act on it; low/none=use auto_drill_down.preview "
-            "if present else cloudwatch_search_logs (drill_down=true). "
-            "Check known_patterns for prior incidents before concluding. "
-            "Use metrics_context to confirm log spikes (compare sum/max vs occurrence_count). "
-            "If data_quality.partial is true, confirm with cloudwatch_search_logs before concluding. "
-            "Stop when you have enough evidence; each Insights query has cost/latency."
+            "A deterministic CloudWatch investigation has ALREADY run — its results "
+            "(alarms, anomalies, error patterns, any drill-down, and a data_quality "
+            "coverage block) are in the 'Pre-computed CloudWatch Analysis' block at the "
+            "start of this query. Treat that as your starting evidence. Do NOT re-run the "
+            "full triage. Use the live tools only to VERIFY or DRILL DEEPER into specific "
+            "findings: cloudwatch_search_logs (drill_down=true) for raw events behind a "
+            "pattern/anomaly, cloudwatch_correlate_logs to trace one request across groups, "
+            "cloudwatch_discover_log_groups only if a referenced group is missing. "
+            "If the user gives a correlation id / request id / trace id (or the pre-computed "
+            "block is a 'correlation-lookup'), LEAD with cloudwatch_correlate_logs for that "
+            "id and build the cross-service timeline before anything else. "
+            "Cite log_group, timestamp, z_score/occurrence_count, and normalized_pattern. "
+            "Respect data_quality: if it reports partial/sampled results or failed groups, "
+            "say so and confirm with a targeted cloudwatch_search_logs before concluding; "
+            "if coverage is full and nothing was found, state that explicitly rather than "
+            "implying a problem. Stop as soon as the evidence supports a conclusion — each "
+            "Insights query has cost and latency."
         )
 
     # ── Code Analyzer instructions (compact) ──────────────────────────

@@ -22,94 +22,9 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogD
 import { cn } from '@/lib/utils';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { mdComponents, cleanLlmText } from '../components/markdown/MarkdownMessage.jsx';
 
 const DAY_MS = 86400000;
-
-/**
- * Strip Python-repr content-block artefact from LLM output stored before the
- * LangChain fix. Old records look like:
- *   [{'type': 'text', 'text': "actual answer here...", 'index': 0}]
- * The keys are single-quoted but the text VALUE may be double-quoted, so a
- * blanket single→double quote replacement breaks the JSON. We use targeted
- * regexes instead.
- * @param {string} text
- * @returns {string}
- */
-function cleanLlmText(text) {
-  if (!text || typeof text !== 'string') return text || '';
-  const trimmed = text.trimStart();
-  if (!trimmed.startsWith("[{")) return text;
-
-  // Strategy 1: 'text': "double-quoted value"
-  // Match everything between 'text': " and the last " that precedes ', or "}
-  const dq = [...text.matchAll(/'text':\s*"([\s\S]*?)"\s*[,}]/g)];
-  if (dq.length) return dq.map(m => m[1]).join('').replace(/\\n/g, '\n').replace(/\\'/g, "'").replace(/\\"/g, '"');
-
-  // Strategy 2: 'text': 'single-quoted value'
-  const sq = [...text.matchAll(/'text':\s*'([\s\S]*?)'\s*[,}]/g)];
-  if (sq.length) return sq.map(m => m[1]).join('').replace(/\\n/g, '\n');
-
-  // Strategy 3: after converting to JSON (works when text value has no quotes)
-  try {
-    const asJson = text
-      .replace(/'/g, '"')
-      .replace(/\bNone\b/g, 'null')
-      .replace(/\bTrue\b/g, 'true')
-      .replace(/\bFalse\b/g, 'false');
-    const blocks = JSON.parse(asJson);
-    if (Array.isArray(blocks)) {
-      const parts = blocks.filter(b => b.type === 'text').map(b => b.text || '');
-      if (parts.length) return parts.join('');
-    }
-  } catch { /* ignore */ }
-
-  return text;
-}
-
-/**
- * Shared react-markdown component overrides — Tailwind-styled, no prose plugin required.
- * Used in both the CloudWatch Analysis and ReAct Final Answer panels.
- */
-const mdComponents = {
-  // eslint-disable-next-line no-unused-vars
-  h1: ({node, ...p}) => <h1 className="text-xl font-bold text-slate-900 mt-4 mb-2" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  h2: ({node, ...p}) => <h2 className="text-lg font-bold text-slate-800 mt-4 mb-2 border-b border-slate-200 pb-1" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  h3: ({node, ...p}) => <h3 className="text-base font-semibold text-slate-800 mt-3 mb-1" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  p: ({node, ...p}) => <p className="text-sm text-slate-900 mb-3 leading-relaxed" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  strong: ({node, ...p}) => <strong className="font-semibold text-slate-900" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  em: ({node, ...p}) => <em className="italic text-slate-700" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  ul: ({node, ...p}) => <ul className="list-disc list-inside mb-3 space-y-1 text-sm text-slate-900" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  ol: ({node, ...p}) => <ol className="list-decimal list-inside mb-3 space-y-1 text-sm text-slate-900" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  li: ({node, ...p}) => <li className="text-sm text-slate-900 ml-2" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  code: ({node, inline, className, ...p}) => inline
-    ? <code className="bg-slate-100 text-slate-800 px-1 py-0.5 rounded text-xs font-mono" {...p} />
-    : <code className="block bg-slate-50 border border-slate-200 rounded p-3 text-xs font-mono overflow-auto whitespace-pre-wrap" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  pre: ({node, ...p}) => <pre className="mb-3" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  table: ({node, ...p}) => <div className="overflow-x-auto mb-4"><table className="min-w-full text-sm border-collapse border border-slate-200" {...p} /></div>,
-  // eslint-disable-next-line no-unused-vars
-  thead: ({node, ...p}) => <thead className="bg-slate-100" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  th: ({node, ...p}) => <th className="px-3 py-2 text-left font-semibold text-slate-700 border border-slate-200 text-xs" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  td: ({node, ...p}) => <td className="px-3 py-2 text-slate-900 border border-slate-200 text-xs" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  tr: ({node, ...p}) => <tr className="even:bg-slate-50" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  blockquote: ({node, ...p}) => <blockquote className="border-l-4 border-blue-300 pl-4 italic text-slate-600 mb-3 text-sm" {...p} />,
-  // eslint-disable-next-line no-unused-vars
-  hr: ({node, ...p}) => <hr className="border-slate-200 my-4" {...p} />,
-};
 
 /** @param {string} [s] "HH:mm" */
 function parseHmToMinutes(s) {

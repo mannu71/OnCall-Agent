@@ -189,3 +189,33 @@ def estimate_confidence(final_answer: str, tool_calls: Optional[List[Any]] = Non
     if tool_calls:
         score += 0.10
     return max(0.0, min(1.0, score))
+
+
+# Phrases that mean the agent announced a NEXT step instead of concluding —
+# i.e. it stopped mid-investigation rather than producing a final report.
+_MIDTHOUGHT_RE = re.compile(
+    r"(?:^|\n)\s*(?:\*\*)?\s*step\s*\d+\b"          # "Step 4: ..."
+    r"|\b(?:now\s+)?let me\b"                        # "Let me / Now let me ..."
+    r"|\blet'?s (?:now |first )?(?:get|check|look|drill|fetch|see|examine)\b"
+    r"|\bnext,?\s+(?:i|let)\b"
+    r"|\bi'?ll (?:now |go )?(?:check|look|drill|fetch|get|examine|investigate)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_midthought(text: str) -> bool:
+    """True when an answer reads as a mid-investigation step, not a conclusion.
+
+    Catches the failure where the open-ended agent narrates its next action
+    ("Now let me check for anomalies:", "Step 4: Drill into raw logs") and then
+    ends its turn — leaving that fragment as the final answer instead of a report.
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    if t.endswith(":"):
+        return True
+    # Only treat narration as mid-thought when it's near the END of the answer
+    # (a long report may legitimately mention "let me" earlier in prose).
+    tail = t[-200:]
+    return bool(_MIDTHOUGHT_RE.search(tail))

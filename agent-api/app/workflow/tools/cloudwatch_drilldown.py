@@ -18,7 +18,7 @@ AUTO_DRILLDOWN_ENABLED = settings.cloudwatch_auto_drilldown
 
 _AUTO_DRILL_GRADES = frozenset({"low", "none"})
 _PLACEHOLDER_RE = re.compile(r"<[A-Z_]+(?::[^>]+)?>")
-_PREVIEW_CHAR_CAP = 3200  # ~800 tokens of drill preview text
+_PREVIEW_CHAR_CAP = 6000  # internal RCA tool — keep raw drill preview (IDs/traces)
 
 # Default benign phrases (override via workflow severity_excludes config).
 DEFAULT_SEVERITY_EXCLUDES = (
@@ -98,7 +98,7 @@ def build_insights_query_for_pattern(
     normalized_pattern: str,
     example_message: str,
     *,
-    limit: int = 20,
+    limit: int = 50,
 ) -> str:
     """Build a bounded Insights query from a normalized error pattern."""
     literals = extract_filter_literals(normalized_pattern, example_message)
@@ -123,7 +123,7 @@ def build_insights_query_for_pattern(
 def build_insights_query_for_anomaly(
     log_group: Optional[str] = None,
     *,
-    limit: int = 20,
+    limit: int = 50,
 ) -> str:
     """Generic error sample query when drilling from an anomaly spike."""
     from app.mcp.tools.watch_tools import SEVERITY_PATTERNS
@@ -146,6 +146,95 @@ def cap_drill_preview(text: str) -> str:
     if len(text) <= _PREVIEW_CHAR_CAP:
         return text
     return text[: _PREVIEW_CHAR_CAP - 1] + "…"
+
+
+def select_drill_targets(
+    patterns_summary: Optional[Dict[str, Any]],
+    anomalies_summary: Optional[Dict[str, Any]],
+    *,
+    top_n: int = 3,
+) -> List[Dict[str, Any]]:
+    """Rank the strongest findings for the staged pipeline to drill into.
+
+    Anomalies (ranked by z_score) take priority over recurring patterns (ranked
+    by occurrence_count), since a volume spike is a stronger lead than a steady
+    error. Returns up to *top_n* normalized target descriptors, each carrying the
+    fields the Insights query builders need.
+    """
+    targets: List[Dict[str, Any]] = []
+
+    anomalies = (anomalies_summary or {}).get("anomalies") or []
+    for a in sorted(anomalies, key=lambda x: (x.get("z_score") or 0), reverse=True):
+        if not isinstance(a, dict):
+            continue
+        targets.append({
+            "kind": "anomaly",
+            "log_group": a.get("log_group"),
+            "z_score": a.get("z_score"),
+            "severity": a.get("severity"),
+            "label": f"anomaly z={a.get('z_score')} in {a.get('log_group') or 'log group'}",
+        })
+
+    patterns = (patterns_summary or {}).get("unique_patterns") or []
+    for p in sorted(patterns, key=lambda x: (x.get("occurrence_count") or 0), reverse=True):
+        if not isinstance(p, dict):
+            continue
+        targets.append({
+            "kind": "pattern",
+            "normalized_pattern": p.get("normalized_pattern", ""),
+            "example_message": p.get("example_message", ""),
+            "occurrence_count": p.get("occurrence_count"),
+            "label": f"pattern x{p.get('occurrence_count')}: "
+                     f"{(p.get('normalized_pattern') or '')[:60]}",
+        })
+
+    return targets[: max(0, top_n)]
+
+
+# CloudWatch Logs Insights queries must start with one of these commands.
+_INSIGHTS_LEAD_COMMANDS = (
+    "fields", "filter", "stats", "parse", "sort", "display", "limit",
+)
+
+
+def lint_insights_query(query: str) -> Optional[str]:
+    """Cheaply validate a CloudWatch Logs Insights query before hitting AWS.
+
+    Returns ``None`` when the query looks structurally sound, or a short
+    corrective hint string when it is obviously malformed — so callers can give
+    the model actionable feedback instead of a raw AWS ``ValidationException``
+    (which wastes an investigation iteration).
+
+    This is a lightweight structural lint, not a full parser — it catches the
+    common mistakes, not every invalid query.
+    """
+    q = (query or "").strip()
+    if not q:
+        return ("Empty Insights query. Start with a `fields` command, e.g. "
+                "`fields @timestamp, @message | filter @message like /(?i)error/ "
+                "| sort @timestamp desc | limit 20`.")
+
+    first_word = q.lstrip("| ").split(None, 1)[0].lower() if q.lstrip("| ") else ""
+    if first_word not in _INSIGHTS_LEAD_COMMANDS:
+        return (f"Insights query must begin with one of "
+                f"{', '.join(_INSIGHTS_LEAD_COMMANDS)} — got '{first_word or '?'}'. "
+                "Example: `fields @timestamp, @message | filter ... | limit 20`.")
+
+    # Each '|' separates a command; every segment must be non-empty.
+    segments = [seg.strip() for seg in q.split("|")]
+    if any(seg == "" for seg in segments):
+        return ("Malformed Insights query: an empty segment around a `|`. "
+                "Each `|` must be followed by a command (filter/stats/sort/limit).")
+
+    if q.count("/") % 2 != 0:
+        return ("Unbalanced regex delimiter `/` in the Insights query. "
+                "Regex literals must be wrapped like /(?i)pattern/.")
+
+    if "limit" not in q.lower():
+        return ("Insights query has no `| limit` clause — add one (e.g. "
+                "`| limit 20`) to bound the result set and cost.")
+
+    return None
 
 
 def compact_kb_patterns(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

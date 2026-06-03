@@ -10,7 +10,10 @@ from typing import Any, Dict, List
 # Triage caps — tuned for ~800–1200 tokens per structured tool response.
 TOP_UNIQUE_PATTERNS = 12
 TOP_ANOMALIES = 15
-EXAMPLE_MSG_CHARS = 200
+# Internal RCA tool — keep enough of the raw example message that correlation /
+# profile / trace IDs survive (tail-truncation preserves the root-cause end of
+# error / stack-trace text).
+EXAMPLE_MSG_CHARS = 600
 PATTERN_CHARS = 150
 CONTEXT_TOP_PATTERNS = 3  # upstream agent-node injection
 

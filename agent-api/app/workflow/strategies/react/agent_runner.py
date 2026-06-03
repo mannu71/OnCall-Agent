@@ -185,14 +185,131 @@ async def execute_agent(
         else:
             raise
 
+    parsed = _serialize_agent_result(result_state)
+
+    # Detect a turn cut off by the output-token limit right before the model
+    # could emit a tool_use (stop_reason=max_tokens/length, no tool_calls). Left
+    # alone, LangGraph treats the truncated reasoning as "done" and we would
+    # return a half-thought (e.g. "Now let me search for more context...") as the
+    # final answer. Continue the turn once so the agent can finish; if it still
+    # truncates or errors, surface the result as incomplete instead of confident.
+    if parsed["last_ai_truncated"] and not parsed["last_ai_had_tool_calls"]:
+        logger_instance.warning(
+            "ReactStrategy: agent turn truncated (stop_reason=%s, output_tokens=%s) with no "
+            "tool call; attempting one continuation — execution_id=%s",
+            parsed["last_stop_reason"], parsed["fallback_output_tokens"], execution_id,
+        )
+        try:
+            cont_state = await invoke_agent(
+                agent,
+                {"messages": result_state.get("messages", [])},
+                run_config,
+            )
+            cont_parsed = _serialize_agent_result(cont_state)
+            if cont_parsed["last_ai_truncated"] and not cont_parsed["last_ai_had_tool_calls"]:
+                # Still truncated after one retry — be honest rather than passing a
+                # partial thought off as a finished analysis.
+                logger_instance.warning(
+                    "ReactStrategy: continuation still truncated (stop_reason=%s) — flagging "
+                    "result as incomplete (execution_id=%s)",
+                    cont_parsed["last_stop_reason"], execution_id,
+                )
+                cont_parsed["final_answer"] = (
+                    "Investigation was cut off by the model output limit before it could "
+                    "complete. Partial findings so far:\n\n"
+                    + (cont_parsed["final_answer"] or "")
+                ).strip()
+                cont_parsed["truncated"] = True
+            parsed = cont_parsed
+        except Exception as cont_exc:  # noqa: BLE001 — never break on a recovery attempt
+            logger_instance.warning(
+                "ReactStrategy: continuation attempt failed (%s); flagging result as incomplete "
+                "(execution_id=%s)", cont_exc, execution_id,
+            )
+            parsed["final_answer"] = (
+                "Investigation was cut off by the model output limit before it could "
+                "complete. Partial findings so far:\n\n" + (parsed["final_answer"] or "")
+            ).strip()
+            parsed["truncated"] = True
+
+    serialized_messages = parsed["messages"]
+    tool_calls_summary  = parsed["tool_calls"]
+    final_answer        = parsed["final_answer"]
+
+    # Prefer token_cb (fires via on_llm_end, works for all providers and streaming
+    # modes); fall back to usage_metadata accumulation if token_cb got nothing.
+    total_input_tokens  = token_cb.input_tokens  or parsed["fallback_input_tokens"]
+    total_output_tokens = token_cb.output_tokens or parsed["fallback_output_tokens"]
+
+    logger_instance.info(
+        "ReactStrategy: agent completed with %d messages, %d tool calls, "
+        "input_tokens=%d output_tokens=%d (source=%s)%s",
+        len(serialized_messages),
+        len(tool_calls_summary),
+        total_input_tokens,
+        total_output_tokens,
+        "callback" if token_cb.input_tokens else "usage_metadata",
+        " [truncated]" if parsed.get("truncated") else "",
+    )
+
+    result: Dict[str, Any] = {
+        "final_answer":   final_answer,
+        "messages":       serialized_messages,
+        "tool_calls":     tool_calls_summary,
+        "input_tokens":   total_input_tokens,
+        "output_tokens":  total_output_tokens,
+        "total_tokens":   total_input_tokens + total_output_tokens,
+    }
+    if parsed.get("truncated"):
+        result["truncated"] = True
+    return result
+
+
+#: Provider stop reasons that mean "output was cut off by the token limit",
+#: not "the model finished". Bedrock Converse → "max_tokens"; OpenAI → "length".
+_TRUNCATED_STOP_REASONS = {"max_tokens", "length"}
+
+
+def _stop_reason_of(msg) -> str:
+    """Normalize a message's stop/finish reason to a lowercase string.
+
+    Different providers expose it under different keys in ``response_metadata``:
+    Bedrock Converse → ``stopReason``, Anthropic → ``stop_reason``,
+    OpenAI → ``finish_reason``. Returns "" when none is present.
+    """
+    meta = getattr(msg, "response_metadata", None) or {}
+    for key in ("stopReason", "stop_reason", "finish_reason"):
+        val = meta.get(key)
+        if val:
+            return str(val).lower()
+    return ""
+
+
+def _serialize_agent_result(result_state: Dict[str, Any]) -> Dict[str, Any]:
+    """Serialize LangGraph messages into the strategy's result contract.
+
+    Also reports truncation state of the *last* AIMessage so the caller can tell
+    a genuine completion from a turn cut off mid-thought by the output limit.
+
+    ``final_answer`` prefers the last *terminal* AIMessage — one with no
+    ``tool_calls`` — so an intermediate "reason then act" message is never
+    mistaken for the answer. Falls back to the last content seen if every
+    AIMessage carried tool calls.
+    """
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+
     messages = result_state.get("messages", [])
     serialized_messages = []
     tool_calls_summary = []
     final_answer = ""
+    last_content = ""          # last AIMessage content regardless of tool_calls
     # Fallback token accumulators from AIMessage.usage_metadata
     # (used only when token_cb didn't capture anything via on_llm_end)
     fallback_input_tokens  = 0
     fallback_output_tokens = 0
+    last_ai_truncated = False
+    last_ai_had_tool_calls = False
+    last_stop_reason = ""
 
     for msg in messages:
         if isinstance(msg, HumanMessage):
@@ -202,7 +319,8 @@ async def execute_agent(
             content = extract_text_content(msg.content) if msg.content else ""
             entry: Dict[str, Any] = {"role": "assistant", "content": content}
 
-            if hasattr(msg, "tool_calls") and msg.tool_calls:
+            has_tool_calls = bool(getattr(msg, "tool_calls", None))
+            if has_tool_calls:
                 entry["tool_calls"] = [
                     {
                         "id": tc.get("id"),
@@ -223,7 +341,15 @@ async def execute_agent(
 
             serialized_messages.append(entry)
             if content:
-                final_answer = content
+                last_content = content
+                # Only a terminal (tool-call-free) message is a real final answer.
+                if not has_tool_calls:
+                    final_answer = content
+
+            # Track the truncation state of the LAST AIMessage seen.
+            last_ai_had_tool_calls = has_tool_calls
+            last_stop_reason = _stop_reason_of(msg)
+            last_ai_truncated = last_stop_reason in _TRUNCATED_STOP_REASONS
 
         elif isinstance(msg, ToolMessage):
             serialized_messages.append({
@@ -235,28 +361,20 @@ async def execute_agent(
         elif isinstance(msg, SystemMessage):
             pass
 
-    # Prefer token_cb (fires via on_llm_end, works for all providers and streaming
-    # modes); fall back to usage_metadata accumulation if token_cb got nothing.
-    total_input_tokens  = token_cb.input_tokens  or fallback_input_tokens
-    total_output_tokens = token_cb.output_tokens or fallback_output_tokens
-
-    logger_instance.info(
-        "ReactStrategy: agent completed with %d messages, %d tool calls, "
-        "input_tokens=%d output_tokens=%d (source=%s)",
-        len(serialized_messages),
-        len(tool_calls_summary),
-        total_input_tokens,
-        total_output_tokens,
-        "callback" if token_cb.input_tokens else "usage_metadata",
-    )
+    # If no terminal message produced content (e.g. the conversation ended on a
+    # tool-call message), fall back to the last content seen rather than empty.
+    if not final_answer:
+        final_answer = last_content
 
     return {
-        "final_answer":   final_answer,
-        "messages":       serialized_messages,
-        "tool_calls":     tool_calls_summary,
-        "input_tokens":   total_input_tokens,
-        "output_tokens":  total_output_tokens,
-        "total_tokens":   total_input_tokens + total_output_tokens,
+        "final_answer":           final_answer,
+        "messages":               serialized_messages,
+        "tool_calls":             tool_calls_summary,
+        "fallback_input_tokens":  fallback_input_tokens,
+        "fallback_output_tokens": fallback_output_tokens,
+        "last_ai_truncated":      last_ai_truncated,
+        "last_ai_had_tool_calls": last_ai_had_tool_calls,
+        "last_stop_reason":       last_stop_reason,
     }
 
 def extract_text_content(content) -> str:

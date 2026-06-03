@@ -7,6 +7,30 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+# ── Pipeline-synthesis guardrail circuit breaker ─────────────────────────────
+# The pipeline's single Bedrock synthesis call is frequently blocked by an
+# account-level Bedrock guardrail (returns a ~45-char refusal), wasting ~24s +
+# tokens every run. Track consecutive refusals and skip the call once a cooldown
+# threshold is reached; one usable synthesis resets it. State is process-local
+# (good enough — a container restart re-probes once).
+_GUARDRAIL_REFUSALS = 0
+
+
+def _synthesis_circuit_open() -> bool:
+    from app.config import settings
+    return _GUARDRAIL_REFUSALS >= max(1, settings.cloudwatch_synthesis_guardrail_cooldown)
+
+
+def _record_guardrail_refusal() -> None:
+    global _GUARDRAIL_REFUSALS
+    _GUARDRAIL_REFUSALS += 1
+
+
+def _reset_guardrail_refusals() -> None:
+    global _GUARDRAIL_REFUSALS
+    _GUARDRAIL_REFUSALS = 0
+
+
 def build_cloudwatch_summary(
     result: Dict[str, Any],
     analysis_type: str,
@@ -62,6 +86,315 @@ def build_cloudwatch_summary(
         )
 
     return f"Analysis complete ({analysis_type})"
+
+
+# Phrases that mean the LLM refused / produced a non-answer. When the synthesis
+# comes back like this (often a provider/guardrail canned response with no token
+# usage), we must NOT show it as the result — fall back to the deterministic
+# evidence report instead.
+_REFUSAL_MARKERS = (
+    "cannot answer", "can't answer", "can not answer", "unable to answer",
+    "cannot help with", "i'm sorry", "i am sorry", "as an ai",
+    "cannot provide", "cannot assist",
+)
+
+
+def is_usable_synthesis(text: Optional[str]) -> bool:
+    """True when an LLM synthesis is a real answer, not empty/refusal/stub."""
+    t = (text or "").strip()
+    if len(t) < 60:
+        return False
+    low = t.lower()
+    return not any(m in low for m in _REFUSAL_MARKERS)
+
+
+def _fmt_drilldown_events(events: Any, max_chars: int = 2000) -> str:
+    """Render drill-down raw events (a JSON string or dict) as readable lines.
+
+    The drill-down Insights query returns @timestamp/@message/@logStream/@log —
+    @message carries correlation/request/trace IDs, so we surface it verbatim.
+    """
+    import json as _json
+    if isinstance(events, str):
+        try:
+            events = _json.loads(events)
+        except Exception:
+            return events[:max_chars]
+    rows = []
+    results = events.get("results") if isinstance(events, dict) else events
+    if isinstance(results, list):
+        for row in results[:10]:
+            # Insights rows are lists of {field, value} dicts.
+            if isinstance(row, list):
+                fields = {f.get("field"): f.get("value") for f in row if isinstance(f, dict)}
+                ts = fields.get("@timestamp", "")
+                msg = fields.get("@message", "")
+                stream = fields.get("@logStream", "")
+                rows.append(f"  [{ts}] {stream}  {msg}".rstrip())
+            elif isinstance(row, dict):
+                rows.append("  " + "  ".join(f"{k}={v}" for k, v in row.items()))
+    text = "\n".join(rows) if rows else (str(events))
+    return text[:max_chars]
+
+
+def _clean_log_line(msg: Any) -> str:
+    """Render a raw log line readably for reports.
+
+    If the line is structured JSON (Serilog ``{"@t":…,"@m":…}`` etc.), surface the
+    human message (`@m`/`@message`) plus any exception — keeping identifiers that
+    live in the message — instead of dumping the full escaped JSON blob (which
+    reads as "raw"). Falls back to the raw text for non-JSON lines.
+    """
+    s = str(msg or "").strip()
+    if s.startswith("{") and ('"@m"' in s or '"@message"' in s or '"message"' in s):
+        try:
+            obj = json.loads(s)
+            m = obj.get("@m") or obj.get("@message") or obj.get("message")
+            if m:
+                ex = obj.get("@x") or obj.get("@l") or obj.get("exception")
+                return (str(m) + (f"  |  {str(ex)[:200]}" if ex else "")).strip()
+        except Exception:  # noqa: BLE001 — best-effort prettifier
+            pass
+    return s
+
+
+def build_synthesis_payload(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact evidence for the LLM synthesis — with REAL identifiers intact.
+
+    This is an internal root-cause-analysis tool, so correlation / profile /
+    trace IDs and raw error text are preserved verbatim (they are exactly what
+    RCA needs). We only keep the payload *compact* (top-N + per-field char caps,
+    tunable via settings) for token budget — no PII masking. Genuine secrets are
+    still stripped later by ``redact()``.
+    """
+    if not isinstance(evidence, dict):
+        return evidence
+
+    from app.config import settings
+    _ex_cap = settings.cloudwatch_example_msg_chars
+    _drill_cap = settings.cloudwatch_drill_sample_chars
+
+    out: Dict[str, Any] = {}
+    if evidence.get("data_quality"):
+        out["data_quality"] = evidence["data_quality"]
+    alarms = evidence.get("alarms")
+    if isinstance(alarms, dict) and alarms.get("summary"):
+        out["alarms_summary"] = alarms["summary"]
+
+    patterns = evidence.get("patterns") or {}
+    uniq = patterns.get("unique_patterns") if isinstance(patterns, dict) else None
+    if uniq:
+        out["error_patterns"] = [
+            {
+                "pattern": str(p.get("normalized_pattern", ""))[:400],
+                "occurrence_count": p.get("occurrence_count"),
+                "affected_streams": p.get("affected_streams"),
+                "example": _clean_log_line(p.get("example_message", ""))[:_ex_cap],
+                "first_seen": p.get("first_seen"),
+                "last_seen": p.get("last_seen"),
+            }
+            for p in uniq[:10] if isinstance(p, dict)
+        ]
+
+    anomalies = evidence.get("anomalies") or {}
+    if anomalies.get("anomalies"):
+        out["anomalies"] = anomalies["anomalies"][:10]
+        out["anomaly_summary"] = anomalies.get("summary")
+
+    # Drill-down samples give the model concrete raw context (with real IDs) to
+    # reason about root cause.
+    drill = evidence.get("drilldown") or []
+    if isinstance(drill, list) and drill:
+        out["drilldown_samples"] = []
+        for d in drill[:5]:
+            if not isinstance(d, dict):
+                continue
+            ev = d.get("events")
+            txt = _fmt_drilldown_events(ev, max_chars=_drill_cap) if ev else (d.get("error") or "")
+            out["drilldown_samples"].append(
+                {"target": d.get("target"), "sample": txt}
+            )
+    return out
+
+
+def build_rich_cloudwatch_report(
+    evidence: Dict[str, Any],
+    log_groups: list,
+    time_range: str,
+    focus: Optional[str] = None,
+) -> str:
+    """Deterministic, detail-rich report built directly from the evidence bundle.
+
+    Does NOT depend on the LLM — surfaces the concrete specifics an on-call
+    engineer needs (actual error messages, correlation/request/trace IDs from
+    the drill-down raw events and pattern example_messages, occurrence counts,
+    timestamps, log streams, anomalies, and alarms). Used as the synthesis floor
+    so a refusing/unavailable LLM never reduces the output to bare counts.
+    """
+    if not isinstance(evidence, dict):
+        return f"CloudWatch analysis across {len(log_groups)} log group(s) over {time_range}."
+
+    dq = evidence.get("data_quality") or {}
+    coverage = dq.get("coverage")
+    lines: List[str] = ["## CloudWatch Investigation"]
+    if coverage == "none":
+        lines.append(
+            f"⚠️ Could not analyze any of {len(log_groups)} log group(s) over {time_range} — "
+            "all analyses failed (check IAM permissions for logs:StartQuery / "
+            "cloudwatch:DescribeAlarms)."
+        )
+    elif coverage == "partial":
+        bits = []
+        if dq.get("sampled"):
+            bits.append("results sampled")
+        if dq.get("failures"):
+            bits.append("failed: " + ", ".join(f.get("analysis", "?") for f in dq["failures"]))
+        lines.append(
+            f"⚠️ Partial coverage of {len(log_groups)} log group(s) over {time_range}"
+            + (f" ({'; '.join(bits)})" if bits else "") + "."
+        )
+    elif coverage == "targeted":
+        _ident = dq.get("correlation_id") or dq.get("trace_id") or "the requested id"
+        lines.append(
+            f"Targeted correlation lookup for `{_ident}` across "
+            f"{len(log_groups)} log group(s) over **{time_range}**."
+        )
+    else:
+        lines.append(f"Checked {len(log_groups)} log group(s) over **{time_range}**.")
+
+    # ── Summary headline (deterministic, mirrors the old format) ─────────
+    _corr_pre = evidence.get("correlation") if isinstance(evidence.get("correlation"), dict) else {}
+    _corr_timeline_pre = (_corr_pre.get("timeline") or []) if _corr_pre else []
+    _patterns_pre = (evidence.get("patterns") or {}).get("unique_patterns") or []
+    _anoms_pre = (evidence.get("anomalies") or {}).get("anomalies") or []
+    _alarms_pre = evidence.get("alarms") or {}
+    _in_alarm_pre = (
+        (_alarms_pre.get("summary") or {}).get("in_alarm")
+        if isinstance(_alarms_pre, dict) else None
+    )
+    _top_oc_pre = (
+        _patterns_pre[0].get("occurrence_count")
+        if _patterns_pre and isinstance(_patterns_pre[0], dict) else None
+    )
+    _summary_bits: List[str] = []
+    if _corr_timeline_pre:
+        _summary_bits.append(
+            f"{_corr_pre.get('timeline_total', len(_corr_timeline_pre))} correlated event(s)"
+        )
+    if _patterns_pre:
+        _summary_bits.append(
+            f"{len(_patterns_pre)} recurring error pattern(s)"
+            + (f" (top ×{_top_oc_pre})" if _top_oc_pre else "")
+        )
+    if _anoms_pre:
+        _summary_bits.append(f"{len(_anoms_pre)} log-volume anomaly(ies)")
+    if _in_alarm_pre:
+        _summary_bits.append(f"{_in_alarm_pre} alarm(s) firing")
+    lines.append("\n### Summary")
+    if _summary_bits:
+        lines.append(
+            "Detected " + ", ".join(_summary_bits)
+            + f" across {len(log_groups)} log group(s) over {time_range}."
+            + (" Some analyses were unavailable — see coverage above."
+               if dq.get("failures") else "")
+        )
+    else:
+        lines.append(
+            f"No errors, anomalies, or firing alarms detected across "
+            f"{len(log_groups)} log group(s) over {time_range}."
+        )
+    lines.append("\n### Findings")
+
+    # Build each section independently, then emit them ordered by the focus lens
+    # (Analysis type). The comprehensive triage always runs; focus only decides
+    # which dimension leads the report.
+    sections: Dict[str, List[str]] = {"alarms": [], "patterns": [], "anomalies": []}
+
+    # ── Alarms ──────────────────────────────────────────────────────────
+    alarms = evidence.get("alarms") or {}
+    if isinstance(alarms, dict):
+        in_alarm = (alarms.get("summary") or {}).get("in_alarm")
+        if in_alarm:
+            sections["alarms"].append(f"\n**Active alarms:** {in_alarm}")
+
+    # ── Error patterns (example_message carries correlation IDs) ─────────
+    patterns = evidence.get("patterns") or {}
+    uniq = patterns.get("unique_patterns") if isinstance(patterns, dict) else None
+    if uniq:
+        sections["patterns"].append("\n**Top error patterns:**")
+        for p in uniq[:10]:
+            if not isinstance(p, dict):
+                continue
+            oc = p.get("occurrence_count")
+            ex = _clean_log_line(p.get("example_message") or p.get("normalized_pattern") or "")
+            seen = ""
+            if p.get("first_seen") or p.get("last_seen"):
+                seen = f" — first {p.get('first_seen')} / last {p.get('last_seen')}"
+            streams = p.get("affected_streams")
+            stream_str = f" [{streams} stream(s)]" if streams else ""
+            sections["patterns"].append(f"- ×{oc}{stream_str}{seen}\n  `{ex}`")
+    elif coverage == "full":
+        sections["patterns"].append("\nNo error/warning patterns found in the window.")
+
+    # ── Anomalies ───────────────────────────────────────────────────────
+    anomalies = (evidence.get("anomalies") or {}).get("anomalies") or []
+    if anomalies:
+        sections["anomalies"].append("\n**Anomalies (log-volume spikes):**")
+        for a in anomalies[:10]:
+            if not isinstance(a, dict):
+                continue
+            sections["anomalies"].append(
+                f"- {a.get('timestamp')} [{a.get('severity')}] z={a.get('z_score')} "
+                f"count={a.get('current_count')} (baseline {a.get('baseline_average')}) "
+                f"in {a.get('log_group')}"
+            )
+
+    # Emit in focus-priority order, then the remaining sections.
+    _focus_section = {
+        "anomaly-detection": "anomalies", "anomalies": "anomalies",
+        "error-patterns": "patterns", "alarms": "alarms",
+    }.get((focus or "").strip().lower())
+    _default_order = ["alarms", "patterns", "anomalies"]
+    _order = ([_focus_section] if _focus_section else []) + [
+        k for k in _default_order if k != _focus_section
+    ]
+    for _key in _order:
+        lines.extend(sections[_key])
+
+    # ── Correlation timeline (targeted trace/correlation lookups) ───────
+    corr = evidence.get("correlation") if isinstance(evidence.get("correlation"), dict) else None
+    if corr:
+        if corr.get("error"):
+            lines.append(f"\n**Correlation lookup failed:** {corr['error']}")
+        else:
+            _tl = corr.get("timeline") or []
+            if _tl:
+                _total = corr.get("timeline_total", len(_tl))
+                lines.append(f"\n**Correlation timeline** ({_total} event(s), chronological):")
+                for ev in _tl[:40]:
+                    if not isinstance(ev, dict):
+                        continue
+                    _stream = ev.get("log_stream")
+                    _loc = f"{ev.get('log_group','')}" + (f"/{_stream}" if _stream else "")
+                    lines.append(
+                        f"- {ev.get('timestamp')} [{_loc}]\n  {_clean_log_line(ev.get('message',''))}"
+                    )
+
+    # ── Raw drill-down events — correlation/request/trace IDs live here ──
+    drill = evidence.get("drilldown") or []
+    if isinstance(drill, list) and drill:
+        lines.append("\n**Raw matching events** (correlation/request/trace IDs, timestamps):")
+        for d in drill[:10]:
+            if not isinstance(d, dict):
+                continue
+            tgt = d.get("target") or "match"
+            if d.get("error"):
+                lines.append(f"- {tgt}: (drill-down failed: {d['error']})")
+                continue
+            rendered = _fmt_drilldown_events(d.get("events"))
+            lines.append(f"- {tgt}:\n```\n{rendered}\n```")
+
+    return "\n".join(lines)
 
 
 def check_cloudwatch_alerts(
@@ -158,6 +491,7 @@ async def analyze_cloudwatch_with_llm(
     log_groups: List[str],
     time_range: str,
     alerts: list,
+    focus: Optional[str] = None,
 ) -> tuple:
     """Use the workflow's LLM node to produce a structured CloudWatch analysis."""
     try:
@@ -201,37 +535,89 @@ async def analyze_cloudwatch_with_llm(
         if not workflow:
             return None, None, None, 0, 0
 
+        from app.workflow.llm_config import LLM_NODE_TYPES
         nodes = workflow.get('nodes', [])
-        if not any(n.get('type') == 'llm' for n in nodes):
-            logger.debug("CloudWatch LLM analysis skipped: no LLM node in workflow")
+        # Accept both the legacy ReactFlow 'llm' node and the new LangflowEditor
+        # 'language_model' node — otherwise synthesis is silently skipped on new
+        # workflows and the run falls back to the terse deterministic summary.
+        if not any(n.get('type') in LLM_NODE_TYPES for n in nodes):
+            logger.info("CloudWatch LLM synthesis skipped: no LLM node in workflow "
+                        "(execution_id=%s)", execution_id)
+            return None, None, None, 0, 0
+
+        from app.config import settings
+        if not settings.cloudwatch_pipeline_llm_synthesis:
+            logger.info("CloudWatch LLM synthesis skipped: disabled via "
+                        "cloudwatch_pipeline_llm_synthesis (execution_id=%s)", execution_id)
+            return None, None, None, 0, 0
+        if _synthesis_circuit_open():
+            logger.info("CloudWatch LLM synthesis skipped: guardrail circuit breaker open "
+                        "(%d consecutive refusals) — using deterministic report "
+                        "(execution_id=%s)", _GUARDRAIL_REFUSALS, execution_id)
             return None, None, None, 0, 0
 
         llm_config = await resolve_llm_config_for_workflow(workflow)
         llm = build_llm(llm_config)
         model_name = llm_config.get('model')
 
-        data_str = json.dumps(raw_result, indent=2, default=str)
-        if len(data_str) > 15_000:
-            data_str = data_str[:15_000] + "\n... [truncated]"
+        # Send a COMPACT, PII-masked payload to the synthesis. The full evidence
+        # bundle (raw drill-down @message blobs + customer/profile IDs) is large
+        # and trips the account's Bedrock guardrail, which blocks the whole
+        # synthesis. build_synthesis_payload mirrors the small summary the agent
+        # gets; redact() additionally strips secrets. Real identifiers stay in the
+        # deterministic report appended to the output, so nothing is lost to the
+        # engineer.
+        from app.core.redact import redact
+        from app.core.toon import encode_toon, TOON_LEGEND
+        # Serialize the compact evidence as TOON (uniform arrays → header + rows,
+        # keys written once) instead of pretty JSON — ~30–60% fewer tokens on the
+        # error_patterns/anomalies/drilldown tables. redact() still strips secrets.
+        synthesis_evidence = build_synthesis_payload(raw_result)
+        data_str = redact(encode_toon(synthesis_evidence))
+        _syn_cap = settings.cloudwatch_synthesis_max_chars
+        if len(data_str) > _syn_cap:
+            data_str = data_str[:_syn_cap] + "\n... [truncated]"
 
         alert_section = ""
         if alerts:
             alert_section = (
                 "\n\nAlerts triggered:\n"
-                + json.dumps(alerts, indent=2, default=str)
+                + redact(json.dumps(alerts, default=str))
             )
 
         system_prompt = (
+            f"{TOON_LEGEND}\n\n"
             "You are an expert CloudWatch log analysis engineer for KYC Protect. "
             "Analyze the provided log analysis results and give a clear, actionable summary. "
-            "Be concise but thorough. Focus on what matters for an on-call engineer."
+            "Be concise but thorough. Focus on what matters for an on-call engineer. "
+            "Respect the 'data_quality' field if present: when coverage is 'full' and no "
+            "errors/anomalies were found, state plainly that the log groups were checked and "
+            "nothing of concern was found — do not invent problems. When coverage is "
+            "'partial' or 'none', or results were sampled, call that out explicitly and lower "
+            "your confidence accordingly rather than presenting incomplete data as definitive. "
+            "Always surface CONCRETE SPECIFICS, not just counts: quote the actual error "
+            "message(s) verbatim, and extract every identifier present in the evidence — "
+            "correlation_id / correlationId, request_id / requestId, trace_id / X-Ray traceId, "
+            "transaction_id, session_id, user_id, order/account IDs, exception class, "
+            "@logStream, and the exact @timestamp. Mine the 'drilldown' raw events and each "
+            "pattern's 'example_message' for these IDs. In key_findings, list each distinct "
+            "error with its identifiers and timestamp so an engineer can grep for it directly; "
+            "if a correlation/request/trace ID is present, ALWAYS include it."
         )
 
         human_prompt = (
             f"Analyze these **{analysis_type}** results from CloudWatch log groups "
             f"{log_groups} over the last **{time_range}**.\n\n"
-            f"Raw analysis data:\n```json\n{data_str}\n```"
-            f"{alert_section}"
+            f"Analysis data (TOON format):\n```\n{data_str}\n```"
+            f"{alert_section}\n\n"
+            "Report the specific error(s) found, quoting the raw message and every "
+            "correlation/request/trace/transaction ID and timestamp you can find in the "
+            "evidence above (check the 'drilldown' events and 'example_message' fields)."
+            + (
+                f"\n\nThe engineer selected '{focus}' as the focus — LEAD your summary and "
+                "key findings with that dimension, while still covering the other signals."
+                if focus else ""
+            )
         )
 
         messages = [
@@ -310,6 +696,19 @@ async def analyze_cloudwatch_with_llm(
                 logger.info(
                     "CloudWatch free-form LLM analysis complete (%d chars, model=%s, tokens=%d)",
                     len(analysis_text), model_name, input_tokens + output_tokens,
+                )
+
+        # Feed the guardrail circuit breaker: a refusal/empty synthesis trips it
+        # (so we stop paying for the blocked call); a usable one resets it.
+        if analysis_text is not None:
+            if is_usable_synthesis(analysis_text):
+                _reset_guardrail_refusals()
+            else:
+                _record_guardrail_refusal()
+                logger.info(
+                    "CloudWatch synthesis returned a refusal/stub (%d chars) — guardrail "
+                    "refusal count now %d (execution_id=%s)",
+                    len(analysis_text), _GUARDRAIL_REFUSALS, execution_id,
                 )
 
         return analysis_text, model_name, structured_analysis, input_tokens, output_tokens

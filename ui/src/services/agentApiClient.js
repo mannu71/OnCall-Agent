@@ -25,6 +25,65 @@ client.interceptors.response.use(
     }
 );
 
+// ── Result extraction helpers ────────────────────────────────────────────────
+// A visual-workflow execute response is keyed by node id, e.g.
+//   { workflow_name, "agent_…": { final_answer, … }, "cloudwatch_tool_…": { output }, … }
+// plus top-level input_tokens / output_tokens / total_tokens. These dig out the
+// agent's answer (preferring the ReAct agent node) and the token counts.
+function _nodeContainers(data) {
+    if (!data || typeof data !== 'object') return [];
+    return [data, data.result, data.results, data.output].filter(
+        (c) => c && typeof c === 'object'
+    );
+}
+
+export function extractFinalAnswer(data) {
+    if (!data) return '';
+    if (typeof data === 'string') return data;
+    if (typeof data.final_answer === 'string' && data.final_answer) return data.final_answer;
+
+    const containers = _nodeContainers(data);
+    // Prefer the agent / ReAct node's final answer.
+    for (const c of containers) {
+        for (const v of Object.values(c)) {
+            if (v && typeof v === 'object' && typeof v.final_answer === 'string' && v.final_answer) {
+                return v.final_answer;
+            }
+        }
+    }
+    // Next: an explicit top-level string output.
+    if (typeof data.output === 'string' && data.output.trim()) return data.output;
+    // Fallback: a substantial node `output` (e.g. the CloudWatch deterministic report).
+    let best = '';
+    for (const c of containers) {
+        for (const v of Object.values(c)) {
+            if (v && typeof v === 'object' && typeof v.output === 'string' && v.output.length > best.length) {
+                best = v.output;
+            }
+        }
+    }
+    return best;
+}
+
+export function extractTokens(data) {
+    if (!data || typeof data !== 'object') return null;
+    if (data.input_tokens != null || data.output_tokens != null || data.total_tokens != null) {
+        const input = data.input_tokens || 0;
+        const output = data.output_tokens || 0;
+        return { input, output, total: data.total_tokens || input + output };
+    }
+    for (const c of _nodeContainers(data)) {
+        for (const v of Object.values(c)) {
+            if (v && typeof v === 'object' && (v.input_tokens != null || v.output_tokens != null)) {
+                const input = v.input_tokens || 0;
+                const output = v.output_tokens || 0;
+                return { input, output, total: v.total_tokens || input + output };
+            }
+        }
+    }
+    return null;
+}
+
 export const agentApiClient = {
     /**
      * List all workflows
@@ -73,12 +132,21 @@ export const agentApiClient = {
     },
 
     /**
-     * Execute a workflow manually
+     * Execute a workflow manually.
+     * @param {string} workflowName
+     * @param {boolean|{background?:boolean, userQuery?:string}} opts
+     *   Legacy boolean = background flag. Object form adds `userQuery` to drive an
+     *   agent chat turn (sent as `query` → normalized to inputs.user_query backend-side).
      */
-    async executeWorkflow(workflowName, background = false) {
-        const response = await client.post(`/api/v1/workflows/${encodeURIComponent(workflowName)}/execute`, null, {
-            params: { background },
-        });
+    async executeWorkflow(workflowName, opts = false) {
+        const o = typeof opts === 'boolean' ? { background: opts } : (opts || {});
+        const params = { background: !!o.background };
+        if (o.userQuery) params.query = o.userQuery;
+        const response = await client.post(
+            `/api/v1/workflows/${encodeURIComponent(workflowName)}/execute`,
+            null,
+            { params },
+        );
         return response.data;
     },
 
@@ -87,6 +155,53 @@ export const agentApiClient = {
      */
     streamWorkflowExecution(workflowName) {
         return new EventSource(`${AGENT_API_URL}/api/v1/workflows/${encodeURIComponent(workflowName)}/stream`);
+    },
+
+    /**
+     * Run an agent with a chat query and stream live progress over SSE.
+     *
+     * The SYNCHRONOUS execute response is the authoritative source of the final
+     * answer (the by-name SSE stream can miss the terminal event on fast runs,
+     * which previously surfaced as a bogus "stream connection error"). The SSE
+     * stream is opened only for live progress and is fully best-effort — its
+     * errors never fail the turn.
+     *
+     * handlers: { onToolCall(name,args), onToolResult(name,result), onToken(t),
+     *             onNode(nodeId,status), onStatus(msg), onError(err) }
+     * Returns: Promise<{ finalAnswer, tokens, raw }>
+     */
+    async runAgentStream(workflowName, userQuery, handlers = {}) {
+        const h = handlers || {};
+
+        // 1) Best-effort live progress via SSE (never fatal).
+        let es = null;
+        try {
+            es = this.streamWorkflowExecution(workflowName);
+            const parse = (evt) => { try { return JSON.parse(evt.data); } catch { return {}; } };
+            es.onmessage = (evt) => { const d = parse(evt); if (d && d.message) h.onStatus && h.onStatus(d.message); };
+            const on = (type, cb) => es.addEventListener(type, cb);
+            on('tool_call',    (e) => { const d = parse(e); h.onToolCall && h.onToolCall(d.tool || d.name, d.args || {}); });
+            on('tool_started', (e) => { const d = parse(e); h.onToolCall && h.onToolCall(d.tool || d.name, d.args || {}); });
+            on('tool_result',  (e) => { const d = parse(e); h.onToolResult && h.onToolResult(d.tool || d.name, d.result || d.output); });
+            on('llm_token',    (e) => { const d = parse(e); h.onToken && h.onToken(d.token || d.text || ''); });
+            on('node_started',   (e) => { const d = parse(e); h.onNode && h.onNode(d.node_id || d.nodeId, 'started'); });
+            on('node_completed', (e) => { const d = parse(e); h.onNode && h.onNode(d.node_id || d.nodeId, 'completed'); });
+            on('agent_progress', (e) => { const d = parse(e); h.onStatus && h.onStatus(d.message || ''); });
+            es.onerror = () => { /* progress stream dropped — non-fatal; the sync result still resolves */ };
+        } catch { /* SSE unavailable — proceed without live progress */ }
+
+        // 2) Synchronous run → the response carries the authoritative result.
+        try {
+            const data = await this.executeWorkflow(workflowName, { background: false, userQuery });
+            if (data && data.status === 'already_running') {
+                throw new Error(`Agent "${workflowName}" is already running. Wait for it to finish.`);
+            }
+            const finalAnswer = extractFinalAnswer(data);
+            const tokens = extractTokens(data);
+            return { finalAnswer, tokens, raw: data };
+        } finally {
+            if (es) { try { es.close(); } catch { /* noop */ } }
+        }
     },
 
     /**

@@ -10,6 +10,7 @@ import React, {
   useState, useMemo, useRef, useEffect, useCallback, memo,
   forwardRef, useImperativeHandle,
 } from 'react';
+import { getDisplayTimezone } from '../../lib/formatTime.js';
 import { getLLMs } from '../../services/llmService.js';
 import { getMCPServers } from '../../services/mcpService.js';
 import { useWorkflowStatus } from '../../context/WorkflowStatusContext.jsx';
@@ -138,6 +139,8 @@ const NODE_TYPES = {
       { kind: 'chips',  id: 'groups',   label: 'Log groups', action: 'discoverCloudWatchLogGroups' },
       { kind: 'select', id: 'analysis', label: 'Analysis type',
         options: ['error-patterns','metrics','alarms','anomalies'] },
+      { kind: 'select', id: 'analysis_depth', label: 'Analysis depth',
+        options: ['auto','shallow','deep'] },
       { kind: 'toggle', id: 'activeAlarmsOnly', label: '🔴 Active alarms only' },
       { kind: 'select', id: 'range',    label: 'Time range',
         options: ['15m','1h','6h','24h'] },
@@ -276,7 +279,7 @@ const NODE_DEFAULTS = {
   http_in:     { method: 'GET', url: '' },
   webhook:     { path: '/hooks/incoming' },
   vector_memory: { collection: '', topK: '5' },
-  cloudwatch_tool: { region: 'us-east-1', profile: '', groups: '', analysis: 'error-patterns', range: '15m', threshold: '10', alerts: 'false' },
+  cloudwatch_tool: { region: 'us-east-1', profile: '', groups: '', analysis: 'error-patterns', analysis_depth: 'auto', range: '15m', threshold: '10', alerts: 'false' },
   agent:       { system: '', maxIter: '10' },
   if:          { condition: '' },
   pagerduty:   { severity: 'P2', service: '' },
@@ -347,6 +350,7 @@ function _dataToParams(type, data) {
         profile:   data.awsProfile || data.profile || '',
         groups,
         analysis:  data.analysisType || data.analysis || 'error-patterns',
+        analysis_depth: data.analysisDepth || data.analysis_depth || 'auto',
         range:     data.timeRange || data.range || '15m',
         threshold: String(data.errorThreshold ?? data.threshold ?? '10'),
         alerts:    String(data.enableAlerts ?? data.alerts ?? 'false'),
@@ -1255,6 +1259,11 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
     const def = NODE_TYPES[nodeType];
     const id = `${nodeType}_${Date.now()}`;
     let params = { ...(NODE_DEFAULTS[nodeType] || {}) };
+    // New schedule nodes default to the operator's global timezone (Settings),
+    // not a hardcoded UTC — so scheduling reflects the app-wide timezone.
+    if (nodeType === 'schedule' && (!params.tz || params.tz === 'UTC')) {
+      params.tz = getDisplayTimezone();
+    }
     try { if (nodeParams) Object.assign(params, JSON.parse(nodeParams)); } catch {}
     setNodes(ns => [...ns, {
       id, type: nodeType,

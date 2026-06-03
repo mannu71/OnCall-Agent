@@ -80,10 +80,12 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
     # ------------------------------------------------------------------
     cw_results = {}
     for key, value in context.items():
-        # Only collect genuine pre-computed analyses (legacy cloudwatchAnalyzer).
-        # tool-provider stubs (cloudwatch_tool) carry analysis_type as config but
-        # have tool_provider='cloudwatch' and no real output — exclude them.
-        if isinstance(value, dict) and value.get('analysis_type') and not value.get('tool_provider'):
+        # Collect pre-computed CloudWatch analyses from BOTH node types:
+        # legacy cloudwatchAnalyzer and the new cloudwatch_tool — both now run
+        # run_investigation_pipeline upfront and carry a real analysis_type +
+        # output + data bundle. (cloudwatch_tool also sets tool_provider, but it
+        # is no longer a no-op stub, so we no longer exclude it.)
+        if isinstance(value, dict) and value.get('analysis_type') and value.get('output'):
             from app.workflow.tools.cloudwatch_summarizers import compact_context_snippet
             entry = {
                 'analysis_type': value.get('analysis_type'),

@@ -29,6 +29,7 @@ import logging
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+from app.config import settings
 from app.infrastructure.persistence import llm_config_repository, model_key_repository
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,10 @@ _NO_CREDENTIALS_PROVIDERS = {"ollama"}
 _BEDROCK_KEY_ALIASES = ("AWS Bedrock", "bedrock", "aws bedrock", "aws")
 
 _DEFAULT_TEMPERATURE = 0.1
-_DEFAULT_MAX_TOKENS  = 4096
+# Sourced from settings so it can be tuned via AGENT_MAX_OUTPUT_TOKENS without
+# a code change. Defaults to 8192 — see Settings.agent_max_output_tokens for why
+# 4096 was too small (truncated mid-reasoning before a tool_use could be emitted).
+_DEFAULT_MAX_TOKENS  = settings.agent_max_output_tokens
 _DEFAULT_REGION      = "us-east-1"
 
 

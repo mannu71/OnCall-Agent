@@ -23,32 +23,96 @@ from app.models.db_models import (
 logger = logging.getLogger(__name__)
 
 
+# AWS error codes that mean "the credentials are no longer usable" — when we see
+# these we rebuild the Bedrock client so a refreshed token (rotated in the DB
+# model_keys store or ~/.aws) is picked up without a process restart.
+_AUTH_ERROR_CODES = frozenset({
+    "ExpiredTokenException", "ExpiredToken", "InvalidClientTokenId",
+    "UnrecognizedClientException", "InvalidSignatureException", "AccessDeniedException",
+})
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    from botocore.exceptions import ClientError, NoCredentialsError
+    if isinstance(exc, NoCredentialsError):
+        return True
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in _AUTH_ERROR_CODES:
+            return True
+    msg = str(exc).lower()
+    return "expired" in msg or "security token" in msg or ("invalid" in msg and "token" in msg)
+
+
 class EmbeddingService:
     """Service for generating embeddings using AWS Bedrock."""
-    
-    def __init__(self, region: str = "us-east-1"):
+
+    def __init__(self, region: Optional[str] = None):
         """Initialize embedding service.
-        
+
         Args:
-            region: AWS region for Bedrock
+            region: AWS region for Bedrock. When omitted, resolved from the app
+                settings / DB model-keys store at first use (same source the
+                chat LLM uses) instead of a hardcoded default.
         """
         self.region = region
         self._client = None
-    
-    @property
-    def client(self):
-        """Get Bedrock client (lazy initialization)."""
-        if self._client is None:
-            import boto3
-            self._client = boto3.client('bedrock-runtime', region_name=self.region)
+
+    def _reset_client(self) -> None:
+        """Drop the cached client so the next call rebuilds it with fresh creds."""
+        self._client = None
+
+    async def _get_client(self):
+        """Build (and cache) a Bedrock client using the app's resolved creds.
+
+        Uses the shared :func:`resolve_aws_credentials` (DB model_keys / profile)
+        and honours ``AWS_SSL_VERIFY`` so it matches the working chat-LLM path —
+        the previous hardcoded ``us-east-1`` + default credential chain was the
+        cause of "expired/invalid security token" playbook-save failures.
+        """
+        if self._client is not None:
+            return self._client
+
+        import boto3
+        from botocore.config import Config as BotocoreConfig
+        from app.config import settings
+        from app.core.aws_credentials import resolve_aws_credentials
+
+        creds, region = await resolve_aws_credentials(
+            aws_profile=settings.aws_profile,
+            aws_region=self.region or settings.aws_region,
+        )
+        self.region = region
+
+        if creds.get("access_key_id") and creds.get("secret_access_key"):
+            session = boto3.Session(
+                region_name=region,
+                aws_access_key_id=creds["access_key_id"],
+                aws_secret_access_key=creds["secret_access_key"],
+                aws_session_token=creds.get("session_token"),
+            )
+        else:
+            session = boto3.Session(
+                region_name=region, profile_name=creds.get("aws_profile"),
+            )
+
+        self._client = session.client(
+            "bedrock-runtime",
+            region_name=region,
+            verify=settings.aws_ssl_verify,
+            config=BotocoreConfig(retries={"max_attempts": 3}),
+        )
         return self._client
-    
+
     async def generate_embedding(self, text: str) -> List[float]:
         """Generate embedding for text using Amazon Titan.
-        
+
+        Retries once on an auth/expiry error after rebuilding the client, so a
+        rotated credential is picked up without a restart.
+
         Args:
             text: Text to embed
-            
+
         Returns:
             Embedding vector (1536 dimensions for Titan)
         """
@@ -57,17 +121,31 @@ class EmbeddingService:
         max_tokens = 8000
         if len(text) > max_tokens:
             text = text[:max_tokens]
+        body = json.dumps({'inputText': text})
 
-        # Call Bedrock API
-        response = await run_in_aws_pool(
-            lambda: self.client.invoke_model(
-                modelId='amazon.titan-embed-text-v1',
-                body=json.dumps({'inputText': text})
-            )
-        )
-        
-        result = json.loads(response['body'].read())
-        return result.get('embedding', [])
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            client = await self._get_client()
+            try:
+                response = await run_in_aws_pool(
+                    lambda: client.invoke_model(
+                        modelId='amazon.titan-embed-text-v1',
+                        body=body,
+                    )
+                )
+                result = json.loads(response['body'].read())
+                return result.get('embedding', [])
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt == 0 and _is_auth_error(exc):
+                    logger.warning(
+                        "EmbeddingService: Bedrock credentials expired/invalid — "
+                        "rebuilding client and retrying once (%s)", exc,
+                    )
+                    self._reset_client()
+                    continue
+                raise
+        raise last_exc  # pragma: no cover — loop always returns or raises above
     
     async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings for multiple texts (bounded parallel)."""

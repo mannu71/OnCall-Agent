@@ -1210,7 +1210,7 @@ async def correlate_logs(
                     "timestamp": parsed.get("@timestamp", ""),
                     "log_group": parsed.get("@log"),
                     "log_stream": parsed.get("@logStream"),
-                    "message": (parsed.get("@message") or "")[:500],
+                    "message": (parsed.get("@message") or "")[:1500],
                 })
         except Exception as e:
             logger.warning("correlate_logs Insights query failed: %s", e)
@@ -1249,7 +1249,7 @@ async def correlate_logs(
                 "timestamp_ms": timestamp_ms,
                 "log_group": event.get("log_group"),
                 "log_stream": event.get("logStreamName"),
-                "message": event.get("message", "")[:500],
+                "message": event.get("message", "")[:1500],
                 "event_id": event.get("eventId"),
             })
         if len(timeline) >= 200 * len(log_group_names):

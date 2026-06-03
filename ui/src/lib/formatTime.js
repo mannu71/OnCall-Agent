@@ -61,3 +61,23 @@ export function formatInTimezone(utcValue, options = {}, tz = getDisplayTimezone
         return new Intl.DateTimeFormat(undefined, { timeZone: 'UTC', ...fmtOptions }).format(date);
     }
 }
+
+/**
+ * Format a timestamp as a short clock time (e.g. "14:05") in the configured
+ * global timezone — for chat bubbles, trace steps, and other compact displays.
+ *
+ * @param {string|number|Date} utcValue ISO string, epoch ms, or Date.
+ * @param {string} [tz] Override timezone; defaults to the global setting.
+ * @returns {string}
+ */
+export function formatClock(utcValue, tz = getDisplayTimezone()) {
+    if (utcValue === null || utcValue === undefined || utcValue === '') return '';
+    const date = utcValue instanceof Date ? utcValue : new Date(utcValue);
+    if (Number.isNaN(date.getTime())) return String(utcValue);
+    const opts = { hour: '2-digit', minute: '2-digit', hour12: false };
+    try {
+        return new Intl.DateTimeFormat(undefined, { timeZone: tz, ...opts }).format(date);
+    } catch {
+        return new Intl.DateTimeFormat(undefined, { timeZone: 'UTC', ...opts }).format(date);
+    }
+}

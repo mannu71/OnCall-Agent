@@ -680,6 +680,26 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
               </select>
             </div>
 
+            <div className="config-field">
+              <label htmlFor="analysis-depth">Analysis Depth</label>
+              <select
+                id="analysis-depth"
+                value={config.analysisDepth || 'auto'}
+                onChange={(e) => handleConfigChange('analysisDepth', e.target.value)}
+              >
+                <option value="auto">Auto — drill down only when it matters (recommended)</option>
+                <option value="shallow">Shallow — triage + summary only</option>
+                <option value="deep">Deep — always drill down + correlate</option>
+              </select>
+              <small style={{ color: '#666', fontSize: '11px' }}>
+                All modes run parallel triage (alarms, anomalies, error patterns) and
+                always end with a structured report. Auto adds targeted drill-down only
+                on high/critical severity, weak evidence, or a firing alarm. Shallow skips
+                drill-down (cheapest); Deep always drills the top findings and correlates
+                across services (slower, higher cost).
+              </small>
+            </div>
+
             {/* Custom query textarea — shown only for custom-query type */}
             {config.analysisType === 'custom-query' && (
               <div className="config-field">

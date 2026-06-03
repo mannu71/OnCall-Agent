@@ -175,12 +175,40 @@ class Settings(BaseSettings):
     provider_transport: str = "anthropic"
     crawler_model: str = "anthropic.claude-3-5-haiku-20241022-v1:0"
     agent_recursion_limit: int = 12
+    # Default per-turn output-token cap for agent/workflow LLM calls. 4096 was
+    # too small: the model could exhaust its budget mid-reasoning (right before
+    # emitting a tool_use), get cut off with stopReason="max_tokens", and have
+    # that truncated half-thought returned as the final answer. 8192 leaves room
+    # for reasoning + a tool call in one turn. Override via AGENT_MAX_OUTPUT_TOKENS.
+    agent_max_output_tokens: int = Field(default=8192, validation_alias="AGENT_MAX_OUTPUT_TOKENS")
     code_analyzer_output_max_chars: int = 8000
     mcp_tool_output_max_chars: int = 8000
     skill_min_tool_calls: int = 3
     guardrail_hard_stop: bool = False
     cloudwatch_auto_drilldown: bool = True
     cloudwatch_metrics_fusion: bool = True
+    # When True, the deterministic cloudwatchAnalyzer node auto-escalates to a
+    # contained agent investigation when its triage signals warrant it (high/
+    # critical severity, low confidence, or a high-severity alert). Set False to
+    # keep the analyzer purely deterministic regardless of node analysis_depth.
+    cloudwatch_auto_escalate: bool = True
+    # Staged investigation pipeline (run_investigation_pipeline): how many top
+    # findings to drill into during Stage 2, and whether the heaviest stage
+    # (cross-group correlation) may run. Tunable without a redeploy.
+    cloudwatch_pipeline_drilldown_top_n: int = 5
+    cloudwatch_pipeline_enable_correlation: bool = True
+    # RCA data-fidelity caps (this is an internal root-cause tool — keep enough
+    # raw detail that correlation/profile/trace IDs and stack traces survive).
+    # Tunable per environment without a redeploy.
+    cloudwatch_synthesis_max_chars: int = 24_000   # LLM synthesis payload size
+    cloudwatch_example_msg_chars: int = 800        # per-pattern example message
+    cloudwatch_drill_sample_chars: int = 1500      # per drill-down sample sent to LLM
+    # Pipeline LLM synthesis control. The synthesis is a single Bedrock call that
+    # produces the narrative; when an account-level Bedrock guardrail blocks it,
+    # it wastes ~24s + tokens every run. Set False to disable entirely; otherwise
+    # a circuit breaker skips it after N consecutive guardrail refusals.
+    cloudwatch_pipeline_llm_synthesis: bool = True
+    cloudwatch_synthesis_guardrail_cooldown: int = 3   # consecutive refusals before skip
 
     # Supervisor
     supervisor_max_retries: int = 1

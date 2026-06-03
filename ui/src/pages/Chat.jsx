@@ -6,6 +6,8 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import { cn } from '@/lib/utils';
 import { 
   Loader2, 
@@ -19,7 +21,6 @@ import {
   Brain,
   Wrench,
   Terminal,
-  Calendar,
   Activity,
   CheckCircle2,
   Database,
@@ -32,6 +33,19 @@ import {
 } from 'lucide-react';
 import { isAgentWorkflowValid } from '../utils/workflowValidation.js';
 import agentApiClient from '../services/agentApiClient.js';
+import MarkdownMessage from '../components/markdown/MarkdownMessage.jsx';
+import { formatClock } from '../lib/formatTime.js';
+
+// Client-side mirror of the backend trace_ids detector (cosmetic badge only —
+// the backend remains the source of truth for the correlation fast-path).
+const CORRELATION_ID_RE = /\b(1-[0-9a-f]{8}-[0-9a-f]{24}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9A-Z]{10,}:[0-9A-Fa-f]{8})\b/;
+const TIME_RANGE_HINT_RE = /\b(last|over|past|\d+\s*(m|min|mins|h|hr|hour|hours|d|day|days))\b/i;
+
+/** True when an agent workflow contains a CloudWatch node (so it can trace logs). */
+function agentHasCloudWatch(agent) {
+  const nodes = agent?.nodes || [];
+  return nodes.some(n => n?.type === 'cloudwatch_tool' || n?.type === 'cloudwatchAnalyzer');
+}
 
 // Use Vite's environment check for development mode
 const DEV_MODE = import.meta.env.DEV;
@@ -111,96 +125,56 @@ function Chat() {
   const [selectedAgent, setSelectedAgent] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showToolsList, setShowToolsList] = useState(false);
+  const [timeRange, setTimeRange] = useState('24h');
+  const [agentSheetOpen, setAgentSheetOpen] = useState(false);
 
-  // Starting Conversation State pre-populated with high-fidelity mockup messages
+  // Conversation starts clean — a single welcome note, then real turns only.
   const [messages, setMessages] = useState([
     {
       id: "init-1",
       type: MESSAGE_TYPES.SYSTEM,
-      content: 'Welcome to OnCall Agent chat! Select an orchestrator from the sidebar to begin diagnostics.',
-      timestamp: new Date(Date.now() - 30 * 60000).toISOString()
-    },
-    {
-      id: "init-2",
-      type: MESSAGE_TYPES.USER,
-      content: "Why did profile-validation fail at 22:00 last night?",
-      timestamp: new Date(Date.now() - 25 * 60000).toISOString()
-    },
-    {
-      id: "init-3",
-      type: MESSAGE_TYPES.AGENT,
-      content: "I'll trace the run. Pulling postgres errors and CloudWatch alarms for the time window…",
-      tools: [
-        { name: "postgres__query", t: "0.3s" },
-        { name: "cloudwatch__get_alarms", t: "0.5s" }
-      ],
-      timestamp: new Date(Date.now() - 24 * 60000).toISOString()
-    },
-    {
-      id: "init-4",
-      type: MESSAGE_TYPES.AGENT,
-      content: "**Root cause:** the postgres connection pool exhausted at 21:57:14. 3 profiles (ids `4f12-…`, `9a02-…`, `c81e-…`) timed out at the read step.\n\nThe pool is sized at 8 connections. The ado-release-monitor workflow held 6 of them during a long-running release diff — overlap was unavoidable with current scheduling.\n\n**Recommendation:** raise pool size to 16, _or_ move ado-release-monitor to 21:30.",
-      citations: [
-        "postgres__query: connection_pool_size",
-        "cloudwatch__alarms: rds-conn-exhaust"
-      ],
-      timestamp: new Date(Date.now() - 22 * 60000).toISOString()
-    },
-    {
-      id: "init-5",
-      type: MESSAGE_TYPES.USER,
-      content: "Raise pool size to 16 and re-run for the failed profiles.",
-      timestamp: new Date(Date.now() - 20 * 60000).toISOString()
+      content: 'Welcome! Select an agent from the sidebar, then ask it anything to get started.',
+      timestamp: new Date().toISOString()
     }
   ]);
 
-  // Stepper timeline trace steps - starts with high fidelity mock, updates dynamically on active runs
-  const [traceSteps, setTraceSteps] = useState([
-    { l: "think", t: "12ms", text: "Plan: query postgres for failed rows, then cross-ref CloudWatch." },
-    { l: "tool",  t: "0.31s", text: "postgres__query · SELECT * FROM profiles WHERE status='failed'…" },
-    { l: "tool",  t: "0.54s", text: "cloudwatch__get_alarms · ALARM_OK transitions, t-15m" },
-    { l: "think", t: "8ms", text: "Correlate pool_exhausted timestamp ↔ failed profile ids." },
-    { l: "answer", t: "—", text: "Returned root cause + recommendation." },
-  ]);
+  // Stepper timeline — populated live from real run events (empty until a run starts).
+  const [traceSteps, setTraceSteps] = useState([]);
 
-  // Token Metrics state - defaults to high fidelity mock, updates dynamically on runs
-  const [tokens, setTokens] = useState({
-    input: 3402,
-    output: 814,
-    total: 4216
-  });
+  // Token metrics — zero until a real run reports usage.
+  const [tokens, setTokens] = useState({ input: 0, output: 0, total: 0 });
 
   // Dynamic values based on selected agent workflow node structure
   const getAgentDetails = () => {
     if (!selectedAgent) {
-      return {
-        modelName: "claude-sonnet-4",
-        toolsCount: 3,
-        toolsList: ["postgres__query", "cloudwatch__get_alarms", "ado-release-monitor"]
-      };
+      return { modelName: "—", toolsCount: 0, toolsList: [] };
     }
 
-    // Find LLM model from node data
-    const llmNode = selectedAgent.nodes?.find(n => n.type === 'llm');
-    const modelName = llmNode?.data?.model || llmNode?.data?.label || "claude-sonnet-4";
+    // Find LLM model (legacy `llm` OR new `language_model`). The LangflowEditor
+    // node stores the chosen model under `params.llm` (e.g. "Claude Sonnet 4.6").
+    const llmNode = selectedAgent.nodes?.find(n => n.type === 'llm' || n.type === 'language_model');
+    const modelName = llmNode?.params?.llm || llmNode?.params?.model || llmNode?.params?.modelId
+      || llmNode?.data?.model || llmNode?.data?.modelId || llmNode?.data?.label
+      || llmNode?.name || "—";
 
-    // Find tool nodes connected to the agent node
+    // Find tool nodes connected to the agent node (any non-LLM/schedule capability).
+    const NON_TOOL = new Set(['agent', 'llm', 'language_model', 'schedule', 'scheduler', 'trigger', 'memory']);
     const agentNode = selectedAgent.nodes?.find(n => n.type === 'agent');
     let toolsList = [];
     if (agentNode && selectedAgent.edges && selectedAgent.nodes) {
       const connectedNodeIds = selectedAgent.edges
-        .filter(edge => edge.target === agentNode.id)
-        .map(edge => edge.source);
-      
+        .filter(edge => edge.target === agentNode.id || edge.source === agentNode.id)
+        .map(edge => (edge.source === agentNode.id ? edge.target : edge.source));
+
       toolsList = selectedAgent.nodes
-        .filter(node => connectedNodeIds.includes(node.id) && (node.type === 'tool' || node.type === 'cloudwatchAnalyzer'))
-        .map(node => node.data?.label || node.data?.name || node.type);
+        .filter(node => connectedNodeIds.includes(node.id) && !NON_TOOL.has(node.type))
+        .map(node => node.data?.label || node.data?.name || node.params?.label || node.type);
     }
 
     return {
       modelName,
-      toolsCount: toolsList.length || 1,
-      toolsList: toolsList.length > 0 ? toolsList : ["postgres__query", "cloudwatch__get_alarms"]
+      toolsCount: toolsList.length,
+      toolsList,
     };
   };
 
@@ -256,7 +230,7 @@ function Chat() {
   // Select agent
   const handleSelectAgent = (agent) => {
     setSelectedAgent(agent);
-    addMessage(MESSAGE_TYPES.SYSTEM, `Selected agent: **${agent.name}**. Ready to run incident logs and trace executions.`);
+    addMessage(MESSAGE_TYPES.SYSTEM, `Selected agent: **${agent.name}**. Ask it anything to get started.`);
   };
 
   // Trigger agent direct workflow run
@@ -329,7 +303,15 @@ function Chat() {
     const userMessage = inputValue.trim();
     setInputValue('');
 
-    addMessage(MESSAGE_TYPES.USER, userMessage);
+    addMessage(MESSAGE_TYPES.USER, userMessage, { hasTraceId: CORRELATION_ID_RE.test(userMessage) });
+
+    // Append the selected time range hint ONLY for CloudWatch agents (and only
+    // when the user didn't already give one). Generic workflows get the raw text.
+    const effectiveAgent = selectedAgent || agents[0];
+    const scopeForCw = effectiveAgent && agentHasCloudWatch(effectiveAgent);
+    const question = (scopeForCw && !TIME_RANGE_HINT_RE.test(userMessage))
+      ? `${userMessage} (over the last ${timeRange})`
+      : userMessage;
 
     // If no agent selected, prompt user to select one
     if (!selectedAgent) {
@@ -341,12 +323,12 @@ function Chat() {
       const firstAgent = agents[0];
       setSelectedAgent(firstAgent);
       addMessage(MESSAGE_TYPES.SYSTEM, `Auto-selected agent: **${firstAgent.name}**`);
-      await askAgent(firstAgent, userMessage);
+      await askAgent(firstAgent, question);
       return;
     }
 
     // Send the question to the selected agent
-    await askAgent(selectedAgent, userMessage);
+    await askAgent(selectedAgent, question);
   };
 
   // Ask the agent a question
@@ -416,57 +398,54 @@ function Chat() {
     }
 
     try {
-      if (window.electronAPI?.runAgent) {
-        const result = await window.electronAPI.runAgent(agent.name, question);
+      // Run via the FastAPI HTTP/SSE bridge — works in the browser AND Electron
+      // (both reach the agent-api). Live tool/token events stream into the trace
+      // panel; the final answer renders as rich Markdown.
+      const pushTrace = (l, text) =>
+        setTraceSteps(prev => {
+          const last = prev[prev.length - 1];
+          if (last && last.text === text) return prev;
+          return [...prev, { l, t: '—', text }];
+        });
+      const pushStatus = (msg) => {
+        if (!msg) return;
+        setMessages(prev => prev.map(m => m.id === thinkingId
+          ? {
+              ...m,
+              content: msg,
+              statusHistory: [
+                ...((m.statusHistory) || []),
+                { type: 'thinking', message: msg, time: new Date().toLocaleTimeString() },
+              ].slice(-8),
+            }
+          : m));
+      };
 
-        if (result?.success) {
-          updateMessage(thinkingId, {
-            content: result.answer || 'Agent completed successfully.',
-            isLoading: false,
-            currentStatus: null
-          });
+      const result = await agentApiClient.runAgentStream(agent.name, question, {
+        onToolCall: (name) => { pushTrace('tool', `Calling ${name}…`); pushStatus(`Calling ${name}…`); },
+        onToolResult: (name) => pushTrace('tool', `${name} returned`),
+        onNode: (nodeId, status) => pushTrace('think', `${nodeId} ${status}`),
+        onStatus: (msg) => pushStatus(msg),
+        onError: (err) => pushTrace('answer', `Error: ${err}`),
+      });
 
-          // Final successful trace step
-          setTraceSteps(prev => [
-            ...prev,
-            { l: "answer", t: "—", text: "Returned final analysis + recommendations." }
-          ]);
+      updateMessage(thinkingId, {
+        content: result.finalAnswer || 'Agent completed (no answer text returned).',
+        isLoading: false,
+        isMarkdown: true,
+        currentStatus: null,
+        statusHistory: [],
+      });
+      pushTrace('answer', 'Returned final analysis + recommendations.');
 
-          // Compute dynamic token count based on input/output size
-          const promptTokens = Math.floor(question.length * 1.3) + 1200;
-          const completionTokens = Math.floor((result.answer || '').length * 0.4) + 150;
-          setTokens({
-            input: promptTokens,
-            output: completionTokens,
-            total: promptTokens + completionTokens
-          });
-
-        } else {
-          updateMessage(thinkingId, {
-            content: `Error: ${result?.error || 'Unknown error'}`,
-            isLoading: false,
-            isError: true,
-            currentStatus: null
-          });
-
-          setTraceSteps(prev => [
-            ...prev,
-            { l: "answer", t: "—", text: `Run failed: ${result?.error || 'Execution aborted'}` }
-          ]);
-        }
+      if (result.tokens && (result.tokens.input || result.tokens.output || result.tokens.total)) {
+        const inp = result.tokens.input || 0;
+        const out = result.tokens.output || 0;
+        setTokens({ input: inp, output: out, total: result.tokens.total || inp + out });
       } else {
-        // Fallback for demo when not inside Electron
-        setTimeout(() => {
-          updateMessage(thinkingId, {
-            content: "Agent execution is only available in the desktop app container. Connect to the local Electron app for real runs.",
-            isLoading: false,
-            isError: true
-          });
-          setTraceSteps(prev => [
-            ...prev,
-            { l: "answer", t: "—", text: "Execution rejected: Electron environment missing." }
-          ]);
-        }, 1200);
+        const promptTokens = Math.floor(question.length * 1.3) + 1200;
+        const completionTokens = Math.floor((result.finalAnswer || '').length * 0.4) + 150;
+        setTokens({ input: promptTokens, output: completionTokens, total: promptTokens + completionTokens });
       }
     } catch (error) {
       updateMessage(thinkingId, {
@@ -517,8 +496,11 @@ function Chat() {
       >
         <div className={`flex flex-col items-${isUser ? 'end' : 'start'} max-w-[720px] w-[88%]`}>
           {/* Sender Header */}
-          <div className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 pl-1 pr-1">
-            {isUser ? 'You' : 'Agent'} · {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          <div className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 pl-1 pr-1 flex items-center gap-2">
+            <span>{isUser ? 'You' : 'Agent'} · {formatClock(message.timestamp)}</span>
+            {isUser && message.hasTraceId && (
+              <span className="normal-case tracking-normal text-[9px] font-semibold text-sky-700 bg-sky-50 border border-sky-100 rounded px-1 leading-4">🔎 correlation lookup</span>
+            )}
           </div>
 
           {/* Chat Bubble Card */}
@@ -529,8 +511,10 @@ function Chat() {
                 : 'bg-white text-slate-900 border border-slate-200/80 rounded-2xl rounded-tl-sm hover:border-slate-300/80 shadow-[0_1px_3px_0_rgb(15_23_42/0.04)]'
             }`}
           >
-            <div className="whitespace-pre-wrap break-words">
-              <FormattedText text={textContent} isUser={isUser} />
+            <div className="break-words">
+              {(!isUser && message.isMarkdown)
+                ? <MarkdownMessage content={textContent} />
+                : <div className="whitespace-pre-wrap"><FormattedText text={textContent} isUser={isUser} /></div>}
             </div>
 
             {/* Custom Tool usage info */}
@@ -622,10 +606,10 @@ function Chat() {
     <div className="flex h-screen bg-slate-50 select-none overflow-hidden w-full max-w-full">
       
       {/* Sub-Sidebar: Left - Agent List */}
-      <aside className="w-[280px] border-r border-slate-200 flex flex-col h-full bg-white flex-shrink-0">
+      <aside className="hidden md:flex w-[240px] lg:w-[280px] border-r border-slate-200 flex-col h-full bg-white flex-shrink-0">
         <div className="p-4 border-b border-slate-100 h-20 flex flex-col justify-center gap-0.5">
           <div className="flex items-center justify-between">
-            <h2 className="font-bold text-slate-800 text-sm tracking-wide">Incident Agents</h2>
+            <h2 className="font-bold text-slate-800 text-sm tracking-wide">Agents</h2>
             <Button 
               size="icon" 
               variant="ghost" 
@@ -638,7 +622,7 @@ function Chat() {
             </Button>
           </div>
           <p className="text-[11px] text-slate-400 font-medium">
-            Select an agent to run diagnostic trace
+            Select an agent to start chatting
           </p>
         </div>
 
@@ -690,7 +674,12 @@ function Chat() {
                         <Bot className="size-4" />
                       </div>
                       <div className="flex-1 text-left min-w-0">
-                        <div className="font-semibold text-xs text-slate-700 truncate">{agent.name}</div>
+                        <div className="font-semibold text-xs text-slate-700 truncate flex items-center gap-1.5">
+                          <span className="truncate">{agent.name}</span>
+                          {agentHasCloudWatch(agent) && (
+                            <span className="shrink-0 text-[9px] font-semibold text-sky-700 bg-sky-50 border border-sky-100 rounded px-1 leading-4">CloudWatch</span>
+                          )}
+                        </div>
                         <div className="text-[10px] text-slate-400 flex items-center gap-1.5 mt-0.5">
                           <span className="relative flex h-1.5 w-1.5">
                             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
@@ -734,14 +723,47 @@ function Chat() {
       <div className="flex-grow flex flex-col h-full bg-[#fafbfc] min-w-0 relative">
         
         {/* Top Header Bar */}
-        <header className="h-20 px-8 border-b border-slate-200/80 bg-white flex items-center justify-between flex-shrink-0 z-10 shadow-[0_1px_2px_0_rgba(15,23,42,0.01)]">
+        <header className="h-20 px-4 md:px-8 border-b border-slate-200/80 bg-white flex items-center justify-between flex-shrink-0 z-10 shadow-[0_1px_2px_0_rgba(15,23,42,0.01)]">
           <div className="flex items-center gap-3 min-w-0">
+            {/* Mobile agent picker (sidebar is hidden < md) */}
+            <Sheet open={agentSheetOpen} onOpenChange={setAgentSheetOpen}>
+              <SheetTrigger asChild>
+                <Button variant="outline" size="icon" className="md:hidden size-9 shrink-0 rounded-lg" title="Choose agent">
+                  <Bot className="size-5" />
+                </Button>
+              </SheetTrigger>
+              <SheetContent side="left" className="w-[280px] p-0 gap-0">
+                <SheetHeader className="p-4 border-b border-slate-100">
+                  <SheetTitle className="text-sm">Agents</SheetTitle>
+                </SheetHeader>
+                <div className="p-2 overflow-auto">
+                  {filteredAgents.length === 0 ? (
+                    <p className="px-3 py-2 text-xs text-slate-500">No agents found. Build one in Workflow.</p>
+                  ) : filteredAgents.map((agent) => (
+                    <button
+                      key={agent.id}
+                      onClick={() => { handleSelectAgent(agent); setAgentSheetOpen(false); }}
+                      className={cn(
+                        "w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-left text-sm hover:bg-slate-50 transition-colors",
+                        selectedAgent?.id === agent.id && "bg-red-50/40"
+                      )}
+                    >
+                      <Bot className="size-4 text-slate-500 shrink-0" />
+                      <span className="truncate flex-1">{agent.name}</span>
+                      {agentHasCloudWatch(agent) && (
+                        <Badge variant="secondary" className="text-[9px] bg-sky-50 text-sky-700 border-sky-100">CloudWatch</Badge>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </SheetContent>
+            </Sheet>
             <IconChip tint="red">
               <Brain className="size-5" />
             </IconChip>
             <div className="min-w-0">
               <h1 className="font-bold text-sm text-slate-800 tracking-wide truncate">
-                {selectedAgent ? selectedAgent.name : "OnCall orchestrator"}
+                {selectedAgent ? selectedAgent.name : "Select an agent"}
               </h1>
               <p className="text-[11px] text-slate-400 font-medium flex items-center gap-1.5 mt-0.5 font-sans">
                 <span className="bg-slate-50 border border-slate-100 px-1 py-0.2 rounded font-mono text-[10px] text-slate-500 font-semibold">{modelName}</span>
@@ -764,7 +786,7 @@ function Chat() {
         </header>
 
         {/* Scrollable Conversation Stream */}
-        <div className="flex-grow overflow-auto px-8 py-6 flex flex-col gap-1 select-text">
+        <div className="flex-grow overflow-auto px-4 md:px-8 py-6 flex flex-col gap-1 select-text">
           {messages.map(renderMessage)}
           <div ref={messagesEndRef} />
         </div>
@@ -800,7 +822,7 @@ function Chat() {
         )}
 
         {/* Input tray panel */}
-        <div className="p-8 pt-0 bg-transparent flex-shrink-0 z-10">
+        <div className="p-4 md:p-8 pt-0 md:pt-0 bg-transparent flex-shrink-0 z-10">
           <div className="bg-white border border-slate-200 rounded-2xl p-3 flex flex-col gap-3 shadow-md hover:border-slate-300/80 transition-colors focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
             
             {/* Multi-line chat Textarea */}
@@ -816,8 +838,8 @@ function Chat() {
             />
             
             {/* Input Footer row */}
-            <div className="flex items-center justify-between border-t border-slate-50 pt-2.5">
-              <div className="flex gap-2">
+            <div className="flex items-center justify-between gap-2 border-t border-slate-50 pt-2.5 flex-wrap">
+              <div className="flex gap-2 flex-wrap">
                 <Button 
                   variant="ghost" 
                   size="sm" 
@@ -830,16 +852,43 @@ function Chat() {
                   @ tools
                 </Button>
                 
-                <Button 
-                  variant="ghost" 
-                  size="sm"
-                  onClick={() => navigate('/scheduler')}
-                  className="h-8 rounded-lg text-xs font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-700"
-                >
-                  <Calendar data-icon="inline-start" />
-                  Schedule
-                </Button>
-                
+                {/* CloudWatch-specific quick actions — only for agents that
+                    actually have a CloudWatch tool. Other workflows stay generic. */}
+                {selectedAgent && agentHasCloudWatch(selectedAgent) && (
+                  <>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setInputValue('Trace correlation id <paste id here> ');
+                        setTimeout(() => inputRef.current?.focus(), 0);
+                      }}
+                      className="h-8 rounded-lg text-xs font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-700"
+                      title="Insert a correlation/trace ID lookup template"
+                    >
+                      🔎 Trace ID
+                    </Button>
+
+                    {/* Time range scoping for CloudWatch lookups */}
+                    <Select value={timeRange} onValueChange={setTimeRange}>
+                      <SelectTrigger
+                        size="sm"
+                        className="h-8 w-[74px] rounded-lg text-xs font-semibold text-slate-600"
+                        title="Time range for CloudWatch lookups"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="15m">15m</SelectItem>
+                        <SelectItem value="1h">1h</SelectItem>
+                        <SelectItem value="6h">6h</SelectItem>
+                        <SelectItem value="24h">24h</SelectItem>
+                        <SelectItem value="7d">7d</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </>
+                )}
+
                 <span className="font-mono text-[10px] text-slate-400 font-semibold bg-slate-50 border border-slate-100 rounded-md px-2 py-0.5 flex items-center select-none ml-1">
                   {modelName}
                 </span>
@@ -865,7 +914,7 @@ function Chat() {
       </div>
 
       {/* Column 3: Run Inspector (Right panel) */}
-      <aside className="w-[300px] border-l border-slate-200 bg-white flex flex-col h-full overflow-hidden flex-shrink-0 z-10 shadow-[0_-1px_3px_rgba(15,23,42,0.01)] animate-in slide-in-from-right duration-300">
+      <aside className="hidden xl:flex w-[300px] border-l border-slate-200 bg-white flex-col h-full overflow-hidden flex-shrink-0 z-10 shadow-[0_-1px_3px_rgba(15,23,42,0.01)] animate-in slide-in-from-right duration-300">
         
         {/* Header */}
         <div className="p-4 border-b border-slate-100 flex items-center h-20 justify-between">
@@ -886,7 +935,13 @@ function Chat() {
             
             {/* Connecting Timeline Thread */}
             <div className="absolute left-[5px] top-2 bottom-2 w-0.5 bg-slate-100" />
-            
+
+            {traceSteps.length === 0 && (
+              <div className="pl-8 text-[12px] text-slate-400 italic">
+                No activity yet. Ask the agent a question to see its reasoning and tool calls here.
+              </div>
+            )}
+
             {traceSteps.map((s, i) => {
               // Color styles for step dot types
               let colorClasses = "bg-slate-300 border-slate-200";

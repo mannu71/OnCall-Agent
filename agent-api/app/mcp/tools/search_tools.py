@@ -127,7 +127,7 @@ class CloudWatchLogsSearchTools:
                 result_dict[field["field"]] = field["value"]
             formatted_results["results"].append(result_dict)
 
-        return json.dumps(formatted_results, indent=2)
+        return json.dumps(formatted_results)
 
     @handle_exceptions
     async def filter_log_events(
@@ -179,4 +179,4 @@ class CloudWatchLogsSearchTools:
                 }
             )
 
-        return json.dumps(formatted_events, indent=2)
+        return json.dumps(formatted_events)

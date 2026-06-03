@@ -39,6 +39,7 @@ from app.workflow.tools.cloudwatch_drilldown import (
     build_insights_query_for_anomaly,
     build_insights_query_for_pattern,
     cap_drill_preview,
+    lint_insights_query,
     pick_drill_target,
     recall_kb_for_log_groups,
     recall_kb_for_pattern,
@@ -76,7 +77,7 @@ def _budget_json(payload: Any, tool_name: str, token_budget: Optional[int] = Non
     import json
     from app.workflow.tools.cloudwatch_sanitizer import _get_encoder
     budget = token_budget if token_budget is not None else _NON_EVENT_TOKEN_BUDGET
-    text = json.dumps(payload, indent=2, default=str)
+    text = json.dumps(payload, default=str)  # compact (no indent) — replayed each ReAct turn
     enc = _get_encoder()
     if enc is not None:
         token_ids = enc.encode(text)
@@ -706,6 +707,12 @@ def build_cloudwatch_agent_tools(
         budget = 2500 if drill_down else _NON_EVENT_TOKEN_BUDGET
         # Hard-cap to 24h to match the global window policy.
         hours = max(1, min(int(hours or 24), 24))
+        # Lint the Insights query before hitting AWS — a clear corrective hint
+        # costs nothing and saves an investigation iteration that a raw AWS
+        # ValidationException would otherwise burn.
+        _lint = lint_insights_query(query)
+        if _lint:
+            return f"Query not run — fix the Insights query first. {_lint}"
         try:
             from app.mcp.tools.search_tools import CloudWatchLogsSearchTools
         except ImportError:

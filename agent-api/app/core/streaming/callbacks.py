@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional, Protocol
 
 from app.core.error_classifier import ClassifiedError
 
+logger = logging.getLogger(__name__)
+
 
 class StreamCallback(Protocol):
     """Enhanced streaming callback protocol for real-time agent execution feedback.
@@ -476,6 +478,10 @@ class TokenUsageCallback:
     def __init__(self) -> None:
         self.input_tokens:  int = 0
         self.output_tokens: int = 0
+        # Prompt-cache visibility (Bedrock/Anthropic). Non-zero cache_read on the
+        # 2nd+ LLM call confirms the cached prefix is being reused.
+        self.cache_read_tokens:     int = 0
+        self.cache_creation_tokens: int = 0
 
     # ── Catch-all: silently absorb any LangChain callback method we don't ────
     # implement (e.g. on_llm_new_token, on_chain_start, on_tool_start …).
@@ -516,6 +522,46 @@ class TokenUsageCallback:
 
         self.input_tokens  += inp
         self.output_tokens += out
+
+        # ── Prompt-cache visibility (best-effort, never fatal) ────────────────
+        try:
+            c_read, c_create = self._parse_cache_tokens(response, llm_output)
+            self.cache_read_tokens     += c_read
+            self.cache_creation_tokens += c_create
+            if c_read or c_create:
+                logger.info(
+                    "Prompt cache: read=%d creation=%d (cumulative read=%d) — caching is engaging",
+                    c_read, c_create, self.cache_read_tokens,
+                )
+        except Exception:  # noqa: BLE001 — metrics must never break the run
+            pass
+
+    @staticmethod
+    def _parse_cache_tokens(response: Any, llm_output: Dict[str, Any]) -> tuple:
+        """Extract (cache_read, cache_creation) tokens across provider shapes."""
+        usage = (llm_output or {}).get("usage", {}) or {}
+        # Bedrock Converse usage / Anthropic usage key variants.
+        read = (
+            usage.get("cacheReadInputTokens")
+            or usage.get("cache_read_input_tokens")
+            or 0
+        )
+        create = (
+            usage.get("cacheWriteInputTokens")
+            or usage.get("cache_creation_input_tokens")
+            or 0
+        )
+        # LangChain standardized: usage_metadata.input_token_details.cache_read
+        generations: List[Any] = getattr(response, "generations", []) or []
+        for gen_list in generations:
+            for gen in (gen_list if isinstance(gen_list, list) else [gen_list]):
+                msg = getattr(gen, "message", None)
+                details = (getattr(msg, "usage_metadata", None) or {}).get(
+                    "input_token_details", {}
+                ) or {}
+                read = read or details.get("cache_read", 0) or 0
+                create = create or details.get("cache_creation", 0) or 0
+        return int(read or 0), int(create or 0)
 
     @staticmethod
     def _parse_llm_output(llm_output: Dict[str, Any]) -> tuple:

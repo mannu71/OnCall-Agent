@@ -554,10 +554,23 @@ async def delete_workflow(
 async def execute_workflow(
     workflow_name: str,
     background: bool = False,
+    query: Optional[str] = None,
+    input: Optional[str] = None,
     inputs: Optional[Dict[str, Any]] = Body(None),
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
 ):
-    """Manually execute a workflow with optional input parameters."""
+    """Manually execute a workflow with optional input parameters.
+
+    The interactive chat query can arrive as the ``query`` or ``input`` query
+    param OR inside the ``inputs`` body. Normalize all of them to
+    ``inputs['user_query']`` so the agent's ReAct loop actually receives it
+    (previously the chat's ``?input=`` was silently dropped because only the body
+    was read).
+    """
+    _typed_query = query or input
+    if _typed_query:
+        inputs = {**(inputs or {}), "user_query": _typed_query}
+
     workflow = await workflow_repo.get_by_name(workflow_name)
     if not workflow:
         raise NotFoundException(

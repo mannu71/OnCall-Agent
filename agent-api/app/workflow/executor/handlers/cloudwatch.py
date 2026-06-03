@@ -118,17 +118,35 @@ def _parse_severity_excludes(raw: Any) -> List[str]:
     return []
 
 
+def _resolve_depth(node: Dict[str, Any]) -> str:
+    """Resolve investigation depth from the node's Analysis Depth field.
+
+    shallow → triage + synthesis only
+    auto    → triage + conditional drill-down + synthesis (default)
+    deep    → triage + always drill-down + correlation + synthesis
+    """
+    depth = str(
+        (node.get("params", {}) or {}).get("analysis_depth")
+        or (node.get("data", {}) or {}).get("analysisDepth")
+        or "auto"
+    ).strip().lower()
+    return depth if depth in ("auto", "shallow", "deep") else "auto"
+
+
 @register("cloudwatch_tool")
 async def execute_tool_provider(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-    """Tool-provider stub for the new ``cloudwatch_tool`` LangflowEditor node.
+    """Pipeline-first handler for the new ``cloudwatch_tool`` LangflowEditor node.
 
-    Validates config and resolves AWS credentials, then returns immediately.
-    The actual CloudWatch work happens when the agent calls the LangChain tools
-    bound by :func:`app.workflow.tools.cloudwatch_agent_tools.build_cloudwatch_agent_tools`
-    via :class:`ReactStrategy`. No pre-computed analysis, no LLM call here.
+    Runs the deterministic :meth:`LogWatchService.run_investigation_pipeline`
+    upfront — exactly like the legacy ``cloudwatchAnalyzer`` — so the run always
+    fetches data and ends in a guaranteed synthesis. The agent then *refines*
+    using this pre-computed analysis as seed plus the live LangChain tools bound
+    by :func:`app.workflow.tools.cloudwatch_agent_tools.build_cloudwatch_agent_tools`
+    via :class:`ReactStrategy`.
+
+    The returned dict carries ``analysis_type`` + ``output`` + ``data`` so the
+    agent handler injects it as a "Pre-computed CloudWatch Analysis" context block.
     """
-    from app.core.aws_credentials import resolve_aws_credentials
-
     cfg = _read_cw_config(node)
     log_groups = cfg["log_groups"]
 
@@ -137,37 +155,96 @@ async def execute_tool_provider(executor, node: Dict[str, Any], context: Dict[st
             "cloudwatch_tool node has no log groups configured — "
             "agent tools will still be available but unscoped"
         )
+        # Clean, non-silent result rather than a stub the agent can't reason about.
+        return {
+            "status":        "success",
+            "tool_provider": "cloudwatch",
+            "analysis_type": cfg["analysis_type"],
+            "output": (
+                "No CloudWatch log groups were configured on the cloudwatch_tool "
+                "node, so no pre-computed analysis could be produced. The agent's "
+                "CloudWatch tools remain available for ad-hoc discovery/queries."
+            ),
+            "log_groups":           log_groups,
+            "log_groups_analyzed":  log_groups,
+            "region":               cfg["aws_region"],
+            "time_range":           cfg["time_range"],
+        }
 
-    # Pre-resolve credentials so ReactStrategy doesn't pay this cost on every
-    # agent step. Failures here are non-fatal: the agent tools re-resolve and
-    # surface a clearer error to the agent itself.
-    try:
-        await resolve_aws_credentials(
-            aws_profile=cfg["aws_profile"],
-            aws_region=cfg["aws_region"],
-        )
-        creds_ok = True
-    except Exception as e:
-        logger.warning(
-            "cloudwatch_tool: credential resolution failed (%s); agent tools will retry", e
-        )
-        creds_ok = False
-
-    logger.info(
-        "cloudwatch_tool node validated: region=%s, %d log group(s), analysis=%s, range=%s, creds=%s",
-        cfg["aws_region"], len(log_groups), cfg["analysis_type"], cfg["time_range"],
-        "ok" if creds_ok else "deferred",
+    credentials, aws_region = await log_watch_service.resolve_credentials(
+        None,
+        cfg["aws_region"],
+        aws_profile=cfg["aws_profile"],
     )
 
-    return {
-        "status":        "success",
-        "tool_provider": "cloudwatch",
-        "output":        f"CloudWatch tools available for {len(log_groups)} log group(s) in {cfg['aws_region']}",
-        "log_groups":    log_groups,
-        "region":        cfg["aws_region"],
-        "analysis_type": cfg["analysis_type"],
-        "time_range":    cfg["time_range"],
+    depth = _resolve_depth(node)
+
+    logger.info(
+        "cloudwatch_tool node running pipeline: region=%s, %d log group(s), depth=%s, range=%s",
+        aws_region, len(log_groups), depth, cfg["time_range"],
+    )
+
+    # Forward the NORMALISED config to the pipeline as node_data. The pipeline's
+    # analyzers read camelCase keys (alarmStateFilter, metricQueries, …); for the
+    # new node these live under node.params, so passing node.data alone would drop
+    # "Active alarms only", metric queries, custom query and severity excludes.
+    pipeline_node_data = {
+        **(node.get("data") or {}),
+        "alarmStateFilter":    cfg["alarm_state_filter"],
+        "alarmNamePrefix":     cfg["alarm_name_prefix"],
+        "metricQueries":       cfg["metric_queries"],
+        "customInsightsQuery": cfg["custom_insights_query"],
+        "severityExcludes":    cfg["severity_excludes"],
     }
+
+    # "Analysis type" is a FOCUS lens — the pipeline still runs the full
+    # comprehensive triage, but leads the report with the selected dimension.
+    # Map the UI label "anomalies" to the internal analysis type.
+    _focus_map = {"anomalies": "anomaly-detection"}
+    focus = _focus_map.get(cfg["analysis_type"], cfg["analysis_type"])
+
+    # Chat fast path: if the user's message contains a correlation / trace id,
+    # the pipeline skips the broad triage and traces just that request.
+    from app.core.trace_ids import extract_trace_ids
+    _user_query = (
+        (context.get("inputs") or {}).get("user_query")
+        or context.get("user_query")
+        or ""
+    )
+    _ids = extract_trace_ids(_user_query)
+    if _ids["found"]:
+        logger.info(
+            "cloudwatch_tool: detected id in query (correlation_id=%s trace_id=%s) — "
+            "fast-path correlation lookup",
+            _ids["correlation_id"], _ids["trace_id"],
+        )
+
+    # Staged deterministic pipeline — always ends in a guaranteed LLM synthesis,
+    # so the result can never be a mid-investigation fragment. The open-ended
+    # agent refines this seed via the bound CloudWatch tools. When an id is
+    # detected, run_investigation_pipeline short-circuits to a targeted trace.
+    result = await log_watch_service.run_investigation_pipeline(
+        log_groups=log_groups,
+        time_range=cfg["time_range"],
+        time_range_minutes=parse_time_range_minutes(cfg["time_range"]),
+        error_threshold=cfg["error_threshold"],
+        enable_alerts=cfg["enable_alerts"],
+        region=aws_region,
+        credentials=credentials,
+        node_data=pipeline_node_data,
+        active_executions=executor.active_executions,
+        execution_id=context.get("execution_id"),
+        depth=depth,
+        focus=focus,
+        correlation_id=_ids["correlation_id"],
+        trace_id=_ids["trace_id"],
+    )
+
+    # Tag as a CloudWatch tool result while preserving analysis_type/output/data
+    # so the agent-handler seed logic injects it (the exclusion guard was removed).
+    result["tool_provider"] = "cloudwatch"
+    result.setdefault("region", aws_region)
+    return result
 
 
 @register("cloudwatchAnalyzer")
@@ -175,7 +252,6 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
     """Execute CloudWatch Analyzer node via ``LogWatchService``."""
     node_data = node.get('data', {})
     log_groups = node_data.get('logGroups', [])
-    analysis_type = node_data.get('analysisType', 'error-patterns')
     time_range = node_data.get('timeRange', '1h')
     error_threshold = node_data.get('errorThreshold', 10)
     aws_region = node_data.get('awsRegion', 'us-east-1')
@@ -201,8 +277,22 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
         aws_profile=aws_profile,
     )
 
-    return await log_watch_service.execute_analyzer_node(
-        analysis_type=analysis_type,
+    # Resolve investigation depth from the node's Analysis Depth field:
+    #   shallow → triage + synthesis only
+    #   auto    → triage + conditional drill-down + synthesis (default)
+    #   deep    → triage + always drill-down + correlation + synthesis
+    depth = str(
+        node.get("params", {}).get("analysis_depth")
+        or node_data.get("analysisDepth")
+        or "auto"
+    ).strip().lower()
+    if depth not in ("auto", "shallow", "deep"):
+        depth = "auto"
+
+    # Staged deterministic pipeline — always ends in a guaranteed LLM synthesis,
+    # so the result can never be a mid-investigation fragment. No ReAct loop here;
+    # the open-ended agent is reserved for ad-hoc agent-chat investigations.
+    return await log_watch_service.run_investigation_pipeline(
         log_groups=log_groups,
         time_range=time_range,
         time_range_minutes=parse_time_range_minutes(time_range),
@@ -213,4 +303,5 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
         node_data=node_data,
         active_executions=executor.active_executions,
         execution_id=context.get('execution_id'),
+        depth=depth,
     )

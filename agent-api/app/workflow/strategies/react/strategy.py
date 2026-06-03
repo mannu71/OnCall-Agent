@@ -18,6 +18,7 @@ from app.workflow.strategies.react.helpers import (
     build_recall_context,
     cap_context_block,
     estimate_confidence,
+    looks_like_midthought,
 )
 from app.workflow.strategies.react.hitl import emit_hitl_pause, make_checkpointer
 from app.workflow.strategies.react.learning import auto_learn, exec_fallback
@@ -251,9 +252,21 @@ class ReactStrategy(BaseStrategy):
                     )
 
             cw_context = context.get("cloudwatch_context")
+            # The deterministic pipeline's synthesis, kept uncapped as a guaranteed
+            # floor for the final answer if the agent's own answer comes back empty
+            # or truncated (see synthesis-as-floor fallback after the agent loop).
+            cw_synthesis: str = ""
             if cw_context:
                 block = cap_context_block("Pre-computed CloudWatch Analysis", cw_context)
                 augmented_query = f"{block}{augmented_query}"
+                try:
+                    if isinstance(cw_context, dict):
+                        for _entry in cw_context.values():
+                            _out = (_entry or {}).get("output") if isinstance(_entry, dict) else None
+                            if _out and len(str(_out)) > len(cw_synthesis):
+                                cw_synthesis = str(_out)
+                except Exception:  # noqa: BLE001 — fallback extraction is best-effort
+                    cw_synthesis = ""
 
             code_analyzer_context = context.get("code_analyzer_context")
             if code_analyzer_context:
@@ -367,6 +380,45 @@ class ReactStrategy(BaseStrategy):
                     result["supervisor_reason"] = verdict.reason
                     break
                 break
+
+            # ── Synthesis-as-floor ──────────────────────────────────────────
+            # The deterministic CloudWatch pipeline already produced a complete,
+            # non-fragmentary synthesis (seeded above). If the agent's own answer
+            # came back empty or was cut off mid-thought, return that synthesis
+            # rather than a half-finished investigation ("Now let me search…").
+            _final_text = (result.get("final_answer") or "").strip()
+            # Treat provider refusals ("…cannot answer this question") as non-answers
+            # too, so the agent never overrides the deterministic CloudWatch report
+            # with a guardrail stub.
+            try:
+                from app.workflow.executor.cloudwatch_analysis import is_usable_synthesis
+                _agent_unusable = not is_usable_synthesis(_final_text)
+            except Exception:  # noqa: BLE001
+                _agent_unusable = not _final_text
+            # Be CONSERVATIVE: only fall back when the agent clearly failed to
+            # produce a usable answer — empty, a provider refusal/stub, a real
+            # token-limit truncation, or a SHORT mid-thought fragment. A long,
+            # substantial narrative is never clobbered, even if it happens to
+            # contain a phrase like "let me …" somewhere in its prose. (Previously
+            # looks_like_midthought alone fired on complete reports and replaced
+            # them with the raw deterministic report.)
+            _short_fragment = looks_like_midthought(_final_text) and len(_final_text) < 400
+            if cw_synthesis and (
+                not _final_text
+                or result.get("truncated")
+                or _agent_unusable
+                or _short_fragment
+            ):
+                logger_instance.info(
+                    "ReactStrategy: agent answer empty/refusal/truncated/short-fragment "
+                    "(len=%d) — falling back to pre-computed CloudWatch synthesis "
+                    "(execution_id=%s)",
+                    len(_final_text), execution_id,
+                    extra={"execution_id": execution_id},
+                )
+                result["final_answer"] = cw_synthesis
+                result["cloudwatch_synthesis_fallback"] = True
+                result.pop("truncated", None)
 
             # Post-run learning is best-effort and must never sink a successful
             # investigation. Any failure here is logged and swallowed.

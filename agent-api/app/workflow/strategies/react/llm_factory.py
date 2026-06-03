@@ -4,6 +4,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
 def build_llm(llm_config: Dict[str, Any]) -> Any:
@@ -34,7 +36,7 @@ def build_llm(llm_config: Dict[str, Any]) -> Any:
         provider = "bedrock"
     model = llm_config.get("model", "")
     temperature = float(llm_config.get("temperature") or 0.1)
-    max_tokens = int(llm_config.get("max_tokens") or 4096)
+    max_tokens = int(llm_config.get("max_tokens") or settings.agent_max_output_tokens)
     region = llm_config.get("region") or "us-east-1"
     api_key = llm_config.get("api_key")
     base_url = llm_config.get("base_url")

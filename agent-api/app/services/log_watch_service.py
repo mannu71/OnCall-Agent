@@ -46,6 +46,31 @@ logger = logging.getLogger(__name__)
 _SSE_DEDUP_MAX = settings.log_watch_sse_dedup_max
 
 
+def _classify_aws_error(exc: BaseException) -> str:
+    """Coarse category for a failed AWS call so coverage signalling is actionable."""
+    if isinstance(exc, ClientError):
+        code = (exc.response.get("Error", {}) or {}).get("Code", "") or ""
+        low = code.lower()
+        if "throttl" in low:
+            return "throttling"
+        if "accessdenied" in low or "unauthorized" in low or "notauthorized" in low:
+            return "access-denied"
+        if "validation" in low or "malformed" in low:
+            return "validation"
+        if "expired" in low or "token" in low:
+            return "expired-credentials"
+    msg = str(exc).lower()
+    if "timeout" in msg or "timed out" in msg:
+        return "timeout"
+    if "throttl" in msg:
+        return "throttling"
+    if "access" in msg and "denied" in msg:
+        return "access-denied"
+    if "validation" in msg:
+        return "validation"
+    return "error"
+
+
 class LogWatchService:
     """Orchestrates CloudWatch log/metric tools and knowledge-base helpers."""
 
@@ -589,6 +614,450 @@ class LogWatchService:
             }
         except Exception as e:
             logger.error("CloudWatch Analyzer execution failed: %s", e)
+            return {"status": "failed", "error": str(e)}
+
+    async def _run_targeted_correlation(
+        self,
+        *,
+        log_groups: List[str],
+        time_range: str,
+        time_range_minutes: int,
+        region: str,
+        credentials: Optional[Dict[str, Any]],
+        active_executions: Dict[str, Dict[str, Any]],
+        execution_id: str,
+        correlation_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        focus: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Fast path: trace a specific correlation/trace id (chat lookup).
+
+        Skips the broad triage — runs one bounded ``correlate_logs`` then the same
+        guaranteed synthesis / deterministic report as the full pipeline. Keeps the
+        result shape compatible with the agent-seed collector.
+        """
+        from app.workflow.executor.cloudwatch_analysis import (
+            analyze_cloudwatch_with_llm,
+            build_rich_cloudwatch_report,
+            is_usable_synthesis,
+        )
+        from app.workflow.tools.cloudwatch_summarizers import summarise_correlation
+
+        ident = correlation_id or trace_id
+        logger.info(
+            "CloudWatch pipeline: targeted correlation lookup id=%s "
+            "(correlation_id=%s trace_id=%s) — skipping broad triage (execution_id=%s)",
+            ident, correlation_id, trace_id, execution_id,
+        )
+        data_quality: Dict[str, Any] = {
+            "coverage": "targeted",
+            "mode": "correlation-lookup",
+            "correlation_id": correlation_id,
+            "trace_id": trace_id,
+            "failures": [],
+            "partial": False,
+            "sampled": False,
+        }
+        try:
+            corr_raw = await asyncio.wait_for(
+                self.correlate_logs(
+                    log_group_names=log_groups,
+                    correlation_id=correlation_id,
+                    trace_id=trace_id,
+                    time_range_minutes=time_range_minutes,
+                    region=region,
+                    credentials=credentials,
+                ),
+                timeout=120.0,
+            )
+            evidence: Dict[str, Any] = {"correlation": summarise_correlation(corr_raw)}
+        except asyncio.TimeoutError:
+            data_quality["failures"].append(
+                {"analysis": "correlation", "type": "timeout", "error": "120s timeout"}
+            )
+            evidence = {"correlation": {"error": "correlation lookup timed out after 120s"}}
+        except Exception as exc:  # noqa: BLE001
+            data_quality["failures"].append(
+                {"analysis": "correlation", "type": _classify_aws_error(exc), "error": str(exc)}
+            )
+            evidence = {"correlation": {"error": str(exc)}}
+        evidence["data_quality"] = data_quality
+
+        llm_result = await analyze_cloudwatch_with_llm(
+            active_executions=active_executions,
+            execution_id=execution_id,
+            raw_result=evidence,
+            analysis_type="investigation",
+            log_groups=log_groups,
+            time_range=time_range,
+            alerts=[],
+            focus=focus,
+        )
+        llm_analysis = model_used = structured_analysis = None
+        in_tok = out_tok = 0
+        if llm_result and len(llm_result) >= 5:
+            llm_analysis, model_used, structured_analysis, in_tok, out_tok = llm_result[:5]
+
+        rich_report = build_rich_cloudwatch_report(evidence, log_groups, time_range, focus=focus)
+        if is_usable_synthesis(llm_analysis):
+            output = llm_analysis.strip() + "\n\n---\n\n### Evidence\n\n" + rich_report
+        else:
+            output = rich_report
+
+        return {
+            "status": "success",
+            "output": output,
+            "analysis_mode": "correlation-lookup",
+            "analysis_type": "investigation",
+            "log_groups_analyzed": log_groups,
+            "time_range": time_range,
+            "data": evidence,
+            "alerts": None,
+            "model": model_used,
+            "structured_analysis": structured_analysis,
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "total_tokens": in_tok + out_tok,
+        }
+
+    async def run_investigation_pipeline(
+        self,
+        *,
+        log_groups: List[str],
+        time_range: str,
+        time_range_minutes: int,
+        error_threshold: int,
+        enable_alerts: bool,
+        region: str,
+        credentials: Optional[Dict[str, Any]],
+        node_data: Dict[str, Any],
+        active_executions: Dict[str, Dict[str, Any]],
+        execution_id: str,
+        depth: str = "auto",
+        focus: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Deterministic staged CloudWatch investigation with guaranteed synthesis.
+
+        Stage 1 (parallel, deterministic): alarms + anomaly-detection + error-patterns
+        (+ metrics when configured) → merged evidence bundle.
+        Stage 2 (bounded, conditional): drill into the top findings with template-safe
+        Insights queries (no free-text → no AWS ValidationException). Gated by depth.
+        Stage 3 (always, terminal): one LLM synthesis → structured report. Falls back to
+        a deterministic summary if no LLM node is wired.
+
+        No ReAct loop — the synthesis is always the last step, so the result can never be
+        a mid-investigation "Step N: let me…" fragment.
+        """
+        from app.workflow.executor.cloudwatch_analysis import (
+            _fmt_drilldown_events,
+            analyze_cloudwatch_with_llm,
+            build_cloudwatch_summary,
+            build_rich_cloudwatch_report,
+            check_cloudwatch_alerts,
+            is_usable_synthesis,
+        )
+        from app.workflow.tools.cloudwatch_drilldown import (
+            build_insights_query_for_anomaly,
+            build_insights_query_for_pattern,
+            select_drill_targets,
+            should_auto_drill_down,
+        )
+        from app.workflow.tools.cloudwatch_summarizers import (
+            summarise_anomalies,
+            summarise_correlation,
+            summarise_patterns,
+        )
+
+        depth = (depth or "auto").strip().lower()
+        if depth not in ("shallow", "auto", "deep"):
+            depth = "auto"
+
+        try:
+            # ── Fast path — targeted correlation/trace lookup (chat) ────────────
+            # When the user pasted a correlation/trace id, skip the broad triage and
+            # go straight to a bounded correlate_logs, then the same synthesis.
+            if correlation_id or trace_id:
+                return await self._run_targeted_correlation(
+                    log_groups=log_groups,
+                    time_range=time_range,
+                    time_range_minutes=time_range_minutes,
+                    region=region,
+                    credentials=credentials,
+                    active_executions=active_executions,
+                    execution_id=execution_id,
+                    correlation_id=correlation_id,
+                    trace_id=trace_id,
+                    focus=focus,
+                )
+
+            # ── Stage 1 — triage (parallel, deterministic) ──────────────────────
+            stage_types = ["alarms", "anomaly-detection", "error-patterns"]
+            if node_data.get("metricQueries"):
+                stage_types.append("metrics")
+
+            async def _run(atype: str):
+                try:
+                    res = await self.run_workflow_analysis(
+                        analysis_type=atype,
+                        log_group_names=log_groups,
+                        time_range_minutes=time_range_minutes,
+                        region=region,
+                        credentials=credentials,
+                        node_data=node_data,
+                    )
+                    return atype, res
+                except Exception as exc:  # noqa: BLE001 — one analyzer must not sink the run
+                    logger.warning("Pipeline triage '%s' failed: %s", atype, exc)
+                    return atype, {"status": "failed", "error": str(exc)}
+
+            triage = dict(await asyncio.gather(*[_run(t) for t in stage_types]))
+
+            alarms_raw = triage.get("alarms") or {}
+            anomalies_raw = triage.get("anomaly-detection") or {}
+            patterns_raw = triage.get("error-patterns") or {}
+            metrics_raw = triage.get("metrics")
+
+            patterns_sum = summarise_patterns(patterns_raw)
+            anomalies_sum = summarise_anomalies(anomalies_raw)
+
+            evidence: Dict[str, Any] = {
+                "alarms": alarms_raw,
+                "anomalies": anomalies_sum,
+                "patterns": patterns_sum,
+            }
+            if metrics_raw is not None:
+                evidence["metrics"] = metrics_raw
+
+            # ── Data coverage signalling ────────────────────────────────────────
+            # Distinguish "genuinely nothing found" from "fetch failed / partial /
+            # sampled" so an empty result is never silent. Inspect triage outcomes
+            # plus each analyzer's own data_quality; drill-down sampling flags are
+            # folded in below during Stage 2.
+            data_quality: Dict[str, Any] = {
+                "log_groups_requested": len(log_groups),
+                "analyses_requested": list(stage_types),
+                "failures": [],
+                "partial": False,
+                "sampled": False,
+            }
+            for _atype, _res in triage.items():
+                if not isinstance(_res, dict):
+                    continue
+                _is_failed = (
+                    str(_res.get("status", "")).lower() in ("failed", "error")
+                    or _res.get("success") is False
+                )
+                if _is_failed:
+                    data_quality["failures"].append(
+                        {"analysis": _atype, "error": str(_res.get("error", "unknown"))}
+                    )
+                _dq = _res.get("data_quality")
+                if isinstance(_dq, dict) and _dq.get("partial"):
+                    data_quality["partial"] = True
+            _failed = len(data_quality["failures"])
+            _total = len(stage_types)
+            data_quality["coverage"] = (
+                "none" if (_total and _failed >= _total)
+                else "partial" if _failed
+                else "full"
+            )
+            evidence["data_quality"] = data_quality
+
+            # ── Stage 2 — bounded, conditional drill-down ───────────────────────
+            alarms_firing = bool(
+                (alarms_raw.get("summary") or {}).get("in_alarm")
+            ) if isinstance(alarms_raw, dict) else False
+            high_anomaly = any(
+                (a.get("severity") in ("critical", "high"))
+                for a in (anomalies_sum.get("anomalies") or [])
+            )
+
+            if depth == "deep":
+                do_drill = True
+            elif depth == "auto":
+                do_drill = (
+                    should_auto_drill_down(patterns_sum)
+                    or should_auto_drill_down(anomalies_sum)
+                    or alarms_firing
+                    or high_anomaly
+                )
+            else:  # shallow
+                do_drill = False
+
+            if do_drill and log_groups:
+                top_n = settings.cloudwatch_pipeline_drilldown_top_n
+                if depth == "deep":
+                    top_n = max(top_n, 5)
+                targets = select_drill_targets(patterns_sum, anomalies_sum, top_n=top_n)
+
+                from app.mcp.tools.watch_tools import get_watcher, _extract_credentials
+
+                watcher = get_watcher(
+                    region=region, **_extract_credentials(credentials or {}),
+                )
+                end_time = datetime.now(timezone.utc)
+                start_time = end_time - timedelta(minutes=time_range_minutes)
+
+                # Build (target, query) pairs, then run all Insights queries
+                # CONCURRENTLY. The sequential await loop was the dominant latency
+                # (N × ~20-40s); asyncio.gather collapses it to ~one query's time.
+                _pairs = []
+                for tgt in targets:
+                    if tgt.get("kind") == "pattern":
+                        q = build_insights_query_for_pattern(
+                            tgt.get("normalized_pattern", ""),
+                            tgt.get("example_message", ""),
+                        )
+                    else:
+                        q = build_insights_query_for_anomaly(tgt.get("log_group"))
+                    _pairs.append((tgt, q))
+
+                _drill_results = await asyncio.gather(
+                    *(
+                        watcher.query_with_insights(
+                            log_group_names=log_groups,
+                            query_string=q,
+                            start_time=start_time,
+                            end_time=end_time,
+                        )
+                        for _tgt, q in _pairs
+                    ),
+                    return_exceptions=True,
+                )
+
+                drilldowns: List[Dict[str, Any]] = []
+                for (tgt, _q), res in zip(_pairs, _drill_results):
+                    label = tgt.get("label")
+                    if isinstance(res, Exception):
+                        _cat = _classify_aws_error(res)
+                        logger.warning("Pipeline drill-down failed for %s (%s): %s",
+                                       label, _cat, res)
+                        data_quality["failures"].append(
+                            {"analysis": f"drilldown:{label}", "type": _cat, "error": str(res)}
+                        )
+                        drilldowns.append({"target": label, "error": str(res), "error_type": _cat})
+                        continue
+                    # Fold drill-down degradation into coverage signalling.
+                    if isinstance(res, dict) and res.get("partial"):
+                        data_quality["partial"] = True
+                        if res.get("sampling_ratio"):
+                            data_quality["sampled"] = True
+                    # Store CLEAN, readable event lines (@timestamp/@message/@logStream),
+                    # already capped by _fmt_drilldown_events — no extra cap needed.
+                    drilldowns.append({
+                        "target": label,
+                        "events": _fmt_drilldown_events(
+                            res, max_chars=settings.cloudwatch_drill_sample_chars,
+                        ),
+                    })
+
+                if drilldowns:
+                    evidence["drilldown"] = drilldowns
+
+                # Correlation is the heaviest step — only on deep (or when enabled).
+                # Bounded so a slow Insights query can't run the whole pipeline away.
+                if settings.cloudwatch_pipeline_enable_correlation and depth == "deep":
+                    try:
+                        corr = await asyncio.wait_for(
+                            self.run_workflow_analysis(
+                                analysis_type="correlation",
+                                log_group_names=log_groups,
+                                time_range_minutes=time_range_minutes,
+                                region=region,
+                                credentials=credentials,
+                                node_data=node_data,
+                            ),
+                            timeout=120.0,
+                        )
+                        evidence["correlation"] = summarise_correlation(corr)
+                    except asyncio.TimeoutError:
+                        logger.warning("Pipeline correlation timed out after 120s; skipping")
+                        data_quality["failures"].append(
+                            {"analysis": "correlation", "type": "timeout", "error": "120s timeout"}
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Pipeline correlation failed: %s", exc)
+
+            # ── Stage 3 — alerts + guaranteed synthesis (terminal) ──────────────
+            alerts: List[Any] = []
+            if enable_alerts:
+                for raw, atype in ((patterns_raw, "error-patterns"),
+                                   (anomalies_raw, "anomaly-detection")):
+                    if isinstance(raw, dict):
+                        try:
+                            alerts.extend(
+                                check_cloudwatch_alerts(raw, atype, error_threshold) or []
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("alert check (%s) skipped: %s", atype, exc)
+
+            llm_result = await analyze_cloudwatch_with_llm(
+                active_executions=active_executions,
+                execution_id=execution_id,
+                raw_result=evidence,
+                analysis_type="investigation",
+                log_groups=log_groups,
+                time_range=time_range,
+                alerts=alerts,
+                focus=focus,
+            )
+            if llm_result and len(llm_result) >= 5:
+                llm_analysis, model_used, structured_analysis, in_tok, out_tok = llm_result[:5]
+            elif llm_result and len(llm_result) == 3:
+                llm_analysis, model_used, structured_analysis = llm_result
+                in_tok = out_tok = 0
+            else:
+                llm_analysis = model_used = structured_analysis = None
+                in_tok = out_tok = 0
+
+            # Guaranteed, detail-rich output. The deterministic evidence report
+            # (actual error messages, correlation/request/trace IDs from drill-down
+            # raw events, timestamps, anomalies, alarms) is ALWAYS built and is the
+            # floor. A usable LLM synthesis is shown on top of it; a refusal/empty
+            # synthesis (e.g. provider guardrail returning "cannot answer this
+            # question") is discarded so it never becomes the result.
+            rich_report = build_rich_cloudwatch_report(evidence, log_groups, time_range, focus=focus)
+            if is_usable_synthesis(llm_analysis):
+                output = (
+                    llm_analysis.strip()
+                    + "\n\n---\n\n### Evidence\n\n"
+                    + rich_report
+                )
+            else:
+                if llm_analysis:
+                    logger.info(
+                        "Pipeline synthesis discarded (refusal/empty, %d chars) — "
+                        "using deterministic evidence report",
+                        len(str(llm_analysis)),
+                    )
+                output = rich_report
+
+            return {
+                "status": "success",
+                "output": output,
+                "analysis_mode": "pipeline",
+                "depth": depth,
+                "analysis_type": "investigation",
+                "log_groups_analyzed": log_groups,
+                "time_range": time_range,
+                "data": evidence,
+                "alerts": alerts if alerts else None,
+                "model": model_used,
+                "structured_analysis": structured_analysis,
+                "stages": {
+                    "triage": stage_types,
+                    "drilldown": bool(evidence.get("drilldown")),
+                    "correlation": bool(evidence.get("correlation")),
+                    "synthesized": llm_analysis is not None,
+                },
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "total_tokens": in_tok + out_tok,
+            }
+        except Exception as e:
+            logger.error("CloudWatch investigation pipeline failed: %s", e)
             return {"status": "failed", "error": str(e)}
 
 
