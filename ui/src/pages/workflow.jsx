@@ -14,6 +14,7 @@ import {
   CalendarClock, RefreshCw,
 } from 'lucide-react';
 import LangflowEditor from '../components/workflow/LangflowEditor.jsx';
+import TemplateGallery from '../components/workflow/TemplateGallery.jsx';
 import { validateWorkflow } from '../utils/workflowValidation.js';
 import agentApiClient from '../services/agentApiClient.js';
 import { useScheduler } from '../context/SchedulerContext';
@@ -237,6 +238,7 @@ function WorkflowPage() {
   const [workflowName, setWorkflowName]         = useState('');
   const [workflowType, setWorkflowType]         = useState('workflow');
   const [currentWfData, setCurrentWfData]       = useState(null);
+  const [pendingTemplate, setPendingTemplate]   = useState(null);
   const [editorKey, setEditorKey]               = useState(0);
   const [messages, setMessages]                 = useState([]);
 
@@ -308,6 +310,7 @@ function WorkflowPage() {
       if (currentWfData) await agentApiClient.updateWorkflow(currentWfData.name, payload);
       else await agentApiClient.createWorkflow(payload);
       await loadSchedules();
+      setPendingTemplate(null);
       setShowEditor(false);
       showMessage('Workflow saved', 'success');
     } catch (err) { showMessage(`Save failed: ${err.message}`, 'error'); }
@@ -327,9 +330,9 @@ function WorkflowPage() {
             key={editorKey}
             ref={editorRef}
             workflowName={workflowName}
-            initialNodes={currentWfData?.nodes || []}
-            initialEdges={currentWfData?.edges || []}
-            initialEnabled={currentWfData?.enabled ?? true}
+            initialNodes={currentWfData?.nodes || pendingTemplate?.nodes || []}
+            initialEdges={currentWfData?.edges || pendingTemplate?.edges || []}
+            initialEnabled={currentWfData?.enabled ?? false}
             onSave={handleSave}
             onCancel={() => setShowEditor(false)}
             onRun={() => currentWfData && handleRun(currentWfData)}
@@ -355,7 +358,7 @@ function WorkflowPage() {
               {workflows.length} workflow{workflows.length !== 1 ? 's' : ''} &middot; {workflows.filter(w => w.enabled).length} active
             </p>
           </div>
-          <Button onClick={() => { setWorkflowName(''); setShowDialog(true); }} className="gap-2 self-start sm:self-auto">
+          <Button onClick={() => { setWorkflowName(''); setPendingTemplate(null); setShowDialog(true); }} className="gap-2 self-start sm:self-auto">
             <Plus className="w-4 h-4" /> New Workflow
           </Button>
         </div>
@@ -373,7 +376,7 @@ function WorkflowPage() {
 
         {/* Grid */}
         {filtered.length === 0 ? (
-          <EmptyState onNew={() => { setWorkflowName(''); setShowDialog(true); }} filtered={searchTerm.length > 0} />
+          <EmptyState onNew={() => { setWorkflowName(''); setPendingTemplate(null); setShowDialog(true); }} filtered={searchTerm.length > 0} />
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
             {filtered.map(w => (
@@ -407,11 +410,11 @@ function WorkflowPage() {
       </Dialog>
 
       {/* Create dialog */}
-      <Dialog open={showDialog} onOpenChange={setShowDialog}>
-        <DialogContent className="max-w-sm">
+      <Dialog open={showDialog} onOpenChange={(open) => { setShowDialog(open); if (!open) setPendingTemplate(null); }}>
+        <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle>Create workflow</DialogTitle>
-            <DialogDescription>Give your workflow a name and choose its type.</DialogDescription>
+            <DialogDescription>Name it, choose a type, and optionally start from a template.</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-2">
             <div className="space-y-1.5">
@@ -435,6 +438,10 @@ function WorkflowPage() {
                 <option value="agent">Agentic Process</option>
               </select>
             </div>
+            <TemplateGallery
+              selectedId={pendingTemplate?.id ?? null}
+              onSelect={setPendingTemplate}
+            />
           </div>
           <DialogFooter className="gap-2">
             <Button variant="outline" onClick={() => setShowDialog(false)}>Cancel</Button>
