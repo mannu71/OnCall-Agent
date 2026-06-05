@@ -64,19 +64,21 @@ def build_agent(
     if capabilities:
         capability_str = ", ".join(capabilities)
         role_sentence = (
-            f"You are an expert on-call engineer assistant for KYC Protect "
-            f"with access to {capability_str}."
+            f"You are an expert engineering assistant "
+            f"with access to {capability_str}. Adapt to whatever the user is "
+            f"trying to do — root-cause analysis, log retrieval, code inspection, "
+            f"code analysis, or general questions."
         )
     else:
-        role_sentence = "You are an expert on-call engineer assistant for KYC Protect."
+        role_sentence = "You are an expert engineering assistant."
 
     # ── Base instructions ──────────────────────────────────────────────
     system_parts = [
         role_sentence,
         "Always reason step by step and use the available tools to find accurate answers.",
         "Present your findings clearly with specific data from the tool results.",
-        "When you resolve an issue or identify its root cause, use the save_playbook tool "
-        "to record the resolution so future investigations can benefit from it.",
+        "When you reach a useful conclusion or resolution worth reusing, use the save_playbook "
+        "tool to record it so future investigations can benefit from it.",
         "If the memory-context block at the start of the query lists 'Executable Skill' entries "
         "that match the current issue, prefer calling execute_skill with the skill's name before "
         "running manual tool calls — this reuses proven remediation steps and is faster.",
@@ -92,11 +94,11 @@ def build_agent(
     # ── CloudWatch instructions (refine, don't redo) ──────────────────────
     if has_cloudwatch:
         system_parts.append(
-            "A deterministic CloudWatch investigation has ALREADY run — its results "
+            "A deterministic CloudWatch log scan has ALREADY run — its results "
             "(alarms, anomalies, error patterns, any drill-down, and a data_quality "
             "coverage block) are in the 'Pre-computed CloudWatch Analysis' block at the "
             "start of this query. Treat that as your starting evidence. Do NOT re-run the "
-            "full triage. Use the live tools only to VERIFY or DRILL DEEPER into specific "
+            "full scan. Use the live tools only to VERIFY or DRILL DEEPER into specific "
             "findings: cloudwatch_search_logs (drill_down=true) for raw events behind a "
             "pattern/anomaly, cloudwatch_correlate_logs to trace one request across groups, "
             "cloudwatch_discover_log_groups only if a referenced group is missing. "
@@ -114,10 +116,16 @@ def build_agent(
     # ── Code Analyzer instructions (compact) ──────────────────────────
     if has_code_analyzer:
         system_parts.append(
-            "Code analysis tools available. code_investigate is the entry point — call first. "
-            "Chain code_explain_flow for deep dives, code_analyze_change when the issue follows a deploy, "
-            "code_get_runtime_evidence when a stack trace / CW anomaly is available (highest confidence). "
-            "Always end with code_finalize_incident. Evidence grade: never conclude on 'speculative' alone."
+            "Code analysis tools available over the connected repositories. To find code by "
+            "natural-language description, use crawler_search_semantic(query, repo). If you are "
+            "tracing a specific error message / stack trace / CloudWatch anomaly back to its "
+            "source, crawler_investigate_alert(alert, repo) locates the offending code for that "
+            "alert. To read a specific symbol: crawler_find_symbol(symbol, repo) returns a body "
+            "handle, then crawler_get_body(handle) prints the source. Use "
+            "crawler_trace_path(symbol, repo, direction='callers'|'callees', depth) to follow the call "
+            "graph. Only call crawler_index_repo(repo) if a repository appears unindexed. Pass the exact "
+            "repo name shown in the tool descriptions, and cite repo, file path, symbol, and line in "
+            "your findings."
         )
 
     if instructions:

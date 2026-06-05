@@ -506,6 +506,29 @@ export const agentApiClient = {
         return response.data;
     },
 
+    /**
+     * Force a full rebuild of a repository index (bypasses the skip-if-unchanged
+     * SHA check). Returns the refreshed repo overview.
+     */
+    async reindexRepo(repo) {
+        const response = await client.post(
+            `/api/v1/crawler/index/${encodeURIComponent(repo)}`,
+            { force: true }
+        );
+        return response.data;
+    },
+
+    /**
+     * Delete the entire index for a repository (knowledge graph + abstractions).
+     * Idempotent on the server: deleting an un-indexed repo is a no-op.
+     */
+    async deleteIndex(repo) {
+        const response = await client.delete(
+            `/api/v1/crawler/index/${encodeURIComponent(repo)}`
+        );
+        return response.data;
+    },
+
     // ==================== Knowledge Graph & Codebase Explorer ====================
 
     /**

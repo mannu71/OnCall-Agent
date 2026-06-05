@@ -6,9 +6,12 @@ import re
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
-# Resolution keywords used to detect when the agent has found an answer worth persisting.
+# Conclusion keywords used to detect when the agent has produced an answer worth
+# persisting. Covers root-cause-style resolutions as well as generic findings /
+# summaries / conclusions so non-RCA investigations are recognised too.
 _RESOLUTION_RE = re.compile(
-    r'\b(root cause|resolved|fix applied|solution|cause is|issue is)\b',
+    r'\b(root cause|resolved|fix applied|solution|cause is|issue is|'
+    r'findings?|summary|in summary|conclusion|to conclude|analysis complete|answer is)\b',
     re.IGNORECASE,
 )
 

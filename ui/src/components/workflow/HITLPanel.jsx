@@ -105,7 +105,7 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
         const newRequest = {
             requestId: data.request_id,
             executionId: data.execution_id || executionId,
-            rootCause: data.root_cause || data.draft_answer || 'Root cause analysis complete.',
+            rootCause: data.root_cause || data.draft_answer || 'Analysis complete.',
             suggestions: Array.isArray(data.suggestions) ? data.suggestions : [],
             toolName,
             toolParams: data.tool_params || null,
@@ -216,10 +216,10 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
             </CardHeader>
 
             <CardContent className="space-y-4">
-                {/* Root cause */}
+                {/* Analysis summary */}
                 <div>
                     <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-1">
-                        Root Cause Analysis
+                        Analysis Summary
                     </p>
                     <div className="rounded-md bg-amber-50 border border-amber-200 p-3 text-sm leading-relaxed text-amber-900 whitespace-pre-wrap">
                         {hitlRequest.rootCause}

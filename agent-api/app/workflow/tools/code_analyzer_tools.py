@@ -9,7 +9,7 @@ workflow graph, the executor calls :func:`build_crawler_tools` to create
 3. ``crawler_get_body``         — retrieve source lines by handle
 4. ``crawler_trace_path``       — trace call-graph edges (callers / callees)
 5. ``crawler_search_semantic``  — natural-language code search
-6. ``crawler_investigate_alert`` — automated root-cause analysis for on-call alerts
+6. ``crawler_investigate_alert`` — locate and analyse the code relevant to an alert / error / query
 """
 from __future__ import annotations
 
@@ -212,9 +212,10 @@ def build_crawler_tools(
             coroutine=_investigate_alert,
             name="crawler_investigate_alert",
             description=(
-                "Perform automated root-cause analysis for an on-call alert. "
-                "Maps the alert to code abstractions, reads implicated files, and "
-                "synthesises a structured RCA with suggestive remediation steps."
+                "Locate and analyse the code relevant to an alert, error, stack trace, "
+                "or natural-language query. Maps the input to code abstractions, reads the "
+                "implicated files, and synthesises a structured analysis with suggested "
+                "next steps (useful for root-cause analysis, but not limited to it)."
                 + repo_hint
             ),
             args_schema=_InvestigateInput,

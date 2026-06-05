@@ -99,6 +99,34 @@ class CrawlerService:
             exclude_patterns=exclude_patterns,
         )
 
+    # Repo-scoped crawler tables, child rows first so FK-free deletes stay safe.
+    _REPO_SCOPED_TABLES = (
+        "kg_edges",
+        "kg_unresolved_refs",
+        "kg_nodes",
+        "kg_files",
+        "repo_abstractions",
+    )
+
+    async def delete_index(self, repo: str) -> Dict[str, Any]:
+        """Remove the entire index for *repo* from every repo-scoped table.
+
+        Idempotent: deleting a repo that was never indexed simply reports zero
+        rows removed rather than erroring, so the UI can call it freely.
+        """
+        rows: Dict[str, int] = {}
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                for table in self._REPO_SCOPED_TABLES:
+                    result = await session.execute(
+                        text(f"DELETE FROM {table} WHERE repo_name = :repo"),
+                        {"repo": repo},
+                    )
+                    rows[table] = result.rowcount or 0
+        total = sum(rows.values())
+        logger.info("Deleted index for repo=%s (%d rows: %s)", repo, total, rows)
+        return {"repo_name": repo, "deleted": True, "rows": rows}
+
     async def find_symbol(
         self,
         *,

@@ -88,16 +88,16 @@ class SubInvestigationResult:
 # ---------------------------------------------------------------------------
 
 _REDUCE_SYSTEM_PROMPT = """\
-You are a senior on-call engineer synthesising findings from parallel \
-sub-investigations of a production incident. You will receive the \
-original high-level query and the analysis reports from each \
-sub-investigation. Your job is to produce a single, concise root-cause \
-report that:
-  1. States the primary root cause clearly.
-  2. Notes any secondary or contributing causes.
-  3. Highlights cross-service correlations and causal chains.
-  4. Provides concrete recommended remediation steps.
-  5. Flags any sub-investigations that failed or produced uncertain results.
+You are a senior engineer synthesising findings from parallel \
+sub-investigations. You will receive the original high-level query and the \
+analysis reports from each sub-investigation. Your job is to produce a \
+single, concise consolidated report that:
+  1. Directly answers the original query.
+  2. States the primary finding (or root cause, when investigating an issue) clearly.
+  3. Notes any secondary or contributing factors.
+  4. Highlights cross-service correlations and causal chains.
+  5. Provides concrete recommended next steps.
+  6. Flags any sub-investigations that failed or produced uncertain results.
 
 Be precise. Cite specific sub-investigation findings where relevant. \
 Do not repeat the raw data — synthesise it into insight."""
@@ -110,11 +110,11 @@ _REDUCE_USER_TEMPLATE = """\
 {sub_results}
 
 ## Task
-Synthesise the above into a unified root-cause report following the \
+Synthesise the above into a unified consolidated report following the \
 format described in your instructions."""
 
 _DECOMPOSE_SYSTEM_PROMPT = """\
-You are a planning agent for an on-call investigation system. \
+You are a planning agent for a parallel investigation system. \
 Your job is to decompose a high-level investigation query into a set of \
 focused, independent sub-queries that can be investigated in parallel. \
 Each sub-query should target a distinct service, component, or log group. \

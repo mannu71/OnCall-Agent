@@ -148,8 +148,9 @@ def build_playbook_tools() -> List[Any]:
             coroutine=_save_playbook,
             name="save_playbook",
             description=(
-                "Save or update an investigation playbook for a known issue type. "
-                "Call this when you have identified the root cause and resolution of an issue."
+                "Save or update an investigation playbook for a recurring task or issue type. "
+                "Call this when you have reached findings and recommendations worth reusing "
+                "(for example the root cause and resolution of an issue)."
             ),
             args_schema=SavePlaybookInput,
         ),

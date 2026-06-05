@@ -74,5 +74,9 @@ disallow_untyped_defs = false
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "evals"]
 asyncio_mode = "auto"
+markers = [
+    "eval: golden-trace regression suite (costs real LLM tokens; excluded from default runs)",
+    "accuracy_eval: CloudWatch/CodeCrawler accuracy harness (costs real LLM tokens; run in the agent-api container)",
+]

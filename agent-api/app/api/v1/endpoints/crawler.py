@@ -80,6 +80,13 @@ async def index_repo(repo: str, body: IndexRequest) -> Dict[str, Any]:
     return result
 
 
+@router.delete("/index/{repo}", summary="Delete a repository index")
+async def delete_index(repo: str) -> Dict[str, Any]:
+    result = await crawler_service.delete_index(repo)
+    _raise_on_error(result)
+    return result
+
+
 @router.get("/index/{repo}", summary="Get cached repo overview")
 async def get_index(repo: str) -> Dict[str, Any]:
     overview = await crawler_service.get_index_overview(repo)

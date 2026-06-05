@@ -18,7 +18,7 @@ AUTO_DRILLDOWN_ENABLED = settings.cloudwatch_auto_drilldown
 
 _AUTO_DRILL_GRADES = frozenset({"low", "none"})
 _PLACEHOLDER_RE = re.compile(r"<[A-Z_]+(?::[^>]+)?>")
-_PREVIEW_CHAR_CAP = 6000  # internal RCA tool — keep raw drill preview (IDs/traces)
+_PREVIEW_CHAR_CAP = 6000  # internal log-analysis tool — keep raw drill preview (IDs/traces)
 
 # Default benign phrases (override via workflow severity_excludes config).
 DEFAULT_SEVERITY_EXCLUDES = (

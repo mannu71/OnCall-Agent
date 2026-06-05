@@ -21,7 +21,10 @@ import {
   Info,
   Layers,
   ChevronRight,
-  ExternalLink
+  ExternalLink,
+  RefreshCw,
+  Trash2,
+  Loader2
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -63,6 +66,8 @@ export default function CodebaseExplorer() {
   const [activeTab, setActiveTab] = useState('structure'); // 'structure' | 'domain' | 'impact'
   const [selectedNode, setSelectedNode] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isMutating, setIsMutating] = useState(false); // reindex / delete in flight
+  const [actionError, setActionError] = useState('');
 
   // Graph state
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
@@ -73,23 +78,81 @@ export default function CodebaseExplorer() {
   const [diffSymbolsText, setDiffSymbolsText] = useState('');
   const [diffImpactResult, setDiffImpactResult] = useState(null);
 
-  // 1. Fetch available indexed repositories
-  useEffect(() => {
-    async function loadRepos() {
-      try {
-        const res = await agentApiClient.listCrawlerRepos();
-        if (res?.repos) {
-          setRepos(res.repos);
-          if (res.repos.length > 0) {
-            setSelectedRepo(res.repos[0].repo_name);
-          }
-        }
-      } catch (err) {
-        console.error('Failed to load repositories', err);
+  // 1. Fetch available indexed repositories. Returns the repo list so callers
+  //    (initial load, post-reindex, post-delete) can react to the new state.
+  const loadRepos = useCallback(async ({ preferRepo } = {}) => {
+    try {
+      const res = await agentApiClient.listCrawlerRepos();
+      const list = res?.repos || [];
+      setRepos(list);
+      if (list.length > 0) {
+        const stillThere = preferRepo && list.some(r => r.repo_name === preferRepo);
+        setSelectedRepo(stillThere ? preferRepo : list[0].repo_name);
+      } else {
+        setSelectedRepo('');
       }
+      return list;
+    } catch (err) {
+      console.error('Failed to load repositories', err);
+      return [];
     }
-    loadRepos();
   }, []);
+
+  useEffect(() => {
+    loadRepos();
+  }, [loadRepos]);
+
+  // Force a full rebuild of the selected repo's index, then refresh counts.
+  const handleReindex = useCallback(async () => {
+    if (!selectedRepo || isMutating) return;
+    setIsMutating(true);
+    setActionError('');
+    try {
+      await agentApiClient.reindexRepo(selectedRepo);
+      await loadRepos({ preferRepo: selectedRepo });
+      // Refresh the file list for the rebuilt index.
+      const res = await agentApiClient.getRepoFiles(selectedRepo, null, false, 500);
+      if (res?.files) {
+        setFiles(res.files);
+        setFilteredFiles(res.files);
+      }
+    } catch (err) {
+      console.error('Reindex failed', err);
+      setActionError(`Reindex failed: ${err?.message || 'unknown error'}`);
+    } finally {
+      setIsMutating(false);
+    }
+  }, [selectedRepo, isMutating, loadRepos]);
+
+  // Delete the entire index for the selected repo after explicit confirmation.
+  const handleDeleteIndex = useCallback(async () => {
+    if (!selectedRepo || isMutating) return;
+    const confirmed = window.confirm(
+      `Delete the entire index for "${selectedRepo}"?\n\n` +
+      'This removes its knowledge graph and overview. You can rebuild it later by re-indexing.'
+    );
+    if (!confirmed) return;
+    setIsMutating(true);
+    setActionError('');
+    try {
+      await agentApiClient.deleteIndex(selectedRepo);
+      const remaining = await loadRepos();
+      if (remaining.length === 0) {
+        setFiles([]);
+        setFilteredFiles([]);
+        setSelectedFile(null);
+        setSelectedNode(null);
+        setNodes([]);
+        setEdges([]);
+        setDiffImpactResult(null);
+      }
+    } catch (err) {
+      console.error('Delete index failed', err);
+      setActionError(`Delete failed: ${err?.message || 'unknown error'}`);
+    } finally {
+      setIsMutating(false);
+    }
+  }, [selectedRepo, isMutating, loadRepos, setNodes, setEdges]);
 
   // 2. Fetch files for selected repository
   useEffect(() => {
@@ -435,6 +498,33 @@ export default function CodebaseExplorer() {
               </option>
             ))}
           </select>
+
+          {/* Index lifecycle actions */}
+          <div className="mt-2 flex items-center gap-2">
+            <button
+              onClick={handleReindex}
+              disabled={!selectedRepo || isMutating}
+              title="Rebuild this repository's index from scratch"
+              className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isMutating
+                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                : <RefreshCw className="w-3.5 h-3.5" />}
+              Reindex
+            </button>
+            <button
+              onClick={handleDeleteIndex}
+              disabled={!selectedRepo || isMutating}
+              title="Delete this repository's entire index"
+              className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-md border border-destructive/30 bg-background px-2.5 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Delete Index
+            </button>
+          </div>
+          {actionError && (
+            <p className="mt-2 text-[11px] text-destructive leading-snug">{actionError}</p>
+          )}
         </div>
 
         {/* Tab Headers */}
