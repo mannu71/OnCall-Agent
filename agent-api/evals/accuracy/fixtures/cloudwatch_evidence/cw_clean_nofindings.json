@@ -1,0 +1,22 @@
+{
+  "data_quality": {
+    "coverage": "full",
+    "partial": false,
+    "sampled": false,
+    "failures": [],
+    "log_groups_requested": 2,
+    "analyses_requested": ["error-patterns", "anomaly-detection", "alarms"]
+  },
+  "alarms": {
+    "summary": {"total": 3, "in_alarm": 0, "names": []}
+  },
+  "patterns": {
+    "unique_patterns": [],
+    "evidence_grade": "high"
+  },
+  "anomalies": {
+    "anomalies": [],
+    "summary": {"total_anomalies": 0, "critical_severity": 0, "high_severity": 0}
+  },
+  "drilldown": []
+}

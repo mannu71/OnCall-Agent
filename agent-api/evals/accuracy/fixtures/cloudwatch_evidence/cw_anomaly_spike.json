@@ -1,0 +1,48 @@
+{
+  "data_quality": {
+    "coverage": "full",
+    "partial": false,
+    "sampled": false,
+    "failures": [],
+    "log_groups_requested": 1,
+    "analyses_requested": ["error-patterns", "anomaly-detection"]
+  },
+  "alarms": {
+    "summary": {"total": 2, "in_alarm": 0, "names": []}
+  },
+  "patterns": {
+    "unique_patterns": [
+      {
+        "normalized_pattern": "HTTP 429 TooManyRequests from rate limiter",
+        "occurrence_count": 530,
+        "affected_streams": 4,
+        "example_message": "2026-06-04T18:42:10Z WARN [sessionId=sess-7712aa traceId=1-65f39988-aabbccddeeff00112233445566] HTTP 429 TooManyRequests: rate limit exceeded for tenant acme-bank",
+        "first_seen": "2026-06-04T18:30:00Z",
+        "last_seen": "2026-06-04T19:10:00Z"
+      }
+    ],
+    "evidence_grade": "high"
+  },
+  "anomalies": {
+    "anomalies": [
+      {
+        "log_group": "/aws/lambda/kyc-gateway",
+        "timestamp": "2026-06-04T18:45:00Z",
+        "severity": "high",
+        "z_score": 5.1,
+        "current_count": 530,
+        "baseline_average": 60.0,
+        "reasons": ["Throttling spike ~9x baseline"]
+      }
+    ],
+    "summary": {"total_anomalies": 1, "critical_severity": 0, "high_severity": 1}
+  },
+  "drilldown": [
+    {
+      "target": "HTTP 429 TooManyRequests from rate limiter",
+      "events": [
+        "2026-06-04T18:42:10Z [sessionId=sess-7712aa traceId=1-65f39988-aabbccddeeff00112233445566 tenant=acme-bank] HTTP 429 TooManyRequests: rate limit exceeded"
+      ]
+    }
+  ]
+}

@@ -305,6 +305,12 @@ class BuildFileMap(AsyncNode):
         # Mermaid graph
         mermaid = ["graph TD"]
         for rel in prep_res["relationships"]:
+            # The relationship-analysis LLM occasionally emits a bare string
+            # (e.g. "A calls B") instead of a {from,to,label} object. Skip
+            # non-dict entries so a single malformed item can't crash the whole
+            # index flow.
+            if not isinstance(rel, dict):
+                continue
             src = rel.get("from", "?").replace(" ", "_").replace("-", "_")
             tgt = rel.get("to", "?").replace(" ", "_").replace("-", "_")
             label = rel.get("label", "→")

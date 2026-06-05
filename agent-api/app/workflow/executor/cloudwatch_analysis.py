@@ -217,6 +217,42 @@ def build_synthesis_payload(evidence: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+_SEVERITY_RANK = ["none", "low", "medium", "high", "critical"]
+
+
+def _clamp_severity_for_weak_evidence(parsed: Any, evidence: Dict[str, Any]) -> None:
+    """Deterministically cap synthesized severity when the evidence is too weak.
+
+    The LLM cannot be relied on to lower severity on its own, so we enforce the
+    guardrail in code: when coverage is 'partial'/'none', results were sampled,
+    or the patterns 'evidence_grade' is 'low', severity is capped at 'medium'
+    UNLESS a CloudWatch alarm is in ALARM state or a high/critical anomaly was
+    detected (both are strong signals that survive incomplete coverage). This
+    stops the synthesis from crying 'high'/'critical' on incomplete data.
+    Mutates *parsed.severity* in place; never raises.
+    """
+    try:
+        dq = (evidence or {}).get("data_quality") or {}
+        coverage = str(dq.get("coverage", "")).lower()
+        sampled = bool(dq.get("sampled"))
+        grade = str(((evidence or {}).get("patterns") or {}).get("evidence_grade", "")).lower()
+        alarm_summary = ((evidence or {}).get("alarms") or {}).get("summary") or {}
+        in_alarm = int(alarm_summary.get("in_alarm") or 0) > 0
+        anomalies = ((evidence or {}).get("anomalies") or {}).get("anomalies") or []
+        strong_anomaly = any(
+            str(a.get("severity", "")).lower() in ("high", "critical")
+            for a in anomalies if isinstance(a, dict)
+        )
+        weak = coverage in ("partial", "none") or grade == "low" or sampled
+        if not (weak and not in_alarm and not strong_anomaly):
+            return
+        current = str(getattr(parsed, "severity", "") or "").lower()
+        if current in _SEVERITY_RANK and _SEVERITY_RANK.index(current) > _SEVERITY_RANK.index("medium"):
+            parsed.severity = "medium"
+    except Exception:  # pragma: no cover - guardrail must never break synthesis
+        pass
+
+
 def build_rich_cloudwatch_report(
     evidence: Dict[str, Any],
     log_groups: list,
@@ -503,9 +539,9 @@ async def analyze_cloudwatch_with_llm(
         from app.workflow.strategies.react.workflow_config import resolve_llm_config_for_workflow
 
         class CloudWatchAnalysisSummary(_PydanticBase):
-            """Structured CloudWatch incident analysis for on-call engineers."""
+            """Structured CloudWatch log analysis summary."""
             headline: str = _Field(
-                description="One-sentence incident summary suitable for Slack or PagerDuty."
+                description="One-sentence summary suitable for Slack or a notification."
             )
             severity: str = _Field(
                 description="Overall severity: critical | high | medium | low | none."
@@ -513,14 +549,15 @@ async def analyze_cloudwatch_with_llm(
             key_findings: _List[str] = _Field(
                 description="2-5 bullet points describing what was found."
             )
-            root_cause_hypothesis: str = _Field(
+            primary_hypothesis: str = _Field(
                 description=(
-                    "Most likely root cause based on the data. "
+                    "Most likely explanation or key takeaway based on the data "
+                    "(e.g. the probable root cause when investigating an issue). "
                     "Use 'Unknown' if there is insufficient evidence."
                 )
             )
             recommended_actions: _List[str] = _Field(
-                description="Ordered list of actions for the on-call engineer."
+                description="Ordered list of recommended next steps."
             )
             related_services: _List[str] = _Field(
                 default_factory=list,
@@ -587,14 +624,19 @@ async def analyze_cloudwatch_with_llm(
 
         system_prompt = (
             f"{TOON_LEGEND}\n\n"
-            "You are an expert CloudWatch log analysis engineer for KYC Protect. "
+            "You are an expert CloudWatch log analysis engineer. "
             "Analyze the provided log analysis results and give a clear, actionable summary. "
-            "Be concise but thorough. Focus on what matters for an on-call engineer. "
+            "Be concise but thorough. Focus on what matters to whoever is investigating — "
+            "whether that is root-cause analysis, log retrieval, or a general query. "
             "Respect the 'data_quality' field if present: when coverage is 'full' and no "
             "errors/anomalies were found, state plainly that the log groups were checked and "
             "nothing of concern was found — do not invent problems. When coverage is "
             "'partial' or 'none', or results were sampled, call that out explicitly and lower "
             "your confidence accordingly rather than presenting incomplete data as definitive. "
+            "CAP SEVERITY WHEN EVIDENCE IS WEAK: if coverage is 'partial'/'none', results were "
+            "sampled, or the patterns 'evidence_grade' is 'low', do NOT assign a severity above "
+            "'medium' unless a CloudWatch alarm is in ALARM state — insufficient evidence cannot "
+            "justify 'high' or 'critical'. "
             "Always surface CONCRETE SPECIFICS, not just counts: quote the actual error "
             "message(s) verbatim, and extract every identifier present in the evidence — "
             "correlation_id / correlationId, request_id / requestId, trace_id / X-Ray traceId, "
@@ -649,13 +691,14 @@ async def analyze_cloudwatch_with_llm(
                 usage = getattr(raw_msg, 'usage_metadata', None) or {}
                 input_tokens += usage.get('input_tokens', 0)
                 output_tokens += usage.get('output_tokens', 0)
+                _clamp_severity_for_weak_evidence(parsed, raw_result)
                 structured_analysis = parsed.model_dump()
                 analysis_text = (
                     f"**{parsed.headline}**\n\n"
                     f"Severity: {parsed.severity.upper()} (confidence: {parsed.confidence})\n\n"
                     f"**Key Findings:**\n"
                     + "\n".join(f"- {f}" for f in parsed.key_findings)
-                    + f"\n\n**Root Cause:** {parsed.root_cause_hypothesis}\n\n"
+                    + f"\n\n**Primary Hypothesis:** {parsed.primary_hypothesis}\n\n"
                     f"**Recommended Actions:**\n"
                     + "\n".join(f"{i+1}. {a}" for i, a in enumerate(parsed.recommended_actions))
                     + (

@@ -1,0 +1,56 @@
+{
+  "data_quality": {
+    "coverage": "full",
+    "partial": false,
+    "sampled": false,
+    "failures": [],
+    "log_groups_requested": 2,
+    "analyses_requested": ["error-patterns", "anomaly-detection", "alarms"]
+  },
+  "alarms": {
+    "summary": {"total": 1, "in_alarm": 1, "names": ["kyc-auth-5xx-rate"]}
+  },
+  "patterns": {
+    "unique_patterns": [
+      {
+        "normalized_pattern": "NullPointerException at com.kyc.AuthService.validate()",
+        "occurrence_count": 247,
+        "affected_streams": 3,
+        "example_message": "2026-06-04T23:14:58Z ERROR [correlationId=7f3a9c2e-1b4d-4e8a-9c6f-2d5e8a1b3c4d traceId=1-65f3a2b1-3c4d5e6f7a8b9c0d1e2f3a4b requestId=req-9X2kPb7Qm4] java.lang.NullPointerException: username is null at com.kyc.AuthService.validate(AuthService.java:145)",
+        "first_seen": "2026-06-04T22:58:11Z",
+        "last_seen": "2026-06-05T01:47:33Z"
+      },
+      {
+        "normalized_pattern": "Timeout calling downstream profile-svc",
+        "occurrence_count": 41,
+        "affected_streams": 2,
+        "example_message": "2026-06-04T23:20:02Z WARN [correlationId=7f3a9c2e-1b4d-4e8a-9c6f-2d5e8a1b3c4d] upstream timeout after 30000ms calling profile-svc /v1/profile",
+        "first_seen": "2026-06-04T23:01:00Z",
+        "last_seen": "2026-06-05T01:30:00Z"
+      }
+    ],
+    "evidence_grade": "high"
+  },
+  "anomalies": {
+    "anomalies": [
+      {
+        "log_group": "/aws/lambda/kyc-auth",
+        "timestamp": "2026-06-04T23:15:00Z",
+        "severity": "critical",
+        "z_score": 8.3,
+        "current_count": 1250,
+        "baseline_average": 45.2,
+        "reasons": ["Error volume spike >25x baseline"]
+      }
+    ],
+    "summary": {"total_anomalies": 1, "critical_severity": 1, "high_severity": 0}
+  },
+  "drilldown": [
+    {
+      "target": "NullPointerException at com.kyc.AuthService.validate()",
+      "events": [
+        "2026-06-04T23:14:58Z [correlationId=7f3a9c2e-1b4d-4e8a-9c6f-2d5e8a1b3c4d traceId=1-65f3a2b1-3c4d5e6f7a8b9c0d1e2f3a4b requestId=req-9X2kPb7Qm4 @logStream=kyc-auth/2026/06/04/[$LATEST]ab12] java.lang.NullPointerException: username is null at com.kyc.AuthService.validate(AuthService.java:145)"
+      ]
+    }
+  ]
+}
