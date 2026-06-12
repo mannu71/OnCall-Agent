@@ -1,0 +1,39 @@
+{
+  "synthesis": "Pre-computed CloudWatch analysis (severity: high). An HTTP 429 throttling spike (~9x baseline) is occurring on /aws/lambda/kyc-gateway. Representative event: sessionId=sess-4d8f1a2b traceId=1-66a1b2c3-7d8e9f0a1b2c3d4e5f6a7b8c 'HTTP 429 Too Many Requests from upstream rate limiter'. data_quality: coverage=full. No source-code fault is implicated; this is a rate-limit/capacity condition.",
+  "responses": {
+    "detect_anomalies": {
+      "success": true,
+      "anomalies": [
+        {
+          "log_group": "/aws/lambda/kyc-gateway",
+          "timestamp": "2026-06-05T09:02:00Z",
+          "severity": "high",
+          "z_score": 5.1,
+          "current_count": 612,
+          "baseline_average": 68.0,
+          "reasons": ["HTTP 429 throttling spike ~9x baseline"]
+        }
+      ],
+      "summary": {"total_anomalies": 1, "critical_severity": 0, "high_severity": 1, "medium_severity": 0},
+      "log_groups_analyzed": ["/aws/lambda/kyc-gateway"],
+      "data_quality": {"coverage": "full", "partial": false}
+    },
+    "analyze_log_patterns": {
+      "success": true,
+      "unique_patterns": [
+        {
+          "normalized_pattern": "HTTP 429 Too Many Requests from upstream rate limiter",
+          "occurrence_count": 612,
+          "affected_streams": 4,
+          "example_message": "2026-06-05T09:02:11Z WARN [sessionId=sess-4d8f1a2b traceId=1-66a1b2c3-7d8e9f0a1b2c3d4e5f6a7b8c] HTTP 429 Too Many Requests from upstream rate limiter",
+          "first_seen": "2026-06-05T08:55:00Z",
+          "last_seen": "2026-06-05T09:20:00Z"
+        }
+      ],
+      "patterns": {"warning": {"status": "Complete", "data": [1, 2, 3]}},
+      "data_quality": {"coverage": "full", "partial": false, "sampled": false},
+      "log_groups_analyzed": ["/aws/lambda/kyc-gateway"],
+      "time_range": "1h"
+    }
+  }
+}

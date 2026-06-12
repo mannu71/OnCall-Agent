@@ -10,12 +10,110 @@ from app.config import settings
 from app.core.error_classifier import classify_error
 from app.core.retry import with_retry
 from app.core.telemetry import agent_span, get_current_trace_id
-from app.workflow.strategies.react.helpers import compact_input_state
+from app.workflow.strategies.react.helpers import compact_input_state, looks_like_midthought
 from app.workflow.strategies.react.hitl import emit_hitl_pause
 from app.workflow.strategies.react.streaming import StreamCallback
 from app.workflow.execution_port import ExecutionPort
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_dangling_tool_calls(messages: list) -> list:
+    """Drop trailing AIMessages whose ``tool_calls`` have no matching ToolMessage.
+
+    A recursion-limit stop leaves the final AIMessage requesting tools that were
+    never executed; re-invoking that history raises INVALID_CHAT_HISTORY. Trimming
+    the unmatched tail lets the model synthesize from the results it already has.
+    """
+    try:
+        satisfied = {
+            tcid for m in messages
+            if (tcid := getattr(m, "tool_call_id", None)) is not None
+        }
+        out = list(messages)
+        while out:
+            calls = getattr(out[-1], "tool_calls", None) or []
+            ids = [c.get("id") for c in calls if isinstance(c, dict)]
+            if ids and not all(i in satisfied for i in ids):
+                out.pop()
+            else:
+                break
+        return out
+    except Exception:  # noqa: BLE001 — sanitization is best-effort
+        return messages
+
+
+# Minimal stand-ins for a message whose content came back empty. Bedrock
+# Converse (and most providers) reject ANY message with empty content
+# ("messages.N: ... must have non-empty content"), which hard-fails the whole
+# request. This is exactly how a run can die mid-loop: context compaction (the
+# pre_model_hook) summarizes via an auxiliary LLM, and if that summary is empty
+# (e.g. a mis-configured summarization model) the compacted message array
+# carries an empty message into the next model call.
+_EMPTY_TEXT_PLACEHOLDER = "(no content)"
+_EMPTY_TOOL_PLACEHOLDER = "(no tool output)"
+
+# Recovery/continuation turns (truncation continuation, mid-thought continuation,
+# recursion-limit synthesis) need their OWN recursion budget. Inheriting the
+# global ``agent_recursion_limit`` means a deployment that lowers it could starve
+# these single-purpose finishing turns and leave the user with a half-answer.
+# A small fixed budget is enough: at most one pending tool plus a synthesis turn.
+_CONTINUATION_RECURSION_LIMIT = 10
+
+
+def sanitize_messages_for_model(messages: list) -> list:
+    """Guarantee no message reaches the model with empty content.
+
+    Mirrors claude-code's "repair with synthetic placeholders" approach: rather
+    than DROP an empty message (which would break tool_use/tool_result pairing
+    and the user/assistant alternation Bedrock requires), substitute a minimal
+    placeholder so the request stays structurally valid. An assistant message
+    that carries ``tool_calls`` is left as-is — empty text there is legitimate.
+    """
+    if not messages:
+        return messages
+    try:
+        from langchain_core.messages import AIMessage, ToolMessage
+    except Exception:  # noqa: BLE001 — never break a run on a guard
+        return messages
+
+    repaired: list = []
+    changed = False
+    for msg in messages:
+        content = getattr(msg, "content", None)
+        is_empty = (
+            content is None
+            or (isinstance(content, str) and not content.strip())
+            or (isinstance(content, list) and len(content) == 0)
+        )
+        # An AIMessage requesting tools is valid with empty text content.
+        if is_empty and isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            repaired.append(msg)
+            continue
+        if not is_empty:
+            repaired.append(msg)
+            continue
+        placeholder = _EMPTY_TOOL_PLACEHOLDER if isinstance(msg, ToolMessage) else _EMPTY_TEXT_PLACEHOLDER
+        changed = True
+        try:
+            repaired.append(msg.model_copy(update={"content": placeholder}))
+        except Exception:  # noqa: BLE001 — fall back to in-place set
+            try:
+                msg.content = placeholder
+            except Exception:  # noqa: BLE001
+                pass
+            repaired.append(msg)
+    if not changed:
+        # Identity-preserving: callers (e.g. the pre_model_hook) rely on an
+        # unchanged return to keep the compaction / prompt-cache no-op fast path.
+        return messages
+    logger.warning(
+        "ReactStrategy: repaired %d empty message(s) with placeholders before "
+        "the model call (compaction/summarization likely produced empty content)",
+        sum(1 for a, b in zip(messages, repaired) if a is not b),
+    )
+    return repaired
+
 
 async def execute_agent(
     agent: Any,
@@ -25,6 +123,7 @@ async def execute_agent(
     stream_callback: Optional[StreamCallback] = None,
     thread_id: Optional[str] = None,
     execution_port: Optional[ExecutionPort] = None,
+    conversation_history: Optional[list] = None,
 ) -> Dict[str, Any]:
     """
     Execute the LangGraph ReAct agent with the user's query.
@@ -54,7 +153,23 @@ async def execute_agent(
 
     logger_instance.info("ReactStrategy: invoking agent with query: %.100s", user_query)
 
-    input_state = {"messages": [HumanMessage(content=user_query)]}
+    # Conversation memory: replay prior chat turns so follow-up questions keep
+    # context (claude-code keeps a messages array and replays it). Compaction
+    # below trims this when it grows large.
+    _prior_messages = []
+    for _m in (conversation_history or []):
+        try:
+            _role = str(_m.get("role") or "").lower()
+            _text = _m.get("content") or ""
+            if not _text:
+                continue
+            if _role in ("assistant", "ai", "agent"):
+                _prior_messages.append(AIMessage(content=_text))
+            elif _role in ("user", "human"):
+                _prior_messages.append(HumanMessage(content=_text))
+        except Exception:  # noqa: BLE001
+            continue
+    input_state = {"messages": _prior_messages + [HumanMessage(content=user_query)]}
 
     # Task #7: compact accumulated messages before invoking the agent.
     # On a fresh call ``input_state["messages"]`` has just one
@@ -77,10 +192,35 @@ async def execute_agent(
             input_state["messages"],
         )
     except Exception as exc:  # noqa: BLE001 — never break the agent
-        logger_instance.debug(
-            "ReactStrategy: compaction skipped (%s); proceeding uncompacted",
-            exc,
+        # Compaction failed (e.g. mis-configured summarization model). Do NOT
+        # silently proceed with a potentially oversized history — surface it and
+        # fall back to a deterministic, LLM-free prune of stale tool results so
+        # the next model call has a bounded message array.
+        logger_instance.warning(
+            "ReactStrategy: LLM compaction failed (%s); falling back to "
+            "deterministic history prune (execution_id=%s)",
+            exc, execution_id,
         )
+        if stream_callback is not None:
+            try:
+                await stream_callback.on_error(
+                    "Context compaction failed; pruning older tool results to "
+                    "stay within the model's context window."
+                )
+            except Exception:  # noqa: BLE001 — never break a run on a notice
+                pass
+        try:
+            input_state = compact_input_state(input_state)
+        except Exception as _prune_exc:  # noqa: BLE001 — fallback is best-effort
+            logger_instance.warning(
+                "ReactStrategy: deterministic prune also failed (%s); "
+                "proceeding uncompacted (execution_id=%s)",
+                _prune_exc, execution_id,
+            )
+
+    # Repair any empty-content messages (e.g. from a failed compaction summary)
+    # before they reach Bedrock, which rejects empty messages outright.
+    input_state["messages"] = sanitize_messages_for_model(input_state["messages"])
 
     # Pass thread_id so the checkpointer can persist state across interrupts.
     run_config: Dict[str, Any] = {}
@@ -145,45 +285,79 @@ async def execute_agent(
         except ImportError:
             pass
 
-        # On context overflow, use LLM-assisted compression then retry once.
-        classified = classify_error(exc)
-        if classified.should_compress:
-            logger_instance.warning(
-                "ReactStrategy: context overflow detected — compressing and retrying",
-                extra={"execution_id": execution_id},
-            )
-            from langchain_core.messages import BaseMessage as _BM
-            from app.core.context_compression import compress as _compress
-
-            existing_msgs = input_state.get("messages", [])
-            if isinstance(existing_msgs, list) and all(isinstance(m, _BM) for m in existing_msgs):
-                # Attempt LLM-assisted compression; fall back to hard truncation if llm=None
-                try:
-                    compressed = await _compress(existing_msgs, llm=None)
-                    input_state = {"messages": compressed}
-                    logger_instance.info(
-                        "ReactStrategy: compressed %d → %d messages via context_compression",
-                        len(existing_msgs), len(compressed),
-                        extra={"execution_id": execution_id},
-                    )
-                except Exception as _ce:
-                    logger_instance.warning(
-                        "ReactStrategy: context_compression failed (%s), falling back to _compact",
-                        _ce,
-                    )
-                    input_state = compact_input_state(input_state)
-            else:
-                input_state = compact_input_state(input_state)
-
-            if stream_callback is not None:
-                result_state = await execute_agent_stream(
-                    agent, input_state, stream_callback, logger_instance, execution_id,
-                    run_config,
+        # Recursion-limit exhaustion: the agent looped without concluding. Recover
+        # the partial conversation from the checkpointer and force ONE tool-free
+        # synthesis turn so the user gets the gathered findings, not a raw error.
+        _recovered = False
+        try:
+            from langgraph.errors import GraphRecursionError
+            if isinstance(exc, GraphRecursionError) and run_config.get("configurable"):
+                logger_instance.warning(
+                    "ReactStrategy: recursion limit hit — forcing a final synthesis from "
+                    "partial state (execution_id=%s)", execution_id,
                 )
+                snap = await agent.aget_state(run_config)
+                msgs = _strip_dangling_tool_calls(
+                    list((getattr(snap, "values", None) or {}).get("messages", []))
+                )
+                if msgs:
+                    from langchain_core.messages import HumanMessage
+                    msgs = msgs + [HumanMessage(content=(
+                        "You have gathered enough information and may NOT call any more tools. "
+                        "Give your FINAL answer now, citing concrete file:line evidence. If you "
+                        "could not fully determine something, say so plainly."
+                    ))]
+                    result_state = await invoke_agent(
+                        agent, {"messages": msgs},
+                        {**run_config, "recursion_limit": _CONTINUATION_RECURSION_LIMIT},
+                    )
+                    _recovered = True
+        except Exception as _rec_exc:  # noqa: BLE001 — recovery is best-effort
+            logger_instance.warning(
+                "ReactStrategy: recursion recovery failed (%s); execution_id=%s",
+                _rec_exc, execution_id,
+            )
+
+        if not _recovered:
+            # On context overflow, use LLM-assisted compression then retry once.
+            classified = classify_error(exc)
+            if classified.should_compress:
+                logger_instance.warning(
+                    "ReactStrategy: context overflow detected — compressing and retrying",
+                    extra={"execution_id": execution_id},
+                )
+                from langchain_core.messages import BaseMessage as _BM
+                from app.core.context_compression import compress as _compress
+
+                existing_msgs = input_state.get("messages", [])
+                if isinstance(existing_msgs, list) and all(isinstance(m, _BM) for m in existing_msgs):
+                    # Attempt LLM-assisted compression; fall back to hard truncation if llm=None
+                    try:
+                        compressed = await _compress(existing_msgs, llm=None)
+                        input_state = {"messages": compressed}
+                        logger_instance.info(
+                            "ReactStrategy: compressed %d → %d messages via context_compression",
+                            len(existing_msgs), len(compressed),
+                            extra={"execution_id": execution_id},
+                        )
+                    except Exception as _ce:
+                        logger_instance.warning(
+                            "ReactStrategy: context_compression failed (%s), falling back to _compact",
+                            _ce,
+                        )
+                        input_state = compact_input_state(input_state)
+                else:
+                    input_state = compact_input_state(input_state)
+
+                if stream_callback is not None:
+                    result_state = await execute_agent_stream(
+                        agent, input_state, stream_callback, logger_instance, execution_id,
+                        run_config,
+                    )
+                else:
+                    result_state = await invoke_agent(agent, input_state, run_config)
             else:
-                result_state = await invoke_agent(agent, input_state, run_config)
-        else:
-            raise
+                raise
 
     parsed = _serialize_agent_result(result_state)
 
@@ -203,7 +377,7 @@ async def execute_agent(
             cont_state = await invoke_agent(
                 agent,
                 {"messages": result_state.get("messages", [])},
-                run_config,
+                {**run_config, "recursion_limit": _CONTINUATION_RECURSION_LIMIT},
             )
             cont_parsed = _serialize_agent_result(cont_state)
             if cont_parsed["last_ai_truncated"] and not cont_parsed["last_ai_had_tool_calls"]:
@@ -232,6 +406,49 @@ async def execute_agent(
             ).strip()
             parsed["truncated"] = True
 
+    # Separately: the agent sometimes ends its turn by NARRATING the next action
+    # ("Let me search for all methods…", "Now let me check…") in prose WITHOUT
+    # emitting the tool call, so LangGraph treats that preamble as the terminal
+    # answer. The turn isn't truncated (stop_reason=end_turn) so the block above
+    # doesn't catch it. When the final answer is a short action-announcing
+    # fragment with no pending tool call, give the agent one more turn to
+    # actually act and synthesize; keep it only if it yields a fuller answer.
+    elif (
+        not parsed.get("truncated")
+        and looks_like_midthought(parsed.get("final_answer") or "")
+        and len((parsed.get("final_answer") or "").strip()) < 400
+    ):
+        # Fires whether or not the last message had pending tool calls: when it
+        # did, re-invoking executes the pending tool and lets the loop reach a
+        # real conclusion; when it didn't, the agent gets a turn to actually act.
+        logger_instance.warning(
+            "ReactStrategy: agent ended on a mid-thought preamble (%r, had_tool_calls=%s); "
+            "continuing one turn so it acts/synthesizes — execution_id=%s",
+            (parsed.get("final_answer") or "")[:80], parsed["last_ai_had_tool_calls"], execution_id,
+        )
+        try:
+            # A recursion-limit stop leaves the last AIMessage with UNEXECUTED
+            # tool_calls (no matching ToolMessage); LangGraph rejects that history
+            # on re-invoke. Trim those trailing dangling-tool-call messages so the
+            # model can synthesize from the results it already gathered.
+            cont_msgs = _strip_dangling_tool_calls(result_state.get("messages", []))
+            cont_state = await invoke_agent(
+                agent,
+                {"messages": cont_msgs},
+                {**run_config, "recursion_limit": _CONTINUATION_RECURSION_LIMIT},
+            )
+            cont_parsed = _serialize_agent_result(cont_state)
+            cont_answer = (cont_parsed.get("final_answer") or "").strip()
+            # Accept the continuation only if it advanced past the preamble.
+            if cont_answer and cont_answer != (parsed.get("final_answer") or "").strip():
+                parsed = cont_parsed
+                result_state = cont_state
+        except Exception as cont_exc:  # noqa: BLE001 — never break on a recovery attempt
+            logger_instance.warning(
+                "ReactStrategy: mid-thought continuation failed (%s); keeping original "
+                "(execution_id=%s)", cont_exc, execution_id,
+            )
+
     serialized_messages = parsed["messages"]
     tool_calls_summary  = parsed["tool_calls"]
     final_answer        = parsed["final_answer"]
@@ -252,6 +469,20 @@ async def execute_agent(
         " [truncated]" if parsed.get("truncated") else "",
     )
 
+    # Live token surfacing: push a token_usage_delta SSE event so the chat's
+    # token counter updates from the stream (the final sync result carries the
+    # same totals). Best-effort — never blocks or fails the run.
+    if execution_port is not None and execution_id is not None:
+        try:
+            await execution_port.publish_token_usage(execution_id, {
+                "input_tokens":  total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "total_tokens":  total_input_tokens + total_output_tokens,
+                "cache_read_tokens": getattr(token_cb, "cache_read_tokens", 0),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+
     result: Dict[str, Any] = {
         "final_answer":   final_answer,
         "messages":       serialized_messages,
@@ -262,6 +493,24 @@ async def execute_agent(
     }
     if parsed.get("truncated"):
         result["truncated"] = True
+
+    # ── ID-grounding guard (log-only telemetry) ───────────────────────────
+    # Flag identifiers cited in the final answer that no tool produced and the
+    # user didn't supply — a likely fabrication. Never blocks or rewrites the
+    # answer; surfaced as result["ungrounded_ids"] for the UI / eval to inspect.
+    try:
+        from app.core.grounding import ungrounded_ids, extract_ids
+        allow = extract_ids(user_query)
+        flagged = ungrounded_ids(final_answer or "", parsed.get("evidence_ids") or set(), allow)
+        if flagged:
+            result["ungrounded_ids"] = flagged
+            logger_instance.warning(
+                "ReactStrategy: %d ID(s) in the final answer are not grounded in any tool "
+                "output or the query (possible fabrication): %s (execution_id=%s)",
+                len(flagged), flagged[:5], execution_id,
+            )
+    except Exception:  # noqa: BLE001 — a telemetry guard must never break a run
+        pass
     return result
 
 
@@ -303,6 +552,7 @@ def _serialize_agent_result(result_state: Dict[str, Any]) -> Dict[str, Any]:
     tool_calls_summary = []
     final_answer = ""
     last_content = ""          # last AIMessage content regardless of tool_calls
+    evidence_ids: set = set()  # ID-like tokens seen in FULL tool outputs (grounding)
     # Fallback token accumulators from AIMessage.usage_metadata
     # (used only when token_cb didn't capture anything via on_llm_end)
     fallback_input_tokens  = 0
@@ -352,10 +602,18 @@ def _serialize_agent_result(result_state: Dict[str, Any]) -> Dict[str, Any]:
             last_ai_truncated = last_stop_reason in _TRUNCATED_STOP_REASONS
 
         elif isinstance(msg, ToolMessage):
+            _full = str(msg.content)
+            # Grounding: harvest IDs from the FULL output, before the 2000-char
+            # serialization cap, so the guard sees every identifier a tool produced.
+            try:
+                from app.core.grounding import extract_ids
+                evidence_ids.update(extract_ids(_full))
+            except Exception:  # noqa: BLE001 — a telemetry guard must never break a run
+                pass
             serialized_messages.append({
                 "role": "tool",
                 "tool_call_id": getattr(msg, "tool_call_id", ""),
-                "content": str(msg.content)[:2000],
+                "content": _full[:2000],
             })
 
         elif isinstance(msg, SystemMessage):
@@ -375,6 +633,7 @@ def _serialize_agent_result(result_state: Dict[str, Any]) -> Dict[str, Any]:
         "last_ai_truncated":      last_ai_truncated,
         "last_ai_had_tool_calls": last_ai_had_tool_calls,
         "last_stop_reason":       last_stop_reason,
+        "evidence_ids":           evidence_ids,
     }
 
 def extract_text_content(content) -> str:
@@ -459,12 +718,15 @@ async def execute_agent_stream(
             elif kind == "on_chat_model_stream":
                 chunk = data.get("chunk")
                 if chunk and hasattr(chunk, "tool_calls") and chunk.tool_calls:
+                    # Tool-call chunks stream incrementally: the FIRST chunk carries
+                    # the tool name, later chunks carry only arg deltas (empty name).
+                    # Only track the name here — the single user-facing "Calling X"
+                    # event is emitted once at on_tool_start (with the real name), so
+                    # we never surface an empty/"undefined" tool name.
                     for tc in chunk.tool_calls:
-                        current_tool_name = tc.get("name", "")
-                        try:
-                            await stream_callback.on_tool_call(current_tool_name, tc.get("args", {}))
-                        except Exception:
-                            pass
+                        _nm = tc.get("name") or ""
+                        if _nm:
+                            current_tool_name = _nm
                 content = getattr(chunk, "content", None) if chunk else None
                 if content and isinstance(content, str):
                     try:

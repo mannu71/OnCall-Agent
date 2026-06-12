@@ -1,0 +1,26 @@
+{
+  "synthesis": "Pre-computed CloudWatch analysis (severity: none). Coverage is full across /aws/lambda/kyc-auth and /aws/lambda/kyc-core. No error patterns, no anomalies, and no alarms in ALARM state were found. data_quality: coverage=full, partial=false. Nothing requires action.",
+  "responses": {
+    "analyze_log_patterns": {
+      "success": true,
+      "unique_patterns": [],
+      "patterns": {"error": {"status": "Complete", "data": []}},
+      "data_quality": {"coverage": "full", "partial": false, "sampled": false, "failures": []},
+      "log_groups_analyzed": ["/aws/lambda/kyc-auth", "/aws/lambda/kyc-core"],
+      "time_range": "2h"
+    },
+    "detect_anomalies": {
+      "success": true,
+      "anomalies": [],
+      "summary": {"total_anomalies": 0, "critical_severity": 0, "high_severity": 0, "medium_severity": 0},
+      "log_groups_analyzed": ["/aws/lambda/kyc-auth", "/aws/lambda/kyc-core"],
+      "data_quality": {"coverage": "full", "partial": false}
+    },
+    "list_metric_alarms": {
+      "success": true,
+      "alarms": [],
+      "summary": {"total": 0, "in_alarm": 0, "names": []},
+      "region": "us-east-1"
+    }
+  }
+}

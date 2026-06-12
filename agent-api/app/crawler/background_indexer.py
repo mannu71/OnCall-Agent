@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 
 _INDEX_CONCURRENCY = settings.background_index_concurrency
 
+# Holds references to recovery tasks so the event loop doesn't GC them mid-run.
+_recovery_tasks: set = set()
+
 
 async def index_workflow_repos(
     workflow_name: str,
@@ -31,12 +34,22 @@ async def index_workflow_repos(
     """
     from app.services.crawler_service import crawler_service
     from app.infrastructure.persistence.workflow_repository import WorkflowRepository
+    from app.services.background_jobs import background_job_store
 
     workflow_repo = WorkflowRepository()
     errors: List[str] = []
     sem = asyncio.Semaphore(_INDEX_CONCURRENCY)
 
+    # Durable job record for live status / restart recovery (best-effort).
+    job_id = await background_job_store.create(
+        "repo_index", workflow_name,
+        total=len(repos), payload={"repos": repos, "model_id": model_id},
+    )
+    await background_job_store.mark_running(job_id)
+    _done = 0
+
     async def _index_one(repo_name: str) -> None:
+        nonlocal _done
         async with sem:
             logger.info(
                 "background_indexer: indexing repo=%s for workflow=%s (model=%s)",
@@ -62,10 +75,19 @@ async def index_workflow_repos(
                     "background_indexer: repo=%s unhandled exception", repo_name
                 )
                 errors.append(repo_name)
+            finally:
+                _done += 1
+                await background_job_store.update_progress(
+                    job_id, progress=_done, detail=f"indexed {repo_name}",
+                )
 
     await asyncio.gather(*[_index_one(repo) for repo in repos])
 
     final_status: str | None = f"indexing_failed: {errors}" if errors else None
+    if errors:
+        await background_job_store.mark_failed(job_id, error=f"repos failed: {errors}")
+    else:
+        await background_job_store.mark_completed(job_id, detail="all repos indexed")
 
     try:
         workflow = await workflow_repo.get_by_name(workflow_name)
@@ -88,3 +110,66 @@ async def index_workflow_repos(
             "background_indexer: failed to re-enable workflow=%s after indexing",
             workflow_name,
         )
+
+
+async def recover_interrupted_indexing() -> None:
+    """Re-fire indexing for workflows left mid-index after a process restart.
+
+    ``index_workflow_repos`` is a fire-and-forget in-process task: it sets
+    ``indexing_status='indexing'`` up front and only clears it on completion.
+    If the process dies in between (restart / crash / OOM) the workflow stays
+    disabled and stuck on 'indexing' forever, since the task that would clear
+    it is gone. Called once on startup, this finds those workflows and re-runs
+    the indexer so they self-heal (or clears the flag when there's nothing to
+    index).
+    """
+    from app.infrastructure.persistence.workflow_repository import WorkflowRepository
+    from app.workflow.code_analyzer_config import (
+        CODE_ANALYZER_NODE_TYPES,
+        read_code_analyzer_repos,
+    )
+
+    repo = WorkflowRepository()
+    try:
+        workflows = await repo.list_all()
+    except Exception:  # noqa: BLE001
+        logger.exception("recover_interrupted_indexing: failed to list workflows")
+        return
+
+    stuck = [w for w in workflows if w.get("indexing_status") == "indexing"]
+    if not stuck:
+        return
+
+    logger.info(
+        "recover_interrupted_indexing: %d workflow(s) stuck mid-index, recovering: %s",
+        len(stuck), [w.get("name") for w in stuck],
+    )
+
+    for wf in stuck:
+        repo_names: List[str] = []
+        for node in wf.get("nodes") or []:
+            if node.get("type") in CODE_ANALYZER_NODE_TYPES:
+                repo_names.extend(
+                    r["name"] for r in read_code_analyzer_repos(node) if r["name"]
+                )
+        repo_names = list(dict.fromkeys(repo_names))  # dedupe, keep order
+
+        if not repo_names:
+            # Nothing to index — clear the stuck flag and re-enable so the card
+            # doesn't show "Indexing" forever.
+            wf["enabled"] = True
+            wf["indexing_status"] = None
+            try:
+                await repo.save(wf)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "recover_interrupted_indexing: failed to clear status for %s",
+                    wf.get("name"),
+                )
+            continue
+
+        task = asyncio.create_task(
+            index_workflow_repos(wf["name"], repo_names, model_id=None)
+        )
+        _recovery_tasks.add(task)
+        task.add_done_callback(_recovery_tasks.discard)

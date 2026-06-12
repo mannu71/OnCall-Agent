@@ -286,44 +286,62 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class CodeSymbol(Base):
-    """A symbol (function, class, method, …) extracted from a SCIP index."""
-    __tablename__ = "code_symbols"
+class BackgroundJobModel(Base):
+    """Durable record of a background job (e.g. repo indexing).
+
+    Source of truth for background work lifecycle + live progress, replacing the
+    fire-and-forget asyncio task as the observable state. ``claimed_by`` enables
+    multi-worker claiming via ``SELECT ... FOR UPDATE SKIP LOCKED``. See migration
+    ``013_background_jobs.sql``.
+    """
+    __tablename__ = "background_jobs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    repo_name = Column(String(255), nullable=False, index=True)
-    symbol_id = Column(String(1024), nullable=False)
-    """SCIP moniker — globally unique identifier produced by scip-python."""
-
-    kind = Column(String(50))           # function | class | method | variable | ...
-    file_path = Column(String(1024), nullable=False)
-    line_start = Column(Integer, nullable=False)
-    line_end = Column(Integer)
-    signature = Column(Text)
-    language = Column(String(50), default="python")
-    indexed_at = Column(DateTime(timezone=True), default=_utcnow)
+    job_type = Column(String(50), nullable=False)           # e.g. 'repo_index'
+    target = Column(String(255), nullable=False)            # e.g. workflow name
+    status = Column(String(20), nullable=False, default="queued")  # queued|running|completed|failed
+    progress = Column(Integer, nullable=False, default=0)
+    total = Column(Integer, nullable=False, default=0)
+    detail = Column(Text)
+    error = Column(Text)
+    payload = Column(JSON)
+    claimed_by = Column(String(64))
+    heartbeat_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    started_at = Column(DateTime(timezone=True))
+    ended_at = Column(DateTime(timezone=True))
 
     __table_args__ = (
-        UniqueConstraint("repo_name", "symbol_id", name="uq_code_symbols_repo_symbol"),
-        Index("ix_code_symbols_file", "repo_name", "file_path"),
+        Index("ix_background_jobs_status", "status"),
+        Index("ix_background_jobs_type_target", "job_type", "target"),
     )
 
 
-class CodeReference(Base):
-    """A single occurrence (definition, reference, or import) of a CodeSymbol."""
-    __tablename__ = "code_references"
+class ToolApprovalModel(Base):
+    """Audit record for a human-in-the-loop tool approval gate.
+
+    One row per ``ask`` tool call (see
+    ``app/workflow/strategies/react/tool_permissions.py``): written as
+    ``pending`` before the agent blocks on operator approval, then updated to
+    ``approved`` / ``denied`` / ``timeout`` when the decision resolves. Durable
+    replacement for the prior browser-localStorage-only record. See migration
+    ``012_tool_approvals.sql``.
+    """
+    __tablename__ = "tool_approvals"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    repo_name = Column(String(255), nullable=False, index=True)
-    symbol_id = Column(String(1024), nullable=False, index=True)
-    file_path = Column(String(1024), nullable=False)
-    line = Column(Integer, nullable=False)
-    role = Column(String(20))           # 'definition' | 'reference' | 'import'
-    caller_symbol = Column(String(1024), index=True)
-    """The enclosing symbol at this call site (for callers query)."""
+    execution_id = Column(String(64), nullable=False, index=True)
+    request_id = Column(String(64), nullable=False)
+    tool_name = Column(String(255), nullable=False)
+    args_summary = Column(Text)
+    decision = Column(String(20), nullable=False, default="pending")  # pending|approved|denied|timeout
+    decided_by = Column(String(255))
+    reason = Column(Text)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    decided_at = Column(DateTime(timezone=True))
 
     __table_args__ = (
-        Index("ix_code_refs_lookup", "repo_name", "symbol_id", "role"),
+        UniqueConstraint("execution_id", "request_id", name="uq_tool_approvals_request"),
     )
 
 
@@ -338,3 +356,39 @@ class AppSettingModel(Base):
     key = Column(String(128), primary_key=True)
     value = Column(Text)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
+class ModelRoleAssignmentModel(Base):
+    """Maps a gateway role (agent | crawler | subagent) to a named LLM config.
+
+    When a workflow does not explicitly wire / name a Language Model node for a
+    consumer, the resolution pipeline falls back to the model assigned to that
+    role here (and only then to the first ``llm_configs`` row). See
+    ``app/infrastructure/persistence/model_role_repository.py``.
+    """
+    __tablename__ = "model_role_assignments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    role = Column(String(50), unique=True, nullable=False)          # agent | crawler | subagent
+    llm_config_name = Column(String(255), nullable=False)           # llm_configs.name
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
+class MCPRoleAssignmentModel(Base):
+    """Maps a gateway role to a default MCP server (one role → many servers).
+
+    Used as the agent's default toolbox when a workflow wires no tool nodes;
+    wired nodes still win. See
+    ``app/infrastructure/persistence/mcp_role_repository.py``.
+    """
+    __tablename__ = "mcp_role_assignments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    role = Column(String(50), nullable=False)                       # agent
+    server_name = Column(String(255), nullable=False)              # mcp_servers.name
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("role", "server_name", name="uq_mcp_role_assignments_role_server"),
+    )

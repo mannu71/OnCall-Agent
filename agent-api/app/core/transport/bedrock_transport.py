@@ -98,12 +98,18 @@ class BedrockTransport(ProviderTransport):
         usage   = result.get("usage", {})
         in_tok  = usage.get("input_tokens", 0)
         out_tok = usage.get("output_tokens", 0)
+        # Surface Bedrock prompt-cache accounting so callers (crawler call_llm,
+        # token ledgers) can see whether caching is actually engaging.
+        cache_read  = usage.get("cache_read_input_tokens", 0) or 0
+        cache_write = usage.get("cache_creation_input_tokens", 0) or 0
 
         return TransportResponse(
             content=content,
             model=model_id,
             input_tokens=in_tok,
             output_tokens=out_tok,
+            cache_read_input_tokens=cache_read,
+            cache_creation_input_tokens=cache_write,
             raw=result,
         )
 

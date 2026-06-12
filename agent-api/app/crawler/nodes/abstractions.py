@@ -125,7 +125,7 @@ Output YAML only, no other text:
 ```"""
 
         response, tokens_in, tokens_out, was_cached = await call_llm(
-            prompt, model_id=prep_res["model"], use_cache=self.cur_retry == 0
+            prompt, model_id=prep_res["model"], use_cache=True, tier="index"
         )
 
         ms = int((time.monotonic() - t0) * 1000)
@@ -227,7 +227,7 @@ Output YAML only:
 ```"""
 
         response, tokens_in, tokens_out, was_cached = await call_llm(
-            prompt, model_id=prep_res["model"], use_cache=self.cur_retry == 0
+            prompt, model_id=prep_res["model"], use_cache=True, tier="index"
         )
 
         ms = int((time.monotonic() - t0) * 1000)

@@ -6,8 +6,9 @@ number is built from; they must be exact and reproducible.
 """
 from __future__ import annotations
 
+import fnmatch
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Path helpers
@@ -244,3 +245,162 @@ def grade_severity(structured: Optional[Dict[str, Any]], expected_sev: str) -> T
         if abs(_SEV_ORDER.index(got) - _SEV_ORDER.index(exp)) == 1:
             return 0.5, f"severity adjacent: got {got}, expected {exp}"
     return 0.0, f"severity mismatch: got {got}, expected {exp}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent trajectory: tool-selection / protocol / final-answer predicates
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# These grade what the *real* ReAct agent did, not a tool in isolation. Because
+# the agent LLM is non-deterministic, every check is a PREDICATE over a SET (did
+# the right family get called? did read precede a citation?) — never an exact
+# call sequence. Each grader scores satisfied/total predicates so a near-miss
+# degrades gracefully instead of collapsing to 0.
+#
+# Canonical call input is a list of TURNS, one per assistant message, each turn a
+# list of tool names invoked in that message (a single message can fan out
+# parallel tool_calls). A plain flat list of names is also accepted and treated
+# as one-call-per-turn. ``first_any`` reads the FIRST turn as an any-of set so a
+# parallel first move isn't penalised for ordering within the turn.
+
+# A tool-name matcher: an fnmatch glob, with '|' meaning alternation, so
+# "crawler_find_symbol|crawler_investigate_alert" matches either.
+Pattern = str
+# A turn is the set of tool names in one assistant message; the trajectory is the
+# ordered list of turns. ``Sequence[str]`` (a flat name list) is also accepted.
+Turns = Union[Sequence[str], Sequence[Sequence[str]]]
+
+
+def _name_matches(name: str, pattern: Pattern) -> bool:
+    """True when *name* matches *pattern* (fnmatch glob, '|' = alternation)."""
+    name = name or ""
+    return any(fnmatch.fnmatch(name, alt.strip())
+               for alt in str(pattern).split("|") if alt.strip())
+
+
+def _as_turns(calls: Turns) -> List[List[str]]:
+    """Normalise input to a list-of-turns. A flat name list → one call per turn."""
+    turns: List[List[str]] = []
+    for item in (calls or []):
+        if isinstance(item, str):
+            turns.append([item])
+        elif isinstance(item, (list, tuple)):
+            turns.append([str(n) for n in item])
+        else:
+            turns.append([str(item)])
+    return turns
+
+
+def _flatten(turns: List[List[str]]) -> List[str]:
+    return [n for turn in turns for n in turn]
+
+
+def _score(predicates: List[Tuple[bool, str]]) -> Tuple[float, str]:
+    """Fold a list of (passed, label) into (satisfied/total, diagnostic)."""
+    if not predicates:
+        return 1.0, "no checks"
+    passed = sum(1 for ok, _ in predicates if ok)
+    fails = [label for ok, label in predicates if not ok]
+    score = passed / len(predicates)
+    diag = "all %d checks passed" % len(predicates) if not fails \
+        else "%d/%d failed: %s" % (len(fails), len(predicates), "; ".join(fails))
+    return score, diag
+
+
+def grade_tool_selection(calls: Turns, spec: Dict[str, Any]) -> Tuple[float, str]:
+    """Did the agent reach for the right tool family for this kind of question?
+
+    Spec keys (all optional):
+      * ``first_any``: list of patterns — the FIRST turn must invoke at least one
+        tool matching one of these (the right opening move).
+      * ``must_call``: list of patterns — each must be invoked at least once.
+      * ``must_not_call``: list of patterns — none may be invoked.
+    """
+    turns = _as_turns(calls)
+    flat = _flatten(turns)
+    predicates: List[Tuple[bool, str]] = []
+
+    first_any = spec.get("first_any") or []
+    if first_any:
+        first_turn = turns[0] if turns else []
+        ok = any(_name_matches(n, p) for n in first_turn for p in first_any)
+        predicates.append((ok, "first_any %s (first turn was %s)" % (first_any, first_turn or "∅")))
+
+    for p in (spec.get("must_call") or []):
+        ok = any(_name_matches(n, p) for n in flat)
+        predicates.append((ok, "must_call %r" % p))
+
+    for p in (spec.get("must_not_call") or []):
+        hit = [n for n in flat if _name_matches(n, p)]
+        predicates.append((not hit, "must_not_call %r (called %s)" % (p, hit)))
+
+    return _score(predicates)
+
+
+def grade_protocol(calls: Turns, spec: Dict[str, Any]) -> Tuple[float, str]:
+    """Did the agent follow the investigation protocol (read before citing, etc.)?
+
+    Spec keys (all optional):
+      * ``requires_before``: list of ``[before_pat, after_pat]`` — if any call
+        matches ``after_pat`` then some EARLIER call must match ``before_pat``.
+        Vacuously satisfied when ``after_pat`` never appears (the gated action
+        was simply not taken).
+      * ``forbidden``: list of patterns — none may be invoked (e.g. re-running the
+        full scan when a pre-computed block was already supplied).
+      * ``max_calls``: int — total tool calls must not exceed this (thrash cap).
+    """
+    turns = _as_turns(calls)
+    flat = _flatten(turns)
+    predicates: List[Tuple[bool, str]] = []
+
+    for pair in (spec.get("requires_before") or []):
+        before_pat, after_pat = pair[0], pair[1]
+        after_idx = next((i for i, n in enumerate(flat) if _name_matches(n, after_pat)), None)
+        if after_idx is None:
+            ok = True  # vacuous: the gated action was never taken
+        else:
+            ok = any(_name_matches(flat[j], before_pat) for j in range(after_idx))
+        predicates.append((ok, "requires %r before %r" % (before_pat, after_pat)))
+
+    for p in (spec.get("forbidden") or []):
+        hit = [n for n in flat if _name_matches(n, p)]
+        predicates.append((not hit, "forbidden %r (called %s)" % (p, hit)))
+
+    if "max_calls" in spec:
+        cap = int(spec["max_calls"])
+        predicates.append((len(flat) <= cap, "max_calls %d (made %d)" % (cap, len(flat))))
+
+    return _score(predicates)
+
+
+def _contains(haystack: str, needle: str) -> bool:
+    """Case-insensitive, separator-normalised substring test (handles file paths)."""
+    h = (haystack or "").replace("\\", "/").lower()
+    n = (needle or "").replace("\\", "/").lower()
+    return bool(n) and n in h
+
+
+def grade_final_answer(answer: str, spec: Dict[str, Any]) -> Tuple[float, str]:
+    """Did the final narrative state the right thing (deterministic substring checks)?
+
+    Spec keys (all optional):
+      * ``must_contain``: list of substrings — each must appear (file paths,
+        symbols, line numbers, severity words). Separator/case-insensitive.
+      * ``any_of``: list of groups — each group satisfied by >=1 of its members.
+      * ``must_not_contain``: list of substrings — none may appear (e.g. forbid
+        "critical" on a clean-logs case).
+    """
+    answer = answer or ""
+    predicates: List[Tuple[bool, str]] = []
+
+    for sub in (spec.get("must_contain") or []):
+        predicates.append((_contains(answer, sub), "must_contain %r" % sub))
+
+    for group in (spec.get("any_of") or []):
+        ok = any(_contains(answer, alt) for alt in group)
+        predicates.append((ok, "any_of %s" % (group,)))
+
+    for sub in (spec.get("must_not_contain") or []):
+        predicates.append((not _contains(answer, sub), "must_not_contain %r" % sub))
+
+    return _score(predicates)

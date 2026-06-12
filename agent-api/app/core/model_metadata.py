@@ -5,11 +5,10 @@ and workflow strategies for pre-flight context checks.
 
 Resolution priority for context length:
 1. Explicit configuration override
-2. Cached value (model@base_url)
-3. Provider API /models endpoint
-4. models.dev lookup
-5. Hardcoded defaults (fuzzy match)
-6. Default fallback (128K)
+2. Provider API /models endpoint
+3. models.dev lookup
+4. Hardcoded defaults (fuzzy match)
+5. Default fallback (128K)
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import httpx
@@ -356,92 +354,6 @@ async def query_models_dev(model: str) -> Optional[int]:
     return None
 
 
-async def get_cached_context_length(
-    model: str,
-    base_url: str,
-    db_session: Optional["AsyncSession"] = None,
-) -> Optional[int]:
-    """Look up previously discovered context length from cache.
-
-    Args:
-        model: The model identifier
-        base_url: The API base URL
-        db_session: Optional database session for async operations
-
-    Returns:
-        Cached context length if found, or None
-    """
-    if db_session is None:
-        return None
-
-    from app.models.db_models import ContextLengthCacheModel
-    from sqlalchemy import select
-
-    cache_key = _make_cache_key(model, base_url)
-
-    try:
-        stmt = select(ContextLengthCacheModel).where(
-            ContextLengthCacheModel.model_provider_key == cache_key
-        )
-        result = await db_session.execute(stmt)
-        cached = result.scalar_one_or_none()
-
-        if cached:
-            return cached.context_length
-
-    except Exception as e:
-        logger.debug(f"Failed to get cached context length: {e}")
-
-    return None
-
-
-async def save_context_length(
-    model: str,
-    base_url: str,
-    length: int,
-    db_session: Optional["AsyncSession"] = None,
-) -> bool:
-    """Persist discovered context length to cache.
-
-    Args:
-        model: The model identifier
-        base_url: The API base URL
-        length: The context length to cache
-        db_session: Optional database session for async operations
-
-    Returns:
-        True if saved successfully, False otherwise
-    """
-    if db_session is None:
-        return False
-
-    from app.models.db_models import ContextLengthCacheModel
-    from sqlalchemy.dialects.postgresql import insert
-
-    cache_key = _make_cache_key(model, base_url)
-
-    try:
-        # Use upsert to handle existing entries
-        stmt = insert(ContextLengthCacheModel).values(
-            model_provider_key=cache_key,
-            context_length=length,
-            discovered_at=datetime.now(timezone.utc),
-        )
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["model_provider_key"],
-            set_={
-                "context_length": length,
-                "discovered_at": datetime.now(timezone.utc),
-            }
-        )
-        await db_session.execute(stmt)
-        return True
-
-    except Exception as e:
-        logger.warning(f"Failed to save context length to cache: {e}")
-        return False
-
-
 def _get_hardcoded_context_length(model: str) -> Optional[int]:
     """Get context length from hardcoded defaults using fuzzy match.
 
@@ -477,11 +389,10 @@ async def get_model_context_length(
 
     Resolution priority:
     1. Explicit config override
-    2. Cached value (model@base_url)
-    3. Provider API /models endpoint
-    4. models.dev lookup
-    5. Hardcoded defaults (fuzzy match)
-    6. Default fallback (128K)
+    2. Provider API /models endpoint
+    3. models.dev lookup
+    4. Hardcoded defaults (fuzzy match)
+    5. Default fallback (128K)
 
     Args:
         model: The model identifier
@@ -489,7 +400,7 @@ async def get_model_context_length(
         api_key: Optional API key for provider queries
         config_context_length: Optional explicit config override
         provider: Optional provider name hint
-        db_session: Optional database session for cache operations
+        db_session: Optional database session (retained for signature compatibility; unused)
         enforce_minimum: If True, enforce MINIMUM_CONTEXT_LENGTH (64K) for agent workflows
 
     Returns:
@@ -503,40 +414,31 @@ async def get_model_context_length(
         logger.debug(f"Using config override for context length: {config_context_length}")
         resolved = config_context_length
     else:
-        # 2. Cached value
-        cached = await get_cached_context_length(model, base_url, db_session)
-        if cached is not None:
-            logger.debug(f"Using cached context length for {model}: {cached}")
-            resolved = cached
-        else:
-            # 3. Check for local server and query appropriately
-            server_type = detect_local_server_type(base_url)
+        # 2. Check for local server and query appropriately
+        server_type = detect_local_server_type(base_url)
 
-            if server_type == "ollama":
-                # Query Ollama-specific API
-                ollama_ctx = await query_ollama_num_ctx(model, base_url)
-                if ollama_ctx:
-                    logger.debug(f"Got context length from Ollama for {model}: {ollama_ctx}")
-                    await save_context_length(model, base_url, ollama_ctx, db_session)
-                    resolved = ollama_ctx
+        if server_type == "ollama":
+            # Query Ollama-specific API
+            ollama_ctx = await query_ollama_num_ctx(model, base_url)
+            if ollama_ctx:
+                logger.debug(f"Got context length from Ollama for {model}: {ollama_ctx}")
+                resolved = ollama_ctx
+            else:
+                resolved = _resolve_fallback_context_length(model)
+        else:
+            # 3. Provider API /models endpoint
+            provider_ctx = await query_provider_models_endpoint(base_url, model, api_key)
+            if provider_ctx:
+                logger.debug(f"Got context length from provider API for {model}: {provider_ctx}")
+                resolved = provider_ctx
+            else:
+                # 4. models.dev lookup
+                models_dev_ctx = await query_models_dev(model)
+                if models_dev_ctx:
+                    logger.debug(f"Got context length from models.dev for {model}: {models_dev_ctx}")
+                    resolved = models_dev_ctx
                 else:
                     resolved = _resolve_fallback_context_length(model)
-            else:
-                # 4. Provider API /models endpoint
-                provider_ctx = await query_provider_models_endpoint(base_url, model, api_key)
-                if provider_ctx:
-                    logger.debug(f"Got context length from provider API for {model}: {provider_ctx}")
-                    await save_context_length(model, base_url, provider_ctx, db_session)
-                    resolved = provider_ctx
-                else:
-                    # 5. models.dev lookup
-                    models_dev_ctx = await query_models_dev(model)
-                    if models_dev_ctx:
-                        logger.debug(f"Got context length from models.dev for {model}: {models_dev_ctx}")
-                        await save_context_length(model, base_url, models_dev_ctx, db_session)
-                        resolved = models_dev_ctx
-                    else:
-                        resolved = _resolve_fallback_context_length(model)
 
     # Validate minimum context length for agent workflows
     if enforce_minimum and resolved < MINIMUM_CONTEXT_LENGTH:

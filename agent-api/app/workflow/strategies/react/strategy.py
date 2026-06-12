@@ -2,34 +2,39 @@
 from __future__ import annotations
 
 import logging
-import os
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from app.config import settings
 from app.core.redact import redact
 from app.core.supervisor import InvestigationSupervisor, SupervisorAction, SupervisorConfig
+from app.harness import harness
+from app.harness.context_builder import (
+    apply_synthesis_floor,
+    build_recall_query,
+    seed_context_blocks,
+)
+from app.harness.spec_factory import build_agent_spec
+from app.harness.supervisor_loop import run_supervised
+from app.harness.tool_assembler import add_extension_tools, assemble_base_tools
 from app.workflow.execution_port import ExecutionPort
 from app.workflow.llm_config import LLM_NODE_TYPES
 from app.workflow.strategies.base import BaseStrategy
 from app.workflow.strategies.react.agent_builder import build_agent
 from app.workflow.strategies.react.agent_runner import execute_agent
-from app.workflow.strategies.react.helpers import (
-    build_recall_context,
-    cap_context_block,
-    estimate_confidence,
-    looks_like_midthought,
-)
 from app.workflow.strategies.react.hitl import emit_hitl_pause, make_checkpointer
 from app.workflow.strategies.react.learning import auto_learn, exec_fallback
 from app.workflow.strategies.react.llm_factory import build_llm
 from app.workflow.strategies.react.streaming import StreamCallback
-from app.workflow.strategies.react.tool_setup import setup_tools
+from app.workflow.llm_config import resolve_llm_config_for_consumer_port
 from app.workflow.strategies.react.workflow_config import (
     extract_agent_config,
     extract_cloudwatch_config,
     extract_code_analyzer_config,
     extract_tools_config,
+    find_agent_node_id,
+    find_code_analyzer_node_id,
+    resolve_default_tools_config,
     resolve_llm_config_for_workflow,
 )
 
@@ -83,109 +88,85 @@ class ReactStrategy(BaseStrategy):
         try:
             agent_config = extract_agent_config(workflow)
             llm_config = await resolve_llm_config_for_workflow(workflow)
+
+            # Node-level gateway: resolve the models wired to the dedicated model
+            # ports. The Code Crawler node carries the crawler model (its own
+            # ``lm`` port); the agent node carries the subagent model. Both are
+            # optional — when unwired they default to the agent's MAIN model so
+            # the whole workflow runs on one model unless a cheaper one is wired.
+            crawler_model_id: Optional[str] = llm_config.get("model")
+            try:
+                ca_node_id = find_code_analyzer_node_id(workflow)
+                if ca_node_id:
+                    _cw = await resolve_llm_config_for_consumer_port(
+                        workflow, ca_node_id, "lm"
+                    )
+                    if _cw and _cw.get("model"):
+                        crawler_model_id = _cw.get("model")
+                        logger.info(
+                            "ReactStrategy: crawler model from Code Crawler node = %s",
+                            crawler_model_id,
+                        )
+
+                agent_node_id = find_agent_node_id(workflow)
+                if agent_node_id:
+                    _sub = await resolve_llm_config_for_consumer_port(
+                        workflow, agent_node_id, "subagent"
+                    )
+                    if _sub:
+                        # Stash the full resolved config (provider + creds) so the
+                        # delegate tool can build a dedicated sub-LLM directly.
+                        # Unwired → subagent.py falls back to the parent (main) LLM.
+                        agent_config = {**agent_config, "subagent_llm_config": _sub}
+                        logger.info(
+                            "ReactStrategy: subagent model from wired port = %s",
+                            _sub.get("model"),
+                        )
+            except Exception as exc:  # noqa: BLE001 — never break on resolution
+                logger.warning(
+                    "ReactStrategy: crawler/subagent port resolution failed (%s)",
+                    exc,
+                )
+
             tools_config = extract_tools_config(workflow)
+            if tools_config:
+                logger.info(
+                    "ReactStrategy: using %d workflow-wired MCP tool node(s)",
+                    len(tools_config),
+                )
+            else:
+                # Gateway: no tool nodes wired — fall back to the agent's default
+                # MCP servers. Wired tool nodes always win over these defaults.
+                tools_config = await resolve_default_tools_config()
+                logger.info(
+                    "ReactStrategy: no wired tool nodes — using %d gateway-default MCP server(s)",
+                    len(tools_config),
+                )
             cloudwatch_config = extract_cloudwatch_config(workflow)
             code_analyzer_config = extract_code_analyzer_config(workflow)
 
-            recall_hits: int = 0
-            augmented_query = user_query
-            try:
-                from app.services.knowledge_base import knowledge_base as _kb
+            # Prepend a knowledge-base recall block (similar past issues /
+            # patterns / skills) so the agent starts with institutional memory.
+            augmented_query, recall_hits = await build_recall_query(
+                user_query=user_query,
+                cloudwatch_config=cloudwatch_config,
+                logger_instance=logger_instance,
+                execution_id=execution_id,
+            )
 
-                _issues = await _kb.search_known_issues(user_query, limit=3, threshold=0.65)
-                _patterns = await _kb.search_similar_patterns(user_query, limit=3, threshold=0.65)
-                if cloudwatch_config:
-                    _lg_query = " ".join(cloudwatch_config.get("log_groups") or [])
-                    if _lg_query:
-                        _cw_pat = await _kb.search_similar_patterns(
-                            _lg_query, limit=2, threshold=0.55,
-                        )
-                        seen = {p.get("id") for p in _patterns}
-                        for _p in _cw_pat:
-                            if _p.get("id") not in seen:
-                                _patterns.append(_p)
-                                seen.add(_p.get("id"))
-                _skills = await _kb.recall_skills_for_agent(user_query, limit=3)
-                recall_hits = len(_issues) + len(_patterns) + len(_skills)
-                recall_block = build_recall_context(_issues, _patterns, _skills)
-                if recall_block:
-                    augmented_query = f"{recall_block}\n\n---\n\n{user_query}"
-            except Exception as _recall_err:
-                logger_instance.warning(
-                    "ReactStrategy: KB recall failed (non-fatal): %s",
-                    redact(str(_recall_err)),
-                    extra={"execution_id": execution_id},
-                )
-
-            tools = await setup_tools(tools_config, mcp_manager, execution_id)
-
-            _expired_creds_msg: Optional[str] = None
-
-            if cloudwatch_config:
-                try:
-                    from app.core.aws_credentials import resolve_aws_credentials
-                    from app.workflow.tools.cloudwatch_agent_tools import build_cloudwatch_agent_tools
-
-                    cw_creds, cw_region = await resolve_aws_credentials(
-                        aws_profile=cloudwatch_config.get("aws_profile"),
-                        aws_region=cloudwatch_config.get("aws_region", "us-east-1"),
-                    )
-
-                    # Pre-flight: validate credentials before invoking the LLM.
-                    # A cheap STS call costs nothing vs. a full agent loop.
-                    try:
-                        import boto3
-                        from botocore.exceptions import ClientError as _BotoClientError
-                        from app.core.thread_pools import run_in_aws_pool
-
-                        _sts_kwargs: Dict[str, Any] = {"region_name": cw_region}
-                        if cw_creds.get("aws_profile"):
-                            _sts_session = boto3.Session(
-                                profile_name=cw_creds["aws_profile"], region_name=cw_region
-                            )
-                            _sts_client = _sts_session.client("sts")
-                        else:
-                            if cw_creds.get("access_key_id"):
-                                _sts_kwargs["aws_access_key_id"] = cw_creds["access_key_id"]
-                                _sts_kwargs["aws_secret_access_key"] = cw_creds.get("secret_access_key", "")
-                                if cw_creds.get("session_token"):
-                                    _sts_kwargs["aws_session_token"] = cw_creds["session_token"]
-                            _sts_client = boto3.client("sts", **_sts_kwargs)
-                        await run_in_aws_pool(_sts_client.get_caller_identity)
-                    except _BotoClientError as _sts_err:
-                        _ec = _sts_err.response.get("Error", {}).get("Code", "")
-                        if _ec == "ExpiredTokenException" or "ExpiredToken" in str(_sts_err):
-                            _expired_creds_msg = (
-                                "AWS credentials are expired. Please refresh your AWS session token "
-                                "in the LLM configuration settings and retry the workflow."
-                            )
-                            logger_instance.warning(
-                                "ReactStrategy: AWS credentials expired — aborting before LLM invocation (exec=%s)",
-                                execution_id,
-                                extra={"execution_id": execution_id},
-                            )
-                    except Exception as _sts_probe_err:
-                        logger_instance.debug(
-                            "ReactStrategy: STS credential pre-flight skipped (%s)",
-                            redact(str(_sts_probe_err)),
-                            extra={"execution_id": execution_id},
-                        )
-
-                    if not _expired_creds_msg:
-                        tools.extend(
-                            build_cloudwatch_agent_tools(
-                                region=cw_region,
-                                credentials=cw_creds,
-                                log_groups=cloudwatch_config.get("log_groups"),
-                                severity_excludes=cloudwatch_config.get("severity_excludes"),
-                            )
-                        )
-                except Exception as _cw_err:
-                    logger_instance.warning(
-                        "ReactStrategy: failed to build CloudWatch tools (non-fatal): %s",
-                        redact(str(_cw_err)),
-                        extra={"execution_id": execution_id},
-                    )
+            # Assemble the base action space (MCP + CloudWatch + crawler + DB
+            # schema tools, pruned by the relevance router) via the harness.
+            tools, _expired_creds_msg = await assemble_base_tools(
+                tools_config=tools_config,
+                mcp_manager=mcp_manager,
+                execution_id=execution_id,
+                cloudwatch_config=cloudwatch_config,
+                code_analyzer_config=code_analyzer_config,
+                db_server_map=context.get("db_server_map") or {},
+                user_query=user_query,
+                logger_instance=logger_instance,
+                crawler_model_id=crawler_model_id,
+            )
 
             if _expired_creds_msg:
                 return {
@@ -204,91 +185,45 @@ class ReactStrategy(BaseStrategy):
                     "total_tokens": 0,
                 }
 
-            if code_analyzer_config:
-                try:
-                    from app.workflow.tools.code_analyzer_tools import build_crawler_tools
-
-                    tools.extend(
-                        build_crawler_tools(repos=code_analyzer_config.get("repos"))
-                    )
-                except Exception as _cr_err:
-                    logger_instance.warning(
-                        "ReactStrategy: failed to build Crawler tools (non-fatal): %s",
-                        redact(str(_cr_err)),
-                        extra={"execution_id": execution_id},
-                    )
-
-            if tools and user_query:
-                try:
-                    from app.core.tools.router import ToolRouter
-
-                    _keep_prefixes_env = os.environ.get(
-                        "TOOL_ROUTER_ALWAYS_KEEP_PREFIXES",
-                        "cloudwatch_,code_,db_,database_,sql_",
-                    )
-                    _keep_prefixes = tuple(
-                        p.strip() for p in _keep_prefixes_env.split(",") if p.strip()
-                    )
-                    _top_k = int(os.environ.get("TOOL_ROUTER_TOP_K", "12"))
-                    _mcp_tools = [
-                        t for t in tools
-                        if hasattr(t, "name")
-                        and not any(t.name.startswith(p) for p in _keep_prefixes)
-                    ]
-                    _special_tools = [t for t in tools if t not in _mcp_tools]
-                    if _mcp_tools:
-                        _schemas = [
-                            {"name": t.name, "description": getattr(t, "description", "")}
-                            for t in _mcp_tools
-                        ]
-                        _filtered = ToolRouter(top_k=_top_k).filter(_schemas, query=user_query)
-                        _allowed = {s["name"] for s in _filtered}
-                        tools = [t for t in _mcp_tools if t.name in _allowed] + _special_tools
-                except Exception as _tr_err:
-                    logger_instance.warning(
-                        "ReactStrategy: ToolRouter skipped (non-fatal): %s",
-                        redact(str(_tr_err)),
-                        extra={"execution_id": execution_id},
-                    )
-
-            cw_context = context.get("cloudwatch_context")
-            # The deterministic pipeline's synthesis, kept uncapped as a guaranteed
-            # floor for the final answer if the agent's own answer comes back empty
-            # or truncated (see synthesis-as-floor fallback after the agent loop).
-            cw_synthesis: str = ""
-            if cw_context:
-                block = cap_context_block("Pre-computed CloudWatch Analysis", cw_context)
-                augmented_query = f"{block}{augmented_query}"
-                try:
-                    if isinstance(cw_context, dict):
-                        for _entry in cw_context.values():
-                            _out = (_entry or {}).get("output") if isinstance(_entry, dict) else None
-                            if _out and len(str(_out)) > len(cw_synthesis):
-                                cw_synthesis = str(_out)
-                except Exception:  # noqa: BLE001 — fallback extraction is best-effort
-                    cw_synthesis = ""
-
-            code_analyzer_context = context.get("code_analyzer_context")
-            if code_analyzer_context:
-                block = cap_context_block("Pre-computed Code Analysis", code_analyzer_context)
-                augmented_query = f"{block}{augmented_query}"
-
-            anomaly_correlation = context.get("anomaly_code_correlation")
-            if anomaly_correlation:
-                block = cap_context_block("Anomaly-Code Correlation", anomaly_correlation)
-                augmented_query = f"{block}{augmented_query}"
+            # Prepend any pre-computed analysis blocks the executor seeded
+            # (CloudWatch synthesis, code analysis, anomaly↔code correlation).
+            # cw_synthesis is surfaced as a guaranteed answer floor (used by the
+            # synthesis-as-floor fallback after the agent loop).
+            augmented_query, cw_synthesis = seed_context_blocks(
+                augmented_query=augmented_query,
+                context=context,
+            )
 
             llm = build_llm(llm_config)
+            # LLM-dependent extension tools (depth-1 delegate + gated edit),
+            # added via the harness so it owns the complete action space.
+            tools = add_extension_tools(
+                tools=tools,
+                llm=llm,
+                agent_config=agent_config,
+                code_analyzer_config=code_analyzer_config,
+                execution_id=execution_id,
+                logger_instance=logger_instance,
+            )
             checkpointer = await make_checkpointer()
-            agent = build_agent(
-                llm,
-                tools,
-                agent_config,
+
+            # Declarative agent spec — single source of truth for building the
+            # agent (initial build + supervisor-retry rebuild go through it).
+            spec = build_agent_spec(
+                agent_config=agent_config,
+                context=context,
                 has_cloudwatch=bool(cloudwatch_config),
                 has_code_analyzer=bool(code_analyzer_config),
-                checkpointer=checkpointer,
                 session_id=execution_id,
             )
+
+            def _rebuild_agent():
+                return harness.build_agent(
+                    spec, llm, tools, checkpointer=checkpointer,
+                    execution_port=execution_port,
+                )
+
+            agent = _rebuild_agent()
 
             supervisor_enabled = agent_config.get("supervisor_enabled", True)
             supervisor = (
@@ -296,129 +231,47 @@ class ReactStrategy(BaseStrategy):
                 if supervisor_enabled
                 else None
             )
-            supervisor_retry_count = 0
-            current_query = augmented_query
-            result: Dict[str, Any] = {}
-            _accum_input_tokens = 0
-            _accum_output_tokens = 0
-            _token_budget = supervisor._cfg.token_budget if supervisor else 0
 
-            while True:
-                result = await execute_agent(
-                    agent,
-                    current_query,
+            async def _run_agent(_agent, _query):
+                return await execute_agent(
+                    _agent,
+                    _query,
                     logger_instance,
                     execution_id,
                     stream_callback,
                     thread_id=execution_id,
                     execution_port=execution_port,
-                )
-                _accum_input_tokens += result.get("input_tokens", 0) or 0
-                _accum_output_tokens += result.get("output_tokens", 0) or 0
-
-                _final_answer = result.get("final_answer") or ""
-                _confidence = estimate_confidence(_final_answer, result.get("tool_calls", []))
-
-                if supervisor is None:
-                    break
-
-                _total_tokens = _accum_input_tokens + _accum_output_tokens
-                if _token_budget and _total_tokens >= _token_budget:
-                    logger_instance.warning(
-                        "ReactStrategy: supervisor token budget exhausted "
-                        "(%d >= %d) — stopping retry loop",
-                        _total_tokens,
-                        _token_budget,
-                        extra={"execution_id": execution_id},
-                    )
-                    result["supervisor_token_budget_exhausted"] = True
-                    break
-
-                verdict = supervisor.evaluate(
-                    final_answer=_final_answer,
-                    tool_calls=result.get("tool_calls", []),
-                    confidence=_confidence,
-                    retry_count=supervisor_retry_count,
+                    conversation_history=(
+                        (context.get("inputs") or {}).get("history")
+                        if isinstance(context, dict) else None
+                    ),
                 )
 
-                if verdict.action == SupervisorAction.PASS:
-                    break
+            # Bounded supervisor loop (run → score → retry/HITL/escalate) lives in
+            # the harness now; it enforces iteration / wall-clock / token bounds.
+            result, _accum_input_tokens, _accum_output_tokens = await run_supervised(
+                agent=agent,
+                run_agent=_run_agent,
+                rebuild_agent=_rebuild_agent,
+                supervisor=supervisor,
+                base_query=augmented_query,
+                execution_id=execution_id,
+                logger_instance=logger_instance,
+                wall_clock_budget=float(
+                    getattr(settings, "supervisor_wall_clock_seconds", 900.0)
+                ),
+                execution_port=execution_port,
+            )
 
-                if verdict.action == SupervisorAction.RETRY:
-                    supervisor_retry_count += 1
-                    current_query = (
-                        f"{verdict.retry_guidance}\n\n---\n\nOriginal query:\n{augmented_query}"
-                    )
-                    agent = build_agent(
-                        llm,
-                        tools,
-                        agent_config,
-                        has_cloudwatch=bool(cloudwatch_config),
-                        has_code_analyzer=bool(code_analyzer_config),
-                        checkpointer=checkpointer,
-                        session_id=execution_id,
-                    )
-                    continue
-
-                if verdict.action == SupervisorAction.HITL:
-                    await emit_hitl_pause(
-                        execution_id,
-                        {
-                            "request_id": str(uuid.uuid4()),
-                            "draft_answer": _final_answer,
-                            "message": (
-                                f"Supervisor quality score {verdict.score:.2f} — "
-                                f"engineer review requested. {verdict.reason}"
-                            ),
-                        },
-                        execution_port=execution_port,
-                    )
-                    break
-
-                if verdict.action == SupervisorAction.ESCALATE:
-                    result["supervisor_escalated"] = True
-                    result["supervisor_reason"] = verdict.reason
-                    break
-                break
-
-            # ── Synthesis-as-floor ──────────────────────────────────────────
-            # The deterministic CloudWatch pipeline already produced a complete,
-            # non-fragmentary synthesis (seeded above). If the agent's own answer
-            # came back empty or was cut off mid-thought, return that synthesis
-            # rather than a half-finished investigation ("Now let me search…").
-            _final_text = (result.get("final_answer") or "").strip()
-            # Treat provider refusals ("…cannot answer this question") as non-answers
-            # too, so the agent never overrides the deterministic CloudWatch report
-            # with a guardrail stub.
-            try:
-                from app.workflow.executor.cloudwatch_analysis import is_usable_synthesis
-                _agent_unusable = not is_usable_synthesis(_final_text)
-            except Exception:  # noqa: BLE001
-                _agent_unusable = not _final_text
-            # Be CONSERVATIVE: only fall back when the agent clearly failed to
-            # produce a usable answer — empty, a provider refusal/stub, a real
-            # token-limit truncation, or a SHORT mid-thought fragment. A long,
-            # substantial narrative is never clobbered, even if it happens to
-            # contain a phrase like "let me …" somewhere in its prose. (Previously
-            # looks_like_midthought alone fired on complete reports and replaced
-            # them with the raw deterministic report.)
-            _short_fragment = looks_like_midthought(_final_text) and len(_final_text) < 400
-            if cw_synthesis and (
-                not _final_text
-                or result.get("truncated")
-                or _agent_unusable
-                or _short_fragment
-            ):
-                logger_instance.info(
-                    "ReactStrategy: agent answer empty/refusal/truncated/short-fragment "
-                    "(len=%d) — falling back to pre-computed CloudWatch synthesis "
-                    "(execution_id=%s)",
-                    len(_final_text), execution_id,
-                    extra={"execution_id": execution_id},
-                )
-                result["final_answer"] = cw_synthesis
-                result["cloudwatch_synthesis_fallback"] = True
-                result.pop("truncated", None)
+            # Synthesis-as-floor: if the agent's own answer is empty/refusal/
+            # truncated/short-fragment, fall back to the deterministic CloudWatch
+            # synthesis seeded above rather than returning a half-finished run.
+            result = apply_synthesis_floor(
+                result=result,
+                cw_synthesis=cw_synthesis,
+                logger_instance=logger_instance,
+                execution_id=execution_id,
+            )
 
             # Post-run learning is best-effort and must never sink a successful
             # investigation. Any failure here is logged and swallowed.
@@ -448,6 +301,43 @@ class ReactStrategy(BaseStrategy):
                         extra={"execution_id": execution_id},
                     )
 
+            # ── Structured "Data Query Mode" ────────────────────────────────
+            # When requested, bind the model to InvestigationReport for ONE final
+            # synthesis over the agent's answer so callers get validated JSON
+            # alongside (not instead of) the prose. The ReAct loop itself stays
+            # freeform — only this last step is schema-constrained.
+            _ctx = context if isinstance(context, dict) else {}
+            _output_mode = str(
+                _ctx.get("output_mode")
+                or (_ctx.get("inputs") or {}).get("output_mode")
+                or agent_config.get("outputMode")
+                or (agent_config.get("params") or {}).get("outputMode")
+                or "text"
+            ).lower()
+            structured_output = None
+            if _output_mode == "structured" and (result.get("final_answer") or "").strip():
+                try:
+                    from app.workflow.strategies.react.output_schemas import InvestigationReport
+                    _struct_llm = llm.with_structured_output(InvestigationReport)
+                    _report = await _struct_llm.ainvoke(
+                        "Convert the following code-investigation answer into the structured "
+                        "report schema. Use ONLY facts present in the answer; cite file:line "
+                        "evidence exactly as written; do not invent fields.\n\n"
+                        f"User question:\n{user_query}\n\n"
+                        f"Investigation answer:\n{result.get('final_answer')}"
+                    )
+                    structured_output = (
+                        _report.model_dump() if hasattr(_report, "model_dump") else dict(_report)
+                    )
+                    logger_instance.info(
+                        "ReactStrategy: structured output produced (execution_id=%s)", execution_id,
+                    )
+                except Exception as _se:  # noqa: BLE001 — structured synth is additive
+                    logger_instance.warning(
+                        "ReactStrategy: structured synthesis failed (%s); returning text only "
+                        "(execution_id=%s)", redact(str(_se)), execution_id,
+                    )
+
             if mcp_manager:
                 await mcp_manager.disconnect_all()
 
@@ -455,6 +345,8 @@ class ReactStrategy(BaseStrategy):
                 "type": "react",
                 "user_query": user_query,
                 "final_answer": result.get("final_answer"),
+                "structured_output": structured_output,
+                "output_mode": _output_mode,
                 "messages": result.get("messages", []),
                 "message_count": len(result.get("messages", [])),
                 "tool_calls": result.get("tool_calls", []),

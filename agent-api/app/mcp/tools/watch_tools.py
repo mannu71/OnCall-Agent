@@ -1292,12 +1292,13 @@ async def discover_log_groups(
     """Discover CloudWatch log groups by name prefix or resource tags.
 
     Engineers can call this tool when they know a service name or tag but
-    not the exact log group path.  Prefix search is fast (single API call);
-    tag search paginates up to 200 groups before filtering.
+    not the exact log group path.  The *prefix* term is matched as a
+    case-sensitive substring anywhere in the log group name (e.g. "kyc"
+    finds "/aws/lambda/kyc-handler"); tag search paginates before filtering.
 
     Args:
-        prefix: Log group name prefix, e.g. '/aws/lambda/kyc-' to find all
-            KYC Lambda log groups.
+        prefix: Substring to match anywhere in the log group name, e.g.
+            'kyc' or '/aws/lambda/kyc-' to find KYC Lambda log groups.
         tag_key: Tag key to filter by (e.g. 'Environment').
         tag_value: Tag value to filter by (e.g. 'production').  Requires
             *tag_key*.
@@ -1314,13 +1315,39 @@ async def discover_log_groups(
 
     log_groups: List[Dict[str, Any]] = []
     next_token = None
+    truncated = False
 
-    # Use prefix-based search (efficient).
-    describe_kwargs: Dict[str, Any] = {"limit": min(limit, 50)}
-    if prefix:
-        describe_kwargs["logGroupNamePrefix"] = prefix
+    # Token-AND, case-insensitive matching.  A path-like query such as
+    # "/ecs/compliance" is split into tokens ["ecs", "compliance"] and matches
+    # any name that contains BOTH tokens anywhere — so the segments need not be
+    # contiguous (it matches "/aws/ecs/containerinsights/compliance-test/..."),
+    # and case does not matter.  A single plain term ("lambda", "/aws/lambda/")
+    # behaves like the previous substring search.
+    tokens = [t for t in re.split(r"[\s/,]+", prefix) if t] if prefix else []
+    lowered_tokens = [t.lower() for t in tokens]
 
-    while len(log_groups) < limit:
+    # Narrow server-side with the most selective (longest) token to limit data
+    # transfer; remaining tokens are applied client-side.  logGroupNamePattern
+    # is a case-sensitive substring match, so we only use it when it is safe
+    # (the token is lowercase, matching the overwhelmingly lowercase naming
+    # convention); otherwise we list and filter client-side.
+    server_filter = max(tokens, key=len) if tokens else None
+    describe_kwargs: Dict[str, Any] = {"limit": 50}
+    if server_filter and server_filter == server_filter.lower():
+        describe_kwargs["logGroupNamePattern"] = server_filter
+
+    def _matches(name: str) -> bool:
+        if not lowered_tokens:
+            return True
+        low = name.lower()
+        return all(tok in low for tok in lowered_tokens)
+
+    # Bound raw pagination: client-side AND-filtering can reject many rows, so
+    # we may need to scan more pages than `limit` to fill `limit` matches.
+    fetch_cap = max(limit * 5, 250)
+    fetched = 0
+
+    while len(log_groups) < limit and fetched < fetch_cap:
         if next_token:
             describe_kwargs["nextToken"] = next_token
 
@@ -1329,19 +1356,29 @@ async def discover_log_groups(
         )
 
         for grp in response.get("logGroups", []):
+            fetched += 1
+            name = grp.get("logGroupName") or ""
+            if not _matches(name):
+                continue
             log_groups.append({
-                "name": grp.get("logGroupName"),
+                "name": name,
                 "arn": grp.get("arn"),
                 "stored_bytes": grp.get("storedBytes", 0),
                 "retention_days": grp.get("retentionInDays"),
                 "creation_time": grp.get("creationTime"),
             })
+            if len(log_groups) >= limit:
+                break
 
         next_token = response.get("nextToken")
         if not next_token:
             break
 
-    search_method = "prefix" if prefix else "all"
+    # More groups may exist than we returned — let the caller surface a hint.
+    if next_token:
+        truncated = True
+
+    search_method = "tokens" if tokens else "all"
 
     # Optional tag filtering (applied after prefix discovery).
     if tag_key and log_groups:
@@ -1378,6 +1415,7 @@ async def discover_log_groups(
         "success": True,
         "log_groups": log_groups[:limit],
         "count": min(len(log_groups), limit),
+        "truncated": truncated,
         "search_method": search_method,
         "prefix": prefix,
         "tag_key": tag_key,

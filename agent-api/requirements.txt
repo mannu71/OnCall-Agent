@@ -22,6 +22,11 @@ sse-starlette==1.8.2
 # Utilities
 python-dateutil==2.8.2
 pytz==2023.3
+# Complete IANA timezone database for zoneinfo — the slim base image lacks legacy
+# aliases (e.g. Asia/Calcutta, America/Buenos_Aires) that browsers still emit, so
+# ZoneInfo(name) raised and Settings → Timezone saves 400'd. tzdata is zoneinfo's
+# fallback source and ships the full alias set.
+tzdata>=2024.1
 
 # HTTP Client
 httpx>=0.27.0

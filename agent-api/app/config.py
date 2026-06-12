@@ -133,6 +133,11 @@ class Settings(BaseSettings):
     background_index_concurrency: int = 2
     index_parse_concurrency: int = 4
     index_file_read_concurrency: int = 8
+    # Bounded DB schema lookup tools (db_list_tables / db_describe_table / db_search_columns)
+    db_schema_cache_ttl_seconds: float = 300.0
+    db_schema_max_tables: int = 2000      # complete-catalog fetch cap (names are cheap)
+    db_schema_output_max_rows: int = 200  # max names/columns returned per tool call
+    db_schema_max_columns: int = 300
 
     # AWS
     aws_ssl_verify: bool = True
@@ -174,7 +179,53 @@ class Settings(BaseSettings):
     # Agent / tools / output limits
     provider_transport: str = "anthropic"
     crawler_model: str = "anthropic.claude-3-5-haiku-20241022-v1:0"
-    agent_recursion_limit: int = 12
+    # Model tiering for crawler LLM flows (see app/crawler/call_llm.py).
+    # Background indexing (ExtractAbstractions / AnalyzeRelationships) is the most
+    # tolerant of a smaller model. Opt-in only: when set, indexing uses this
+    # model (e.g. a Haiku inference profile) instead of the DB-configured agent
+    # model. Leave unset to keep the DB model — set it only after confirming the
+    # model/inference-profile is enabled in your Bedrock account, since an
+    # invalid ID fails the indexing LLM call. Override via CRAWLER_INDEX_MODEL.
+    crawler_index_model: Optional[str] = Field(
+        default=None, validation_alias="CRAWLER_INDEX_MODEL"
+    )
+    # Opt-in override for the *search* crawler flows (semantic/find/trace/
+    # investigate). When set, these flows use this model instead of the
+    # DB-configured agent model — pricier flows can be moved to a cheaper tier
+    # once the accuracy harness confirms recall holds. None = keep DB model.
+    crawler_model_override: Optional[str] = Field(
+        default=None, validation_alias="CRAWLER_MODEL_OVERRIDE"
+    )
+    # Total context-char cap for the search crawler flows' LLM prompt. The KG
+    # fast path (QueryKGForHits / QueryKGForSymbol) short-circuits most queries;
+    # the LLM path is the fallback, so a tighter cap halves its dominant token
+    # cost with minimal recall risk. Override via CRAWLER_SEARCH_CONTEXT_MAX_CHARS.
+    crawler_search_context_max_chars: int = Field(
+        default=80_000, validation_alias="CRAWLER_SEARCH_CONTEXT_MAX_CHARS"
+    )
+    # Max chars of raw alert text sent to the investigateAlertFlow ParseAlert
+    # node — defensive cap so a pathological alert can't blow the prompt budget.
+    crawler_alert_max_chars: int = Field(
+        default=10_000, validation_alias="CRAWLER_ALERT_MAX_CHARS"
+    )
+    # Snippet extraction for the search crawler flows: instead of sending whole
+    # file bodies to the LLM, send line-numbered windows around lexical matches
+    # of the query terms (±crawler_snippet_window lines). Cuts per-file tokens
+    # 5–10× while keeping the lines the model needs to cite. Disable to fall back
+    # to full-file truncation if recall regresses. Override via env.
+    crawler_snippet_extraction: bool = Field(
+        default=True, validation_alias="CRAWLER_SNIPPET_EXTRACTION"
+    )
+    crawler_snippet_window: int = Field(
+        default=40, validation_alias="CRAWLER_SNIPPET_WINDOW"
+    )
+    # ReAct loop bound. LangGraph counts a "step" as one node transition; each
+    # ReAct iteration is ~2 steps (agent + tool node), so 25 ≈ 12 iterations.
+    # Raised from 12 because code investigations legitimately need more hops
+    # (find → paginate get_body → trace → synthesize); at 12 the agent was hit
+    # the limit mid-investigation and returned a "Let me search…" preamble.
+    # Override via AGENT_RECURSION_LIMIT.
+    agent_recursion_limit: int = Field(default=25, validation_alias="AGENT_RECURSION_LIMIT")
     # Default per-turn output-token cap for agent/workflow LLM calls. 4096 was
     # too small: the model could exhaust its budget mid-reasoning (right before
     # emitting a tool_use), get cut off with stopReason="max_tokens", and have
@@ -183,6 +234,11 @@ class Settings(BaseSettings):
     agent_max_output_tokens: int = Field(default=8192, validation_alias="AGENT_MAX_OUTPUT_TOKENS")
     code_analyzer_output_max_chars: int = 8000
     mcp_tool_output_max_chars: int = 8000
+    # Universal safety-net ceiling for ANY single tool result that lacks its own
+    # cap (db/edit/playbook StructuredTools). Larger than the per-family 8 KB
+    # caps so it only catches truly unbounded outputs; matches claude-code's
+    # DEFAULT_MAX_RESULT_SIZE_CHARS. Set to 0 to disable. Override via env.
+    tool_output_max_chars: int = Field(default=50000, validation_alias="TOOL_OUTPUT_MAX_CHARS")
     skill_min_tool_calls: int = 3
     guardrail_hard_stop: bool = False
     cloudwatch_auto_drilldown: bool = True
@@ -217,6 +273,9 @@ class Settings(BaseSettings):
     supervisor_hitl_enabled: bool = True
     supervisor_llm_scoring: bool = False
     supervisor_token_budget: int = 100_000
+    # Defensive wall-clock ceiling for the supervisor retry loop (seconds).
+    # Independent of max_retries/token_budget — guarantees the loop terminates.
+    supervisor_wall_clock_seconds: float = 900.0
 
     # Semantic router
     router_query_max_chars: int = 2000

@@ -8,13 +8,16 @@ from app.api.v1.endpoints import (
     crawler,
     curator,
     executions,
+    gateway,
     health,
     insights,
+    jobs,
     llm_config,
     log_watch,
     mcp_config,
     model_keys,
     settings,
+    tools,
     trajectories,
     workflows,
 )
@@ -35,3 +38,7 @@ api_router.include_router(code_analyzer.router)
 api_router.include_router(crawler.router)
 api_router.include_router(trajectories.router)
 api_router.include_router(settings.router)
+api_router.include_router(tools.router)
+api_router.include_router(tools.node_schemas_router)
+api_router.include_router(jobs.router)
+api_router.include_router(gateway.router)

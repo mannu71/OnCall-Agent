@@ -13,8 +13,9 @@ import React, {
 import { getDisplayTimezone } from '../../lib/formatTime.js';
 import { getLLMs } from '../../services/llmService.js';
 import { getMCPServers } from '../../services/mcpService.js';
+import { getAppSettings } from '../../services/apiClient.js';
 import { useWorkflowStatus } from '../../context/WorkflowStatusContext.jsx';
-import { validateConnection, getValidDropTargets } from './portValidation.js';
+import { validateConnection, getValidDropTargets, slotsForNode, modelNamesOf, reconcileModelEdges } from './portValidation.js';
 import agentApiClient from '../../services/agentApiClient.js';
 
 // ─────────────────────────────────────────────────────────────────
@@ -30,6 +31,23 @@ const CAT_TINT = {
   Logic:   { bg: '#f1f5f9', fg: '#334155', border: '#cbd5e1', accent: '#475569' },
   Outputs: { bg: '#ecfdf5', fg: '#065f46', border: '#a7f3d0', accent: '#059669' },
 };
+
+// Global application timezone (Settings → Timezone). Schedule nodes display it
+// read-only; the editor refreshes it on mount via getAppSettings(). Module-level
+// so the pure SlotRow renderer can read it without prop drilling.
+let GLOBAL_TZ = 'UTC';
+export function _setGlobalTzCache(tz) { if (tz) GLOBAL_TZ = String(tz); }
+
+// Format an IANA zone like the Settings dropdown does: "Asia / Kolkata (GMT+5:30)".
+function formatTz(tz) {
+  if (!tz) return 'UTC';
+  const pretty = String(tz).replace(/_/g, ' ').replace(/\//g, ' / ');
+  try {
+    const part = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'shortOffset' })
+      .formatToParts(new Date()).find(p => p.type === 'timeZoneName');
+    return part ? `${pretty} (${part.value})` : pretty;
+  } catch { return pretty; }
+}
 
 const PORT_TYPE = {
   message: { color: '#475569', label: 'Message'        },
@@ -55,11 +73,9 @@ const NODE_TYPES = {
         options: ['Every 5 min','Every 15 min','Every 30 min','Hourly','Daily','Weekly','Monthly'] },
       { kind: 'field',       id: 'time',      label: 'Time (HH:MM)', mono: true },
       { kind: 'weekday-select', id: 'days',   label: 'Days' },
-      { kind: 'select',      id: 'tz',        label: 'Timezone',
-        options: ['UTC','America/New_York','America/Chicago','America/Denver','America/Los_Angeles',
-                  'America/Toronto','America/Vancouver','Europe/London','Europe/Paris','Europe/Berlin',
-                  'Europe/Amsterdam','Asia/Tokyo','Asia/Singapore','Asia/Kolkata','Asia/Shanghai',
-                  'Australia/Sydney','Pacific/Auckland'] },
+      // Timezone is global (Settings → Timezone), shared by every schedule —
+      // shown read-only here, not editable per node.
+      { kind: 'tz-info',     id: 'tz',        label: 'Timezone' },
       { kind: 'port-out', id: 'trigger', label: 'Trigger', portType: 'trigger' },
     ],
   },
@@ -106,9 +122,9 @@ const NODE_TYPES = {
   // New unified LLM node — dropdown populated from Settings
   language_model: {
     category: 'Models', label: 'Language Model', icon: 'sparkle',
-    desc: 'LLM configured in Settings',
+    desc: 'Pick one or more models · wire each output',
     slots: [
-      { kind: 'llm-select', id: 'llm',    label: 'Model' },   // dynamic — see NodeProperties
+      { kind: 'llm-select', id: 'llm',    label: 'Models' },  // multi — one output port per model
       { kind: 'field',      id: 'temp',   label: 'Temperature', suffix: '0–1' },
       { kind: 'textarea',   id: 'system', label: 'System message' },
       { kind: 'port-out',   id: 'lm',     label: 'Language Model', portType: 'model' },
@@ -170,6 +186,7 @@ const NODE_TYPES = {
     desc: 'Grep across repositories',
     slots: [
       { kind: 'repo-select', id: 'repos', label: 'Repositories' },
+      { kind: 'port-in',     id: 'lm',    label: 'Crawler model', portType: 'model', optional: true },
       { kind: 'port-out',    id: 'tool',  label: 'Tool', portType: 'tool' },
     ],
   },
@@ -204,6 +221,7 @@ const NODE_TYPES = {
     slots: [
       { kind: 'port-in',  id: 'trigger',  label: 'Trigger',        portType: 'trigger', optional: true },
       { kind: 'port-in',  id: 'lm',       label: 'Language Model', portType: 'model'   },
+      { kind: 'port-in',  id: 'subagent', label: 'Subagent model', portType: 'model', optional: true },
       { kind: 'port-in',  id: 'memory',   label: 'Memory',         portType: 'memory', optional: true },
       { kind: 'port-in',  id: 'tools',    label: 'Tools',          portType: 'tool',   multi: true },
       { kind: 'port-in',  id: 'input',    label: 'Input',          portType: 'message', optional: true },
@@ -468,6 +486,7 @@ const TOGGLE_H  = 38;
 const CHIPS_H   = 62;
 function rowHeight(slot) {
   if (slot.kind === 'field')                                   return FIELD_H;
+  if (slot.kind === 'tz-info')                                 return FIELD_H;
   if (slot.kind === 'textarea')                                return TEXTAREA_H;
   if (slot.kind === 'select' || slot.kind === 'llm-select' ||
       slot.kind === 'db-select' || slot.kind === 'repo-select') return SELECT_H;
@@ -488,7 +507,7 @@ function totalHeight(slots) {
 function handlePosition(node, slotId) {
   const def = NODE_TYPES[node.type];
   if (!def) return { x: node.x, y: node.y };
-  const slots = def.slots || [];
+  const slots = slotsForNode(NODE_TYPES, node);
   const idx = slots.findIndex(s => s.id === slotId);
   if (idx < 0) return { x: node.x, y: node.y };
   const slot = slots[idx];
@@ -597,7 +616,7 @@ function PortHandle({ side, y, color, onPointerDown, drawing }) {
   );
 }
 
-function SlotRow({ slot, value }) {
+function SlotRow({ slot, value, gtz }) {
   if (slot.kind === 'port-in') {
     const tp = PORT_TYPE[slot.portType] || PORT_TYPE.message;
     return (
@@ -613,12 +632,18 @@ function SlotRow({ slot, value }) {
   }
   if (slot.kind === 'port-out') {
     const tp = PORT_TYPE[slot.portType] || PORT_TYPE.message;
+    // Language Model outputs: the row label IS the model name, so the generic
+    // "Language Model" chip would be redundant — show a slim colored dot instead.
+    const isModelPort = slot.id === 'lm' || slot.id.startsWith('lm::');
     return (
       <div style={{ height: ROW_H, padding: '0 18px 0 12px', display: 'flex',
                     alignItems: 'center', gap: 8, justifyContent: 'flex-end',
                     borderTop: '1px dashed #f1f5f9' }}>
-        <PortChip color={tp.color} label={tp.label} />
-        <span style={{ fontSize: 11.5, color: '#334155', fontWeight: 600, textAlign: 'right' }}>
+        {isModelPort
+          ? <span style={{ width: 6, height: 6, borderRadius: 999, background: tp.color }} />
+          : <PortChip color={tp.color} label={tp.label} />}
+        <span style={{ fontSize: 11.5, color: '#334155', fontWeight: 600, textAlign: 'right',
+                       overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {slot.label}
         </span>
       </div>
@@ -639,6 +664,24 @@ function SlotRow({ slot, value }) {
                       fontFamily: slot.mono ? "'JetBrains Mono', monospace" : 'inherit',
                       overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {value ?? '—'}
+        </div>
+      </div>
+    );
+  }
+  if (slot.kind === 'tz-info') {
+    return (
+      <div style={{ padding: '6px 12px 4px', height: FIELD_H, boxSizing: 'border-box' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between' }}>
+          <span style={{ fontSize: 10.5, color: '#64748b', fontWeight: 600,
+                         letterSpacing: '0.02em', textTransform: 'uppercase' }}>{slot.label}</span>
+          <span style={{ fontSize: 9, color: '#cbd5e1', fontWeight: 600,
+                         letterSpacing: '0.02em', textTransform: 'uppercase' }}>from Settings</span>
+        </div>
+        <div style={{ marginTop: 3, height: 26, padding: '0 9px', display: 'flex', alignItems: 'center',
+                      gap: 6, background: '#f8fafc', border: '1px dashed #e2e8f0', borderRadius: 6,
+                      fontSize: 12, color: '#475569',
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {formatTz(gtz || GLOBAL_TZ)}
         </div>
       </div>
     );
@@ -761,9 +804,10 @@ function SlotRow({ slot, value }) {
   if (slot.kind === 'llm-select' || slot.kind === 'db-select') {
     // Canvas card: show selected value(s) as plain text — actual picker is in properties panel
     const parts = value ? String(value).split(',').filter(Boolean) : [];
+    const noun = slot.kind === 'llm-select' ? 'models' : 'servers';
     const display = parts.length === 0 ? '—'
       : parts.length === 1 ? parts[0]
-      : `${parts.length} servers`;
+      : `${parts.length} ${noun}`;
     return (
       <div style={{ padding: '6px 12px 4px', height: SELECT_H, boxSizing: 'border-box' }}>
         <div style={{ fontSize: 10.5, color: '#64748b', fontWeight: 600,
@@ -806,6 +850,22 @@ function NodeFooter({ slots }) {
       </div>
     );
   }
+  // Language Model node: every output is a model port and each row already shows
+  // its model name, so collapse the repeated identical chips into one summary.
+  const allModelOuts = outs.every(o => o.id === 'lm' || o.id.startsWith('lm::'));
+  if (allModelOuts && outs.length > 1) {
+    return (
+      <div style={{ height: FOOTER_H, padding: '0 12px', display: 'flex', alignItems: 'center',
+                    gap: 6, justifyContent: 'flex-end', background: '#fafbfc',
+                    borderTop: '1px solid #f1f5f9', borderBottomLeftRadius: 11, borderBottomRightRadius: 11 }}>
+        <span style={{ fontSize: 10, color: '#94a3b8', letterSpacing: '0.06em',
+                       textTransform: 'uppercase', fontWeight: 600 }}>Outputs</span>
+        <span style={{ fontSize: 10.5, color: '#64748b', fontWeight: 600 }}>
+          {outs.length} models · wire each
+        </span>
+      </div>
+    );
+  }
   return (
     <div style={{ height: FOOTER_H, padding: '0 12px', display: 'flex', alignItems: 'center',
                   gap: 6, justifyContent: 'flex-end', background: '#fafbfc',
@@ -828,12 +888,12 @@ function NodeFooter({ slots }) {
   );
 }
 
-const WfNode = memo(function WfNode({ node, selected, dragging, drawingSourceSlot, onClick, onPointerDown, onDelete, onPortPointerDown, liveStatus }) {
+const WfNode = memo(function WfNode({ node, selected, dragging, drawingSourceSlot, onClick, onPointerDown, onDelete, onPortPointerDown, liveStatus, gtz }) {
   const def = NODE_TYPES[node.type];
   if (!def) return null;
   const tint = CAT_TINT[def.category] || CAT_TINT.Tools;
   const w = def.width || NODE_W;
-  const slots = def.slots || [];
+  const slots = slotsForNode(NODE_TYPES, node);
   const h = totalHeight(slots);
   // liveStatus: 'running' | 'success' | 'failed' | null (null = idle/unknown)
   const effectiveStatus = liveStatus ?? node.status ?? 'idle';
@@ -913,7 +973,7 @@ const WfNode = memo(function WfNode({ node, selected, dragging, drawingSourceSlo
 
       {/* Slot rows */}
       <div style={{ padding: `${BODY_PAD_TOP}px 0 ${BODY_PAD_BOT}px` }}>
-        {slots.map(s => <SlotRow key={s.id} slot={s} value={node.params?.[s.id]} />)}
+        {slots.map(s => <SlotRow key={s.id} slot={s} value={node.params?.[s.id]} gtz={gtz} />)}
       </div>
 
       {/* Footer */}
@@ -1033,7 +1093,7 @@ function CanvasBtn({ onClick, icon, title }) {
   );
 }
 
-function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selectedEdgeId, onSelect, onSelectEdge, onDelete, workflowName }) {
+function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selectedEdgeId, onSelect, onSelectEdge, onDelete, workflowName, gtz }) {
   const ref = useRef(null);
   const [view, setView]     = useState({ x: 24, y: 24, zoom: 0.62 });
   const [panning, setPanning] = useState(false);
@@ -1292,7 +1352,7 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
     const src = nodeById.get(e.source), dst = nodeById.get(e.target);
     if (!src || !dst) return null;
     const from = handlePosition(src, e.sourceSlot), to = handlePosition(dst, e.targetSlot);
-    const srcSlot = (NODE_TYPES[src.type]?.slots || []).find(s => s.id === e.sourceSlot);
+    const srcSlot = slotsForNode(NODE_TYPES, src).find(s => s.id === e.sourceSlot);
     return { ...e, from, to, portType: srcSlot?.portType || 'message', srcStatus: src.status, dstStatus: dst.status };
   }).filter(Boolean), [edges, nodeById]);
 
@@ -1344,7 +1404,7 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
         {nodes.map(n => {
           const def = NODE_TYPES[n.type];
           if (!def) return null;
-          const slots = def.slots || [];
+          const slots = slotsForNode(NODE_TYPES, n);
           const w = n.width || def.width || NODE_W;
           return slots.filter(s => s.kind === 'port-in').map((s, i) => {
             const portY = rowOffset(slots, slots.indexOf(s)) + ROW_H / 2;
@@ -1377,6 +1437,7 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
             onDelete={onDelete}
             onPortPointerDown={startPortDrag}
             liveStatus={isLive ? 'running' : (nodeStatusMap[n.id] ?? (connectedNodeIds.has(n.id) ? 'success' : null))}
+            gtz={gtz}
           />
         ))}
       </div>
@@ -1670,6 +1731,16 @@ function WeekdaySelect({ value, onChange }) {
   );
 }
 
+// Compact human-readable byte size for log-group hints (e.g. 1.4 MB).
+function formatStoredBytes(bytes) {
+  if (bytes == null || Number.isNaN(bytes)) return null;
+  if (bytes === 0) return 'empty';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const v = bytes / Math.pow(1024, i);
+  return `${v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+}
+
 // Chip editor component for logs/list configurations
 function ChipEditor({ value, onChange, action, actionContext }) {
   const [inputValue, setInputValue] = React.useState('');
@@ -1677,6 +1748,9 @@ function ChipEditor({ value, onChange, action, actionContext }) {
   const [discovered, setDiscovered] = React.useState([]);
   const [discoverPrefix, setDiscoverPrefix] = React.useState('');
   const [showDiscover, setShowDiscover] = React.useState(false);
+  const [discoverError, setDiscoverError] = React.useState(null);
+  const [searched, setSearched] = React.useState(false);
+  const [truncated, setTruncated] = React.useState(false);
 
   const chips = React.useMemo(() => {
     return value ? value.split(',').map(s => s.trim()).filter(Boolean) : [];
@@ -1699,26 +1773,43 @@ function ChipEditor({ value, onChange, action, actionContext }) {
     onChange(next.join(', '));
   };
 
+  const region = actionContext.awsRegion || actionContext.region || 'us-east-1';
+
   const handleDiscover = async () => {
     if (action !== 'discoverCloudWatchLogGroups') return;
     setDiscovering(true);
+    setDiscoverError(null);
     setDiscovered([]);
     try {
-      const region = actionContext.awsRegion || actionContext.region || 'us-east-1';
       const profile = actionContext.awsProfile || actionContext.profile || undefined;
       const result = await agentApiClient.discoverCloudWatchLogGroups(
         discoverPrefix || undefined,
         region,
-        50,
+        200,
         profile
       );
-      const groups = (result?.log_groups || []).map(g => g.name).filter(Boolean);
-      setDiscovered(groups);
+      // Keep the full metadata (size, retention) so the picker can show it.
+      setDiscovered((result?.log_groups || []).filter(g => g && g.name));
+      setTruncated(Boolean(result?.truncated));
+      setSearched(true);
     } catch (err) {
       console.error('Failed to discover log groups:', err);
+      setDiscovered([]);
+      setSearched(true);
+      setDiscoverError(
+        err?.response?.data?.detail
+        || err?.message
+        || 'Could not reach AWS. Check the region, profile, and credentials.'
+      );
     } finally {
       setDiscovering(false);
     }
+  };
+
+  const handleAddAll = () => {
+    const names = discovered.map(g => g.name).filter(Boolean);
+    const merged = Array.from(new Set([...chips, ...names]));
+    onChange(merged.join(', '));
   };
 
   return (
@@ -1796,61 +1887,117 @@ function ChipEditor({ value, onChange, action, actionContext }) {
               type="text"
               value={discoverPrefix}
               onChange={e => setDiscoverPrefix(e.target.value)}
-              placeholder="Search prefix (e.g. /aws/lambda/)"
+              placeholder={`Filter by name in ${region} (blank = all)`}
               style={{
                 flex: 1, border: '1px solid #cbd5e1', borderRadius: 6,
                 padding: '4px 8px', fontSize: 11, outline: 'none',
                 background: '#fff'
               }}
-              onKeyDown={e => e.key === 'Enter' && handleDiscover()}
+              onKeyDown={e => { if (e.key === 'Enter' && !discovering) handleDiscover(); }}
             />
             <button
               type="button"
               onClick={handleDiscover}
               disabled={discovering}
               style={{
-                padding: '4px 10px', background: '#3b82f6', border: 'none',
-                borderRadius: 6, fontSize: 11, color: '#fff', cursor: 'pointer',
-                fontWeight: 600
+                padding: '4px 12px', background: discovering ? '#93c5fd' : '#3b82f6',
+                border: 'none', borderRadius: 6, fontSize: 11, color: '#fff',
+                cursor: discovering ? 'wait' : 'pointer', fontWeight: 600,
+                whiteSpace: 'nowrap'
               }}
             >
-              {discovering ? 'Searching...' : 'Scan'}
+              {discovering ? 'Scanning…' : 'Scan'}
             </button>
           </div>
 
-          {discovered.length > 0 ? (
+          {/* Error */}
+          {discoverError && (
             <div style={{
-              maxHeight: 120, overflowY: 'auto', border: '1px solid #e2e8f0',
-              borderRadius: 6, background: '#fff'
+              padding: '6px 8px', fontSize: 11, color: '#b91c1c',
+              background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6
             }}>
-              {discovered.map(group => {
-                const isAdded = chips.includes(group);
-                return (
-                  <div key={group}
-                    onClick={() => !isAdded && handleAdd(group)}
-                    style={{
-                      padding: '4px 8px', fontSize: 11.5, cursor: isAdded ? 'default' : 'pointer',
-                      borderBottom: '1px solid #f1f5f9', display: 'flex',
-                      justifyContent: 'space-between', alignItems: 'center',
-                      background: isAdded ? '#f8fafc' : 'transparent',
-                      color: isAdded ? '#94a3b8' : '#334155',
-                      fontFamily: "'JetBrains Mono', monospace"
-                    }}
-                    onMouseEnter={e => { if (!isAdded) e.currentTarget.style.background = '#eff6ff'; }}
-                    onMouseLeave={e => { if (!isAdded) e.currentTarget.style.background = 'transparent'; }}
-                  >
-                    <span>{group}</span>
-                    {isAdded && <span style={{ color: '#10b981', fontSize: 9, fontWeight: 700 }}>ADDED</span>}
-                  </div>
-                );
-              })}
+              ⚠ {discoverError}
             </div>
-          ) : (
-            !discovering && (
-              <div style={{ textAlign: 'center', padding: '6px 0', fontSize: 11, color: '#94a3b8' }}>
-                No groups found. Enter prefix and click Scan.
+          )}
+
+          {/* Initial hint — before any scan */}
+          {!searched && !discovering && !discoverError && (
+            <div style={{ textAlign: 'center', padding: '8px 4px', fontSize: 11, color: '#94a3b8', lineHeight: 1.5 }}>
+              Type part of a name (or leave blank) and click <strong>Scan</strong> to
+              list CloudWatch log groups from AWS.
+            </div>
+          )}
+
+          {/* Searched, nothing found */}
+          {searched && !discovering && !discoverError && discovered.length === 0 && (
+            <div style={{ textAlign: 'center', padding: '8px 4px', fontSize: 11, color: '#94a3b8' }}>
+              No log groups found{discoverPrefix ? ` matching “${discoverPrefix}”` : ''} in {region}.
+            </div>
+          )}
+
+          {/* Results */}
+          {discovered.length > 0 && (
+            <div style={{ border: '1px solid #e2e8f0', borderRadius: 6, background: '#fff', overflow: 'hidden' }}>
+              <div style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '4px 8px', fontSize: 10.5, color: '#64748b',
+                background: '#f8fafc', borderBottom: '1px solid #f1f5f9'
+              }}>
+                <span>
+                  {discovered.length}{truncated ? '+' : ''} found — click to add
+                  {truncated && <em style={{ color: '#b45309', fontStyle: 'normal' }}> (refine to see more)</em>}
+                </span>
+                <button
+                  type="button"
+                  onClick={handleAddAll}
+                  style={{
+                    background: 'none', border: 'none', color: '#3b82f6',
+                    cursor: 'pointer', fontSize: 10.5, fontWeight: 700, padding: 0
+                  }}
+                >
+                  + Add all
+                </button>
               </div>
-            )
+              <div style={{ maxHeight: 160, overflowY: 'auto' }}>
+                {discovered.map(group => {
+                  const isAdded = chips.includes(group.name);
+                  const size = formatStoredBytes(group.stored_bytes);
+                  const retention = group.retention_days ? `${group.retention_days}d` : 'no expiry';
+                  const meta = [size, retention].filter(Boolean).join(' · ');
+                  return (
+                    <div key={group.name}
+                      onClick={() => !isAdded && handleAdd(group.name)}
+                      title={isAdded ? 'Already added' : 'Click to add'}
+                      style={{
+                        padding: '5px 8px', fontSize: 11.5, cursor: isAdded ? 'default' : 'pointer',
+                        borderBottom: '1px solid #f1f5f9', display: 'flex',
+                        justifyContent: 'space-between', alignItems: 'center', gap: 8,
+                        background: isAdded ? '#f8fafc' : 'transparent',
+                        color: isAdded ? '#94a3b8' : '#334155'
+                      }}
+                      onMouseEnter={e => { if (!isAdded) e.currentTarget.style.background = '#eff6ff'; }}
+                      onMouseLeave={e => { if (!isAdded) e.currentTarget.style.background = 'transparent'; }}
+                    >
+                      <span style={{ overflow: 'hidden', minWidth: 0 }}>
+                        <span style={{
+                          display: 'block', overflow: 'hidden', textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap', fontFamily: "'JetBrains Mono', monospace"
+                        }}>{group.name}</span>
+                        {meta && (
+                          <span style={{ display: 'block', fontSize: 9.5, color: '#94a3b8' }}>{meta}</span>
+                        )}
+                      </span>
+                      <span style={{
+                        flexShrink: 0, fontSize: 9, fontWeight: 700,
+                        color: isAdded ? '#10b981' : '#3b82f6'
+                      }}>
+                        {isAdded ? '✓ ADDED' : '+ ADD'}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           )}
         </div>
       )}
@@ -2130,9 +2277,11 @@ function MultiRepoSelect({ value, onChange }) {
   const isCode      = slotKind === 'textarea';
   const isWeekday   = slotKind === 'weekday-select';
   const isFilePick  = slotKind === 'file-select';
-  const isMultiDb   = slotKind === 'db-select';
+  // 'llm-select' is multi: selecting N models on a Language Model node yields N
+  // output ports (one per model) that can each be wired to a different consumer.
+  const isMultiDb   = slotKind === 'db-select' || slotKind === 'llm-select';
   const isRepoSel   = slotKind === 'repo-select';
-  const isSelect    = slotKind === 'select' || slotKind === 'llm-select';
+  const isSelect    = slotKind === 'select';
   const isToggle    = slotKind === 'toggle';
   const isChips     = slotKind === 'chips';
   const isMono      = isCode || k === 'cron' || k === 'url';
@@ -2634,7 +2783,7 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, workflo
         <div style={{ marginTop: 8, background: '#fafbfc', border: '1px solid #eef2f6',
                       borderRadius: 8, padding: '10px 12px',
                       display: 'flex', flexDirection: 'column', gap: 6 }}>
-          {(def.slots || []).filter(s => s.kind === 'port-in' || s.kind === 'port-out')
+          {slotsForNode(NODE_TYPES, node).filter(s => s.kind === 'port-in' || s.kind === 'port-out')
             .map(s => <PortRowR key={s.id} slot={s} />)}
         </div>
 
@@ -2959,10 +3108,16 @@ const LangflowEditor = forwardRef(function LangflowEditor(
   // Load LLMs and MCP servers from settings
   const [llms, setLlms]           = useState({});
   const [dbServers, setDbServers] = useState({});
+  const [gtz, setGtz]             = useState(GLOBAL_TZ);
   useEffect(() => {
     getLLMs().then(data => setLlms(data || {})).catch(() => {});
     // Show all MCP servers — user picks which one is their database
     getMCPServers().then(all => setDbServers(all || {})).catch(() => {});
+    // Global timezone (Settings) — shown read-only on Schedule nodes.
+    getAppSettings().then(s => {
+      const tz = s?.global_timezone;
+      if (tz) { _setGlobalTzCache(tz); setGtz(tz); }
+    }).catch(() => {});
   }, []);
 
   const selectedNode = useMemo(() => nodes.find(n => n.id === selectedId), [nodes, selectedId]);
@@ -2970,13 +3125,22 @@ const LangflowEditor = forwardRef(function LangflowEditor(
   // Update a node's fields (name, params, etc.)
   // Deep-merges `params` so two successive param updates don't overwrite each other.
   const handleUpdateNode = useCallback((id, patch) => {
+    const oldNode = nodes.find(n => n.id === id);
     setNodes(ns => ns.map(n => {
       if (n.id !== id) return n;
       const merged = { ...n, ...patch };
       if (patch.params) merged.params = { ...(n.params || {}), ...patch.params };
       return merged;
     }));
-  }, []);
+    // When a Language Model node's model selection changes, its output port ids
+    // change (lm ↔ lm::<name>) — re-point or prune edges so existing wires don't
+    // dangle/misalign.
+    if (oldNode?.type === 'language_model' && patch.params &&
+        ('llm' in patch.params || 'models' in patch.params)) {
+      const newNode = { ...oldNode, ...patch, params: { ...(oldNode.params || {}), ...patch.params } };
+      setEdges(es => reconcileModelEdges(es, id, oldNode, newNode));
+    }
+  }, [nodes]);
 
   // Delete a node and its connected edges
   const handleDeleteNode = useCallback((id) => {
@@ -3069,6 +3233,7 @@ const LangflowEditor = forwardRef(function LangflowEditor(
             selectedEdgeId={selectedEdgeId} onSelectEdge={setSelectedEdgeId}
             onDelete={handleDeleteNode}
             workflowName={workflowName}
+            gtz={gtz}
           />
         </div>
         {selectedNode && (

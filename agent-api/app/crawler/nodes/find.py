@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_SCAN_FILES = 30           # cap how many files we hand to the LLM
 _MAX_FILE_CHARS = 80_000       # per-file content truncation for the LLM prompt
-_MAX_CONTEXT_CHARS = 160_000   # total context cap for the LLM prompt
+# Total LLM-prompt context cap comes from settings.crawler_search_context_max_chars.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -302,6 +302,7 @@ class ScanFilesInScope(AsyncNode):
         return {
             "repo": shared["repo"],
             "candidate_files": shared["_candidate_files"],
+            "symbol": shared.get("symbol", ""),
         }
 
     async def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
@@ -332,21 +333,41 @@ class ScanFilesInScope(AsyncNode):
         file_contents = await asyncio.to_thread(_read_files)
         ms = int((time.monotonic() - t0) * 1000)
 
-        # Build LLM context, capped at _MAX_CONTEXT_CHARS
+        # Build LLM context, capped at the configured search-context budget.
+        from app.crawler.files import extract_snippets
+        _ctx_cap = settings.crawler_search_context_max_chars
+        symbol = str(prep_res.get("symbol", "")).strip()
+        use_snippets = settings.crawler_snippet_extraction and len(symbol) >= 3
+
         parts: List[str] = []
         total = 0
         included: List[str] = []
         for relpath, content in file_contents:
-            truncated = content[:_MAX_FILE_CHARS]
-            entry = f"--- File: {relpath} ---\n{truncated}\n\n"
-            if total + len(entry) > _MAX_CONTEXT_CHARS:
+            if use_snippets:
+                body = extract_snippets(
+                    content, [symbol],
+                    window=settings.crawler_snippet_window,
+                    max_chars=_MAX_FILE_CHARS,
+                )
+            else:
+                body = content[:_MAX_FILE_CHARS]
+            entry = f"--- File: {relpath} ---\n{body}\n\n"
+            if total + len(entry) > _ctx_cap:
                 break
             parts.append(entry)
             included.append(relpath)
             total += len(entry)
 
+        context = "".join(parts)
+        if use_snippets and context:
+            context = (
+                "NOTE: Each code line is prefixed with its 1-based file line "
+                "number (`<n>: <code>`). Use these exact numbers for the 'line' "
+                "field; `... [N lines omitted] ...` marks elided regions.\n\n"
+            ) + context
+
         return {
-            "file_context": "".join(parts),
+            "file_context": context,
             "included_files": included,
             "ms": ms,
         }

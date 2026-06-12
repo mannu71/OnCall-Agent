@@ -388,6 +388,13 @@ class CrawlerService:
 
         return await crawler_node(qualified_name=qualified_name, repo=repo)
 
+    async def get_repo_map(
+        self, repo: str, *, name_like: Optional[str] = None, limit: int = 60,
+    ) -> Dict[str, Any]:
+        from app.services.crawler_flows import crawler_repo_map
+
+        return await crawler_repo_map(repo=repo, name_like=name_like, limit=limit)
+
     async def get_callers(self, repo: str, symbol: str, *, depth: int = 2) -> Dict[str, Any]:
         from app.services.crawler_flows import crawler_callers
 

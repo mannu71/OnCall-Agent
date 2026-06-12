@@ -36,6 +36,38 @@ class VisualWorkflowExecutor:
         self.event_queues: Dict[str, List[asyncio.Queue]] = defaultdict(list)
         self.mcp_managers: Dict[str, MCPClientManager] = {}  # Per-execution MCP managers
         self.background_tasks: set = set()  # Keep references to background tasks
+        # Serializes read-modify-write on the per-execution cache entry. Same-level
+        # nodes run concurrently via asyncio.gather and mutate shared lists
+        # (events buffer, nodes_completed); a lock keeps those compound updates
+        # atomic and guards against a cleanup popping the entry mid-update.
+        self._state_lock = asyncio.Lock()
+
+    async def _record_event(self, execution_id: str, event) -> None:
+        """Append an event to the cache buffer (capped), under the state lock.
+
+        No-op when the execution entry is absent (already cleaned up / cancelled).
+        """
+        async with self._state_lock:
+            entry = self.active_executions.get(execution_id)
+            if entry is None:
+                return
+            events = entry.setdefault('events', [])
+            events.append(event.dict())
+            cap = settings.max_runtime_events
+            if len(events) > cap:
+                del events[:-cap]
+
+    async def _mark_node_completed(self, execution_id: str, node_id: str) -> None:
+        """Record a completed node under the state lock.
+
+        Uses setdefault so an orphaned entry (missing nodes_completed) never
+        raises, and skips silently if the entry was already cleaned up.
+        """
+        async with self._state_lock:
+            entry = self.active_executions.get(execution_id)
+            if entry is None:
+                return
+            entry.setdefault('nodes_completed', []).append(node_id)
     
     def subscribe_to_events(self, execution_id: str) -> asyncio.Queue:
         """Subscribe to execution events."""
@@ -54,15 +86,10 @@ class VisualWorkflowExecutor:
     async def _publish_event(self, execution_id: str, event_type: str, data: Dict[str, Any]):
         """Publish an event to all subscribers."""
         event = ExecutionEvent(event_type, data)
-        
-        # Store in execution state
-        if execution_id in self.active_executions:
-            events = self.active_executions[execution_id].setdefault('events', [])
-            events.append(event.dict())
-            cap = settings.max_runtime_events
-            if len(events) > cap:
-                del events[:-cap]
-        
+
+        # Store in execution state (atomic read-modify-write under the lock).
+        await self._record_event(execution_id, event)
+
         # Publish to queues using non-blocking put with drop-on-full semantics.
         # Prevents a slow SSE subscriber from stalling the executor's event loop.
         for queue in self.event_queues.get(execution_id, []):
@@ -250,8 +277,10 @@ class VisualWorkflowExecutor:
         
         start_time = datetime.now(timezone.utc)
         context['execution_id'] = execution_id
-        context['inputs'] = self.active_executions[execution_id].get('inputs', {})
-        context['workflow_name'] = self.active_executions[execution_id].get('workflow_name')
+        # Guard against the entry being cleaned up (e.g. cancelled) mid-run.
+        entry = self.active_executions.get(execution_id, {})
+        context['inputs'] = entry.get('inputs', {})
+        context['workflow_name'] = entry.get('workflow_name')
         
         # Node type dispatch — handler registry is canonical.
         try:
@@ -278,8 +307,8 @@ class VisualWorkflowExecutor:
                 "total_tokens":  result.get('total_tokens',  0) or 0,
             })
             
-            self.active_executions[execution_id]['nodes_completed'].append(node_id)
-            
+            await self._mark_node_completed(execution_id, node_id)
+
             return result
         
         except Exception as e:

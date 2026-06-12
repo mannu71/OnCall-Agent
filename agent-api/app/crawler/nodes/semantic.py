@@ -19,7 +19,73 @@ logger = logging.getLogger(__name__)
 
 _MAX_SCAN_FILES = 25
 _MAX_FILE_CHARS = 80_000
-_MAX_CONTEXT_CHARS = 160_000
+# Total LLM-prompt context cap comes from settings.crawler_search_context_max_chars.
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Node 0: QueryKGForHits  (knowledge-graph fast path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class QueryKGForHits(AsyncNode):
+    """Answer the query directly from ``kg_nodes`` before falling back to the LLM.
+
+    Deterministic, disk-valid retrieval over the knowledge graph: rows are real
+    indexed definitions, so there is no LLM guess and no on-disk verification
+    gate (which previously rejected every LLM-proposed hit on large repos,
+    yielding ``VerifyOnDisk: 0/N``). On a hit we populate ``_verified_hits``
+    (BuildHitList's input shape) and skip the LLM pipeline; on a miss we fall
+    through to the existing LLM-based flow so natural-language recall is kept.
+
+    Reads shared:  repo, query, limit (default 10), kind (optional)
+    Writes shared: _verified_hits, _kg_hit; returns ``"skip_to_build"`` on hit.
+    """
+
+    async def prep(self, shared: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "repo":  shared["repo"],
+            "query": shared["query"],
+            "limit": shared.get("limit", 10),
+            "kind":  shared.get("kind"),
+        }
+
+    async def exec(self, prep_res: Dict[str, Any]) -> List[Dict[str, Any]]:
+        from app.crawler.kg_search import kg_search
+
+        t0 = time.monotonic()
+        rows = await kg_search(
+            repo=prep_res["repo"], query=prep_res["query"],
+            limit=prep_res["limit"], kind=prep_res["kind"],
+        )
+        prep_res["_ms"] = int((time.monotonic() - t0) * 1000)
+        # Map kg_search rows → BuildHitList hit shape.
+        return [
+            {
+                "file":        r["file"],
+                "line":        r["line"],
+                "snippet":     r["snippet"],
+                "relevance":   f"{r['kind']} {r['name']}".strip(),
+                "_line_count": r["_line_count"],
+            }
+            for r in rows
+        ]
+
+    async def post(
+        self, shared: Dict[str, Any], prep_res: Dict[str, Any], exec_res: List[Dict[str, Any]]
+    ) -> Optional[str]:
+        if exec_res:
+            shared["_verified_hits"] = exec_res
+            shared["_kg_hit"] = True
+            _append_trace(shared, "QueryKGForHits", len(exec_res), 0, 0, False,
+                          ms=prep_res.get("_ms", 0))
+            logger.info("QueryKGForHits: HIT repo=%s query=%r → %d hits",
+                        shared.get("repo"), str(shared.get("query"))[:60], len(exec_res))
+            return "skip_to_build"
+
+        shared["_kg_hit"] = False
+        _append_trace(shared, "QueryKGForHits", 0, 0, 0, False, ms=prep_res.get("_ms", 0))
+        logger.info("QueryKGForHits: MISS repo=%s query=%r → LLM fallback",
+                    shared.get("repo"), str(shared.get("query"))[:60])
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,8 +183,11 @@ Output YAML only:
 - app/models/user.py
 ```"""
 
+        # This node falls back gracefully on a parse miss (uses all mapped
+        # files), so retries are transport-only — reading the cache on retry is
+        # always safe here.
         response, tokens_in, tokens_out, was_cached = await call_llm(
-            prompt, model_id=prep_res["model"], use_cache=self.cur_retry == 0
+            prompt, model_id=prep_res["model"], use_cache=True
         )
         ms = int((time.monotonic() - t0) * 1000)
 
@@ -170,7 +239,11 @@ class ReadFiles(AsyncNode):
     """Read suggested files from disk and build LLM context."""
 
     async def prep(self, shared: Dict[str, Any]) -> Dict[str, Any]:
-        return {"repo": shared["repo"], "files": shared["_suggested_files"]}
+        return {
+            "repo": shared["repo"],
+            "files": shared["_suggested_files"],
+            "query": shared.get("query", ""),
+        }
 
     async def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
         import asyncio
@@ -199,19 +272,39 @@ class ReadFiles(AsyncNode):
         file_contents = await asyncio.to_thread(_read)
         ms = int((time.monotonic() - t0) * 1000)
 
+        from app.crawler.files import extract_snippets, derive_search_terms
+        _ctx_cap = settings.crawler_search_context_max_chars
+        terms = derive_search_terms(prep_res.get("query", ""))
+        use_snippets = settings.crawler_snippet_extraction and bool(terms)
+
         parts: List[str] = []
         total = 0
         included: List[str] = []
         for relpath, content in file_contents:
-            truncated = content[:_MAX_FILE_CHARS]
-            entry = f"--- File: {relpath} ---\n{truncated}\n\n"
-            if total + len(entry) > _MAX_CONTEXT_CHARS:
+            if use_snippets:
+                body = extract_snippets(
+                    content, terms,
+                    window=settings.crawler_snippet_window,
+                    max_chars=_MAX_FILE_CHARS,
+                )
+            else:
+                body = content[:_MAX_FILE_CHARS]
+            entry = f"--- File: {relpath} ---\n{body}\n\n"
+            if total + len(entry) > _ctx_cap:
                 break
             parts.append(entry)
             included.append(relpath)
             total += len(entry)
 
-        return {"file_context": "".join(parts), "included": included, "ms": ms}
+        context = "".join(parts)
+        if use_snippets and context:
+            context = (
+                "NOTE: Each code line is prefixed with its 1-based file line "
+                "number (`<n>: <code>`). Use these exact numbers for the 'line' "
+                "field; `... [N lines omitted] ...` marks elided regions.\n\n"
+            ) + context
+
+        return {"file_context": context, "included": included, "ms": ms}
 
     async def post(
         self, shared: Dict[str, Any], prep_res: Dict[str, Any], exec_res: Dict[str, Any]

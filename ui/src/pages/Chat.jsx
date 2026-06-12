@@ -143,6 +143,11 @@ function Chat() {
 
   // Token metrics — zero until a real run reports usage.
   const [tokens, setTokens] = useState({ input: 0, output: 0, total: 0 });
+  // A single model turn can emit SEVERAL gated tool calls (e.g. multiple
+  // edit_file), each needing its own approval. Track them as a FIFO queue and
+  // surface the head; resolving one (by its requestId) reveals the next.
+  const [pendingApprovals, setPendingApprovals] = useState([]); // [{ tool, args, requestId, executionId }]
+  const pendingApproval = pendingApprovals[0] || null;
 
   // Dynamic values based on selected agent workflow node structure
   const getAgentDetails = () => {
@@ -421,20 +426,50 @@ function Chat() {
           : m));
       };
 
+      // Conversation memory: replay prior completed turns so follow-ups keep
+      // context. The current question is sent separately as the query, so drop
+      // any trailing user turn equal to it.
+      const history = (messages || [])
+        .filter(m => (m.type === MESSAGE_TYPES.USER || m.type === MESSAGE_TYPES.AGENT)
+          && !m.isLoading && (m.content || m.text))
+        .map(m => ({ role: m.type === MESSAGE_TYPES.USER ? 'user' : 'assistant', content: m.content || m.text }))
+        .slice(-12);
+      while (history.length && history[history.length - 1].role === 'user'
+             && history[history.length - 1].content === question) history.pop();
+
       const result = await agentApiClient.runAgentStream(agent.name, question, {
+        history,
         onToolCall: (name) => { pushTrace('tool', `Calling ${name}…`); pushStatus(`Calling ${name}…`); },
         onToolResult: (name) => pushTrace('tool', `${name} returned`),
         onNode: (nodeId, status) => pushTrace('think', `${nodeId} ${status}`),
         onStatus: (msg) => pushStatus(msg),
+        onTokens: (t) => setTokens(t),
+        onHitlPause: (p) => {
+          pushStatus(`Awaiting approval: ${p.tool}…`);
+          // Append (dedup by requestId — SSE can redeliver on reconnect).
+          setPendingApprovals(prev => prev.some(x => x.requestId === p.requestId) ? prev : [...prev, p]);
+        },
         onError: (err) => pushTrace('answer', `Error: ${err}`),
       });
 
+      // Pull the structured InvestigationReport (Data Query Mode) out of the raw
+      // node results, if the run produced one.
+      let structured = null;
+      try {
+        const nodes = result?.raw?.results || {};
+        for (const k of Object.keys(nodes)) {
+          if (nodes[k] && nodes[k].structured_output) { structured = nodes[k].structured_output; break; }
+        }
+      } catch { /* ignore */ }
+
+      setPendingApprovals([]);
       updateMessage(thinkingId, {
         content: result.finalAnswer || 'Agent completed (no answer text returned).',
         isLoading: false,
         isMarkdown: true,
         currentStatus: null,
         statusHistory: [],
+        structured,
       });
       pushTrace('answer', 'Returned final analysis + recommendations.');
 
@@ -467,6 +502,20 @@ function Chat() {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSendMessage();
+    }
+  };
+
+  // Approve or deny the HEAD gated tool call, then reveal the next pending one.
+  // Each is resolved by its own requestId so concurrent gates unblock correctly.
+  const handleApproval = async (approved) => {
+    const p = pendingApprovals[0];
+    if (!p) return;
+    setPendingApprovals(prev => prev.slice(1));
+    try {
+      await agentApiClient.approveHITL(p.executionId, p.requestId, approved,
+        approved ? '' : 'Denied by operator');
+    } catch (err) {
+      setTraceSteps(prev => [...prev, { l: 'answer', t: '—', text: `Approval failed: ${err.message}` }]);
     }
   };
 
@@ -516,6 +565,44 @@ function Chat() {
                 ? <MarkdownMessage content={textContent} />
                 : <div className="whitespace-pre-wrap"><FormattedText text={textContent} isUser={isUser} /></div>}
             </div>
+
+            {/* Structured InvestigationReport card (Data Query Mode) */}
+            {message.structured && (
+              <div className="mt-3.5 rounded-xl border border-indigo-200/70 bg-indigo-50/40 p-3 text-[12px]">
+                <div className="flex items-center gap-1.5 mb-2 font-semibold text-indigo-700 uppercase tracking-wide text-[10px]">
+                  <Terminal className="size-3.5" /> Structured report
+                  {message.structured.severity && (
+                    <span className="ml-1 px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 normal-case tracking-normal">{message.structured.severity}</span>
+                  )}
+                  {typeof message.structured.confidence === 'number' && (
+                    <span className="ml-auto text-indigo-400 normal-case tracking-normal">conf {Math.round(message.structured.confidence * 100)}%</span>
+                  )}
+                </div>
+                {message.structured.root_cause && (
+                  <div className="mb-2"><span className="font-semibold text-slate-600">Root cause:</span> <span className="text-slate-700">{message.structured.root_cause}</span></div>
+                )}
+                {Array.isArray(message.structured.evidence) && message.structured.evidence.length > 0 && (
+                  <div className="mb-2">
+                    <div className="font-semibold text-slate-600 mb-1">Evidence</div>
+                    <ul className="space-y-0.5">
+                      {message.structured.evidence.map((ev, i) => (
+                        <li key={i} className="font-mono text-[11px] text-slate-600">
+                          {ev.file}{ev.line ? `:${ev.line}` : ''}{ev.symbol ? ` — ${ev.symbol}` : ''}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {Array.isArray(message.structured.next_steps) && message.structured.next_steps.length > 0 && (
+                  <div>
+                    <div className="font-semibold text-slate-600 mb-1">Next steps</div>
+                    <ul className="list-disc list-inside text-slate-600 space-y-0.5">
+                      {message.structured.next_steps.map((s, i) => <li key={i}>{s}</li>)}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Custom Tool usage info */}
             {message.tools && message.tools.length > 0 && (
@@ -817,6 +904,57 @@ function Chat() {
                   <span className="font-mono text-slate-700 font-semibold truncate">{t}</span>
                 </div>
               ))}
+            </div>
+          </div>
+        )}
+
+        {/* Tool-approval gate (Permission Gatekeeping) */}
+        {pendingApproval && (
+          <div className="px-4 md:px-8 pb-2 flex-shrink-0">
+            <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 shadow-sm">
+              <div className="flex items-center gap-2 text-amber-800 text-sm font-semibold mb-1">
+                <Terminal className="size-4" /> Approval required
+                {pendingApprovals.length > 1 && (
+                  <span className="ml-auto text-[11px] font-medium text-amber-700/80">
+                    +{pendingApprovals.length - 1} more pending
+                  </span>
+                )}
+              </div>
+              <div className="text-[12px] text-amber-900/90 mb-2">
+                The agent wants to run <span className="font-mono font-semibold">{pendingApproval.tool}</span>
+                {pendingApproval.args && pendingApproval.args.file && (
+                  <> on <span className="font-mono">{pendingApproval.args.file}</span></>
+                )}.
+              </div>
+
+              {pendingApproval.tool === 'edit_file' && pendingApproval.args ? (
+                <div className="mb-2 space-y-1.5 text-[11px]">
+                  {pendingApproval.args.repo && (
+                    <div className="text-amber-900/80"><span className="font-semibold">Repo:</span> <span className="font-mono">{pendingApproval.args.repo}</span></div>
+                  )}
+                  <div>
+                    <div className="font-semibold text-red-700 mb-0.5">− Replace</div>
+                    <pre className="max-h-28 overflow-auto rounded bg-red-50 border border-red-200 p-2 font-mono text-red-800 whitespace-pre-wrap">{pendingApproval.args.old_string}</pre>
+                  </div>
+                  <div>
+                    <div className="font-semibold text-emerald-700 mb-0.5">+ With</div>
+                    <pre className="max-h-28 overflow-auto rounded bg-emerald-50 border border-emerald-200 p-2 font-mono text-emerald-800 whitespace-pre-wrap">{pendingApproval.args.new_string}</pre>
+                  </div>
+                </div>
+              ) : (pendingApproval.args && Object.keys(pendingApproval.args).length > 0 && (
+                <div className="mb-2 space-y-1 text-[11px]">
+                  {Object.entries(pendingApproval.args).map(([k, v]) => (
+                    <div key={k} className="flex gap-1.5">
+                      <span className="font-semibold text-amber-900/80 flex-shrink-0">{k}:</span>
+                      <span className="font-mono text-amber-900 break-all">{typeof v === 'string' ? v : JSON.stringify(v)}</span>
+                    </div>
+                  ))}
+                </div>
+              ))}
+              <div className="flex items-center gap-2">
+                <button onClick={() => handleApproval(true)} className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold">Approve</button>
+                <button onClick={() => handleApproval(false)} className="px-3 py-1.5 rounded-lg bg-white border border-red-300 text-red-600 hover:bg-red-50 text-xs font-semibold">Deny</button>
+              </div>
             </div>
           </div>
         )}

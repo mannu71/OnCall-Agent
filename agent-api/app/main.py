@@ -102,6 +102,29 @@ async def lifespan(app: FastAPI):
     # investigation workflows.  Degrades gracefully when AWS is unavailable.
     heartbeat_monitor.start()
 
+    # Re-fire any repo indexing that was interrupted by a previous restart so
+    # workflows don't stay stuck on indexing_status='indexing' forever. The
+    # in-process indexer task dies with the process; this heals on next boot.
+    try:
+        # Reap background jobs left 'running' by a previous process, then re-fire
+        # any workflows still stuck mid-index so they self-heal.
+        from app.services.background_jobs import background_job_store
+        from app.crawler.background_indexer import recover_interrupted_indexing
+
+        await background_job_store.reap_orphans()
+        await recover_interrupted_indexing()
+    except Exception as e:
+        logger.warning(f"Indexing recovery skipped: {e}")
+
+    # Populate the tool registry (built-in + MCP-discovered) so the catalog is
+    # available via GET /api/v1/tools. Discovery-only in Phase 1; never fatal.
+    try:
+        from app.harness.registry_loader import load_registry
+
+        await load_registry()
+    except Exception as e:
+        logger.warning(f"Tool registry load skipped: {e}")
+
     yield
 
     # Shutdown

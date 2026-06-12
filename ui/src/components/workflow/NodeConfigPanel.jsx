@@ -3,6 +3,16 @@ import PropTypes from 'prop-types';
 import { localTimeToCron, cronToLocalTime } from '../../utils/cronUtils';
 import { agentApiClient } from '../../services/agentApiClient';
 
+// Compact human-readable byte size for log-group hints (e.g. 1.4 MB).
+const formatStoredBytes = (bytes) => {
+  if (bytes == null || Number.isNaN(bytes)) return null;
+  if (bytes === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / Math.pow(1024, i);
+  return `${value >= 10 || i === 0 ? Math.round(value) : value.toFixed(1)} ${units[i]}`;
+};
+
 const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
   const [config, setConfig] = useState(node?.data || {});
   const fileInputRef = useRef(null);
@@ -11,6 +21,8 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
   const [discoveringGroups, setDiscoveringGroups] = useState(false);
   const [discoveredGroups, setDiscoveredGroups] = useState([]);
   const [discoverPrefix, setDiscoverPrefix] = useState('');
+  const [discoverError, setDiscoverError] = useState(null);
+  const [discoverSearched, setDiscoverSearched] = useState(false);
   const [timeInput, setTimeInput] = useState(() => {
     // Initialize time from startTime first (most reliable), then cronExpression, or default to current time
     if (node?.data?.startTime) {
@@ -48,6 +60,7 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
 
   const handleDiscoverGroups = async () => {
     setDiscoveringGroups(true);
+    setDiscoverError(null);
     setDiscoveredGroups([]);
     try {
       const result = await agentApiClient.discoverCloudWatchLogGroups(
@@ -56,21 +69,42 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
         50,
         config.awsProfile || undefined,
       );
-      setDiscoveredGroups((result.log_groups || []).map(g => g.name).filter(Boolean));
+      // Keep the full metadata (size, retention) so the picker can show it.
+      setDiscoveredGroups((result.log_groups || []).filter(g => g && g.name));
+      setDiscoverSearched(true);
     } catch (error) {
       setDiscoveredGroups([]);
+      setDiscoverSearched(true);
+      setDiscoverError(
+        error?.response?.data?.detail
+        || error?.message
+        || 'Could not reach AWS. Check the region, profile, and credentials.',
+      );
     } finally {
       setDiscoveringGroups(false);
     }
   };
 
+  // Add a single discovered group WITHOUT closing the result list, so the
+  // user can pick several from one search.
   const handleAddDiscoveredGroup = (groupName) => {
     const existing = config.logGroups || [];
     if (!existing.includes(groupName)) {
       handleConfigChange('logGroups', [...existing, groupName]);
     }
+  };
+
+  const handleAddAllDiscovered = () => {
+    const existing = config.logGroups || [];
+    const names = discoveredGroups.map(g => g.name).filter(Boolean);
+    const merged = Array.from(new Set([...existing, ...names]));
+    handleConfigChange('logGroups', merged);
+  };
+
+  const handleClearDiscovered = () => {
     setDiscoveredGroups([]);
-    setDiscoverPrefix('');
+    setDiscoverSearched(false);
+    setDiscoverError(null);
   };
 
   const handleTestConnection = async () => {
@@ -588,79 +622,159 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                   </div>
                 ))}
               </div>
-              <div style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
-                <button
-                  className="add-btn"
-                  onClick={() => handleConfigChange('logGroups', [...(config.logGroups || []), ''])}
-                  style={{
-                    background: '#4caf50',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '4px',
-                    cursor: 'pointer',
-                    padding: '8px 12px',
-                    flex: 1,
-                  }}
-                >+ Add</button>
-                <button
-                  type="button"
-                  onClick={handleDiscoverGroups}
-                  disabled={discoveringGroups}
-                  style={{
-                    background: discoveringGroups ? '#9e9e9e' : '#7b1fa2',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '4px',
-                    cursor: discoveringGroups ? 'not-allowed' : 'pointer',
-                    padding: '8px 12px',
-                    flex: 1,
-                    fontSize: '12px',
-                  }}
-                >
-                  {discoveringGroups ? 'Discovering…' : '🔍 Discover'}
-                </button>
-              </div>
-
-              {/* Discover prefix input */}
-              <input
-                type="text"
-                value={discoverPrefix}
-                onChange={(e) => setDiscoverPrefix(e.target.value)}
-                placeholder="Prefix to discover, e.g. /aws/lambda/kyc-"
-                style={{ marginTop: '6px', width: '100%', fontSize: '12px', padding: '4px 6px', boxSizing: 'border-box' }}
-              />
-
-              {/* Discovered groups dropdown */}
-              {discoveredGroups.length > 0 && (
-                <div style={{
-                  marginTop: '6px',
-                  border: '1px solid #ccc',
+              <button
+                className="add-btn"
+                onClick={() => handleConfigChange('logGroups', [...(config.logGroups || []), ''])}
+                style={{
+                  background: '#4caf50',
+                  color: 'white',
+                  border: 'none',
                   borderRadius: '4px',
-                  maxHeight: '140px',
-                  overflowY: 'auto',
-                  background: '#fff',
-                }}>
-                  <div style={{ padding: '4px 8px', fontSize: '11px', color: '#666', borderBottom: '1px solid #eee' }}>
-                    Click to add to Log Groups
-                  </div>
-                  {discoveredGroups.map((g) => (
-                    <div
-                      key={g}
-                      onClick={() => handleAddDiscoveredGroup(g)}
-                      style={{
-                        padding: '5px 8px',
-                        cursor: 'pointer',
-                        fontSize: '12px',
-                        borderBottom: '1px solid #f5f5f5',
-                      }}
-                      onMouseOver={(e) => { e.currentTarget.style.background = '#e3f2fd'; }}
-                      onMouseOut={(e) => { e.currentTarget.style.background = ''; }}
-                    >
-                      {g}
-                    </div>
-                  ))}
+                  cursor: 'pointer',
+                  padding: '8px 12px',
+                  width: '100%',
+                }}
+              >+ Add manually</button>
+
+              {/* ── Discover from AWS ───────────────────────────────────── */}
+              {/* Step 1: type an optional prefix.  Step 2: Discover.        */}
+              {/* Results stay open so several groups can be added at once.  */}
+              <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px dashed #ddd' }}>
+                <div style={{ fontSize: '11px', color: '#666', marginBottom: '6px' }}>
+                  Don&apos;t know the exact path? Discover log groups from AWS:
                 </div>
-              )}
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <input
+                    type="text"
+                    value={discoverPrefix}
+                    onChange={(e) => setDiscoverPrefix(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !discoveringGroups) {
+                        e.preventDefault();
+                        handleDiscoverGroups();
+                      }
+                    }}
+                    placeholder="Filter by prefix, e.g. /aws/lambda/kyc- (blank = all)"
+                    style={{ flex: 1, fontSize: '12px', padding: '6px 8px', boxSizing: 'border-box' }}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleDiscoverGroups}
+                    disabled={discoveringGroups}
+                    style={{
+                      background: discoveringGroups ? '#9e9e9e' : '#7b1fa2',
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '4px',
+                      cursor: discoveringGroups ? 'not-allowed' : 'pointer',
+                      padding: '6px 12px',
+                      fontSize: '12px',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {discoveringGroups ? 'Discovering…' : '🔍 Discover'}
+                  </button>
+                </div>
+
+                {/* Error state */}
+                {discoverError && (
+                  <div style={{
+                    marginTop: '6px',
+                    padding: '6px 8px',
+                    fontSize: '12px',
+                    color: '#c62828',
+                    background: '#fdecea',
+                    border: '1px solid #f5c6cb',
+                    borderRadius: '4px',
+                  }}>
+                    ⚠ {discoverError}
+                  </div>
+                )}
+
+                {/* Empty state — searched, no error, nothing found */}
+                {!discoveringGroups && discoverSearched && !discoverError && discoveredGroups.length === 0 && (
+                  <div style={{ marginTop: '6px', fontSize: '12px', color: '#777' }}>
+                    No log groups found{discoverPrefix ? ` matching "${discoverPrefix}"` : ''} in {config.awsRegion || 'us-east-1'}.
+                  </div>
+                )}
+
+                {/* Discovered groups list */}
+                {discoveredGroups.length > 0 && (
+                  <div style={{
+                    marginTop: '6px',
+                    border: '1px solid #ccc',
+                    borderRadius: '4px',
+                    background: '#fff',
+                  }}>
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '4px 8px',
+                      fontSize: '11px',
+                      color: '#666',
+                      borderBottom: '1px solid #eee',
+                    }}>
+                      <span>{discoveredGroups.length} found — click to add</span>
+                      <span>
+                        <button
+                          type="button"
+                          onClick={handleAddAllDiscovered}
+                          style={{
+                            background: 'none', border: 'none', color: '#7b1fa2',
+                            cursor: 'pointer', fontSize: '11px', padding: '0 6px',
+                          }}
+                        >Add all</button>
+                        <button
+                          type="button"
+                          onClick={handleClearDiscovered}
+                          style={{
+                            background: 'none', border: 'none', color: '#999',
+                            cursor: 'pointer', fontSize: '11px', padding: '0 4px',
+                          }}
+                        >Clear</button>
+                      </span>
+                    </div>
+                    <div style={{ maxHeight: '180px', overflowY: 'auto' }}>
+                      {discoveredGroups.map((g) => {
+                        const added = (config.logGroups || []).includes(g.name);
+                        const size = formatStoredBytes(g.stored_bytes);
+                        const retention = g.retention_days ? `${g.retention_days}d retention` : 'never expires';
+                        return (
+                          <div
+                            key={g.name}
+                            onClick={() => !added && handleAddDiscoveredGroup(g.name)}
+                            title={added ? 'Already added' : 'Click to add'}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              gap: '8px',
+                              padding: '6px 8px',
+                              cursor: added ? 'default' : 'pointer',
+                              fontSize: '12px',
+                              borderBottom: '1px solid #f5f5f5',
+                              opacity: added ? 0.55 : 1,
+                            }}
+                            onMouseOver={(e) => { if (!added) e.currentTarget.style.background = '#e3f2fd'; }}
+                            onMouseOut={(e) => { e.currentTarget.style.background = ''; }}
+                          >
+                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {g.name}
+                              <span style={{ display: 'block', fontSize: '10px', color: '#999' }}>
+                                {[size, retention].filter(Boolean).join(' · ')}
+                              </span>
+                            </span>
+                            <span style={{ fontSize: '11px', color: added ? '#2e7d32' : '#7b1fa2', whiteSpace: 'nowrap' }}>
+                              {added ? '✓ added' : '+ add'}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
 
             <div className="config-field">

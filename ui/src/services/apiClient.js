@@ -4,16 +4,22 @@
  * whether running in Electron (packaged) or as a standalone web app.
  */
 
-const DEFAULT_API_URL = 'http://localhost:8000/api/v1';
+const DEFAULT_API_HOST = 'http://localhost:8000';
+const API_PREFIX = '/api/v1';
 
 /**
- * Get the API base URL based on environment
+ * Get the API base URL based on environment.
+ *
+ * The backend mounts every route under ``/api/v1`` (main.py). VITE_API_URL is
+ * commonly set to the bare host (e.g. ``http://localhost:8000``) — matching the
+ * convention used by agentApiClient, which appends ``/api/v1`` per call. So we
+ * normalise here: strip any trailing slash and ensure the ``/api/v1`` suffix,
+ * whether the env var includes it or not. Without this, calls like
+ * ``/settings/general`` hit the host root and 404.
  */
 function getApiBaseUrl() {
-    // In packaged Electron app, the API runs on localhost
-    // In development, it also runs on localhost
-    // Can be overridden via environment variable
-    return import.meta.env.VITE_API_URL || DEFAULT_API_URL;
+    const raw = (import.meta.env.VITE_API_URL || DEFAULT_API_HOST).replace(/\/+$/, '');
+    return raw.endsWith(API_PREFIX) ? raw : `${raw}${API_PREFIX}`;
 }
 
 /**
@@ -369,6 +375,30 @@ export async function getCodeAnalyzerRepo(repoName) {
 }
 
 // ============================================
+// Tool catalog / node schemas / background jobs
+// ============================================
+
+/** List the tool catalog (built-in + MCP-discovered) from the registry. */
+export async function listTools() {
+    return apiRequest('/tools');
+}
+
+/** Canonical per-node-type param contract (backend source of truth). */
+export async function getNodeSchemas() {
+    return apiRequest('/node-schemas');
+}
+
+/** Background jobs; active-only by default. */
+export async function listJobs(activeOnly = true) {
+    return apiRequest(`/jobs?active_only=${activeOnly}`);
+}
+
+/** Live repo-indexing status: { indexing, count, jobs:[{target,progress,total,...}] }. */
+export async function getIndexingStatus() {
+    return apiRequest('/jobs/indexing/status');
+}
+
+// ============================================
 // Utility exports
 // ============================================
 
@@ -427,6 +457,12 @@ export const apiClient = {
     // Code Analyzer
     listCodeAnalyzerRepos,
     getCodeAnalyzerRepo,
+
+    // Tools / node schemas / jobs
+    listTools,
+    getNodeSchemas,
+    listJobs,
+    getIndexingStatus,
 
     // Utility
     getApiBaseUrl,

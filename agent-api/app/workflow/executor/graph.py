@@ -17,6 +17,21 @@ from typing import Any, Awaitable, Callable, Dict, List
 logger = logging.getLogger(__name__)
 
 
+class WorkflowDeadlockError(RuntimeError):
+    """Raised internally when the BFS frontier can make no further progress.
+
+    Carries the node ids that never became runnable so callers (and the user)
+    can see exactly which nodes were stranded instead of silently dropping them.
+    """
+
+    def __init__(self, blocked_node_ids):
+        self.blocked_node_ids = list(blocked_node_ids)
+        super().__init__(
+            "Workflow deadlocked — nodes never became runnable: "
+            + ", ".join(str(n) for n in self.blocked_node_ids)
+        )
+
+
 def build_execution_graph(nodes, edges):
     """Build adjacency list, start nodes, parent mapping, and node map from workflow."""
     adjacency = defaultdict(list)
@@ -114,12 +129,22 @@ async def execute_nodes_bfs(
                 blocked.append(nid)
 
         if not ready:
-            # Deadlock guard — no node became ready this pass. Log and bail
-            # out rather than spinning forever.
-            logger.warning(
-                "BFS made no progress for execution %s; blocked frontier=%s",
+            # Deadlock guard — no node became ready this pass. Instead of
+            # silently dropping the stranded nodes, mark each as failed so the
+            # executor's failed-node reporting surfaces exactly which nodes
+            # never ran (partial results from completed nodes are preserved).
+            logger.error(
+                "BFS deadlocked for execution %s; stranded nodes=%s",
                 execution_id, blocked,
             )
+            for nid in blocked:
+                execution_results[nid] = {
+                    "status": "failed",
+                    "error": (
+                        "Node never became runnable — its upstream "
+                        "dependencies did not all complete (workflow deadlock)."
+                    ),
+                }
             break
 
         # Launch every ready node concurrently.
@@ -170,6 +195,20 @@ async def execute_nodes_bfs(
         frontier = next_frontier
 
     if levels >= max_levels:
-        logger.warning("BFS hit level limit for execution %s", execution_id)
+        # Hit the safety cap with frontier nodes still pending — surface them
+        # as failed rather than returning a silently-incomplete run.
+        stranded = [nid for nid in frontier if nid not in executed]
+        logger.error(
+            "BFS hit level limit for execution %s; stranded nodes=%s",
+            execution_id, stranded,
+        )
+        for nid in stranded:
+            execution_results.setdefault(nid, {
+                "status": "failed",
+                "error": (
+                    "Node never ran — workflow exceeded the maximum execution "
+                    "depth (possible cycle or malformed graph)."
+                ),
+            })
 
     return executed, execution_results

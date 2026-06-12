@@ -225,6 +225,7 @@ class WorkflowRepository:
             "viewport": workflow.viewport,
             "enabled": workflow.enabled,
             "schedule": workflow.schedule,
+            "indexing_status": workflow.indexing_status,
             "created_at": workflow.created_at.isoformat() if workflow.created_at else None,
             "updated_at": workflow.updated_at.isoformat() if workflow.updated_at else None
         }

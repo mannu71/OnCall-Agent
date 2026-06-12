@@ -11,12 +11,13 @@ import {
 import {
   Plus, Search, Play, Pencil, Trash2, MoreHorizontal, Workflow,
   Clock, CheckCircle2, XCircle, Loader2, ChevronLeft, Save, X, Zap,
-  CalendarClock, RefreshCw,
+  CalendarClock, RefreshCw, Activity, Layers, Sparkles, Power, ListFilter,
 } from 'lucide-react';
 import LangflowEditor from '../components/workflow/LangflowEditor.jsx';
 import TemplateGallery from '../components/workflow/TemplateGallery.jsx';
 import { validateWorkflow } from '../utils/workflowValidation.js';
 import agentApiClient from '../services/agentApiClient.js';
+import { getIndexingStatus } from '../services/apiClient.js';
 import { useScheduler } from '../context/SchedulerContext';
 import { useWorkflowStatus } from '../context/WorkflowStatusContext';
 
@@ -43,48 +44,127 @@ const TYPE_META = {
   agent:    { label: 'Agent',    color: 'bg-violet-50 text-violet-700 border-violet-200' },
 };
 
+// Derive every status-driven visual treatment for a workflow in one place so
+// the card stays consistent (accent bar, icon wrap, pill colors, label).
+function statusMeta(w) {
+  const isIndexing = w.indexingStatus === 'indexing';
+  const indexFailed = typeof w.indexingStatus === 'string' && w.indexingStatus.startsWith('indexing_failed');
+  if (isIndexing) return {
+    key: 'indexing', label: 'Indexing', spinner: true,
+    bar: 'from-amber-400 to-orange-400',
+    iconWrap: 'bg-gradient-to-br from-amber-50 to-orange-50 text-amber-600 ring-amber-100',
+    pill: 'bg-amber-50 text-amber-700 border-amber-200', dot: 'bg-amber-500',
+  };
+  if (indexFailed) return {
+    key: 'failed', label: 'Index failed',
+    bar: 'from-red-400 to-rose-500',
+    iconWrap: 'bg-gradient-to-br from-red-50 to-rose-50 text-red-600 ring-red-100',
+    pill: 'bg-red-50 text-red-700 border-red-200', dot: 'bg-red-500',
+  };
+  if (w.enabled) return {
+    key: 'active', label: 'Active',
+    bar: 'from-emerald-400 to-teal-400',
+    iconWrap: 'bg-gradient-to-br from-emerald-50 to-teal-50 text-emerald-600 ring-emerald-100',
+    pill: 'bg-emerald-50 text-emerald-700 border-emerald-200', dot: 'bg-emerald-500',
+  };
+  return {
+    key: 'disabled', label: 'Disabled',
+    bar: 'from-slate-300 to-slate-300',
+    iconWrap: 'bg-slate-100 text-slate-400 ring-slate-100',
+    pill: 'bg-slate-50 text-slate-500 border-slate-200', dot: 'bg-slate-400',
+  };
+}
+
+// ─── StatCard ─────────────────────────────────────────────────────────────────
+
+function StatCard({ icon: Icon, label, value, accent, ring }) {
+  return (
+    <div className="group relative flex items-center gap-3 rounded-2xl border border-slate-200/80 bg-white/70 backdrop-blur px-4 py-3.5 shadow-sm transition-all hover:shadow-md hover:border-slate-300">
+      <div className={`flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center ring-1 ${accent} ${ring}`}>
+        <Icon className="w-[18px] h-[18px]" />
+      </div>
+      <div className="min-w-0">
+        <div className="text-2xl font-bold text-slate-900 leading-none tabular-nums">{value}</div>
+        <div className="text-[11px] font-medium uppercase tracking-wide text-slate-400 mt-1">{label}</div>
+      </div>
+    </div>
+  );
+}
+
+// ─── MetaItem ─────────────────────────────────────────────────────────────────
+
+function MetaItem({ icon: Icon, children }) {
+  return (
+    <div className="flex items-center gap-1.5 min-w-0 text-[11px] text-slate-500">
+      <Icon className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
+      <span className="truncate font-mono">{children}</span>
+    </div>
+  );
+}
+
 // ─── WorkflowCard ────────────────────────────────────────────────────────────
 
-function WorkflowCard({ w, isRunning, onEdit, onRun, onDelete }) {
+function WorkflowCard({ w, isRunning, onEdit, onRun, onDelete, indexProgress }) {
   const typeMeta = TYPE_META[w.type] || TYPE_META.workflow;
+  const s = statusMeta(w);
   const scheduleLabel = formatScheduleLabel(w);
   const lastRun = relativeTime(w.updatedAt || w.updated_at);
+  const nodeCount = Array.isArray(w.nodes) ? w.nodes.length : 0;
+  const isIndexing = s.key === 'indexing';
+  // Live progress from the background-job store (GET /jobs/indexing/status).
+  const indexLabel = (isIndexing && indexProgress && indexProgress.total > 0)
+    ? `Indexing… (${indexProgress.progress}/${indexProgress.total})`
+    : 'Indexing…';
 
   return (
-    <div className="group relative flex flex-col bg-white rounded-xl border border-slate-200 shadow-sm hover:shadow-md hover:border-slate-300 transition-all duration-200 overflow-hidden">
-      {/* accent bar */}
-      <div className={`h-1 w-full ${w.enabled ? 'bg-emerald-400' : 'bg-slate-200'}`} />
+    <div className="group relative flex flex-col rounded-2xl border border-slate-200 bg-white shadow-sm transition-all duration-300 hover:shadow-xl hover:shadow-slate-200/70 hover:border-slate-300 hover:-translate-y-1 overflow-hidden">
+      {/* gradient accent bar */}
+      <div className={`h-1.5 w-full bg-gradient-to-r ${s.bar}`} />
+
+      {/* running highlight ring */}
+      {isRunning && (
+        <span className="pointer-events-none absolute inset-0 rounded-2xl ring-2 ring-amber-300/60" />
+      )}
 
       <div className="flex flex-col flex-1 p-5 gap-4">
         {/* header */}
         <div className="flex items-start justify-between gap-3">
           <div className="flex items-start gap-3 min-w-0">
-            <div className={`mt-0.5 flex-shrink-0 w-9 h-9 rounded-lg flex items-center justify-center ${
-              w.enabled ? 'bg-emerald-50 text-emerald-600' : 'bg-slate-100 text-slate-400'
-            }`}>
-              <Workflow className="w-[18px] h-[18px]" />
+            <div className={`relative mt-0.5 flex-shrink-0 w-11 h-11 rounded-xl flex items-center justify-center ring-1 ${s.iconWrap}`}>
+              <Workflow className="w-5 h-5" />
+              {isIndexing && (
+                <span className="absolute -inset-0.5 rounded-xl border-2 border-amber-300/70 border-t-transparent animate-spin" />
+              )}
             </div>
             <div className="min-w-0">
               <h3 className="font-semibold text-slate-900 text-sm leading-snug truncate">{w.name}</h3>
-              <div className="flex items-center gap-1.5 mt-1 flex-wrap">
-                <span className={`inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded border ${typeMeta.color}`}>
+              <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                <span className={`inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded-md border ${typeMeta.color}`}>
                   {typeMeta.label}
                 </span>
-                <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded border ${
-                  w.enabled
-                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                    : 'bg-slate-50 text-slate-500 border-slate-200'
-                }`}>
-                  <span className={`w-1.5 h-1.5 rounded-full ${w.enabled ? 'bg-emerald-500' : 'bg-slate-400'}`} />
-                  {w.enabled ? 'Active' : 'Disabled'}
-                </span>
+                {isRunning ? (
+                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-semibold rounded-md border bg-amber-50 text-amber-700 border-amber-200">
+                    <span className="relative flex h-1.5 w-1.5">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-400 opacity-75" />
+                      <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-amber-500" />
+                    </span>
+                    Live
+                  </span>
+                ) : (
+                  <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded-md border ${s.pill}`}>
+                    {s.spinner
+                      ? <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                      : <span className={`w-1.5 h-1.5 rounded-full ${s.dot}`} />}
+                    {s.label}
+                  </span>
+                )}
               </div>
             </div>
           </div>
 
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <button className="flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity w-7 h-7 rounded-md hover:bg-slate-100 flex items-center justify-center text-slate-500">
+              <button className="flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity w-7 h-7 rounded-lg hover:bg-slate-100 flex items-center justify-center text-slate-500">
                 <MoreHorizontal className="w-4 h-4" />
               </button>
             </DropdownMenuTrigger>
@@ -92,7 +172,7 @@ function WorkflowCard({ w, isRunning, onEdit, onRun, onDelete }) {
               <DropdownMenuItem onClick={onEdit}>
                 <Pencil className="w-3.5 h-3.5 mr-2" /> Edit
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={onRun} disabled={isRunning}>
+              <DropdownMenuItem onClick={onRun} disabled={isRunning || isIndexing}>
                 <Play className="w-3.5 h-3.5 mr-2" /> Run Now
               </DropdownMenuItem>
               <DropdownMenuSeparator />
@@ -103,34 +183,30 @@ function WorkflowCard({ w, isRunning, onEdit, onRun, onDelete }) {
           </DropdownMenu>
         </div>
 
-        {/* meta row */}
-        <div className="flex items-center gap-4 text-[11px] text-slate-500">
-          <div className="flex items-center gap-1.5">
-            <CalendarClock className="w-3.5 h-3.5 text-slate-400" />
-            <span>{scheduleLabel}</span>
-          </div>
-          {lastRun && (
-            <div className="flex items-center gap-1.5">
-              <Clock className="w-3.5 h-3.5 text-slate-400" />
-              <span>{lastRun}</span>
-            </div>
-          )}
+        {/* meta grid */}
+        <div className="grid grid-cols-2 gap-x-3 gap-y-2 rounded-xl bg-slate-50/70 border border-slate-100 px-3 py-2.5">
+          <MetaItem icon={CalendarClock}>{scheduleLabel}</MetaItem>
+          <MetaItem icon={Clock}>{lastRun || '—'}</MetaItem>
+          <MetaItem icon={Layers}>{nodeCount} node{nodeCount !== 1 ? 's' : ''}</MetaItem>
+          <MetaItem icon={Power}>{w.enabled ? 'Enabled' : 'Off'}</MetaItem>
         </div>
 
         {/* actions */}
-        <div className="flex items-center gap-2 mt-auto pt-1 border-t border-slate-100">
-          <Button size="sm" variant="outline" className="h-8 text-xs flex-1 gap-1.5" onClick={onEdit}>
-            <Pencil className="w-3 h-3" /> Edit
+        <div className="flex items-center gap-2 mt-auto pt-1">
+          <Button size="sm" variant="outline" className="h-9 text-xs flex-1 gap-1.5 rounded-lg" onClick={onEdit}>
+            <Pencil className="w-3.5 h-3.5" /> Edit
           </Button>
           <Button
             size="sm"
-            className={`h-8 text-xs flex-1 gap-1.5 ${isRunning ? 'bg-amber-500 hover:bg-amber-600' : ''}`}
+            className={`h-9 text-xs flex-1 gap-1.5 rounded-lg shadow-sm ${isRunning || isIndexing ? 'bg-amber-500 hover:bg-amber-600' : ''}`}
             onClick={onRun}
-            disabled={isRunning}
+            disabled={isRunning || isIndexing}
           >
-            {isRunning
-              ? <><Loader2 className="w-3 h-3 animate-spin" /> Running…</>
-              : <><Play className="w-3 h-3" /> Run</>}
+            {isIndexing
+              ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> {indexLabel}</>
+              : isRunning
+                ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Running…</>
+                : <><Play className="w-3.5 h-3.5" /> Run</>}
           </Button>
         </div>
       </div>
@@ -142,20 +218,23 @@ function WorkflowCard({ w, isRunning, onEdit, onRun, onDelete }) {
 
 function EmptyState({ onNew, filtered }) {
   return (
-    <div className="flex flex-col items-center justify-center py-24 px-6 text-center">
-      <div className="w-16 h-16 rounded-2xl bg-slate-100 flex items-center justify-center mb-5">
-        <Workflow className="w-8 h-8 text-slate-400" />
+    <div className="flex flex-col items-center justify-center py-24 px-6 text-center rounded-3xl border border-dashed border-slate-200 bg-white/60">
+      <div className="relative w-20 h-20 rounded-3xl bg-gradient-to-br from-slate-100 to-slate-50 flex items-center justify-center mb-5 ring-1 ring-slate-100">
+        <Workflow className="w-9 h-9 text-slate-400" />
+        <span className="absolute -top-1.5 -right-1.5 w-7 h-7 rounded-full bg-gradient-to-br from-rose-500 to-red-600 flex items-center justify-center shadow-lg shadow-rose-500/30">
+          <Sparkles className="w-3.5 h-3.5 text-white" />
+        </span>
       </div>
-      <h3 className="text-base font-semibold text-slate-800 mb-1">
+      <h3 className="text-lg font-semibold text-slate-800 mb-1.5">
         {filtered ? 'No workflows match' : 'No workflows yet'}
       </h3>
-      <p className="text-sm text-slate-500 max-w-xs mb-6">
+      <p className="text-sm text-slate-500 max-w-sm mb-6 leading-relaxed">
         {filtered
-          ? 'Try a different search term.'
+          ? 'Try a different search term or clear the active filter.'
           : 'Workflows orchestrate AI agents, schedules, and tools into repeatable automated processes.'}
       </p>
       {!filtered && (
-        <Button size="sm" onClick={onNew} className="gap-2">
+        <Button onClick={onNew} className="gap-2 rounded-lg">
           <Plus className="w-4 h-4" /> Create your first workflow
         </Button>
       )}
@@ -181,7 +260,7 @@ function ToastStack({ messages }) {
   return (
     <div className="fixed bottom-5 right-5 flex flex-col gap-2 z-[200]">
       {messages.map(m => (
-        <div key={m.id} className={`flex items-center gap-2.5 min-w-[260px] max-w-sm px-4 py-3 rounded-xl border text-sm font-medium shadow-sm ${styles[m.type] || styles.info}`}>
+        <div key={m.id} className={`flex items-center gap-2.5 min-w-[260px] max-w-sm px-4 py-3 rounded-xl border text-sm font-medium shadow-lg ${styles[m.type] || styles.info}`}>
           {icons[m.type]}
           <span>{m.msg}</span>
         </div>
@@ -233,6 +312,7 @@ function WorkflowPage() {
   const [showDialog, setShowDialog]             = useState(false);
   const [showEditor, setShowEditor]             = useState(false);
   const [searchTerm, setSearchTerm]             = useState('');
+  const [statusFilter, setStatusFilter]         = useState('all');
   const [selectedWorkflow, setSelectedWorkflow] = useState(null);
   const [deleteOpen, setDeleteOpen]             = useState(false);
   const [workflowName, setWorkflowName]         = useState('');
@@ -244,7 +324,35 @@ function WorkflowPage() {
 
   const editorRef = useRef(null);
 
+  // Live repo-indexing progress (name → {progress,total}) from the background
+  // job store. Polls only while at least one workflow is indexing.
+  const [indexProgress, setIndexProgress] = useState({});
+  const anyIndexing = useMemo(
+    () => (workflows || []).some(w => w.indexingStatus === 'indexing'),
+    [workflows],
+  );
+
   useEffect(() => { loadSchedules(); }, [loadSchedules]);
+
+  useEffect(() => {
+    if (!anyIndexing) { setIndexProgress({}); return; }
+    let active = true;
+    const poll = async () => {
+      try {
+        const res = await getIndexingStatus();
+        if (!active) return;
+        const map = {};
+        for (const j of (res.jobs || [])) map[j.target] = { progress: j.progress, total: j.total };
+        setIndexProgress(map);
+        // When indexing finishes server-side, refresh the workflow list so the
+        // card flips out of the Indexing state.
+        if (!res.indexing) loadSchedules();
+      } catch { /* transient — ignore */ }
+    };
+    poll();
+    const id = setInterval(poll, 3000);
+    return () => { active = false; clearInterval(id); };
+  }, [anyIndexing, loadSchedules]);
 
   const removeMessage = useCallback((id) => setMessages(prev => prev.filter(m => m.id !== id)), []);
   const showMessage   = useCallback((msg, type = 'info') => {
@@ -316,10 +424,33 @@ function WorkflowPage() {
     } catch (err) { showMessage(`Save failed: ${err.message}`, 'error'); }
   };
 
+  // ── Derived stats + filtering ───────────────────────────────────────────────
+  const stats = useMemo(() => ({
+    total:     workflows.length,
+    active:    workflows.filter(w => w.enabled).length,
+    indexing:  workflows.filter(w => w.indexingStatus === 'indexing').length,
+    scheduled: workflows.filter(w => w.schedule && w.schedule !== 'Manual').length,
+  }), [workflows]);
+
+  const FILTERS = [
+    { key: 'all',       label: 'All',       count: stats.total },
+    { key: 'active',    label: 'Active',    count: stats.active },
+    { key: 'scheduled', label: 'Scheduled', count: stats.scheduled },
+    { key: 'indexing',  label: 'Indexing',  count: stats.indexing },
+  ];
+
   const filtered = useMemo(() => {
     const t = searchTerm.toLowerCase();
-    return workflows.filter(w => w.name.toLowerCase().includes(t));
-  }, [workflows, searchTerm]);
+    return workflows.filter(w => {
+      if (t && !w.name.toLowerCase().includes(t)) return false;
+      if (statusFilter === 'active')    return w.enabled;
+      if (statusFilter === 'scheduled') return w.schedule && w.schedule !== 'Manual';
+      if (statusFilter === 'indexing')  return w.indexingStatus === 'indexing';
+      return true;
+    });
+  }, [workflows, searchTerm, statusFilter]);
+
+  const openCreate = () => { setWorkflowName(''); setPendingTemplate(null); setShowDialog(true); };
 
   // ── Editor view ────────────────────────────────────────────────────────────
   if (showEditor) {
@@ -347,36 +478,82 @@ function WorkflowPage() {
 
   // ── List view ──────────────────────────────────────────────────────────────
   return (
-    <div className="min-h-screen bg-slate-50">
-      <div className="max-w-7xl mx-auto px-6 py-8">
+    <div className="min-h-screen bg-gradient-to-b from-slate-50 via-slate-50 to-white">
 
-        {/* Page header */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
-          <div>
-            <h1 className="text-2xl font-bold text-slate-900">Workflows</h1>
-            <p className="text-sm text-slate-500 mt-0.5">
-              {workflows.length} workflow{workflows.length !== 1 ? 's' : ''} &middot; {workflows.filter(w => w.enabled).length} active
-            </p>
+      {/* Hero header */}
+      <div className="relative overflow-hidden border-b border-slate-200/80">
+        {/* decorative glows */}
+        <div className="pointer-events-none absolute -top-24 -right-16 w-72 h-72 rounded-full bg-blue-200/30 blur-3xl" />
+        <div className="pointer-events-none absolute -top-32 left-1/3 w-72 h-72 rounded-full bg-rose-200/20 blur-3xl" />
+
+        <div className="relative max-w-7xl mx-auto px-6 pt-8 pb-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex items-center gap-4">
+              <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-rose-500 to-red-600 shadow-lg shadow-rose-500/25 flex items-center justify-center">
+                <Workflow className="w-6 h-6 text-white" />
+              </div>
+              <div>
+                <h1 className="text-2xl font-bold text-slate-900 tracking-tight">Workflows</h1>
+                <p className="text-sm text-slate-500 mt-0.5">
+                  Orchestrate agents, schedules, and tools into automated processes.
+                </p>
+              </div>
+            </div>
+            <Button onClick={openCreate} className="gap-2 self-start sm:self-auto rounded-lg shadow-sm shadow-rose-500/20">
+              <Plus className="w-4 h-4" /> New Workflow
+            </Button>
           </div>
-          <Button onClick={() => { setWorkflowName(''); setPendingTemplate(null); setShowDialog(true); }} className="gap-2 self-start sm:self-auto">
-            <Plus className="w-4 h-4" /> New Workflow
-          </Button>
-        </div>
 
-        {/* Search */}
-        <div className="relative mb-6 max-w-sm">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-          <Input
-            placeholder="Search workflows…"
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="pl-9 h-9 bg-white"
-          />
+          {/* Stat cards */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mt-6">
+            <StatCard icon={Layers}       label="Total"     value={stats.total}     accent="bg-slate-50 text-slate-600"     ring="ring-slate-100" />
+            <StatCard icon={Activity}     label="Active"    value={stats.active}    accent="bg-emerald-50 text-emerald-600" ring="ring-emerald-100" />
+            <StatCard icon={CalendarClock} label="Scheduled" value={stats.scheduled} accent="bg-blue-50 text-blue-600"       ring="ring-blue-100" />
+            <StatCard icon={RefreshCw}    label="Indexing"  value={stats.indexing}  accent="bg-amber-50 text-amber-600"     ring="ring-amber-100" />
+          </div>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="max-w-7xl mx-auto px-6 py-6">
+
+        {/* Toolbar: search + filter pills */}
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3 mb-6">
+          <div className="relative w-full sm:max-w-xs">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+            <Input
+              placeholder="Search workflows…"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="pl-9 h-10 bg-white rounded-lg shadow-sm"
+            />
+          </div>
+
+          <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-100/80 border border-slate-200/80 w-fit">
+            {FILTERS.map(f => (
+              <button
+                key={f.key}
+                onClick={() => setStatusFilter(f.key)}
+                className={`inline-flex items-center gap-1.5 px-3 h-8 rounded-lg text-xs font-medium transition-all ${
+                  statusFilter === f.key
+                    ? 'bg-white text-slate-900 shadow-sm'
+                    : 'text-slate-500 hover:text-slate-700'
+                }`}
+              >
+                {f.label}
+                <span className={`inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-md text-[10px] font-semibold ${
+                  statusFilter === f.key ? 'bg-slate-100 text-slate-600' : 'bg-slate-200/70 text-slate-500'
+                }`}>
+                  {f.count}
+                </span>
+              </button>
+            ))}
+          </div>
         </div>
 
         {/* Grid */}
         {filtered.length === 0 ? (
-          <EmptyState onNew={() => { setWorkflowName(''); setPendingTemplate(null); setShowDialog(true); }} filtered={searchTerm.length > 0} />
+          <EmptyState onNew={openCreate} filtered={searchTerm.length > 0 || statusFilter !== 'all'} />
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
             {filtered.map(w => (
@@ -384,6 +561,7 @@ function WorkflowPage() {
                 key={w.name}
                 w={w}
                 isRunning={isWorkflowRunning(w.name)}
+                indexProgress={indexProgress[w.name]}
                 onEdit={() => openEdit(w)}
                 onRun={() => handleRun(w)}
                 onDelete={() => { setSelectedWorkflow(w); setDeleteOpen(true); }}

@@ -142,9 +142,16 @@ export const agentApiClient = {
         const o = typeof opts === 'boolean' ? { background: opts } : (opts || {});
         const params = { background: !!o.background };
         if (o.userQuery) params.query = o.userQuery;
+        if (o.outputMode) params.output_mode = o.outputMode;
+        if (o.permissionMode) params.permission_mode = o.permissionMode;
+        // Conversation memory: prior turns sent in the body as inputs.history so
+        // follow-up questions keep context across messages.
+        const body = (Array.isArray(o.history) && o.history.length)
+            ? { history: o.history }
+            : null;
         const response = await client.post(
             `/api/v1/workflows/${encodeURIComponent(workflowName)}/execute`,
-            null,
+            body,
             { params },
         );
         return response.data;
@@ -177,22 +184,53 @@ export const agentApiClient = {
         let es = null;
         try {
             es = this.streamWorkflowExecution(workflowName);
-            const parse = (evt) => { try { return JSON.parse(evt.data); } catch { return {}; } };
+            // ExecutionEvent serializes as { event_type, data: {...}, timestamp };
+            // unwrap the nested `data` so handlers can read fields (tool, token,
+            // node_id, message) directly. Flat events (connected/stream_end) with
+            // no nested object pass through unchanged.
+            const parse = (evt) => {
+                try {
+                    const o = JSON.parse(evt.data);
+                    return (o && typeof o.data === 'object' && o.data) ? { ...o, ...o.data } : o;
+                } catch { return {}; }
+            };
             es.onmessage = (evt) => { const d = parse(evt); if (d && d.message) h.onStatus && h.onStatus(d.message); };
             const on = (type, cb) => es.addEventListener(type, cb);
-            on('tool_call',    (e) => { const d = parse(e); h.onToolCall && h.onToolCall(d.tool || d.name, d.args || {}); });
-            on('tool_started', (e) => { const d = parse(e); h.onToolCall && h.onToolCall(d.tool || d.name, d.args || {}); });
-            on('tool_result',  (e) => { const d = parse(e); h.onToolResult && h.onToolResult(d.tool || d.name, d.result || d.output); });
+            on('tool_call',    (e) => { const d = parse(e); const nm = d.tool || d.name; if (nm) h.onToolCall && h.onToolCall(nm, d.args || {}); });
+            on('tool_started', (e) => { const d = parse(e); const nm = d.tool || d.name; if (nm) h.onToolCall && h.onToolCall(nm, d.args || {}); });
+            on('tool_result',  (e) => { const d = parse(e); const nm = d.tool || d.name; if (nm) h.onToolResult && h.onToolResult(nm, d.result || d.output); });
             on('llm_token',    (e) => { const d = parse(e); h.onToken && h.onToken(d.token || d.text || ''); });
             on('node_started',   (e) => { const d = parse(e); h.onNode && h.onNode(d.node_id || d.nodeId, 'started'); });
             on('node_completed', (e) => { const d = parse(e); h.onNode && h.onNode(d.node_id || d.nodeId, 'completed'); });
             on('agent_progress', (e) => { const d = parse(e); h.onStatus && h.onStatus(d.message || ''); });
+            on('token_usage_delta', (e) => {
+                const d = parse(e);
+                h.onTokens && h.onTokens({
+                    input: d.input_tokens || 0,
+                    output: d.output_tokens || 0,
+                    total: d.total_tokens || ((d.input_tokens || 0) + (d.output_tokens || 0)),
+                });
+            });
+            on('hitl_pause', (e) => {
+                const d = parse(e);
+                // Tool-approval gate: surface tool + args so the user can approve/deny.
+                h.onHitlPause && h.onHitlPause({
+                    executionId: d.execution_id,
+                    requestId: d.request_id,
+                    tool: d.tool,
+                    args: d.args,
+                    type: d.type,
+                    message: d.message,
+                });
+            });
             es.onerror = () => { /* progress stream dropped — non-fatal; the sync result still resolves */ };
         } catch { /* SSE unavailable — proceed without live progress */ }
 
         // 2) Synchronous run → the response carries the authoritative result.
         try {
-            const data = await this.executeWorkflow(workflowName, { background: false, userQuery });
+            const data = await this.executeWorkflow(workflowName, {
+                background: false, userQuery, history: h.history,
+            });
             if (data && data.status === 'already_running') {
                 throw new Error(`Agent "${workflowName}" is already running. Wait for it to finish.`);
             }

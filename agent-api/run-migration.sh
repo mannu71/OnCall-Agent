@@ -38,6 +38,9 @@ MIGRATIONS=(
   "migrations/009_knowledge_graph.sql"
   "migrations/010_kg_domain_mapping.sql"
   "migrations/011_app_settings.sql"
+  "migrations/012_tool_approvals.sql"
+  "migrations/013_background_jobs.sql"
+  "migrations/014_gateway_assignments.sql"
 )
 
 for migration in "${MIGRATIONS[@]}"; do

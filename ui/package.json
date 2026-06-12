@@ -11,6 +11,7 @@
     "build": "vite build",
     "start": "electron .",
     "lint": "eslint .",
+    "test:ports": "node scripts/test-port-slots.mjs",
     "preview": "vite preview",
     "package": "npm run build && electron-builder",
     "postinstall": "cd ../agent-api && pip install -r requirements.txt"

@@ -1,0 +1,208 @@
+"""Tool assembly — the harness's "action space" builder.
+
+Assembles the agent's base tool set from the workflow's tool/CloudWatch/code/DB
+config: MCP tools, CloudWatch tools (with a cheap STS credential pre-flight that
+aborts before the LLM is invoked if the session token is expired), code-crawler
+tools, DB-schema lookup tools, then prunes the result with the relevance router.
+
+Extracted verbatim (behaviour-preserving) from ``ReactStrategy.execute``. The
+``_expired_creds_msg`` is returned to the caller rather than early-returning from
+here, so the strategy keeps ownership of the user-facing result envelope.
+
+Subagent-delegate and edit tools are added by the caller *after* the LLM is
+built (they need the model), so they are intentionally NOT part of this base set.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.core.redact import redact
+
+
+async def assemble_base_tools(
+    *,
+    tools_config: List[Dict[str, Any]],
+    mcp_manager: Any,
+    execution_id: Optional[str],
+    cloudwatch_config: Optional[Dict[str, Any]],
+    code_analyzer_config: Optional[Dict[str, Any]],
+    db_server_map: Dict[str, Any],
+    user_query: str,
+    logger_instance: Any,
+    crawler_model_id: Optional[str] = None,
+) -> Tuple[List[Any], Optional[str]]:
+    """Build the base tool set. Returns ``(tools, expired_creds_msg)``.
+
+    When ``expired_creds_msg`` is non-None the caller should short-circuit with a
+    credential-refresh message instead of invoking the LLM.
+    """
+    from app.workflow.strategies.react.tool_setup import setup_tools
+
+    tools = await setup_tools(tools_config, mcp_manager, execution_id)
+
+    expired_creds_msg: Optional[str] = None
+
+    if cloudwatch_config:
+        try:
+            from app.core.aws_credentials import resolve_aws_credentials
+            from app.workflow.tools.cloudwatch_agent_tools import build_cloudwatch_agent_tools
+
+            cw_creds, cw_region = await resolve_aws_credentials(
+                aws_profile=cloudwatch_config.get("aws_profile"),
+                aws_region=cloudwatch_config.get("aws_region", "us-east-1"),
+            )
+
+            # Pre-flight: validate credentials before invoking the LLM.
+            # A cheap STS call costs nothing vs. a full agent loop.
+            try:
+                import boto3
+                from botocore.exceptions import ClientError as _BotoClientError
+                from app.core.thread_pools import run_in_aws_pool
+
+                _sts_kwargs: Dict[str, Any] = {"region_name": cw_region}
+                if cw_creds.get("aws_profile"):
+                    _sts_session = boto3.Session(
+                        profile_name=cw_creds["aws_profile"], region_name=cw_region
+                    )
+                    _sts_client = _sts_session.client("sts")
+                else:
+                    if cw_creds.get("access_key_id"):
+                        _sts_kwargs["aws_access_key_id"] = cw_creds["access_key_id"]
+                        _sts_kwargs["aws_secret_access_key"] = cw_creds.get("secret_access_key", "")
+                        if cw_creds.get("session_token"):
+                            _sts_kwargs["aws_session_token"] = cw_creds["session_token"]
+                    _sts_client = boto3.client("sts", **_sts_kwargs)
+                await run_in_aws_pool(_sts_client.get_caller_identity)
+            except _BotoClientError as _sts_err:
+                _ec = _sts_err.response.get("Error", {}).get("Code", "")
+                if _ec == "ExpiredTokenException" or "ExpiredToken" in str(_sts_err):
+                    expired_creds_msg = (
+                        "AWS credentials are expired. Please refresh your AWS session token "
+                        "in the LLM configuration settings and retry the workflow."
+                    )
+                    logger_instance.warning(
+                        "ReactStrategy: AWS credentials expired — aborting before LLM invocation (exec=%s)",
+                        execution_id,
+                        extra={"execution_id": execution_id},
+                    )
+            except Exception as _sts_probe_err:
+                logger_instance.debug(
+                    "ReactStrategy: STS credential pre-flight skipped (%s)",
+                    redact(str(_sts_probe_err)),
+                    extra={"execution_id": execution_id},
+                )
+
+            if not expired_creds_msg:
+                tools.extend(
+                    build_cloudwatch_agent_tools(
+                        region=cw_region,
+                        credentials=cw_creds,
+                        log_groups=cloudwatch_config.get("log_groups"),
+                        severity_excludes=cloudwatch_config.get("severity_excludes"),
+                    )
+                )
+        except Exception as _cw_err:
+            logger_instance.warning(
+                "ReactStrategy: failed to build CloudWatch tools (non-fatal): %s",
+                redact(str(_cw_err)),
+                extra={"execution_id": execution_id},
+            )
+
+    if expired_creds_msg:
+        # Short-circuit: caller will return the refresh message. Tools built so
+        # far are irrelevant.
+        return tools, expired_creds_msg
+
+    if code_analyzer_config:
+        try:
+            from app.workflow.tools.code_analyzer_tools import build_crawler_tools
+
+            tools.extend(
+                build_crawler_tools(
+                    repos=code_analyzer_config.get("repos"),
+                    default_model_id=crawler_model_id,
+                )
+            )
+            if crawler_model_id:
+                logger_instance.info(
+                    "ReactStrategy: crawler tools using wired model=%s",
+                    crawler_model_id,
+                    extra={"execution_id": execution_id},
+                )
+        except Exception as _cr_err:
+            logger_instance.warning(
+                "ReactStrategy: failed to build Crawler tools (non-fatal): %s",
+                redact(str(_cr_err)),
+                extra={"execution_id": execution_id},
+            )
+
+    # Bounded, cached DB schema lookup tools — added only when a database node is
+    # wired. Lets the agent find the right table with a small filtered lookup
+    # instead of dumping the whole schema into context.
+    if db_server_map and mcp_manager:
+        try:
+            from app.workflow.tools.db_schema_tools import build_db_schema_tools
+
+            tools.extend(build_db_schema_tools(db_server_map, mcp_manager))
+        except Exception as _db_err:
+            logger_instance.warning(
+                "ReactStrategy: failed to build DB schema tools (non-fatal): %s",
+                redact(str(_db_err)),
+                extra={"execution_id": execution_id},
+            )
+
+    if tools and user_query:
+        try:
+            from app.harness.tool_router import filter_tools
+
+            tools = filter_tools(tools, user_query)
+        except Exception as _tr_err:
+            logger_instance.warning(
+                "ReactStrategy: ToolRouter skipped (non-fatal): %s",
+                redact(str(_tr_err)),
+                extra={"execution_id": execution_id},
+            )
+
+    return tools, expired_creds_msg
+
+
+def add_extension_tools(
+    *,
+    tools: List[Any],
+    llm: Any,
+    agent_config: Dict[str, Any],
+    code_analyzer_config: Optional[Dict[str, Any]],
+    execution_id: Optional[str],
+    logger_instance: Any,
+) -> List[Any]:
+    """Append the LLM-dependent extension tools (delegate + edit), in place.
+
+    Added only when code tools are present: the depth-1 sub-agent delegate tool
+    (built from a snapshot of the current tools, so it never includes itself or
+    the edit tool) and the gated code-edit tool. Returns the same list for
+    call-site convenience.
+    """
+    if not code_analyzer_config:
+        return tools
+
+    # On-demand subagent delegation (depth-1). The sub-agent is built from a
+    # snapshot WITHOUT this tool, so it cannot fan out further.
+    try:
+        from app.workflow.strategies.react.subagent import build_delegate_tool
+        tools.append(
+            build_delegate_tool(
+                llm, list(tools), agent_config, parent_execution_id=execution_id,
+            )
+        )
+    except Exception as _de:  # noqa: BLE001
+        logger_instance.warning("ReactStrategy: delegate tool skipped (%s)", _de)
+
+    # Code-edit tool (apply fixes). Gated as 'ask' by the permission layer, so
+    # every edit needs operator approval.
+    try:
+        from app.workflow.strategies.react.edit_tools import build_edit_tools
+        tools.extend(build_edit_tools())
+    except Exception as _ee:  # noqa: BLE001
+        logger_instance.warning("ReactStrategy: edit tool skipped (%s)", _ee)
+
+    return tools

@@ -4,7 +4,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from app.workflow.llm_config import LLM_NODE_TYPES, resolve_llm_config
+from app.workflow.llm_config import (
+    LLM_NODE_TYPES,
+    resolve_llm_config,
+    resolve_llm_config_for_consumer_port,
+)
 from app.workflow.executor.handlers.cloudwatch import _read_cw_config
 
 logger = logging.getLogger(__name__)
@@ -15,19 +19,53 @@ def extract_agent_config(workflow: Dict[str, Any]) -> Dict[str, Any]:
     agent_node = next((n for n in nodes if n.get("type") == "agent"), None)
     return agent_node.get("data", {}) if agent_node else {}
 
-async def resolve_llm_config_for_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
-    """Resolve the LLM config for *workflow*.
+def find_agent_node_id(workflow: Dict[str, Any]) -> Optional[str]:
+    """Return the id of the first ``agent`` node (or None)."""
+    for n in workflow.get("nodes", []) or []:
+        if n.get("type") == "agent":
+            return n.get("id")
+    return None
 
-    Delegates to :func:`app.workflow.llm_config.resolve_llm_config`
-    which implements a clean three-stage pipeline: node-schema
-    normalisation → source resolution (inline / named DB / default
-    DB) → credential enrichment (API key or AWS Bedrock).
+def find_code_analyzer_node_id(workflow: Dict[str, Any]) -> Optional[str]:
+    """Return the id of the first Code Crawler node (or None).
+
+    Accepts both dialects (``code_search_tool`` / ``codeAnalyzer``). Used to
+    resolve the model wired to the Code Crawler node's ``lm`` port.
     """
+    from app.workflow.code_analyzer_config import CODE_ANALYZER_NODE_TYPES
+    for n in workflow.get("nodes", []) or []:
+        if n.get("type") in CODE_ANALYZER_NODE_TYPES:
+            return n.get("id")
+    return None
+
+async def resolve_llm_config_for_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve the agent's main LLM config for *workflow*.
+
+    Node-level gateway: if a Language Model node is wired to the agent's ``lm``
+    port, that model wins (per-workflow source of truth). Otherwise fall back to
+    :func:`app.workflow.llm_config.resolve_llm_config` (first LLM node → global
+    "agent" role → first DB row), so unwired/legacy workflows are unchanged.
+    """
+    agent_id = find_agent_node_id(workflow)
+    if agent_id:
+        try:
+            wired = await resolve_llm_config_for_consumer_port(workflow, agent_id, "lm")
+            if wired:
+                logger.info(
+                    "ReactStrategy: agent main model from wired lm port = %s",
+                    wired.get("model"),
+                )
+                return wired
+        except Exception as exc:  # noqa: BLE001 — never break on resolution
+            logger.warning(
+                "ReactStrategy: agent lm-port resolution failed (%s) — falling back",
+                exc,
+            )
     return await resolve_llm_config(workflow)
 
 def get_connected_node_ids(
     workflow: Dict[str, Any],
-    target_type: str,
+    target_type: "str | tuple[str, ...]",
 ) -> List[str]:
     """Return IDs of nodes of *target_type* connected to any ``agent`` node.
 
@@ -37,18 +75,20 @@ def get_connected_node_ids(
 
     Args:
         workflow: Full workflow definition (nodes + edges).
-        target_type: The ``type`` value to look for (e.g. ``"tool"``,
-            ``"cloudwatchAnalyzer"``).
+        target_type: The ``type`` value(s) to look for. Accepts a single string
+            (e.g. ``"tool"``) or a tuple of types (e.g. both code-analyzer
+            dialects).
 
     Returns:
-        List of node IDs of type *target_type* reachable from at least one
-        agent node.
+        List of node IDs whose type matches *target_type*, reachable from at
+        least one agent node.
     """
     nodes = workflow.get("nodes", [])
     edges = workflow.get("edges", [])
 
+    target_types = (target_type,) if isinstance(target_type, str) else tuple(target_type)
     agent_ids = {n["id"] for n in nodes if n.get("type") == "agent"}
-    target_ids = {n["id"] for n in nodes if n.get("type") == target_type}
+    target_ids = {n["id"] for n in nodes if n.get("type") in target_types}
 
     if not agent_ids or not target_ids:
         return []
@@ -134,6 +174,33 @@ def extract_tools_config(workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     return tools
 
+async def resolve_default_tools_config() -> List[Dict[str, Any]]:
+    """Return the gateway's default MCP tool configs for the agent role.
+
+    Reads the ``agent`` MCP role assignment and synthesizes the same tool-config
+    dicts :func:`extract_tools_config` produces. ``setup_tools`` resolves
+    command/args/env from the ``mcp_servers`` DB row by name, so only the name is
+    required here. Used only when a workflow wires no tool nodes; returns ``[]``
+    (and logs a warning) on any error.
+    """
+    try:
+        from app.infrastructure.persistence import mcp_role_repository
+        names = await mcp_role_repository.list_for_role("agent")
+    except Exception as exc:  # noqa: BLE001 — defaults must never break a run
+        logger.warning("ReactStrategy: could not load default MCP servers: %s", exc)
+        return []
+
+    return [
+        {
+            "node_id": f"gateway-{name}",
+            "name": name,
+            "command": None,
+            "args": [],
+            "env": {},
+        }
+        for name in names
+    ]
+
 def extract_cloudwatch_config(
     workflow: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
@@ -211,19 +278,27 @@ def extract_code_analyzer_config(
 ) -> Optional[Dict[str, Any]]:
     """Extract Code Analyzer config from codeAnalyzer nodes connected to the agent.
 
-    Merges repo lists from all connected ``codeAnalyzer`` nodes, deduplicating
-    by repo name.  First occurrence (BFS order) wins on name conflicts.
+    Merges repo lists from all connected code-analyzer nodes (both the
+    ``codeAnalyzer`` and ``code_search_tool`` dialects), deduplicating by repo
+    name.  First occurrence (BFS order) wins on name conflicts.
 
     Returns:
-        Dict with ``repos`` list, or ``None`` if no codeAnalyzer node is connected.
+        Dict with ``repos`` list, or ``None`` if no code-analyzer node is connected.
     """
+    from app.workflow.code_analyzer_config import (
+        CODE_ANALYZER_NODE_TYPES,
+        read_code_analyzer_repos,
+    )
+
     nodes = workflow.get("nodes", [])
-    connected_ids = get_connected_node_ids(workflow, "codeAnalyzer")
+    connected_ids = get_connected_node_ids(workflow, CODE_ANALYZER_NODE_TYPES)
 
     if not connected_ids:
         return None
 
-    ca_nodes = {n["id"]: n for n in nodes if n.get("type") == "codeAnalyzer"}
+    ca_nodes = {
+        n["id"]: n for n in nodes if n.get("type") in CODE_ANALYZER_NODE_TYPES
+    }
 
     merged_repos: List[Dict[str, Any]] = []
     seen_names: Dict[str, str] = {}  # name → first path (for conflict detection)
@@ -231,8 +306,7 @@ def extract_code_analyzer_config(
     for ca_id in connected_ids:
         if ca_id not in ca_nodes:
             continue
-        ca_data = ca_nodes[ca_id].get("data", {})
-        for repo in ca_data.get("repos", []):
+        for repo in read_code_analyzer_repos(ca_nodes[ca_id]):
             rname = repo.get("name", "")
             rpath = repo.get("path", "")
             if not rname:

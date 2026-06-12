@@ -38,6 +38,7 @@ function schedulesMetadataEqual(a, b) {
       x.updatedAt !== y.updatedAt ||
       x.startTime !== y.startTime ||
       x.recurrence !== y.recurrence ||
+      x.indexingStatus !== y.indexingStatus ||
       x.type !== y.type
     ) {
       return false;
@@ -66,6 +67,7 @@ const fromApi = (wf) => {
     workflow: wf.name,
     schedule: wf.schedule,
     enabled: wf.enabled ?? true,
+    indexingStatus: wf.indexing_status ?? null,
     startTime: startTime,
     recurrence: recurrence || wf.recurrence || 'daily',
     nodes: wf.nodes || [],

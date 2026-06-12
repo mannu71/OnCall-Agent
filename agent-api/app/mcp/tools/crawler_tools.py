@@ -118,6 +118,14 @@ async def crawler_node(qualified_name: str, repo: str) -> Dict[str, Any]:
     return await crawler_service.get_node(repo, qualified_name)
 
 
+async def crawler_repo_map(
+    repo: str, name_like: Optional[str] = None, limit: int = 60,
+) -> Dict[str, Any]:
+    from app.services.crawler_service import crawler_service
+
+    return await crawler_service.get_repo_map(repo, name_like=name_like, limit=limit)
+
+
 async def crawler_files(
     repo: str,
     language: Optional[str] = None,

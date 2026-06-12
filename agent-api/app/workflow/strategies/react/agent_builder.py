@@ -16,6 +16,8 @@ def build_agent(
     has_code_analyzer: bool = False,
     checkpointer: Any = None,
     session_id: Optional[str] = None,
+    permission_mode: str = "default",
+    execution_port: Any = None,
 ) -> Any:
     """
     Build a LangGraph ReAct agent graph.
@@ -72,23 +74,54 @@ def build_agent(
     else:
         role_sentence = "You are an expert engineering assistant."
 
-    # ── Base instructions ──────────────────────────────────────────────
-    system_parts = [
-        role_sentence,
-        "Always reason step by step and use the available tools to find accurate answers.",
-        "Present your findings clearly with specific data from the tool results.",
-        "When you reach a useful conclusion or resolution worth reusing, use the save_playbook "
-        "tool to record it so future investigations can benefit from it.",
-        "If the memory-context block at the start of the query lists 'Executable Skill' entries "
+    # ── System prompt assembly ─────────────────────────────────────────
+    # CACHE CONTRACT: this prompt MUST stay deterministic given agent_config.
+    # Never inject recalled memory, retry guidance, timestamps, or any other
+    # run-specific data here — those belong in the query (see strategy.py
+    # `augmented_query`). The composed string is the Bedrock cachePoint prefix
+    # (system + tools), so any per-run variation busts the prompt cache on
+    # every model call. Keep the section order and tool ordering stable too.
+    system_parts = [role_sentence]
+
+    # § Doing tasks — shared discipline that governs every capability below.
+    system_parts.append(
+        "# Doing tasks\n"
+        "- Always reason step by step and call the available tools to get facts — never guess "
+        "or invent data.\n"
+        "- Answer exactly what was asked and back every claim with specific evidence from the "
+        "tool results (repo/file/line, log_group/timestamp, table/column). Don't gold-plate or "
+        "pad with unrequested analysis.\n"
+        "- Stop as soon as the evidence supports a conclusion — every tool call has cost and "
+        "latency, so don't keep digging once you can answer.\n"
+        "- NEVER end a turn by announcing a next step (e.g. 'Let me search…', 'Now I'll check…'). "
+        "If you say you will do something, call the tool in the SAME turn. If a focused search "
+        "finds nothing, say so plainly rather than inventing an answer or trailing off."
+    )
+
+    # § Using your tools — shared steering: prefer the specific tool, reuse work.
+    system_parts.append(
+        "# Using your tools\n"
+        "- Prefer the most specific tool over a generic one, and fetch only what the question "
+        "needs — never read whole files or dump an entire schema when a targeted lookup will do.\n"
+        "- When you reach a useful conclusion or resolution worth reusing, call save_playbook to "
+        "record it so future investigations can benefit from it.\n"
+        "- If the memory-context block at the start of the query lists 'Executable Skill' entries "
         "that match the current issue, prefer calling execute_skill with the skill's name before "
-        "running manual tool calls — this reuses proven remediation steps and is faster.",
-    ]
+        "running manual tool calls — this reuses proven remediation steps and is faster."
+    )
 
     # DB-specific guidance only when SQL/MCP tools are actually present.
     if has_db_tools:
         system_parts.append(
-            "When querying databases, prefer targeted queries over full table scans. "
-            "Use WHERE clauses, date ranges, and LIMIT to avoid expensive full scans."
+            "To find the right table, call db_list_tables(name_like='<keyword>'); if you know a "
+            "column/field but not its table, call db_search_columns(name_like='<column>'); then "
+            "db_describe_table('<table>') for just that table. Do NOT query information_schema "
+            "directly or list the entire schema (it wastes context). With multiple databases "
+            "connected, omit `server` to search all of them at once (results are labelled "
+            "[server]). IMPORTANT: if a filtered lookup returns nothing, broaden or drop the "
+            "name_like and retry before concluding the table/column does not exist — the "
+            "unfiltered list is complete. When querying data, prefer targeted queries over full "
+            "table scans: use WHERE clauses, date ranges, and LIMIT."
         )
 
     # ── CloudWatch instructions (refine, don't redo) ──────────────────────
@@ -109,23 +142,42 @@ def build_agent(
             "Respect data_quality: if it reports partial/sampled results or failed groups, "
             "say so and confirm with a targeted cloudwatch_search_logs before concluding; "
             "if coverage is full and nothing was found, state that explicitly rather than "
-            "implying a problem. Stop as soon as the evidence supports a conclusion — each "
-            "Insights query has cost and latency."
+            "implying a problem."
         )
 
     # ── Code Analyzer instructions (compact) ──────────────────────────
     if has_code_analyzer:
         system_parts.append(
-            "Code analysis tools available over the connected repositories. To find code by "
-            "natural-language description, use crawler_search_semantic(query, repo). If you are "
-            "tracing a specific error message / stack trace / CloudWatch anomaly back to its "
-            "source, crawler_investigate_alert(alert, repo) locates the offending code for that "
-            "alert. To read a specific symbol: crawler_find_symbol(symbol, repo) returns a body "
-            "handle, then crawler_get_body(handle) prints the source. Use "
-            "crawler_trace_path(symbol, repo, direction='callers'|'callees', depth) to follow the call "
-            "graph. Only call crawler_index_repo(repo) if a repository appears unindexed. Pass the exact "
-            "repo name shown in the tool descriptions, and cite repo, file path, symbol, and line in "
-            "your findings."
+            "Code analysis tools are available over the connected repositories. Fetch only what each "
+            "question needs — never read whole files or dump the codebase.\n"
+            "MANDATORY drill-in: whenever a finding (a CloudWatch error pattern, stack trace, log "
+            "line, or alert) names a source location — a file path, file:line (e.g. "
+            "'ReportService.cs:427'), class, method, or symbol — you MUST confirm it in code before "
+            "stating a root cause. Call crawler_investigate_alert(<the error/stack trace>, repo) or "
+            "crawler_find_symbol(<symbol>, repo), then crawler_get_body(handle) to read the "
+            "responsible lines. Do NOT conclude root cause from the log text alone when the code is "
+            "reachable. Map the failing service to its repo by name (e.g. a "
+            "'compliance_kyc-protect-api' log group → the 'compliance-api' repo).\n"
+            "Tool-selection protocol:\n"
+            "1. LOCATE — if you know the symbol name, use crawler_find_symbol(symbol, repo) (exact, "
+            "fastest). If you only have a concept/description, use crawler_search_semantic(query, repo). "
+            "To orient in an unfamiliar repo, crawler_repo_map(repo, name_like=...) gives a cheap "
+            "names-only list. For an error/stack-trace/alert, crawler_investigate_alert(alert, repo).\n"
+            "2. READ — call crawler_get_body(handle) on a returned body_handle to confirm the code "
+            "before citing it. Never conclude from a name alone.\n"
+            "3. TRACE — crawler_trace_path(symbol, repo, direction='callers'|'callees', depth) to follow "
+            "the call graph once you have a symbol.\n"
+            "Only call crawler_index_repo(repo) if a repository appears unindexed. Pass the exact repo "
+            "name shown in the tool descriptions.\n"
+            "When you conclude, cite repo, file path, symbol and line number(s) as evidence.\n"
+            "Implement-feature protocol (when asked to ADD or CHANGE code, not just diagnose): "
+            "1. LOCATE the insertion point with crawler_find_symbol / crawler_repo_map. "
+            "2. READ the surrounding code with crawler_get_body so your change matches the existing "
+            "conventions. 3. APPLY: edit_file for surgical changes to an existing file (old_string "
+            "must be unique); create_file ONLY for a genuinely new file (it fails if the file already "
+            "exists). Keep the change minimal — no drive-by refactors. 4. AFTER applying, summarize "
+            "exactly what changed (file and lines) and tell the user to build/test — you cannot run "
+            "the build yourself."
         )
 
     if instructions:
@@ -142,6 +194,37 @@ def build_agent(
     # Add agent-writable playbook tools so the agent can persist resolutions.
     playbook_tools = build_playbook_tools()
     all_tools = list(tools) + playbook_tools
+
+    # ── Per-tool permission gatekeeping (rules + ask-in-chat) ─────────────
+    # Wrap mutating tools so they are denied / require approval per policy.
+    # Read-only investigation tools pass through unchanged, so the model-facing
+    # schema (and the prompt-cache prefix) is preserved.
+    try:
+        from app.workflow.strategies.react.tool_permissions import wrap_tools_with_permissions
+        all_tools = wrap_tools_with_permissions(
+            all_tools, mode=permission_mode,
+            execution_id=session_id, execution_port=execution_port,
+        )
+        logger.info("ReactStrategy: tool permission gate active (mode=%s)", permission_mode)
+    except Exception as _perm_err:  # noqa: BLE001 — never break a run on the gate
+        logger.warning("ReactStrategy: tool permission wrap skipped (%s)", _perm_err)
+
+    # ── Universal tool-result cap (token safety-net) ──────────────────────
+    # Applied AFTER the permission wrap so the model-facing schema (and the
+    # prompt-cache prefix) is untouched. Caps any single StructuredTool result
+    # that lacks its own per-family cap (db/edit/playbook), so a large dump
+    # can't inflate input cost on every later ReAct iteration. MCP wrappers
+    # and already-capped results are skipped — see wrap_tools_with_output_cap.
+    try:
+        from app.config import settings as _settings
+        from app.workflow.strategies.react.tool_permissions import wrap_tools_with_output_cap
+        all_tools = wrap_tools_with_output_cap(all_tools, _settings.tool_output_max_chars)
+        logger.info(
+            "ReactStrategy: tool-result cap active (max_chars=%d)",
+            _settings.tool_output_max_chars,
+        )
+    except Exception as _cap_err:  # noqa: BLE001 — never break a run on the cap
+        logger.warning("ReactStrategy: tool-result cap skipped (%s)", _cap_err)
 
     # ── Prompt caching (provider-aware) ───────────────────────────────
     # AWS Bedrock (ChatBedrockConverse) is the only live provider. It does
@@ -216,6 +299,16 @@ def build_agent(
             out = await mgr.compact_if_needed(list(msgs))
         except Exception:  # noqa: BLE001 — compaction must never break a run
             out = msgs
+        # Repair any empty-content messages a failed/empty compaction summary
+        # may have produced — Bedrock rejects empty messages ("messages.N: ...
+        # must have non-empty content"), which would hard-fail this model call.
+        # sanitize_messages_for_model is identity-preserving when nothing needs
+        # repair, so the no-op fast path (and prompt cache) below is unaffected.
+        try:
+            from app.workflow.strategies.react.agent_runner import sanitize_messages_for_model
+            out = sanitize_messages_for_model(out)
+        except Exception:  # noqa: BLE001 — a guard must never break a run
+            pass
         if _is_anthropic:
             try:
                 from app.core.prompt_caching import apply_anthropic_cache_control

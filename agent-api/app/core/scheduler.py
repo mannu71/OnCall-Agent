@@ -39,6 +39,29 @@ class WorkflowScheduler:
         self.active_executions: Dict[str, WorkflowExecution] = {}
         self.event_queues: Dict[str, Set[asyncio.Queue]] = {}
         self._running = False
+        # Multi-replica leader election: only the replica holding the advisory
+        # lock fires *scheduled* runs (manual API runs are unaffected). Single
+        # node always wins the lock, so behaviour is unchanged there.
+        self._leader_lock = None
+        self._is_leader = False
+
+    async def _ensure_leader(self) -> bool:
+        """Return True if this replica is the scheduling leader.
+
+        Lazily (re)acquires a Postgres advisory lock; a follower can become
+        leader on a later fire after the previous leader's connection drops.
+        """
+        if self._is_leader:
+            return True
+        try:
+            from app.core.distributed_lock import LeaderLock
+            if self._leader_lock is None:
+                self._leader_lock = LeaderLock("workflow_scheduler")
+            self._is_leader = await self._leader_lock.acquire()
+        except Exception as exc:  # noqa: BLE001 — fail-open for single node
+            logger.warning("scheduler: leader check failed (%s) — assuming leader", exc)
+            self._is_leader = True
+        return self._is_leader
 
     def start(self):
         """Start the scheduler and load workflows."""
@@ -142,7 +165,15 @@ class WorkflowScheduler:
             logger.debug(f"Workflow '{workflow_name}' was not scheduled")
 
     async def _execute_workflow_wrapper(self, workflow_name: str):
-        """Wrapper for workflow execution to handle async."""
+        """Wrapper for a *scheduled* workflow fire (cron-triggered)."""
+        # Only the leader replica fires scheduled runs, so a multi-replica
+        # deployment doesn't double-execute the same cron. Manual API runs go
+        # through execute_workflow() directly and are never gated.
+        if not await self._ensure_leader():
+            logger.debug(
+                "scheduler: not leader — skipping scheduled run of '%s'", workflow_name
+            )
+            return
         try:
             await self.execute_workflow(workflow_name)
         except Exception as e:

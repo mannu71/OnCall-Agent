@@ -525,3 +525,104 @@ async def crawl_local_files(
 
     logger.info("Crawled %d files from '%s'", len(files), repo_name)
     return sorted(files, key=lambda t: t[0])
+
+
+# ---------------------------------------------------------------------------
+# Snippet extraction — reduce file bodies to the lines that matter for an LLM
+# search prompt, so the search flows don't pay tokens on whole files.
+# ---------------------------------------------------------------------------
+
+# Common natural-language filler that would otherwise match half the file and
+# defeat the point of windowing. Identifiers (authenticate, UserService, …) are
+# what we actually want to anchor on.
+_QUERY_STOPWORDS: Set[str] = {
+    "the", "is", "are", "was", "were", "a", "an", "of", "to", "in", "on", "for",
+    "and", "or", "not", "how", "does", "do", "did", "where", "what", "which",
+    "when", "why", "who", "this", "that", "these", "those", "with", "from", "by",
+    "find", "show", "list", "get", "set", "use", "used", "using", "via", "code",
+    "file", "files", "function", "functions", "class", "classes", "method",
+    "methods", "handle", "handled", "handling", "implement", "implements",
+    "implementation", "logic", "all", "any", "some", "into", "out", "about",
+}
+
+
+def derive_search_terms(query: str, *, max_terms: int = 8, min_len: int = 3) -> List[str]:
+    """Extract identifier-like anchor terms from a natural-language *query*.
+
+    Keeps tokens of length ≥ *min_len* that aren't common English filler, so
+    snippet windows anchor on meaningful symbols (``authenticate``,
+    ``UserService``) rather than stopwords. Order-preserving and de-duplicated.
+    """
+    import re
+
+    terms: List[str] = []
+    seen: Set[str] = set()
+    for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]{%d,}" % (min_len - 1), query or ""):
+        low = tok.lower()
+        if low in _QUERY_STOPWORDS or low in seen:
+            continue
+        seen.add(low)
+        terms.append(tok)
+        if len(terms) >= max_terms:
+            break
+    return terms
+
+
+def _number_lines(lines: List[str], start: int = 1) -> str:
+    return "\n".join(f"{start + i}: {ln}" for i, ln in enumerate(lines))
+
+
+def extract_snippets(
+    content: str,
+    terms: List[str],
+    *,
+    window: int = 40,
+    max_chars: int = 80_000,
+    min_term_len: int = 3,
+) -> str:
+    """Reduce a file body to the line-numbered regions relevant to *terms*.
+
+    Returns 1-based line-numbered windows (±*window* lines) around every line
+    that lexically matches any term (case-insensitive), merging overlapping
+    windows and inserting ``... [N lines omitted] ...`` markers for the gaps.
+    The line numbers reflect the TRUE file position, so a model can cite exact
+    lines even though intervening content is elided — this is what keeps the
+    downstream on-disk line verification passing.
+
+    Falls back to the line-numbered file head (first ``2*window`` lines) when no
+    term matches; signatures, imports and docstrings live there. Hard-capped at
+    *max_chars*.
+    """
+    if not content:
+        return content
+    lines = content.splitlines()
+
+    usable = [t.lower() for t in terms if t and len(t) >= min_term_len]
+    if not usable:
+        return _number_lines(lines[: 2 * window])[:max_chars]
+
+    hits = [i for i, ln in enumerate(lines) if any(t in ln.lower() for t in usable)]
+    if not hits:
+        return _number_lines(lines[: 2 * window])[:max_chars]
+
+    ranges: List[Tuple[int, int]] = []
+    for h in hits:
+        lo = max(0, h - window)
+        hi = min(len(lines), h + window + 1)
+        if ranges and lo <= ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], hi))
+        else:
+            ranges.append((lo, hi))
+
+    out: List[str] = []
+    prev_hi = 0
+    for lo, hi in ranges:
+        if lo > prev_hi:
+            out.append(f"... [{lo - prev_hi} lines omitted] ...")
+        for i in range(lo, hi):
+            out.append(f"{i + 1}: {lines[i]}")
+        prev_hi = hi
+    if prev_hi < len(lines):
+        out.append(f"... [{len(lines) - prev_hi} lines omitted] ...")
+
+    return "\n".join(out)[:max_chars]

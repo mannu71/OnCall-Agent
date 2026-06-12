@@ -30,8 +30,10 @@ services:
     volumes:
       - ./data:/app/data
       - ~/.aws:/root/.aws:ro
-      # Host path mounted read-only for the code analyzer (set REPOS_HOST_PATH in .env).
-      - ${REPOS_HOST_PATH}:/app/data/indexed_repos:ro
+      # Host path for the code analyzer (set REPOS_HOST_PATH in .env). Mounted
+      # READ-WRITE so the gated edit_file tool can apply approved fixes; every
+      # edit still requires operator approval via the permission gate.
+      - ${REPOS_HOST_PATH}:/app/data/indexed_repos
     environment:
       - API_HOST=0.0.0.0
       - API_PORT=8000

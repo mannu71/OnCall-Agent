@@ -159,6 +159,8 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
             'status': 'success',
             'output': result.get('final_answer', 'Agent completed (no answer returned).'),
             'final_answer': result.get('final_answer'),
+            'structured_output': result.get('structured_output'),
+            'output_mode': result.get('output_mode', 'text'),
             'messages': result.get('messages', []),
             'message_count': result.get('message_count', 0),
             'tool_calls': result.get('tool_calls', []),

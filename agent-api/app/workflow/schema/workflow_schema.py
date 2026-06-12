@@ -1,0 +1,146 @@
+"""Workflow node-graph dialect handling and save-time validation.
+
+Two node dialects coexist (see the project memory ``project_node_dialects``):
+legacy ReactFlow stores config under ``node.data.*`` (``codeAnalyzer``,
+``cloudwatchAnalyzer``, ``logGroups`` …); the newer LangflowEditor stores it
+under ``node.params.*`` (``code_search_tool``, ``cloudwatch_tool``, ``groups`` …).
+
+This module provides:
+
+  * :func:`get_node_param` — single dialect-agnostic accessor (params first,
+    then data) so every reader uses one rule.
+  * :func:`normalize_workflow_dialect` — NON-DESTRUCTIVE save-time normalization:
+    guarantees ``params`` is populated from ``data`` where missing, while leaving
+    ``data`` intact so existing legacy readers keep working ("normalize on save,
+    accept both on read").
+  * :func:`validate_workflow` — per-node-type required-field checks, reusing the
+    existing dialect-aware readers where they already exist. Returns a list of
+    human-readable errors (empty == valid); the API layer turns a non-empty list
+    into a 400.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
+
+
+def get_node_param(node: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """Return the first present value for *keys*, checking ``params`` then ``data``.
+
+    Example: ``get_node_param(node, "serverName", "server_name")``.
+    """
+    params = node.get("params") or {}
+    data = node.get("data") or {}
+    for key in keys:
+        if key in params and params[key] not in (None, ""):
+            return params[key]
+    for key in keys:
+        if key in data and data[key] not in (None, ""):
+            return data[key]
+    return default
+
+
+def normalize_workflow_dialect(workflow_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure every node's ``params`` is populated from legacy ``data`` (in place).
+
+    Non-destructive: copies keys from ``data`` into ``params`` only when the key
+    is absent from ``params``; never deletes ``data``. This means a workflow saved
+    by the legacy editor becomes readable by ``params``-based readers without
+    breaking anything that still reads ``data``.
+    """
+    nodes = workflow_dict.get("nodes")
+    if not isinstance(nodes, list):
+        return workflow_dict
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        data = node.get("data")
+        if not isinstance(data, dict) or not data:
+            continue
+        params = node.get("params")
+        if not isinstance(params, dict):
+            params = {}
+            node["params"] = params
+        for key, value in data.items():
+            params.setdefault(key, value)
+    return workflow_dict
+
+
+# Node type groupings (both dialects).
+_AGENT_TYPES = ("agent",)
+_LLM_TYPES = ("llm", "language_model")
+_TOOL_TYPES = ("tool",)
+_CLOUDWATCH_TYPES = ("cloudwatchAnalyzer", "cloudwatch_tool")
+_CODE_TYPES = ("codeAnalyzer", "code_search_tool")
+
+
+def validate_workflow(workflow_dict: Dict[str, Any]) -> List[str]:
+    """Validate per-node required config. Returns a list of error strings."""
+    errors: List[str] = []
+    nodes = workflow_dict.get("nodes")
+    if not isinstance(nodes, list):
+        return errors  # structural emptiness handled elsewhere
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        ntype = node.get("type")
+        label = (
+            get_node_param(node, "label")
+            or node.get("name")
+            or f"{ntype or 'node'} {node.get('id', '?')}"
+        )
+
+        if ntype in _CLOUDWATCH_TYPES:
+            if not _cloudwatch_has_groups(node):
+                errors.append(f"CloudWatch node '{label}' has no log groups configured.")
+
+        elif ntype in _CODE_TYPES:
+            if not _code_has_repos(node):
+                errors.append(f"Code analyzer node '{label}' has no repositories configured.")
+
+        elif ntype in _TOOL_TYPES:
+            server = get_node_param(node, "serverName", "server_name", "name")
+            command = get_node_param(node, "command")
+            if not server and not command:
+                errors.append(f"Tool node '{label}' has no MCP server selected.")
+
+        elif ntype in _LLM_TYPES:
+            # The unified language_model node references an LLM *config* (by id or
+            # name) rather than a raw model string — accept all of those keys, in
+            # both dialects, matching how the executor resolves the LLM.
+            model = get_node_param(
+                node, "model", "modelId", "model_id", "modelName",
+                "configName", "llmConfigId", "llm",
+            )
+            if not model:
+                errors.append(f"LLM node '{label}' has no model selected.")
+
+    return errors
+
+
+def _cloudwatch_has_groups(node: Dict[str, Any]) -> bool:
+    """Reuse the canonical CloudWatch config reader to check for log groups."""
+    try:
+        from app.workflow.executor.handlers.cloudwatch import _read_cw_config
+        cfg = _read_cw_config(node)
+        return bool(cfg.get("log_groups"))
+    except Exception as exc:  # noqa: BLE001 — fall back to a direct read
+        logger.debug("validate_workflow: _read_cw_config failed (%s); direct read", exc)
+        raw = get_node_param(node, "groups", "logGroups", default=[])
+        if isinstance(raw, str):
+            return any(g.strip() for g in raw.split(","))
+        return bool(raw)
+
+
+def _code_has_repos(node: Dict[str, Any]) -> bool:
+    """Reuse the canonical code-analyzer repo reader (handles both dialects)."""
+    try:
+        from app.workflow.code_analyzer_config import read_code_analyzer_repos
+        return bool(read_code_analyzer_repos(node))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("validate_workflow: read_code_analyzer_repos failed (%s)", exc)
+        return bool(get_node_param(node, "repos", default=None))

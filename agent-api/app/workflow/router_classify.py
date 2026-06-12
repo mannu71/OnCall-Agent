@@ -159,7 +159,7 @@ async def classify_route(
         execution_id=execution_id,
     )
 
-    _, lm_connected = find_llm_node_for_consumer(workflow, router_id)
+    _, _, lm_connected = find_llm_node_for_consumer(workflow, router_id)
 
     return ClassifyResult(
         selected_key=selected_key,

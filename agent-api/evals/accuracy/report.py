@@ -70,8 +70,34 @@ def render(agg: Dict[str, Any]) -> str:
     add("- **id_grounding** is the hallucination detector: fraction of ID-like tokens in "
         "the narrative that actually appear in the evidence. 100% = no fabricated IDs.\n")
 
+    t = agg.get("trajectory") or {}
+    if t.get("objective_n"):
+        add("## Agent trajectory (end-to-end)\n")
+        add("Runs the REAL ReAct agent with CloudWatch (faked at the data layer over recorded "
+            "fixtures) and/or the live crawler attached, then grades — deterministically — which "
+            "tool family it reached for, whether it followed the locate→read→trace / "
+            "drill-don't-rescan protocol, the correctness of the final answer, and ID-grounding "
+            "of that answer. Because the agent LLM is non-deterministic, a missing case is retried "
+            "once and the better run kept.\n")
+        add(f"Objective accuracy: **{_pct(t['objective_accuracy'])}** "
+            f"({t['objective_passed']}/{t['objective_n']} checks; {t.get('retried', 0)} case-rows retried).\n")
+        add("| Metric | Accuracy | Passed |")
+        add("|---|---|---|")
+        for metric, s in (t.get("by_metric") or {}).items():
+            add(f"| {metric} | {_pct(s['mean'])} | {s['passed']}/{s['n']} |")
+        add("")
+
+    lk = agg.get("lookup") or {}
+    if lk.get("n"):
+        add("## Lazy-lookup recall\n")
+        add("Deterministic check that the token-saving lookups (repo_map / db_list_tables / "
+            "db_search_columns) still surface the correct symbol/table without seeing the whole "
+            "codebase or schema.\n")
+        add(f"Recall accuracy: **{_pct(lk['objective_accuracy'])}** ({lk['passed']}/{lk['n']}).\n")
+
     add("## Sub-perfect cases\n")
-    fails = _fail_rows(c["rows"]) + _fail_rows(w["rows"])
+    fails = _fail_rows(c["rows"]) + _fail_rows(w["rows"]) \
+        + _fail_rows(t.get("rows") or []) + _fail_rows(lk.get("rows") or [])
     if not fails:
         add("_None on objective metrics._\n")
     else:

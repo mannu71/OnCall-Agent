@@ -9,11 +9,13 @@ from app.workflow.execution_port import ExecutionPort
 logger = logging.getLogger(__name__)
 
 async def make_checkpointer() -> Any:
-    """Create an AsyncPostgresSaver connected to the app database.
+    """Create a LangGraph checkpointer for the agent graph.
 
-    Returns None (gracefully) if the dependency is not installed or the
-    connection fails — the agent still runs without crash-safe state in
-    that case.
+    Prefers a crash-safe ``AsyncPostgresSaver``; if that package is unavailable
+    or fails to connect, falls back to an in-process ``InMemorySaver`` rather
+    than ``None``. A checkpointer is required for HITL resume AND for recovering
+    the partial conversation when the ReAct loop hits its recursion limit, so we
+    always provide one (single-worker deployment → in-memory state is fine).
     """
     try:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -29,10 +31,22 @@ async def make_checkpointer() -> Any:
         return checkpointer
     except Exception as exc:
         logger.warning(
-            "ReactStrategy: AsyncPostgresSaver unavailable — running without checkpointer: %s",
-            exc,
+            "ReactStrategy: AsyncPostgresSaver unavailable (%s) — falling back to in-memory "
+            "checkpointer", exc,
         )
-        return None
+        try:
+            from langgraph.checkpoint.memory import InMemorySaver
+            return InMemorySaver()
+        except Exception:  # pragma: no cover — very old langgraph
+            try:
+                from langgraph.checkpoint.memory import MemorySaver
+                return MemorySaver()
+            except Exception as mem_exc:  # noqa: BLE001
+                logger.warning(
+                    "ReactStrategy: in-memory checkpointer also unavailable (%s) — "
+                    "running without checkpointer", mem_exc,
+                )
+                return None
 
 # ------------------------------------------------------------------
 # HITL pause helper

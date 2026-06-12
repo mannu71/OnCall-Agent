@@ -8,6 +8,7 @@ from typing import Any, Dict
 from app.config import settings
 from app.core.security import check_path, PathJailError
 from app.services.crawler_service import crawler_service
+from app.workflow.code_analyzer_config import read_code_analyzer_repos
 
 from . import register
 
@@ -17,8 +18,9 @@ _WIN_ABS_RE = re.compile(r'^[A-Za-z]:[/\\]')
 
 
 @register("codeAnalyzer")
+@register("code_search_tool")
 async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-    """Execute a Code Analyzer node."""
+    """Execute a Code Analyzer node (both ``codeAnalyzer`` and ``code_search_tool``)."""
     try:
         from app.core.security import scan_injection, InjectionError
     except ImportError:
@@ -29,8 +31,10 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
             pass
 
     node_data = node.get('data', {})
-    repos = node_data.get('repos', [])
-    pre_summary = node_data.get('preSummary', False)
+    node_params = node.get('params', {})
+    # Accept both dialects: data.repos (list) and params.repos (string).
+    repos = read_code_analyzer_repos(node)
+    pre_summary = node_data.get('preSummary', node_params.get('preSummary', False))
     repos_base_path = settings.repos_base_path
 
     if not repos:
@@ -70,14 +74,18 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
                 'error': f'Injection detected in repo config: {exc}',
                 'code_analysis_type': 'pre_summary',
             }
-        try:
-            check_path(repo.get('path', ''), jail=repos_base_path)
-        except PathJailError as exc:
-            return {
-                'status': 'failed',
-                'error': f'Repo path outside allowed root ({repos_base_path}): {exc}',
-                'code_analysis_type': 'pre_summary',
-            }
+        # Name-only repos (the LangflowEditor dialect) carry no explicit path —
+        # they resolve under REPOS_BASE_PATH downstream, so only jail-check an
+        # explicit path when one is provided.
+        if repo.get('path'):
+            try:
+                check_path(repo.get('path', ''), jail=repos_base_path)
+            except PathJailError as exc:
+                return {
+                    'status': 'failed',
+                    'error': f'Repo path outside allowed root ({repos_base_path}): {exc}',
+                    'code_analysis_type': 'pre_summary',
+                }
 
     repo_names = [repo.get("name", "") for repo in repos if repo.get("name")]
     unindexed = await crawler_service.filter_unindexed_repos(repo_names)
@@ -103,8 +111,9 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
             or inputs.get('user_query', '')[:200]
         )
         if search_query:
-            from app.services.crawler_service import crawler_service
-
+            # crawler_service is already imported at module scope; re-importing
+            # here would make it a function-local name and shadow the earlier
+            # use above (UnboundLocalError).
             search_concurrency = settings.code_analyzer_search_concurrency
             search_sem = asyncio.Semaphore(search_concurrency)
 

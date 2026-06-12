@@ -47,19 +47,39 @@ def _clear_schedule_fields(workflow_dict: Dict[str, Any]) -> None:
     logger.info("[SYNC] No scheduler node found, clearing schedule")
 
 
+#: Schedule-node weekday label → cron day-of-week number (Sun=0 … Sat=6).
+_DOW_NUM = {'Mon': '1', 'Tue': '2', 'Wed': '3', 'Thu': '4', 'Fri': '5', 'Sat': '6', 'Sun': '0'}
+
+
+def _days_to_cron_dow(days: Any) -> str:
+    """Map the Schedule node's ``days`` ("Mon,Tue,…") to a cron day-of-week field.
+
+    Empty or all-seven selections → ``*`` (every day). Order-independent.
+    """
+    parts = [d.strip() for d in str(days or '').split(',') if d.strip()]
+    nums = [_DOW_NUM[d] for d in parts if d in _DOW_NUM]
+    if not nums or len(set(nums)) == 7:
+        return '*'
+    # Preserve Mon→Sun order for readability.
+    ordered = [_DOW_NUM[d] for d in ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
+               if _DOW_NUM[d] in nums]
+    return ','.join(ordered)
+
+
 def _params_to_cron(params: Dict[str, Any]) -> Optional[str]:
     """Convert new-schema Schedule node params to a UTC cron expression.
 
     New Schedule node stores: ``params.frequency``, ``params.time`` (HH:MM local),
-    ``params.tz`` (IANA timezone), ``params.days`` (unused for now).
+    ``params.days`` ("Mon,Tue,…"). The timezone is the operator-configured GLOBAL
+    timezone (Settings page) — the node no longer carries its own tz.
     """
     from app.core.app_timezone import get_global_timezone_name
 
     frequency = (params.get('frequency') or 'Daily').strip()
     time_str = params.get('time') or '09:00'
-    # Fall back to the operator-configured global timezone when the Schedule
-    # node doesn't pin its own tz, instead of assuming UTC.
-    tz_str = params.get('tz') or get_global_timezone_name()
+    # Timezone is global (Settings → global_timezone), not per-node. Any legacy
+    # ``params.tz`` is intentionally ignored so all schedules share one tz.
+    tz_str = get_global_timezone_name()
 
     freq_lower = frequency.lower()
 
@@ -73,7 +93,7 @@ def _params_to_cron(params: Dict[str, Any]) -> Optional[str]:
     if freq_lower == 'hourly':
         return '0 * * * *'
 
-    # Time-based frequencies — convert local time in tz to UTC
+    # Time-based frequencies — convert local time in the global tz to UTC
     try:
         hour, minute = (int(p) for p in time_str.split(':'))
     except (ValueError, AttributeError):
@@ -87,12 +107,15 @@ def _params_to_cron(params: Dict[str, Any]) -> Optional[str]:
     except Exception:
         utc_hour, utc_minute = hour, minute
 
-    if freq_lower == 'weekly':
-        return f'{utc_minute} {utc_hour} * * 1'
     if freq_lower == 'monthly':
         return f'{utc_minute} {utc_hour} 1 * *'
-    # Daily (default)
-    return f'{utc_minute} {utc_hour} * * *'
+
+    # Daily / Weekly both honour the selected days-of-week. Weekly with no day
+    # selected defaults to Monday; Daily with none → every day.
+    dow = _days_to_cron_dow(params.get('days'))
+    if freq_lower == 'weekly' and dow == '*':
+        dow = '1'
+    return f'{utc_minute} {utc_hour} * * {dow}'
 
 
 def _frequency_to_recurrence(frequency: str) -> str:
@@ -251,6 +274,24 @@ def _validate_orchestrator_nodes(workflow_dict: Dict[str, Any]) -> None:
         )
 
 
+def _normalize_and_validate(workflow_dict: Dict[str, Any]) -> None:
+    """Normalize node dialect (data.* → params.*) and validate required config.
+
+    Normalization is non-destructive; validation raises HTTP 400 with the list of
+    field-level problems when a node is missing required config (e.g. a CloudWatch
+    node with no log groups, a code analyzer node with no repos).
+    """
+    from app.workflow.schema import normalize_workflow_dialect, validate_workflow
+
+    normalize_workflow_dialect(workflow_dict)
+    errors = validate_workflow(workflow_dict)
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"message": "Workflow validation failed", "errors": errors},
+        )
+
+
 @router.get("", response_model=List[WorkflowResponse])
 async def list_workflows(
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
@@ -288,10 +329,15 @@ async def create_workflow(
     
     now = _get_now_timestamp()
     workflow_dict = workflow_data.model_dump()
-    
+
+    # Normalize legacy data.* → params.* (non-destructive) then validate per-node
+    # required config so a structurally-invalid workflow fails fast at save time
+    # rather than mid-execution.
+    _normalize_and_validate(workflow_dict)
+
     # Validate orchestrator nodes have SQL files
     _validate_orchestrator_nodes(workflow_dict)
-    
+
     # Sync scheduler node and fields
     _sync_scheduler_node(workflow_dict)
     
@@ -323,7 +369,12 @@ async def update_workflow(
     workflow_dict = {**existing_workflow, **update_data}
     
     logger.info(f"[UPDATE] Updating workflow '{workflow_name}'")
-    
+
+    # Normalize legacy data.* → params.* (non-destructive) then validate per-node
+    # required config (only when this update carries nodes).
+    if 'nodes' in workflow_dict:
+        _normalize_and_validate(workflow_dict)
+
     # Validate orchestrator nodes have SQL files
     _validate_orchestrator_nodes(workflow_dict)
     
@@ -382,16 +433,23 @@ async def update_workflow(
 
 
 async def _extract_unindexed_repos(workflow_dict: dict) -> list:
-    """Return repo names from codeAnalyzer nodes not yet in repo_abstractions."""
+    """Return repo names from code-analyzer nodes not yet in repo_abstractions.
+
+    Accepts both node dialects (``codeAnalyzer`` with ``data.repos`` list and
+    ``code_search_tool`` with ``params.repos`` string) via the shared parser.
+    """
     from app.services.crawler_service import crawler_service
+    from app.workflow.code_analyzer_config import (
+        CODE_ANALYZER_NODE_TYPES,
+        read_code_analyzer_repos,
+    )
 
     repo_names: list = []
     for node in workflow_dict.get("nodes") or []:
-        if node.get("type") == "codeAnalyzer":
-            for r in node.get("data", {}).get("repos") or []:
-                name = r.get("name") if isinstance(r, dict) else r
-                if name:
-                    repo_names.append(name)
+        if node.get("type") in CODE_ANALYZER_NODE_TYPES:
+            for r in read_code_analyzer_repos(node):
+                if r["name"]:
+                    repo_names.append(r["name"])
 
     return await crawler_service.filter_unindexed_repos(repo_names)
 
@@ -556,6 +614,8 @@ async def execute_workflow(
     background: bool = False,
     query: Optional[str] = None,
     input: Optional[str] = None,
+    output_mode: Optional[str] = None,
+    permission_mode: Optional[str] = None,
     inputs: Optional[Dict[str, Any]] = Body(None),
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
 ):
@@ -570,6 +630,12 @@ async def execute_workflow(
     _typed_query = query or input
     if _typed_query:
         inputs = {**(inputs or {}), "user_query": _typed_query}
+    if output_mode:
+        # "Data Query Mode" — agent returns a validated InvestigationReport too.
+        inputs = {**(inputs or {}), "output_mode": output_mode}
+    if permission_mode:
+        # Tool gatekeeping: default | auto_allow | plan.
+        inputs = {**(inputs or {}), "permission_mode": permission_mode}
 
     workflow = await workflow_repo.get_by_name(workflow_name)
     if not workflow:

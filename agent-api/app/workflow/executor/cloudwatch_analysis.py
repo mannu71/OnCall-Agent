@@ -674,6 +674,29 @@ async def analyze_cloudwatch_with_llm(
         analysis_text: Optional[str] = None
         input_tokens = 0
         output_tokens = 0
+        cache_read_tokens = 0
+        raw_msg: Any = None
+
+        def _cache_read(usage: Any) -> int:
+            """Pull cache-read tokens out of a LangChain usage_metadata dict."""
+            if not isinstance(usage, dict):
+                return 0
+            details = usage.get('input_token_details') or {}
+            return (details.get('cache_read', 0) if isinstance(details, dict) else 0) or 0
+
+        def _coerce_message_text(content: Any) -> str:
+            """Flatten an AIMessage.content (str or content-block list) to text."""
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                        parts.append(block["text"])
+                    elif isinstance(block, str):
+                        parts.append(block)
+                return "".join(parts)
+            return str(content) if content else ""
 
         if provider in _structured_providers:
             try:
@@ -684,36 +707,55 @@ async def analyze_cloudwatch_with_llm(
                     structured_llm.ainvoke(messages),
                     timeout=60.0,
                 )
-                parsed: CloudWatchAnalysisSummary = (
+                parsed: Optional[CloudWatchAnalysisSummary] = (
                     llm_raw.get('parsed') if isinstance(llm_raw, dict) else llm_raw
                 )
                 raw_msg = llm_raw.get('raw') if isinstance(llm_raw, dict) else None
                 usage = getattr(raw_msg, 'usage_metadata', None) or {}
                 input_tokens += usage.get('input_tokens', 0)
                 output_tokens += usage.get('output_tokens', 0)
-                _clamp_severity_for_weak_evidence(parsed, raw_result)
-                structured_analysis = parsed.model_dump()
-                analysis_text = (
-                    f"**{parsed.headline}**\n\n"
-                    f"Severity: {parsed.severity.upper()} (confidence: {parsed.confidence})\n\n"
-                    f"**Key Findings:**\n"
-                    + "\n".join(f"- {f}" for f in parsed.key_findings)
-                    + f"\n\n**Primary Hypothesis:** {parsed.primary_hypothesis}\n\n"
-                    f"**Recommended Actions:**\n"
-                    + "\n".join(f"{i+1}. {a}" for i, a in enumerate(parsed.recommended_actions))
-                    + (
-                        f"\n\n**Related Services:** {', '.join(parsed.related_services)}"
-                        if parsed.related_services else ""
+                cache_read_tokens += _cache_read(usage)
+                if parsed is not None:
+                    _clamp_severity_for_weak_evidence(parsed, raw_result)
+                    structured_analysis = parsed.model_dump()
+                    analysis_text = (
+                        f"**{parsed.headline}**\n\n"
+                        f"Severity: {parsed.severity.upper()} (confidence: {parsed.confidence})\n\n"
+                        f"**Key Findings:**\n"
+                        + "\n".join(f"- {f}" for f in parsed.key_findings)
+                        + f"\n\n**Primary Hypothesis:** {parsed.primary_hypothesis}\n\n"
+                        f"**Recommended Actions:**\n"
+                        + "\n".join(f"{i+1}. {a}" for i, a in enumerate(parsed.recommended_actions))
+                        + (
+                            f"\n\n**Related Services:** {', '.join(parsed.related_services)}"
+                            if parsed.related_services else ""
+                        )
                     )
-                )
-                logger.info(
-                    "CloudWatch structured LLM analysis complete (severity=%s, model=%s, tokens=%d)",
-                    parsed.severity, model_name, input_tokens + output_tokens,
-                )
+                    logger.info(
+                        "CloudWatch structured LLM analysis complete (severity=%s, model=%s, "
+                        "tokens=%d, cache_read=%d)",
+                        parsed.severity, model_name, input_tokens + output_tokens,
+                        cache_read_tokens,
+                    )
             except Exception as struct_err:
                 logger.warning(
                     "CloudWatch structured output failed, falling back to free-form: %s",
                     struct_err,
+                )
+
+        # Reuse the structured call's raw response instead of paying for a second
+        # free-form call. When schema validation fails (parsed is None) the model
+        # often still emitted usable prose in the raw message — format that
+        # directly. The second call is only issued when the first produced no
+        # usable text at all (e.g. it errored/timed out before responding).
+        if analysis_text is None and raw_msg is not None:
+            raw_text = _coerce_message_text(getattr(raw_msg, 'content', None))
+            if raw_text.strip():
+                analysis_text = raw_text
+                logger.info(
+                    "CloudWatch synthesis: reused structured raw text (%d chars, model=%s) — "
+                    "skipped free-form fallback call",
+                    len(raw_text), model_name,
                 )
 
         if analysis_text is None:
@@ -734,11 +776,14 @@ async def analyze_cloudwatch_with_llm(
             usage = getattr(response, 'usage_metadata', None) or {}
             input_tokens += usage.get('input_tokens', 0)
             output_tokens += usage.get('output_tokens', 0)
-            analysis_text = str(response.content) if response.content else None
+            cache_read_tokens += _cache_read(usage)
+            analysis_text = _coerce_message_text(response.content) or None
             if analysis_text:
                 logger.info(
-                    "CloudWatch free-form LLM analysis complete (%d chars, model=%s, tokens=%d)",
+                    "CloudWatch free-form LLM analysis complete (%d chars, model=%s, "
+                    "tokens=%d, cache_read=%d)",
                     len(analysis_text), model_name, input_tokens + output_tokens,
+                    cache_read_tokens,
                 )
 
         # Feed the guardrail circuit breaker: a refusal/empty synthesis trips it

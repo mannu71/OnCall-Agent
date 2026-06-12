@@ -101,14 +101,18 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
         if (!last) return;
 
         const data = last.data || last.payload || last;
-        const toolName = data.tool_name || null;
+        // Backend (tool_permissions.py) publishes `tool` + `args`; older/HITL
+        // synthesis events may use `tool_name`/`tool_params`. Accept both so the
+        // approval card always renders the real tool name + arguments.
+        const toolName = data.tool || data.tool_name || null;
+        const toolParams = data.args || data.tool_params || null;
         const newRequest = {
             requestId: data.request_id,
             executionId: data.execution_id || executionId,
-            rootCause: data.root_cause || data.draft_answer || 'Analysis complete.',
+            rootCause: data.root_cause || data.message || data.draft_answer || 'Analysis complete.',
             suggestions: Array.isArray(data.suggestions) ? data.suggestions : [],
             toolName,
-            toolParams: data.tool_params || null,
+            toolParams,
         };
         setHitlRequest(newRequest);
         setDecision(null);
@@ -261,12 +265,46 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
                         </p>
                         <div className="rounded-md bg-muted p-2 font-mono text-xs">
                             <span className="text-blue-600">{hitlRequest.toolName}</span>
-                            {hitlRequest.toolParams && (
-                                <span className="text-muted-foreground ml-1">
-                                    ({JSON.stringify(hitlRequest.toolParams)})
-                                </span>
-                            )}
                         </div>
+
+                        {/* edit_file → show the diff; other tools → key/value list */}
+                        {hitlRequest.toolName === 'edit_file' && hitlRequest.toolParams ? (
+                            <div className="mt-1.5 space-y-1.5 text-[11px]">
+                                {hitlRequest.toolParams.repo && (
+                                    <div className="text-muted-foreground">
+                                        <span className="font-semibold">Repo:</span>{' '}
+                                        <span className="font-mono">{hitlRequest.toolParams.repo}</span>
+                                    </div>
+                                )}
+                                {hitlRequest.toolParams.file && (
+                                    <div className="text-muted-foreground">
+                                        <span className="font-semibold">File:</span>{' '}
+                                        <span className="font-mono">{hitlRequest.toolParams.file}</span>
+                                    </div>
+                                )}
+                                {hitlRequest.toolParams.old_string !== undefined && (
+                                    <div>
+                                        <div className="font-semibold text-red-700 mb-0.5">− Replace</div>
+                                        <pre className="max-h-28 overflow-auto rounded bg-red-50 border border-red-200 p-2 font-mono text-red-800 whitespace-pre-wrap">{hitlRequest.toolParams.old_string}</pre>
+                                    </div>
+                                )}
+                                {hitlRequest.toolParams.new_string !== undefined && (
+                                    <div>
+                                        <div className="font-semibold text-emerald-700 mb-0.5">+ With</div>
+                                        <pre className="max-h-28 overflow-auto rounded bg-emerald-50 border border-emerald-200 p-2 font-mono text-emerald-800 whitespace-pre-wrap">{hitlRequest.toolParams.new_string}</pre>
+                                    </div>
+                                )}
+                            </div>
+                        ) : (hitlRequest.toolParams && Object.keys(hitlRequest.toolParams).length > 0 && (
+                            <div className="mt-1.5 space-y-1 text-[11px]">
+                                {Object.entries(hitlRequest.toolParams).map(([k, v]) => (
+                                    <div key={k} className="flex gap-1.5">
+                                        <span className="font-semibold text-muted-foreground flex-shrink-0">{k}:</span>
+                                        <span className="font-mono break-all">{typeof v === 'string' ? v : JSON.stringify(v)}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        ))}
                     </div>
                 )}
 

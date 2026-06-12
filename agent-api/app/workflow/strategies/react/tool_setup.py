@@ -27,9 +27,24 @@ async def setup_tools(
     """
     from app.workflow.mcp.mcp_langchain_adapter import build_langchain_tools
 
+    # Track server names already wired so a workflow with two tool nodes pointing
+    # at the SAME MCP server doesn't silently connect/overwrite it twice (which
+    # yields duplicate tool names the agent can't disambiguate). First wins; the
+    # duplicate is logged and skipped.
+    _seen_servers: set = set()
+
     for tool_config in tools_config:
         server_name = tool_config["name"]
         node_id = tool_config.get("node_id", server_name)
+
+        if server_name in _seen_servers:
+            logger.warning(
+                "ReactStrategy: duplicate MCP server '%s' in workflow — already "
+                "wired, skipping the duplicate tool node (node_id=%s)",
+                server_name, node_id,
+            )
+            continue
+        _seen_servers.add(server_name)
 
         # Resolve command from DB if not inline
         if not tool_config.get("command"):
@@ -67,12 +82,28 @@ async def setup_tools(
 
     # Convert all live MCP connections to LangChain tools
     langchain_tools = build_langchain_tools(mcp_manager)
+
+    # Final safety net: collapse any tools that ended up sharing a name (e.g.
+    # two different servers exposing the same tool). A duplicate name makes the
+    # model's tool choice ambiguous, so keep the first and drop the rest.
+    _by_name: Dict[str, Any] = {}
+    for t in langchain_tools:
+        tname = getattr(t, "name", None) or ""
+        if tname in _by_name:
+            logger.warning(
+                "ReactStrategy: duplicate tool name '%s' from MCP — keeping first, "
+                "dropping duplicate", tname,
+            )
+            continue
+        _by_name[tname] = t
+    deduped = list(_by_name.values())
+
     logger.info(
-        "ReactStrategy: built %d LangChain tools",
-        len(langchain_tools),
+        "ReactStrategy: built %d LangChain tools (%d after de-dup)",
+        len(langchain_tools), len(deduped),
         extra={"execution_id": execution_id},
     )
-    return langchain_tools
+    return deduped
 def build_playbook_tools() -> List[Any]:
     """Build LangChain StructuredTool instances that let the agent write
     and update investigation playbooks in the knowledge base.

@@ -1,4 +1,5 @@
 """Execution event types for SSE streaming."""
+import json
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -17,3 +18,10 @@ class ExecutionEvent:
             "data": self.data,
             "timestamp": self.timestamp,
         }
+
+    def to_sse(self) -> str:
+        """Render as an SSE chunk — identical wire format to WorkflowEvent.to_sse
+        so the frontend (useWorkflowStream.js) parses both interchangeably.
+        """
+        payload = json.dumps(self.dict())
+        return f"event: {self.event_type}\ndata: {payload}\n\n"

@@ -213,8 +213,12 @@ async def approve_hitl_request(
             detail=f"No active execution '{execution_id}' found",
         )
 
+    # Tool-approval gates register a per-request_id Future (tool_permissions.py);
+    # the supervisor/interrupt path uses the legacy single hitl_queue. Accept
+    # either so a single approve call always reaches the right waiter.
+    tool_approvals: dict = exec_data.get("tool_approvals") or {}
     hitl_queue: asyncio.Queue | None = exec_data.get("hitl_queue")
-    if hitl_queue is None:
+    if not tool_approvals and hitl_queue is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Execution '{execution_id}' is not waiting for HITL approval",
@@ -225,7 +229,19 @@ async def approve_hitl_request(
         "approved": body.approved,
         "reason": body.reason,
     }
-    await hitl_queue.put(decision)
+    # Route to the exact gate that published this request_id. With several
+    # ask-tool calls pending at once, this guarantees the right one unblocks
+    # (and the others keep waiting for their own approval).
+    fut = tool_approvals.get(body.request_id)
+    if fut is not None and not fut.done():
+        fut.set_result(decision)
+    elif hitl_queue is not None:
+        await hitl_queue.put(decision)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"No pending approval matching request '{body.request_id}'",
+        )
 
     # Publish SSE event so the frontend updates immediately
     event = (
@@ -250,6 +266,20 @@ async def approve_hitl_request(
         if body.approved
         else "Execution rejected — workflow will be stopped.",
     )
+
+
+@router.get("/{execution_id}/approvals")
+async def list_tool_approvals(execution_id: str) -> Dict[str, Any]:
+    """Return the durable tool-approval audit trail for an execution.
+
+    Reads the ``tool_approvals`` table (written by the permission gate in
+    ``tool_permissions.py``) so operators — and the HITL history UI — can see
+    every approve / deny / timeout decision, independent of any browser state.
+    """
+    from app.infrastructure.persistence import tool_approval_repository
+
+    records = await tool_approval_repository.list_for_execution(execution_id)
+    return {"execution_id": execution_id, "approvals": records}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

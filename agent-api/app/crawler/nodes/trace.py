@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_SCAN_FILES = 40
 _MAX_FILE_CHARS = 60_000
-_MAX_CONTEXT_CHARS = 150_000
+# Total LLM-prompt context cap comes from settings.crawler_search_context_max_chars.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -273,8 +273,10 @@ candidate_files:
   - app/middleware.py
 ```"""
 
+        # Graceful fallback on a parse miss (data={}), so retries are
+        # transport-only — reading the cache on retry is always safe here.
         response, tokens_in, tokens_out, was_cached = await call_llm(
-            prompt, model_id=prep_res["model"], use_cache=self.cur_retry == 0
+            prompt, model_id=prep_res["model"], use_cache=True
         )
         ms = int((time.monotonic() - t0) * 1000)
 
@@ -352,13 +354,14 @@ class ScanCallerCandidates(AsyncNode):
         file_contents = await asyncio.to_thread(_read)
         ms = int((time.monotonic() - t0) * 1000)
 
+        _ctx_cap = settings.crawler_search_context_max_chars
         parts: List[str] = []
         total = 0
         included: List[str] = []
         for relpath, content in file_contents:
             truncated = content[:_MAX_FILE_CHARS]
             entry = f"--- File: {relpath} ---\n{truncated}\n\n"
-            if total + len(entry) > _MAX_CONTEXT_CHARS:
+            if total + len(entry) > _ctx_cap:
                 break
             parts.append(entry)
             included.append(relpath)

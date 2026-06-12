@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_SYMBOLS = 5
 _MAX_FILE_CHARS = 60_000
-_MAX_CONTEXT_CHARS = 140_000
+# Total LLM-prompt context cap comes from settings.crawler_search_context_max_chars.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,8 +34,16 @@ class ParseAlert(AsyncNode):
         super().__init__(max_retries=max_retries, wait=wait)
 
     async def prep(self, shared: Dict[str, Any]) -> Dict[str, Any]:
+        from app.config import settings
+
+        # Defensive cap: a pathological alert payload shouldn't blow the prompt
+        # budget. The structured fields we extract live near the top of the text.
+        alert = str(shared["alert"])
+        _cap = settings.crawler_alert_max_chars
+        if len(alert) > _cap:
+            alert = alert[:_cap] + "\n... [alert truncated]"
         return {
-            "alert": shared["alert"],
+            "alert": alert,
             "repo": shared["repo"],
             "model": shared.get("model_id"),
         }
@@ -66,8 +74,10 @@ error_message: "Exact error string if present, else empty"
 stack_trace_snippet: "Key stack frame(s) if present, else empty"
 ```"""
 
+        # Graceful fallback on a parse miss, so retries are transport-only —
+        # reading the cache on retry is always safe here.
         response, tokens_in, tokens_out, was_cached = await call_llm(
-            prompt, model_id=prep_res["model"], use_cache=self.cur_retry == 0
+            prompt, model_id=prep_res["model"], use_cache=True
         )
         ms = int((time.monotonic() - t0) * 1000)
 
@@ -203,8 +213,10 @@ key_symbols:
   - get_user_by_token
 ```"""
 
+        # Graceful fallback on a parse miss (data={}), so retries are
+        # transport-only — reading the cache on retry is always safe here.
         response, tokens_in, tokens_out, was_cached = await call_llm(
-            prompt, model_id=prep_res["model"], use_cache=self.cur_retry == 0
+            prompt, model_id=prep_res["model"], use_cache=True
         )
         ms = int((time.monotonic() - t0) * 1000)
 
@@ -229,6 +241,23 @@ key_symbols:
                 if path not in seen:
                     seen.add(path)
                     scope_files.append(path)
+
+        # Ground the scope in the knowledge graph. The abstraction file_map only
+        # samples a fraction of a large repo, so resolve the alert's symbols to
+        # their real, indexed files via kg_search — disk-verified definitions the
+        # LLM/file_map can miss. This is what makes RCA work on large repos.
+        from app.crawler.kg_search import kg_search
+        for sym in list(key_symbols)[:_MAX_SYMBOLS]:
+            if not sym:
+                continue
+            try:
+                for hit in await kg_search(prep_res["repo"], str(sym), limit=3):
+                    p = hit.get("file")
+                    if p and p not in seen:
+                        seen.add(p)
+                        scope_files.append(p)
+            except Exception as exc:  # noqa: BLE001 — grounding is best-effort
+                logger.debug("RCA kg_search failed for %r: %s", sym, exc)
 
         return {
             "relevant_abstractions": relevant_abstractions,
@@ -279,6 +308,7 @@ class FindSymbolsInScope(AsyncNode):
         from app.config import settings
         repos_root = settings.repos_base_path
         repo_dir = os.path.join(repos_root, prep_res["repo"])
+        _ctx_cap = settings.crawler_search_context_max_chars
 
         def _read_scope() -> str:
             parts = []
@@ -293,7 +323,7 @@ class FindSymbolsInScope(AsyncNode):
                         content = f.read()
                     truncated = content[:_MAX_FILE_CHARS]
                     entry = f"--- File: {relpath} ---\n{truncated}\n\n"
-                    if total + len(entry) > _MAX_CONTEXT_CHARS:
+                    if total + len(entry) > _ctx_cap:
                         break
                     parts.append(entry)
                     total += len(entry)
@@ -389,8 +419,10 @@ immediate_actions:
   - "Check X log"
 ```"""
 
+        # Graceful fallback on a parse miss (rca defaults), so retries are
+        # transport-only — reading the cache on retry is always safe here.
         response, tokens_in, tokens_out, was_cached = await call_llm(
-            prompt, model_id=prep_res["model"], use_cache=self.cur_retry == 0,
+            prompt, model_id=prep_res["model"], use_cache=True,
             max_tokens=8192,
         )
         ms = int((time.monotonic() - t0) * 1000)

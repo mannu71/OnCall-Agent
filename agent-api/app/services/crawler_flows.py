@@ -7,7 +7,13 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from app.core.ttl_cache import TTLCache
+
 logger = logging.getLogger(__name__)
+
+# Names-only repo map cached per repo content-version (files_sha256). Lets the
+# agent orient with a cheap symbol list instead of reading the whole codebase.
+_repo_map_cache = TTLCache(ttl_seconds=3600.0, maxsize=64)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -565,6 +571,75 @@ async def crawler_node(
     except Exception as exc:
         logger.error("crawler_node failed (qname=%s repo=%s): %s", qualified_name, repo, exc)
         return {"error": str(exc), "qualified_name": qualified_name, "repo": repo}
+
+
+async def crawler_repo_map(
+    repo: str,
+    name_like: Optional[str] = None,
+    limit: int = 60,
+) -> Dict[str, Any]:
+    """Cheap, names-only map of a repo's top-level symbols (no source bodies).
+
+    Lets the agent orient ("what's in this repo?") with a tiny list and then
+    fetch detail lazily via ``crawler_find_symbol`` / ``crawler_get_body``,
+    instead of reading large chunks of the codebase. The full top-symbol list is
+    cached per repo content-version (``files_sha256``), so it is computed once
+    per repo version; the optional ``name_like`` substring is applied in-process.
+
+    Args:
+        repo:       Repository name under REPOS_BASE_PATH.
+        name_like:  Optional case-insensitive substring to filter symbol names.
+        limit:      Max symbols to return after filtering.
+
+    Returns:
+        ``{repo, version, count, symbols:[{name,kind,file}]}`` or ``{error,...}``.
+    """
+    from app.core.database import AsyncSessionLocal
+    from sqlalchemy import text
+
+    _FETCH_CAP = 2000  # hard ceiling for the cached full map
+    try:
+        async with AsyncSessionLocal() as session:
+            ver = (await session.execute(
+                text("SELECT files_sha256 FROM repo_abstractions WHERE repo_name = :r"),
+                {"r": repo},
+            )).scalar()
+            if ver is None:
+                return {"error": "repo not indexed", "repo": repo}
+
+            cache_key = f"{repo}:{ver}"
+            full = _repo_map_cache.get(cache_key)
+            if full is None:
+                rows = await session.execute(
+                    text("""
+                        SELECT name, kind, file_path
+                        FROM kg_nodes
+                        WHERE repo_name = :r
+                          AND (exported = true
+                               OR kind IN ('class','interface','function','method','enum','struct'))
+                        ORDER BY file_path, line_start
+                        LIMIT :cap
+                    """),
+                    {"r": repo, "cap": _FETCH_CAP},
+                )
+                full = [{"name": n, "kind": k, "file": f} for (n, k, f) in rows.fetchall()]
+                _repo_map_cache.set(cache_key, full)
+
+        needle = (name_like or "").strip().lower()
+        filtered = [s for s in full if not needle or needle in str(s["name"]).lower()]
+        symbols = filtered[: max(1, int(limit))]
+        return {
+            "repo": repo,
+            "version": str(ver)[:12],
+            "count": len(symbols),
+            "total_available": len(filtered),
+            "symbols": symbols,
+            "note": "Names-only map. Use crawler_find_symbol / crawler_get_body for source; "
+                    "pass name_like to narrow.",
+        }
+    except Exception as exc:
+        logger.error("crawler_repo_map failed (repo=%s): %s", repo, exc)
+        return {"error": str(exc), "repo": repo}
 
 
 async def crawler_files(

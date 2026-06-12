@@ -56,6 +56,11 @@ class ExecutionPort:
                 "message", "Engineer approval required.",
             ),
         }
+        # Pass through tool-approval context so the UI can show what's being
+        # approved (tool name + args) for a pre-tool-execution gate.
+        for _k in ("type", "tool", "args"):
+            if _k in interrupt_data:
+                payload[_k] = interrupt_data[_k]
 
         if self._publish is not None:
             from app.workflow.event_schema import EventType
@@ -69,3 +74,17 @@ class ExecutionPort:
 
             event = WorkflowEvent(event_type=EventType.HITL_PAUSE, data=payload)
             await queue.put(event.to_sse())
+
+    async def publish_token_usage(
+        self,
+        execution_id: Optional[str],
+        totals: Dict[str, Any],
+    ) -> None:
+        """Push a ``token_usage_delta`` SSE event so the UI token counter updates
+        from the stream (the final sync result carries the same totals)."""
+        if not execution_id or self._publish is None:
+            return
+        try:
+            await self._publish(execution_id, "token_usage_delta", dict(totals))
+        except Exception:  # noqa: BLE001 — telemetry must never break a run
+            pass

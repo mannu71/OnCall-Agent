@@ -1,0 +1,79 @@
+{
+  "synthesis": "Pre-computed CloudWatch analysis (severity: critical). A TokenError spike (247 occurrences, ~25x baseline) is firing on /aws/lambda/kyc-auth. The CloudWatch alarm 'kyc-auth-5xx-rate' is in ALARM. Representative event: correlationId=7f3a9c2e-1b4d-4e8a-9c6f-2d5e8a1b3c4d traceId=1-65f3a2b1-3c4d5e6f7a8b9c0d1e2f3a4b requestId=req-9X2kPb7Qm4 'TokenError: empty token at auth.py:11 in verify_token'. data_quality: coverage=full. The implicated source location is auth.py (verify_token) in the eval-fixture-repo.",
+  "responses": {
+    "analyze_log_patterns": {
+      "success": true,
+      "unique_patterns": [
+        {
+          "normalized_pattern": "TokenError: empty token in verify_token",
+          "occurrence_count": 247,
+          "affected_streams": 3,
+          "example_message": "2026-06-04T23:14:58Z ERROR [correlationId=7f3a9c2e-1b4d-4e8a-9c6f-2d5e8a1b3c4d traceId=1-65f3a2b1-3c4d5e6f7a8b9c0d1e2f3a4b requestId=req-9X2kPb7Qm4] TokenError: empty token at auth.py:11 in verify_token",
+          "first_seen": "2026-06-04T22:58:11Z",
+          "last_seen": "2026-06-05T01:47:33Z"
+        },
+        {
+          "normalized_pattern": "Timeout calling downstream profile-svc",
+          "occurrence_count": 41,
+          "affected_streams": 2,
+          "example_message": "2026-06-04T23:20:02Z WARN [correlationId=7f3a9c2e-1b4d-4e8a-9c6f-2d5e8a1b3c4d] upstream timeout after 30000ms calling profile-svc /v1/profile",
+          "first_seen": "2026-06-04T23:01:00Z",
+          "last_seen": "2026-06-05T01:30:00Z"
+        }
+      ],
+      "patterns": {"error": {"status": "Complete", "data": [1, 2, 3, 4]}},
+      "data_quality": {"coverage": "full", "partial": false, "sampled": false, "failures": []},
+      "log_groups_analyzed": ["/aws/lambda/kyc-auth"],
+      "time_range": "2h"
+    },
+    "detect_anomalies": {
+      "success": true,
+      "anomalies": [
+        {
+          "log_group": "/aws/lambda/kyc-auth",
+          "timestamp": "2026-06-04T23:15:00Z",
+          "severity": "critical",
+          "z_score": 8.3,
+          "current_count": 1250,
+          "baseline_average": 45.2,
+          "reasons": ["Error volume spike >25x baseline"]
+        }
+      ],
+      "summary": {"total_anomalies": 1, "critical_severity": 1, "high_severity": 0, "medium_severity": 0},
+      "log_groups_analyzed": ["/aws/lambda/kyc-auth"],
+      "data_quality": {"coverage": "full", "partial": false}
+    },
+    "correlate_logs": {
+      "success": true,
+      "correlation_id": "7f3a9c2e-1b4d-4e8a-9c6f-2d5e8a1b3c4d",
+      "timeline": [
+        {"timestamp": "2026-06-04T23:14:55Z", "log_group": "/aws/lambda/kyc-core", "message": "[correlationId=7f3a9c2e-1b4d-4e8a-9c6f-2d5e8a1b3c4d requestId=req-9X2kPb7Qm4] received place_order request"},
+        {"timestamp": "2026-06-04T23:14:58Z", "log_group": "/aws/lambda/kyc-auth", "message": "[correlationId=7f3a9c2e-1b4d-4e8a-9c6f-2d5e8a1b3c4d traceId=1-65f3a2b1-3c4d5e6f7a8b9c0d1e2f3a4b] TokenError: empty token at auth.py:11 in verify_token"},
+        {"timestamp": "2026-06-04T23:14:59Z", "log_group": "/aws/lambda/kyc-core", "message": "[correlationId=7f3a9c2e-1b4d-4e8a-9c6f-2d5e8a1b3c4d] place_order failed: upstream auth rejected token"}
+      ],
+      "data_quality": {"coverage": "full", "partial": false}
+    },
+    "list_metric_alarms": {
+      "success": true,
+      "alarms": [
+        {"name": "kyc-auth-5xx-rate", "state": "ALARM", "reason": "Threshold Crossed: 5xx rate > 5% for 3 datapoints", "metric_name": "HTTPCode_Target_5XX_Count", "namespace": "AWS/ApplicationELB"}
+      ],
+      "summary": {"total": 1, "in_alarm": 1, "names": ["kyc-auth-5xx-rate"]},
+      "region": "us-east-1"
+    },
+    "search_logs": {
+      "results": [
+        [
+          {"field": "@timestamp", "value": "2026-06-04T23:14:58.000Z"},
+          {"field": "@message", "value": "ERROR [correlationId=7f3a9c2e-1b4d-4e8a-9c6f-2d5e8a1b3c4d] TokenError: empty token at auth.py:11 in verify_token"},
+          {"field": "@logStream", "value": "kyc-auth/2026/06/04/[$LATEST]ab12"}
+        ],
+        [
+          {"field": "@timestamp", "value": "2026-06-04T23:15:01.000Z"},
+          {"field": "@message", "value": "ERROR [correlationId=7f3a9c2e-1b4d-4e8a-9c6f-2d5e8a1b3c4d] TokenError: empty token at auth.py:11 in verify_token"},
+          {"field": "@logStream", "value": "kyc-auth/2026/06/04/[$LATEST]ab12"}
+        ]
+      ]
+    }
+  }
+}

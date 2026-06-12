@@ -30,21 +30,91 @@ logger = logging.getLogger(__name__)
 _TEMPERATURE = 0.1
 _MAX_TOKENS = 4096
 
+# Bedrock cross-region inference-profile remapping. Newer Bedrock models require
+# a region-prefixed inference profile ID (e.g. "eu.anthropic.claude-sonnet-4-6")
+# instead of the bare foundation model ID for on-demand invocation.
+_PROFILE_PREFIXES = ("us.", "eu.", "ap.")
+_NEEDS_PROFILE_FOR = ("anthropic.", "amazon.", "meta.", "mistral.")
+_BEDROCK_PROVIDERS = ("bedrock", "aws", "aws_bedrock", "aws bedrock")
+
+
+def _apply_inference_profile(model: str, region: str) -> str:
+    """Prefix a bare Bedrock foundation model ID with its region inference profile."""
+    if any(model.startswith(p) for p in _PROFILE_PREFIXES):
+        return model
+    if not any(model.startswith(p) for p in _NEEDS_PROFILE_FOR):
+        return model
+    if region.startswith("eu-"):
+        return f"eu.{model}"
+    if region.startswith("ap-"):
+        return f"ap.{model}"
+    return f"us.{model}"
+
+
+def _select_model_for_tier(
+    cfg: Dict[str, Any], tier: str, explicit: Optional[str]
+) -> str:
+    """Pick the model ID for a crawler call given its *tier*.
+
+    Precedence: an explicit per-call ``model_id`` wins; then the tier-specific
+    opt-in setting (``crawler_index_model`` for indexing, ``crawler_model_override``
+    for search flows); otherwise the DB-resolved model (already profile-remapped
+    in ``_resolve_llm_config``). Both tier settings default to None, so the DB
+    model is used until an operator opts a tier into a cheaper model — and has
+    confirmed that model/inference-profile is enabled in their account. Non-DB
+    choices get the same Bedrock inference-profile remap.
+    """
+    if explicit:
+        chosen = explicit
+    elif tier == "index" and settings.crawler_index_model:
+        chosen = settings.crawler_index_model
+    elif tier != "index" and settings.crawler_model_override:
+        chosen = settings.crawler_model_override
+    else:
+        return cfg["model"]
+
+    if cfg.get("provider", "").lower() in _BEDROCK_PROVIDERS:
+        chosen = _apply_inference_profile(chosen, cfg.get("region", "us-east-1"))
+    return chosen
+
 
 async def _resolve_llm_config() -> Dict[str, Any]:
     """Return the active LLM config from the DB (Settings page).
 
     Mirrors the logic in ReactStrategy._resolve_llm_config:
-    1. First config row in llm_configs table
+    1. Gateway "crawler" role assignment, else first config row in llm_configs
     2. Enriches Bedrock configs with AWS credentials from model_keys table
     3. Falls back to env vars (CRAWLER_MODEL + PROVIDER_TRANSPORT) if DB is empty
     """
-    from app.infrastructure.persistence import llm_config_repository, model_key_repository
+    from app.infrastructure.persistence import (
+        llm_config_repository,
+        model_key_repository,
+        model_role_repository,
+    )
 
     try:
         db_configs = await llm_config_repository.list_all()
         if db_configs:
             _name, cfg = next(iter(db_configs.items()))
+
+            # Gateway: a "crawler" role assignment overrides the first-row default.
+            try:
+                role_name = await model_role_repository.get("crawler")
+                if role_name:
+                    role_cfg = db_configs.get(role_name)
+                    if role_cfg is None:
+                        role_cfg = await llm_config_repository.get_by_name(role_name)
+                    if role_cfg:
+                        _name, cfg = role_name, role_cfg
+                        logger.info("call_llm: using crawler role-assigned config '%s'", role_name)
+                    else:
+                        logger.warning(
+                            "call_llm: crawler role references missing config '%s' — using first row",
+                            role_name,
+                        )
+            except Exception as exc:
+                logger.warning("call_llm: crawler role lookup failed: %s", exc)
+
             resolved: Dict[str, Any] = {
                 "provider":    cfg["provider"],
                 "model":       cfg["model"],
@@ -73,18 +143,8 @@ async def _resolve_llm_config() -> Dict[str, Any]:
                 # (e.g. "eu.anthropic.claude-sonnet-4-6") instead of the bare
                 # foundation model ID for on-demand invocation.  Apply the same
                 # region-prefix remapping that ReactStrategy._build_llm() uses.
-                _PROFILE_PREFIXES  = ("us.", "eu.", "ap.")
-                _NEEDS_PROFILE_FOR = ("anthropic.", "amazon.", "meta.", "mistral.")
-                _model  = resolved["model"]
-                _region = resolved["region"]
-                if (not any(_model.startswith(p) for p in _PROFILE_PREFIXES) and
-                        any(_model.startswith(p) for p in _NEEDS_PROFILE_FOR)):
-                    if _region.startswith("eu-"):
-                        _model = f"eu.{_model}"
-                    elif _region.startswith("ap-"):
-                        _model = f"ap.{_model}"
-                    else:
-                        _model = f"us.{_model}"
+                _model = _apply_inference_profile(resolved["model"], resolved["region"])
+                if _model != resolved["model"]:
                     resolved["model"] = _model
                     logger.info("call_llm: remapped model to inference profile: %s", _model)
 
@@ -164,6 +224,7 @@ async def call_llm(
     model_id: Optional[str] = None,
     use_cache: bool = True,
     max_tokens: int = _MAX_TOKENS,
+    tier: str = "search",
 ) -> Tuple[str, int, int, bool]:
     """Call the configured LLM with cache-through.
 
@@ -172,17 +233,20 @@ async def call_llm(
 
     Args:
         prompt:     The full prompt text.
-        model_id:   Override model identifier. When omitted the DB-configured
-                    model is used.
+        model_id:   Override model identifier. When omitted the model is chosen
+                    by *tier* (see _select_model_for_tier).
         use_cache:  Whether to check/populate the Postgres prompt cache.
         max_tokens: Maximum tokens in the response.
+        tier:       Cost tier — "index" (background indexing, defaults to the
+                    cheap crawler_index_model) or "search" (semantic/find/trace/
+                    investigate, follows crawler_model_override else DB model).
 
     Returns:
         (response_text, tokens_in, tokens_out, was_cached)
         where *was_cached* is True when the response came from the prompt cache.
     """
     cfg   = await _resolve_llm_config()
-    model = model_id or cfg["model"]
+    model = _select_model_for_tier(cfg, tier, model_id)
 
     if use_cache:
         cached = await get_cached(prompt, model)
@@ -204,7 +268,12 @@ async def call_llm(
     tokens_in  = response.input_tokens
     tokens_out = response.output_tokens
 
-    logger.debug("call_llm: live (model=%s, in=%d, out=%d)", model, tokens_in, tokens_out)
+    logger.info(
+        "call_llm: live tier=%s model=%s in=%d out=%d cache_read=%d cache_write=%d",
+        tier, model, tokens_in, tokens_out,
+        getattr(response, "cache_read_input_tokens", 0) or 0,
+        getattr(response, "cache_creation_input_tokens", 0) or 0,
+    )
 
     if use_cache:
         await put_cached(prompt, model, text_out, tokens_in, tokens_out)
