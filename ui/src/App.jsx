@@ -12,9 +12,7 @@ import './App.css';
 const Dashboard = lazy(() => import('./pages/Dashboard'));
 const Scheduler = lazy(() => import('./pages/Scheduler'));
 const Settings = lazy(() => import('./pages/Settings'));
-const LogWatchConfig = lazy(() => import('./components/logwatch/LogWatchConfig'));
 const Workflow = lazy(() => import('./pages/workflow'));
-const Analytics = lazy(() => import('./pages/Analytics'));
 const Chat = lazy(() => import('./pages/Chat'));
 const CodebaseExplorer = lazy(() => import('./pages/CodebaseExplorer'));
 
@@ -58,13 +56,11 @@ const AppRoutes = () => {
               <Route path="/" element={<Dashboard />} />
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/scheduler" element={<Scheduler />} />
-              <Route path="/log-watch" element={<LogWatchConfig />} />
               <Route path="/chat" element={<Chat />} />
               <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
               <Route path="/workflow" element={<Workflow />} />
               <Route path="/explorer" element={<CodebaseExplorer />} />
               <Route path="/alerts" element={<PlaceholderPage title="Alerts" />} />
-              {isDevelopment && <Route path="/analytics" element={<Analytics />} />}
               <Route path="/emergency" element={<PlaceholderPage title="Emergency Contact" />} />
               <Route path="/settings" element={<Settings />} />
               <Route path="*" element={<Dashboard />} />

@@ -115,10 +115,22 @@ def build_crawler_tools(
         crawler_search_semantic as _semantic,
         crawler_investigate_alert as _investigate,
         crawler_repo_map as _repo_map,
+        crawler_project_brief as _brief,
+        crawler_module_doc as _module_doc,
+        crawler_coding_standards as _standards,
+        crawler_find_feature as _find_feature,
+        crawler_grep as _grep,
+        crawler_read_file as _read_file,
+        crawler_list_files as _list_files,
     )
 
     _repo_names = [r.get("name", "") for r in (repos or [])]
     repo_hint = f" Available repositories: {_repo_names}." if _repo_names else ""
+    if len(_repo_names) > 1:
+        repo_hint += (
+            " For find/trace/grep/list you may omit repo (or pass repos=[...]) to "
+            "search across all connected repos at once."
+        )
 
     # ── Input schemas ─────────────────────────────────────────────────────────
 
@@ -135,6 +147,9 @@ def build_crawler_tools(
         )
         limit: int = PydanticField(5, description="Max results (1-20).")
         model_id: Optional[str] = PydanticField(None, description="LLM model override.")
+        repos: Optional[List[str]] = PydanticField(
+            None, description="Optional list of repos to search across (group-wide search)."
+        )
 
     class _BodyInput(BaseModel):
         handle: str = PydanticField(..., description="Body handle from crawler_find_symbol.")
@@ -146,6 +161,9 @@ def build_crawler_tools(
         direction: str = PydanticField("callers", description="'callers' or 'callees'.")
         depth: int = PydanticField(2, description="Number of hops to trace.")
         model_id: Optional[str] = PydanticField(None, description="LLM model override.")
+        repos: Optional[List[str]] = PydanticField(
+            None, description="Optional list of repos to trace across (group-wide, cross-repo)."
+        )
 
     class _SemanticInput(BaseModel):
         query: str = PydanticField(..., description="Natural-language query.")
@@ -166,6 +184,35 @@ def build_crawler_tools(
             None, description="Optional case-insensitive substring to filter symbol names.")
         limit: int = PydanticField(60, description="Max symbols to return (default 60).")
 
+    class _RepoInput(BaseModel):
+        repo: str = PydanticField(..., description="Repository name under REPOS_BASE_PATH.")
+
+    class _ModuleDocInput(BaseModel):
+        repo: str = PydanticField(..., description="Repository name under REPOS_BASE_PATH.")
+        path: Optional[str] = PydanticField(
+            None, description="Module/directory path. Omit to list documented modules.")
+
+    class _FindFeatureInput(BaseModel):
+        repo: str = PydanticField(..., description="Repository name under REPOS_BASE_PATH.")
+        query: str = PydanticField(..., description="Feature/flow to locate (e.g. 'workflow execution').")
+
+    class _GrepInput(BaseModel):
+        pattern: str = PydanticField(..., description="Regex (or literal) to search file contents for.")
+        repo: Optional[str] = PydanticField(None, description="Repo to search. Omit to search all connected repos.")
+        glob: Optional[str] = PydanticField(None, description="Optional file glob filter, e.g. '*.cs' or 'appsettings*.json'.")
+        max_results: int = PydanticField(80, description="Max matches to return.")
+
+    class _ReadFileInput(BaseModel):
+        repo: str = PydanticField(..., description="Repository name under REPOS_BASE_PATH.")
+        path: str = PydanticField(..., description="File path relative to the repo root.")
+        start: Optional[int] = PydanticField(None, description="First line (1-based) to read.")
+        end: Optional[int] = PydanticField(None, description="Last line to read.")
+
+    class _ListFilesInput(BaseModel):
+        repo: Optional[str] = PydanticField(None, description="Repo to list. Omit to list across all connected repos.")
+        glob: Optional[str] = PydanticField(None, description="Optional file glob filter, e.g. '**/*.tf' or '*Controller.cs'.")
+        limit: int = PydanticField(400, description="Max file paths to return.")
+
     # ── Async wrappers (return JSON strings for the agent) ────────────────────
 
     async def _index_repo(repo: str, force: bool = False, model_id: Optional[str] = None) -> str:
@@ -179,11 +226,13 @@ def build_crawler_tools(
         kind: Optional[str] = None,
         limit: int = 5,
         model_id: Optional[str] = None,
+        repos: Optional[List[str]] = None,
     ) -> str:
         import json
         result = await _find(
             symbol=symbol, repo=repo, kind=kind, limit=limit,
             model_id=model_id or default_model_id,
+            repos=repos,
         )
         return _cap(json.dumps(result, default=str))
 
@@ -194,12 +243,13 @@ def build_crawler_tools(
 
     async def _trace_path(
         symbol: str, repo: str, direction: str = "callers", depth: int = 2,
-        model_id: Optional[str] = None,
+        model_id: Optional[str] = None, repos: Optional[List[str]] = None,
     ) -> str:
         import json
         result = await _trace(
             symbol=symbol, repo=repo, direction=direction, depth=depth,
             model_id=model_id or default_model_id,
+            repos=repos,
         )
         return _cap(json.dumps(result, default=str))
 
@@ -240,6 +290,44 @@ def build_crawler_tools(
                               "narrow, or call with a single repo for its full map.")
             return _cap(json.dumps(merged, default=str))
         result = await _repo_map(repo=repo, name_like=name_like, limit=limit)
+        return _cap(json.dumps(result, default=str))
+
+    async def _project_brief(repo: str) -> str:
+        import json
+        return _cap(json.dumps(await _brief(repo=repo), default=str))
+
+    async def _module_doc_tool(repo: str, path: Optional[str] = None) -> str:
+        import json
+        return _cap(json.dumps(await _module_doc(repo=repo, path=path), default=str))
+
+    async def _coding_standards(repo: str) -> str:
+        import json
+        return _cap(json.dumps(await _standards(repo=repo), default=str))
+
+    async def _find_feature_tool(repo: str, query: str) -> str:
+        import json
+        return _cap(json.dumps(await _find_feature(repo=repo, query=query), default=str))
+
+    async def _grep_tool(pattern: str, repo: Optional[str] = None,
+                         glob: Optional[str] = None, max_results: int = 80) -> str:
+        import json
+        # Default scope = all connected repos when repo omitted.
+        result = await _grep(pattern, repo=repo,
+                             repos=(None if repo else (_repo_names or None)),
+                             glob=glob, max_results=max_results)
+        return _cap(json.dumps(result, default=str))
+
+    async def _read_file_tool(repo: str, path: str, start: Optional[int] = None,
+                              end: Optional[int] = None) -> str:
+        import json
+        return _cap(json.dumps(await _read_file(repo, path, start=start, end=end), default=str))
+
+    async def _list_files_tool(repo: Optional[str] = None, glob: Optional[str] = None,
+                               limit: int = 400) -> str:
+        import json
+        result = await _list_files(repo=repo,
+                                   repos=(None if repo else (_repo_names or None)),
+                                   glob=glob, limit=limit)
         return _cap(json.dumps(result, default=str))
 
     # ── StructuredTool instances ──────────────────────────────────────────────
@@ -333,6 +421,90 @@ def build_crawler_tools(
                 + repo_hint
             ),
             args_schema=_InvestigateInput,
+        ),
+        StructuredTool.from_function(
+            coroutine=_project_brief,
+            name="crawler_project_brief",
+            description=(
+                "Get the crawler's top-level understanding of a repo: what the product does, its "
+                "business domain model, and the architecture narrative (how UI/API/DB/external "
+                "systems fit together). WHEN TO USE: at the start of a task to ground yourself in "
+                "the project before reasoning about or changing code. Generated once at index "
+                "time — cheap to call."
+                + repo_hint
+            ),
+            args_schema=_RepoInput,
+        ),
+        StructuredTool.from_function(
+            coroutine=_coding_standards,
+            name="crawler_coding_standards",
+            description=(
+                "Get a repo's coding-conventions profile: naming, file/folder layout, framework "
+                "idioms, error handling, testing, and frontend-vs-backend patterns the codebase "
+                "ACTUALLY uses. CALL THIS BEFORE writing or proposing code so your change blends "
+                "in with the project's conventions."
+                + repo_hint
+            ),
+            args_schema=_RepoInput,
+        ),
+        StructuredTool.from_function(
+            coroutine=_module_doc_tool,
+            name="crawler_module_doc",
+            description=(
+                "Get the wiki-style doc for a module/directory (responsibility, key components, "
+                "data flow, dependencies). Omit 'path' to list documented modules, then call "
+                "again with a path. WHEN TO USE: to understand how a part of the codebase works "
+                "before editing it."
+                + repo_hint
+            ),
+            args_schema=_ModuleDocInput,
+        ),
+        StructuredTool.from_function(
+            coroutine=_find_feature_tool,
+            name="crawler_find_feature",
+            description=(
+                "Map a user-facing feature/flow to the modules that implement it ('where is X "
+                "done?'). WHEN TO USE: you know the feature by name but not the code location, "
+                "and want a fast semantic answer before drilling in with crawler_find_symbol / "
+                "crawler_get_body."
+                + repo_hint
+            ),
+            args_schema=_FindFeatureInput,
+        ),
+        StructuredTool.from_function(
+            coroutine=_grep_tool,
+            name="crawler_grep",
+            description=(
+                "Regex/text search across repository file CONTENTS (like ripgrep) — any "
+                "language, config, or IaC file. WHEN TO USE: find anything by its text when "
+                "the knowledge-graph tools don't cover it — a URL/base address, a queue or "
+                "topic name, an env/config key, a string literal, a call across services. "
+                "Omit repo to search ALL connected repos. Then crawler_read_file the hit."
+                + repo_hint
+            ),
+            args_schema=_GrepInput,
+        ),
+        StructuredTool.from_function(
+            coroutine=_read_file_tool,
+            name="crawler_read_file",
+            description=(
+                "Read any repository file by path, returning numbered lines (optional "
+                "start/end range). WHEN TO USE: inspect a file you found via crawler_grep / "
+                "crawler_list_files — config (appsettings/yaml/json), IaC (Terraform), or "
+                "source in any language not covered by the symbol graph."
+            ),
+            args_schema=_ReadFileInput,
+        ),
+        StructuredTool.from_function(
+            coroutine=_list_files_tool,
+            name="crawler_list_files",
+            description=(
+                "List repository file paths (optionally filtered by a glob), across one repo "
+                "or ALL connected repos. WHEN TO USE: orient in unfamiliar layout or find "
+                "config/infra files (e.g. glob '**/*.tf', '*Controller.cs', 'appsettings*.json')."
+                + repo_hint
+            ),
+            args_schema=_ListFilesInput,
         ),
     ]
 

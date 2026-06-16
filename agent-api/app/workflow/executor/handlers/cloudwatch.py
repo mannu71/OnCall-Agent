@@ -87,9 +87,23 @@ def _read_cw_config(node: Dict[str, Any]) -> Dict[str, Any]:
     else:
         alarm_state_filter = raw_alarm_filter or None
 
+    # Multi-region (Phase 5): an optional comma-separated/list "regions" field
+    # fans the investigation across regions. Falls back to the single region.
+    _primary_region = _pick("region", "awsRegion", "us-east-1")
+    raw_regions = _pick("regions", "awsRegions", None)
+    if isinstance(raw_regions, list):
+        regions = [r.strip() for r in raw_regions if isinstance(r, str) and r.strip()]
+    elif isinstance(raw_regions, str):
+        regions = [r.strip() for r in raw_regions.split(",") if r.strip()]
+    else:
+        regions = []
+    if not regions:
+        regions = [_primary_region]
+
     return {
         "log_groups":         log_groups,
-        "aws_region":         _pick("region", "awsRegion", "us-east-1"),
+        "aws_region":         _primary_region,
+        "regions":            regions,
         "aws_profile":        _pick("profile", "awsProfile", None),
         "analysis_type":      _pick("analysis", "analysisType", "error-patterns"),
         "time_range":         _pick("range", "timeRange", "1h"),
@@ -218,6 +232,28 @@ async def execute_tool_provider(executor, node: Dict[str, Any], context: Dict[st
             "fast-path correlation lookup",
             _ids["correlation_id"], _ids["trace_id"],
         )
+
+    # Multi-region fan-out (Phase 5): when the node lists >1 region, run per-region
+    # triage and synthesize once over the merged, region-namespaced evidence.
+    regions = cfg.get("regions") or [aws_region]
+    if len([r for r in regions if r]) > 1:
+        logger.info("cloudwatch_tool: multi-region investigation across %s", regions)
+        result = await log_watch_service.run_multiregion_investigation(
+            regions=regions,
+            log_groups=log_groups,
+            time_range=cfg["time_range"],
+            time_range_minutes=parse_time_range_minutes(cfg["time_range"]),
+            error_threshold=cfg["error_threshold"],
+            enable_alerts=cfg["enable_alerts"],
+            credentials=credentials,
+            node_data=pipeline_node_data,
+            active_executions=executor.active_executions,
+            execution_id=context.get("execution_id"),
+            focus=focus,
+        )
+        result["tool_provider"] = "cloudwatch"
+        result.setdefault("region", aws_region)
+        return result
 
     # Staged deterministic pipeline — always ends in a guaranteed LLM synthesis,
     # so the result can never be a mid-investigation fragment. The open-ended

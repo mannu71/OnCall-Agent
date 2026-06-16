@@ -102,12 +102,16 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
 
     connected = []
     failed = []
+    # server_name -> human-readable failure reason, so the node reports WHY a
+    # connection failed (e.g. command not found) instead of a generic message.
+    failure_reasons: Dict[str, str] = {}
 
     for server_name in server_names:
         mcp_config = all_server_configs.get(server_name)
         if not mcp_config:
             logger.warning("Database node: MCP server '%s' not found in settings", server_name)
             failed.append(server_name)
+            failure_reasons[server_name] = "not found in MCP settings (or disabled)"
             continue
 
         # The connection key is node_id + server_name to stay unique per node per server.
@@ -126,13 +130,16 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
             context['db_server_map'][server_name] = conn_key
             connected.append(server_name)
         else:
-            logger.error("Database node: failed to connect to '%s'", server_name)
+            reason = mcp_manager.last_errors.get(conn_key, "connection failed")
+            logger.error("Database node: failed to connect to '%s': %s", server_name, reason)
             failed.append(server_name)
+            failure_reasons[server_name] = reason
 
     if not connected:
+        detail = "; ".join(f"{n} ({failure_reasons.get(n, 'connection failed')})" for n in failed)
         return {
             "status": "failed",
-            "error": f"Could not connect to any database server: {', '.join(failed)}",
+            "error": f"Could not connect to any database server: {detail}",
         }
 
     status = "success" if not failed else "partial"

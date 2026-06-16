@@ -7,6 +7,7 @@ so triage + drill fit in ~3000 tokens total.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from typing import Any, Dict, List, Optional
 
@@ -142,10 +143,70 @@ def build_insights_query_for_anomaly(
     return "\n".join(lines) + "\n"
 
 
+def _parse_iso(ts: Optional[str]):
+    """Best-effort ISO-8601 → aware datetime; None on failure."""
+    if not ts:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def compute_drill_window(target: Dict[str, Any], default_start, default_end, *, margin_minutes: int = 5):
+    """Cost-aware drill-down window (Phase 3).
+
+    A pattern target carries first_seen/last_seen — drilling only that span
+    (padded by *margin_minutes*) instead of the whole triage window scans far
+    less data. The result is always clamped within [default_start, default_end]
+    so it can never widen the query. Falls back to the full window when the
+    target has no usable timestamps. Pure/deterministic.
+    """
+    from datetime import timedelta
+
+    first = _parse_iso(target.get("first_seen"))
+    last = _parse_iso(target.get("last_seen"))
+    if not first and not last:
+        return default_start, default_end
+    lo = (first or last) - timedelta(minutes=margin_minutes)
+    hi = (last or first) + timedelta(minutes=margin_minutes)
+    # Clamp inside the triage window — never widen it.
+    lo = max(lo, default_start)
+    hi = min(hi, default_end)
+    if lo >= hi:
+        return default_start, default_end
+    return lo, hi
+
+
 def cap_drill_preview(text: str) -> str:
     if len(text) <= _PREVIEW_CHAR_CAP:
         return text
     return text[: _PREVIEW_CHAR_CAP - 1] + "…"
+
+
+_SEV_WEIGHT = {"critical": 4.0, "high": 3.0, "medium": 2.0, "low": 1.0, "none": 0.5}
+_GRADE_WEIGHT = {"high": 1.0, "medium": 0.85, "low": 0.7, "none": 0.6}
+
+
+def score_drill_target(target: Dict[str, Any], grade_weight: float = 1.0) -> float:
+    """Deterministic priority score for a drill-down candidate (Phase 2).
+
+    Combines three available signals so the strongest lead is drilled first:
+    ``severity`` × ``volume/spike`` × ``evidence_grade``. Anomalies use their
+    z-score as the spike term (a volume spike is a strong lead); patterns use a
+    log-scaled occurrence count (diminishing returns on sheer volume). Pure and
+    deterministic — same input always yields the same score.
+    """
+    sev = _SEV_WEIGHT.get(str(target.get("severity", "")).lower(), 1.5)
+    if target.get("kind") == "anomaly":
+        z = float(target.get("z_score") or 0.0)
+        spike = 1.0 + min(max(z, 0.0), 20.0) / 2.0
+    else:
+        occ = float(target.get("occurrence_count") or 0.0)
+        spike = 1.0 + math.log10(max(occ, 1.0))
+    return round(sev * spike * grade_weight, 6)
 
 
 def select_drill_targets(
@@ -156,18 +217,21 @@ def select_drill_targets(
 ) -> List[Dict[str, Any]]:
     """Rank the strongest findings for the staged pipeline to drill into.
 
-    Anomalies (ranked by z_score) take priority over recurring patterns (ranked
-    by occurrence_count), since a volume spike is a stronger lead than a steady
-    error. Returns up to *top_n* normalized target descriptors, each carrying the
-    fields the Insights query builders need.
+    With ``cloudwatch_drilldown_scoring`` enabled (default) all candidates are
+    ranked together by :func:`score_drill_target` (severity × spike × evidence
+    grade), so a high-volume critical pattern can outrank a marginal anomaly.
+    With the knob off, the legacy ordering is used (anomalies by z-score first,
+    then patterns by occurrence count). Returns up to *top_n* normalized target
+    descriptors carrying the fields the Insights query builders need.
     """
-    targets: List[Dict[str, Any]] = []
-
     anomalies = (anomalies_summary or {}).get("anomalies") or []
-    for a in sorted(anomalies, key=lambda x: (x.get("z_score") or 0), reverse=True):
+    patterns = (patterns_summary or {}).get("unique_patterns") or []
+
+    anomaly_targets: List[Dict[str, Any]] = []
+    for a in anomalies:
         if not isinstance(a, dict):
             continue
-        targets.append({
+        anomaly_targets.append({
             "kind": "anomaly",
             "log_group": a.get("log_group"),
             "z_score": a.get("z_score"),
@@ -175,20 +239,37 @@ def select_drill_targets(
             "label": f"anomaly z={a.get('z_score')} in {a.get('log_group') or 'log group'}",
         })
 
-    patterns = (patterns_summary or {}).get("unique_patterns") or []
-    for p in sorted(patterns, key=lambda x: (x.get("occurrence_count") or 0), reverse=True):
+    pattern_targets: List[Dict[str, Any]] = []
+    for p in patterns:
         if not isinstance(p, dict):
             continue
-        targets.append({
+        pattern_targets.append({
             "kind": "pattern",
             "normalized_pattern": p.get("normalized_pattern", ""),
             "example_message": p.get("example_message", ""),
             "occurrence_count": p.get("occurrence_count"),
+            "severity": p.get("severity"),
+            "first_seen": p.get("first_seen"),
+            "last_seen": p.get("last_seen"),
             "label": f"pattern x{p.get('occurrence_count')}: "
                      f"{(p.get('normalized_pattern') or '')[:60]}",
         })
 
-    return targets[: max(0, top_n)]
+    if not settings.cloudwatch_drilldown_scoring:
+        # Legacy ordering: anomalies (z-score desc) then patterns (count desc).
+        anomaly_targets.sort(key=lambda x: (x.get("z_score") or 0), reverse=True)
+        pattern_targets.sort(key=lambda x: (x.get("occurrence_count") or 0), reverse=True)
+        return (anomaly_targets + pattern_targets)[: max(0, top_n)]
+
+    grade_w = _GRADE_WEIGHT.get(
+        str((patterns_summary or {}).get("evidence_grade", "")).lower(), 0.8
+    )
+    scored = [(score_drill_target(t, grade_w), t) for t in (anomaly_targets + pattern_targets)]
+    # Sort by score desc; tie-break on label for stable, deterministic ordering.
+    scored.sort(key=lambda st: (-st[0], st[1].get("label", "")))
+    for s, t in scored:
+        t["drill_score"] = s
+    return [t for _s, t in scored[: max(0, top_n)]]
 
 
 # CloudWatch Logs Insights queries must start with one of these commands.
@@ -235,6 +316,44 @@ def lint_insights_query(query: str) -> Optional[str]:
                 "`| limit 20`) to bound the result set and cost.")
 
     return None
+
+
+# Hard ceiling on Insights pipe stages — a query with this many segments is
+# almost certainly malformed/pathological, and each stage adds scan cost.
+_MAX_PIPE_STAGES = 12
+_DEFAULT_FIXUP_LIMIT = 100
+
+
+def fixup_insights_query(query: str, *, default_limit: int = _DEFAULT_FIXUP_LIMIT):
+    """Auto-correct minor Insights-query issues instead of rejecting outright.
+
+    Returns ``(fixed_query, error)``:
+
+    * ``error`` is a corrective hint string for *unfixable* structural problems
+      (empty, bad lead command, unbalanced regex, empty segment, too many pipe
+      stages) — the caller should not run the query.
+    * Otherwise ``error`` is ``None`` and ``fixed_query`` is the query with a
+      ``| limit`` clause injected when one was missing (the one mistake that is
+      safe to fix silently). When nothing needs fixing the original query is
+      returned unchanged.
+
+    This keeps an agent's almost-correct query runnable (saving an investigation
+    iteration) while still hard-failing genuinely broken ones.
+    """
+    q = (query or "").strip()
+    # Reuse the strict linter for everything except the missing-limit case,
+    # which we fix rather than reject.
+    hint = lint_insights_query(q)
+    if hint and "no `| limit`" not in hint:
+        return q, hint
+
+    if len([seg for seg in q.split("|")]) - 1 > _MAX_PIPE_STAGES:
+        return q, (f"Insights query has too many pipe stages (>{_MAX_PIPE_STAGES}); "
+                   "simplify it into fewer commands.")
+
+    if "limit" not in q.lower():
+        q = q.rstrip() + f"\n| limit {default_limit}"
+    return q, None
 
 
 def compact_kb_patterns(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

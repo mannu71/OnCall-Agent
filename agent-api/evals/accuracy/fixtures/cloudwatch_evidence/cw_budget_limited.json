@@ -1,0 +1,31 @@
+{
+  "data_quality": {
+    "coverage": "partial",
+    "partial": true,
+    "sampled": true,
+    "budget_limited": true,
+    "failures": [],
+    "log_groups_requested": 1,
+    "analyses_requested": ["error-patterns", "anomaly-detection"]
+  },
+  "alarms": {
+    "summary": {"total": 1, "in_alarm": 0, "ok": 1, "insufficient_data": 0}
+  },
+  "patterns": {
+    "unique_patterns": [
+      {
+        "normalized_pattern": "Connection pool exhausted",
+        "occurrence_count": 210,
+        "affected_streams": 4,
+        "example_message": "2026-06-13T11:14:02Z ERROR Connection pool exhausted: no available connections (requestId=req-Bb22Cc44Dd)",
+        "first_seen": "2026-06-13T11:00:00Z",
+        "last_seen": "2026-06-13T11:30:00Z"
+      }
+    ],
+    "evidence_grade": "low"
+  },
+  "anomalies": {
+    "anomalies": [],
+    "summary": {"total_anomalies": 0, "critical_severity": 0, "high_severity": 0}
+  }
+}

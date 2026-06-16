@@ -105,6 +105,7 @@ class CrawlerService:
         "kg_unresolved_refs",
         "kg_nodes",
         "kg_files",
+        "repo_docs",
         "repo_abstractions",
     )
 
@@ -135,6 +136,7 @@ class CrawlerService:
         kind: Optional[str] = None,
         limit: int = 5,
         model_id: Optional[str] = None,
+        repos: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         from app.services.crawler_flows import crawler_find_symbol
 
@@ -144,6 +146,7 @@ class CrawlerService:
             kind=kind,
             limit=limit,
             model_id=model_id,
+            repos=repos,
         )
 
     async def get_body(self, *, handle: str, page: int = 1) -> Dict[str, Any]:
@@ -262,6 +265,7 @@ class CrawlerService:
         direction: str = "callers",
         depth: int = 2,
         model_id: Optional[str] = None,
+        repos: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         from app.services.crawler_flows import crawler_trace_path
 
@@ -271,6 +275,7 @@ class CrawlerService:
             direction=direction,
             depth=depth,
             model_id=model_id,
+            repos=repos,
         )
 
     async def search_semantic(
@@ -395,27 +400,40 @@ class CrawlerService:
 
         return await crawler_repo_map(repo=repo, name_like=name_like, limit=limit)
 
-    async def get_callers(self, repo: str, symbol: str, *, depth: int = 2) -> Dict[str, Any]:
+    async def get_callers(
+        self, repo: str, symbol: str, *, depth: int = 2,
+        repos: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         from app.services.crawler_flows import crawler_callers
 
-        return await crawler_callers(symbol=symbol, repo=repo, depth=depth)
+        return await crawler_callers(symbol=symbol, repo=repo, depth=depth,
+                                     repos=repos)
 
-    async def get_callees(self, repo: str, symbol: str, *, depth: int = 2) -> Dict[str, Any]:
+    async def get_callees(
+        self, repo: str, symbol: str, *, depth: int = 2,
+        repos: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         from app.services.crawler_flows import crawler_callees
 
-        return await crawler_callees(symbol=symbol, repo=repo, depth=depth)
+        return await crawler_callees(symbol=symbol, repo=repo, depth=depth,
+                                     repos=repos)
 
-    async def get_impact(self, repo: str, symbol: str) -> Dict[str, Any]:
+    async def get_impact(
+        self, repo: str, symbol: str,
+        repos: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         from app.services.crawler_flows import crawler_impact
 
-        return await crawler_impact(symbol=symbol, repo=repo)
+        return await crawler_impact(symbol=symbol, repo=repo, repos=repos)
 
     async def get_references(
-        self, repo: str, symbol: str, *, limit: int = 20
+        self, repo: str, symbol: str, *, limit: int = 20,
+        repos: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         from app.services.crawler_flows import crawler_find_references
 
-        return await crawler_find_references(symbol=symbol, repo=repo, limit=limit)
+        return await crawler_find_references(symbol=symbol, repo=repo, limit=limit,
+                                             repos=repos)
 
     async def diff_impact(
         self, repo: str, *, files: List[str], symbols: List[str]
@@ -510,6 +528,69 @@ class CrawlerService:
             "affected_tests": affected_tests,
             "affected_entry_points": affected_entry_points,
         }
+
+    # ── Project-intelligence reads (repo_docs, migration 015) ────────────────
+
+    async def get_project_brief(self, repo: str) -> Dict[str, Any]:
+        from app.services.crawler_flows import crawler_project_brief
+
+        return await crawler_project_brief(repo)
+
+    async def get_module_docs(self, repo: str, path: Optional[str] = None) -> Dict[str, Any]:
+        from app.services.crawler_flows import crawler_module_doc
+
+        return await crawler_module_doc(repo, path=path)
+
+    async def get_coding_standards(self, repo: str) -> Dict[str, Any]:
+        from app.services.crawler_flows import crawler_coding_standards
+
+        return await crawler_coding_standards(repo)
+
+    async def find_feature(self, repo: str, query: str) -> Dict[str, Any]:
+        from app.services.crawler_flows import crawler_find_feature
+
+        return await crawler_find_feature(repo, query)
+
+    async def get_project_context(self, repo: str) -> Optional[Dict[str, Any]]:
+        """Compact project intelligence for auto-injection at agent run start.
+
+        Returns a small dict (brief + architecture + a standards summary + top
+        features) capped for the agent's initial context, or None if the repo has
+        no generated brief. Deeper detail is fetched on demand via the tools.
+        """
+        from app.services.crawler_flows import (
+            crawler_project_brief, crawler_coding_standards, crawler_find_feature,
+        )
+
+        brief = await crawler_project_brief(repo)
+        if brief.get("error"):
+            return None
+        standards = await crawler_coding_standards(repo)
+        features = await crawler_find_feature(repo, "")
+
+        ctx: Dict[str, Any] = {
+            "repo": repo,
+            "brief": str(brief.get("brief", ""))[:1200],
+            "architecture": str(brief.get("architecture", ""))[:1200],
+        }
+        dm = brief.get("domain_model")
+        if dm:
+            ctx["domain_model"] = dm[:12]
+        if not standards.get("error"):
+            ctx["coding_standards"] = {
+                "naming": standards.get("naming", [])[:8],
+                "layout": str(standards.get("layout", ""))[:600],
+                "frameworks": standards.get("frameworks", [])[:8],
+                "error_handling": str(standards.get("error_handling", ""))[:400],
+                "frontend_patterns": str(standards.get("frontend_patterns", ""))[:400],
+                "backend_patterns": str(standards.get("backend_patterns", ""))[:400],
+            }
+        if not features.get("error"):
+            ctx["features"] = [
+                {"feature": f.get("feature"), "modules": f.get("modules", [])}
+                for f in (features.get("matches") or [])[:12] if isinstance(f, dict)
+            ]
+        return ctx
 
     async def discover_filesystem_repos(self, *, refresh: bool = False) -> Dict[str, Any]:
         """List repos visible on disk under REPOS_BASE_PATH."""

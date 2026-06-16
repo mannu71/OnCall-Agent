@@ -119,6 +119,7 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
                 'repos_indexed':      value.get('repos_indexed'),
                 'repos_config':       value.get('repos_config'),
                 'pre_summary':        value.get('pre_summary'),
+                'project_brief':      value.get('project_brief'),
                 'output':             value.get('output'),
             }
     if code_results:

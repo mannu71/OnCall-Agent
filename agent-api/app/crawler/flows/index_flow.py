@@ -9,6 +9,9 @@ DAG::
       >> PersistGraphDelta        (writes kg_nodes/kg_edges/kg_files)
       >> ExtractAbstractions      (LLM — high-level overview, best-effort)
       >> AnalyzeRelationships     (LLM — relationship summary, best-effort)
+      >> SummarizeModules         (LLM — per-directory wiki docs, incremental)
+      >> BuildProjectBrief        (LLM — product/domain/architecture + features)
+      >> ExtractStandards         (LLM — coding-conventions profile)
       >> BuildFileMap             (deterministic)
       >> PersistOverview          (writes repo_abstractions row)
 
@@ -16,6 +19,10 @@ KG-first ordering: the knowledge graph (deterministic, no LLM) is built
 and persisted *before* the LLM nodes run.  If a downstream LLM call is
 refused by a content filter the kg_* tables are already populated and the
 KG-backed query flows (findSymbolFlow, tracePathFlow) keep working.
+
+Project-intelligence nodes (SummarizeModules → BuildProjectBrief →
+ExtractStandards) run last and are all best-effort: they write to ``repo_docs``
+(migration 015) and never fail the flow on a refusal/parse error.
 """
 from app.engine.crawler_engine import AsyncFlow
 from app.crawler.nodes import (
@@ -28,6 +35,9 @@ from app.crawler.nodes import (
     ParseFilesAST,
     ResolveBareCallTargets,
     PersistGraphDelta,
+    SummarizeModules,
+    BuildProjectBrief,
+    ExtractStandards,
 )
 
 _fetch = FetchRepo()
@@ -37,10 +47,14 @@ _kg_resolve = ResolveBareCallTargets()
 _kg_persist = PersistGraphDelta()
 _extract = ExtractAbstractions(max_retries=3, wait=10.0)
 _analyze = AnalyzeRelationships(max_retries=3, wait=10.0)
+_summarize = SummarizeModules()
+_brief = BuildProjectBrief()
+_standards = ExtractStandards()
 _build = BuildFileMap()
 _persist = PersistOverview()
 
 (_fetch >> _kg_filter >> _kg_parse >> _kg_resolve >> _kg_persist
-        >> _extract >> _analyze >> _build >> _persist)
+        >> _extract >> _analyze >> _summarize >> _brief >> _standards
+        >> _build >> _persist)
 
 index_flow = AsyncFlow(start=_fetch)

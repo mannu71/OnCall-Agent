@@ -5,6 +5,7 @@ analyzing patterns, detecting anomalies, and correlating logs across services.
 """
 import asyncio
 import logging
+import random
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -72,6 +73,28 @@ def handle_exceptions(func: Callable) -> Callable:
                 "message": str(e)
             }
     return wrapper
+
+
+def compute_time_buckets(
+    start_time: datetime, end_time: datetime, bucket_minutes: int,
+) -> List[tuple]:
+    """Split [start_time, end_time] into newest-first buckets of ≤ bucket_minutes.
+
+    Returns a list of ``(bucket_start, bucket_end)`` tuples ordered most-recent
+    first (so an early-stopping consumer sees the freshest events first). The
+    last (oldest) bucket may be shorter than *bucket_minutes*. Pure and
+    deterministic — the unit test for the Phase 4 bucketing math.
+    """
+    if bucket_minutes <= 0 or end_time <= start_time:
+        return [(start_time, end_time)]
+    delta = timedelta(minutes=bucket_minutes)
+    buckets: List[tuple] = []
+    cur_end = end_time
+    while cur_end > start_time:
+        cur_start = max(start_time, cur_end - delta)
+        buckets.append((cur_start, cur_end))
+        cur_end = cur_start
+    return buckets
 
 
 class CloudWatchLogWatcher:
@@ -176,6 +199,61 @@ class CloudWatchLogWatcher:
         
         return logs[:limit]
     
+    async def query_with_insights_bucketed(
+        self,
+        log_group_names: List[str],
+        query_string: str,
+        start_time: datetime,
+        end_time: datetime,
+        limit: int = 1000,
+        bucket_minutes: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Run an Insights query over a long range as sequential time buckets.
+
+        For ranges beyond ``bucket_minutes`` (default ``cloudwatch_bucket_minutes``)
+        the window is split into newest-first buckets, each ≤ bucket size, and
+        queried in turn (reusing :meth:`query_with_insights` per bucket, so each
+        keeps the retry/sampling/rate-limit machinery). Results are concatenated
+        newest-first and the scan stops early once *limit* rows are collected —
+        recent events are usually the relevant ones. Scan statistics are summed
+        across buckets so Phase 3 cost accounting still sees the whole range.
+        """
+        bm = bucket_minutes or settings.cloudwatch_bucket_minutes
+        buckets = compute_time_buckets(start_time, end_time, bm)
+        merged: List[Dict[str, Any]] = []
+        stats = {"bytesScanned": 0.0, "recordsScanned": 0.0, "recordsMatched": 0.0}
+        status = "Complete"
+        partial = False
+        for bstart, bend in buckets:
+            res = await self.query_with_insights(
+                log_group_names=log_group_names,
+                query_string=query_string,
+                start_time=bstart,
+                end_time=bend,
+                limit=limit,
+            )
+            merged.extend(res.get("results", []) or [])
+            st = res.get("statistics") or {}
+            stats["bytesScanned"] += float(st.get("bytesScanned", 0) or 0)
+            stats["recordsScanned"] += float(st.get("recordsScanned", 0) or 0)
+            stats["recordsMatched"] += float(st.get("recordsMatched", 0) or 0)
+            if res.get("partial"):
+                partial = True
+            if res.get("status") and res["status"] != "Complete":
+                status = res["status"]
+            if len(merged) >= limit:
+                merged = merged[:limit]
+                break
+        out: Dict[str, Any] = {
+            "status": status,
+            "results": merged,
+            "statistics": stats,
+            "buckets": len(buckets),
+        }
+        if partial:
+            out["partial"] = True
+        return out
+
     async def query_with_insights(
         self,
         log_group_names: List[str],
@@ -209,12 +287,34 @@ class CloudWatchLogWatcher:
         Returns:
             Query results dict. May include ``partial=True`` and ``sampling_ratio``.
         """
+        # Long-range bucketing (Phase 4): when the window exceeds the bucket size
+        # (default 24h), split into sequential buckets so each Insights query
+        # stays within CloudWatch's practical per-query range. Callers passing a
+        # ≤24h window (the historical cap) are unaffected — no window exceeds the
+        # 1440-min default bucket, so this never fires for them.
+        _bm = settings.cloudwatch_bucket_minutes
+        if _bm > 0 and (end_time - start_time).total_seconds() / 60.0 > _bm:
+            return await self.query_with_insights_bucketed(
+                log_group_names=log_group_names,
+                query_string=query_string,
+                start_time=start_time,
+                end_time=end_time,
+                limit=limit,
+                bucket_minutes=_bm,
+            )
+
         backoffs = [2.0, 8.0, 30.0]
         last_error: Optional[str] = None
         last_query_id: Optional[str] = None
 
         async def _execute_once(qs: str, qstart: datetime, qend: datetime, qlimit: int) -> Dict[str, Any]:
             """Run a single Insights query and poll to completion or timeout."""
+            # Smooth StartQuery bursts (Phase 3) so a wide fan-out doesn't trip
+            # CloudWatch's per-account request-rate limit and throttle the run.
+            from app.core import cloudwatch_ratelimit
+            await cloudwatch_ratelimit.acquire(
+                self.region, "StartQuery", settings.cloudwatch_ratelimit_startquery_rps,
+            )
             start_resp = await run_in_aws_pool(
                 lambda: self.client.start_query(
                     logGroupNames=log_group_names,
@@ -282,7 +382,10 @@ class CloudWatchLogWatcher:
                     raise
 
             if attempt < max_attempts - 1:
-                await asyncio.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+                # Jitter (±25%) so parallel queries that throttle together don't
+                # retry in lockstep and re-collide on the same throttle window.
+                _base = backoffs[min(attempt, len(backoffs) - 1)]
+                await asyncio.sleep(_base * random.uniform(0.75, 1.25))
 
         # Sampling fallback: shrink window to last 25% and cap to 1000 rows.
         window = end_time - start_time

@@ -56,6 +56,262 @@ const NODE_CLASSES = {
 
 const DEFAULT_NODE_CLASS = 'bg-slate-500/10 dark:bg-slate-500/20 border border-slate-500/40 text-slate-800 dark:text-slate-200 rounded-md p-2.5 text-xs w-[220px] text-center shadow-sm cursor-pointer hover:bg-slate-500/25 transition-all font-medium';
 
+// A response is "missing" intelligence when the backend returns nothing or an
+// explicit { error } shape (e.g. a 404 surfaced as data). Treat both as
+// "not generated yet" so the panel renders a hint instead of crashing.
+function _hasIntel(res) {
+  return !!res && typeof res === 'object' && !res.error;
+}
+
+// Read-only, collapsible project-intelligence viewer for an indexed repo.
+// Lazily fetches brief / standards / modules when first expanded and caches
+// them in local state. Never mutates the index.
+function ProjectIntelligencePanel({ repo }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [brief, setBrief] = useState(null);
+  const [standards, setStandards] = useState(null);
+  const [modules, setModules] = useState([]);
+  const [expandedModule, setExpandedModule] = useState(null); // path of expanded module
+  const [moduleDetail, setModuleDetail] = useState({});        // path -> detail
+  const [moduleLoading, setModuleLoading] = useState('');      // path currently loading
+
+  // Reset cached intelligence whenever the selected repo changes.
+  useEffect(() => {
+    setOpen(false);
+    setBrief(null);
+    setStandards(null);
+    setModules([]);
+    setExpandedModule(null);
+    setModuleDetail({});
+    setError('');
+  }, [repo]);
+
+  const load = useCallback(async () => {
+    if (!repo) return;
+    setLoading(true);
+    setError('');
+    try {
+      const [briefRes, standardsRes, docsRes] = await Promise.all([
+        agentApiClient.getRepoBrief(repo).catch(() => null),
+        agentApiClient.getRepoStandards(repo).catch(() => null),
+        agentApiClient.getRepoDocs(repo).catch(() => null),
+      ]);
+      setBrief(_hasIntel(briefRes) ? briefRes : null);
+      setStandards(_hasIntel(standardsRes) ? standardsRes : null);
+      const mods = _hasIntel(docsRes) ? (docsRes.modules || docsRes.docs || []) : [];
+      setModules(Array.isArray(mods) ? mods : []);
+    } catch (err) {
+      console.error('Failed to load project intelligence', err);
+      setError(err?.message || 'Failed to load project intelligence');
+    } finally {
+      setLoading(false);
+    }
+  }, [repo]);
+
+  const handleToggle = () => {
+    const next = !open;
+    setOpen(next);
+    // Lazy-load on first expand.
+    if (next && brief === null && standards === null && modules.length === 0 && !loading) {
+      load();
+    }
+  };
+
+  const handleModuleClick = useCallback(async (path) => {
+    if (expandedModule === path) {
+      setExpandedModule(null);
+      return;
+    }
+    setExpandedModule(path);
+    if (moduleDetail[path] !== undefined) return; // cached
+    setModuleLoading(path);
+    try {
+      const res = await agentApiClient.getRepoDocs(repo, path);
+      setModuleDetail(prev => ({ ...prev, [path]: _hasIntel(res) ? res : null }));
+    } catch (err) {
+      console.error('Failed to load module detail', err);
+      setModuleDetail(prev => ({ ...prev, [path]: null }));
+    } finally {
+      setModuleLoading('');
+    }
+  }, [repo, expandedModule, moduleDetail]);
+
+  const nothing = !loading && !error && !brief && !standards && modules.length === 0;
+  const domainModel = brief?.domain_model || [];
+
+  return (
+    <div className="border-t border-border">
+      <button
+        onClick={handleToggle}
+        className="w-full flex items-center gap-2 px-5 py-3 text-left text-xs font-semibold text-foreground hover:bg-muted transition-colors"
+      >
+        <ChevronRight className={`w-3.5 h-3.5 text-muted-foreground transition-transform ${open ? 'rotate-90' : ''}`} />
+        <Layers className="w-4 h-4 text-primary" />
+        <span>Project Intelligence</span>
+        {loading && <Activity className="w-3.5 h-3.5 text-primary animate-spin ml-auto" />}
+      </button>
+
+      {open && (
+        <div className="px-5 pb-5 space-y-5 text-xs">
+          {error && (
+            <p className="text-[11px] text-destructive leading-snug">{error}</p>
+          )}
+
+          {nothing && (
+            <p className="text-muted-foreground italic leading-relaxed">
+              No project intelligence yet — reindex to generate.
+            </p>
+          )}
+
+          {/* Project brief + architecture */}
+          {brief && (
+            <div className="space-y-3">
+              {brief.brief && (
+                <div className="space-y-1.5">
+                  <h4 className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">Project Brief</h4>
+                  <p className="text-foreground leading-relaxed bg-muted/40 p-3 rounded-md border border-border whitespace-pre-wrap">
+                    {brief.brief}
+                  </p>
+                </div>
+              )}
+              {brief.architecture && (
+                <div className="space-y-1.5">
+                  <h4 className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">Architecture</h4>
+                  <p className="text-foreground leading-relaxed bg-muted/40 p-3 rounded-md border border-border whitespace-pre-wrap">
+                    {brief.architecture}
+                  </p>
+                </div>
+              )}
+              {domainModel.length > 0 && (
+                <div className="space-y-1.5">
+                  <h4 className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">Domain Model</h4>
+                  <ul className="space-y-1.5">
+                    {domainModel.map((d, i) => (
+                      <li key={d.entity || d.name || i} className="bg-muted/40 p-2.5 rounded-md border border-border">
+                        <span className="font-semibold text-foreground">{d.entity || d.name}</span>
+                        {(d.description || d.desc) && (
+                          <span className="text-muted-foreground"> — {d.description || d.desc}</span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Coding standards */}
+          {standards && (
+            <div className="space-y-3">
+              <h4 className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">Coding Standards</h4>
+              {Array.isArray(standards.naming) && standards.naming.length > 0 && (
+                <div className="space-y-1">
+                  <span className="text-[10px] font-semibold text-foreground">Naming</span>
+                  <ul className="list-disc pl-4 space-y-0.5 text-muted-foreground">
+                    {standards.naming.map((n, i) => <li key={i} className="break-words">{n}</li>)}
+                  </ul>
+                </div>
+              )}
+              {standards.layout && (
+                <div className="space-y-1">
+                  <span className="text-[10px] font-semibold text-foreground">Layout</span>
+                  <p className="text-muted-foreground leading-relaxed whitespace-pre-wrap">{standards.layout}</p>
+                </div>
+              )}
+              {Array.isArray(standards.frameworks) && standards.frameworks.length > 0 && (
+                <div className="space-y-1">
+                  <span className="text-[10px] font-semibold text-foreground">Frameworks</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {standards.frameworks.map((f, i) => (
+                      <span key={i} className="text-[10px] bg-muted text-muted-foreground px-1.5 py-0.5 rounded border border-border">{f}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {standards.error_handling && (
+                <div className="space-y-1">
+                  <span className="text-[10px] font-semibold text-foreground">Error Handling</span>
+                  <p className="text-muted-foreground leading-relaxed whitespace-pre-wrap">{standards.error_handling}</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Modules */}
+          {modules.length > 0 && (
+            <div className="space-y-2">
+              <h4 className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">Modules</h4>
+              <div className="space-y-1">
+                {modules.map((m, i) => {
+                  const path = m.path || m.module || m.name;
+                  const isExpanded = expandedModule === path;
+                  const detail = moduleDetail[path];
+                  return (
+                    <div key={path || i} className="rounded-md border border-border overflow-hidden">
+                      <button
+                        onClick={() => handleModuleClick(path)}
+                        className="w-full text-left px-2.5 py-2 flex items-start gap-2 hover:bg-muted transition-colors"
+                      >
+                        <ChevronRight className={`w-3 h-3 mt-0.5 text-muted-foreground flex-shrink-0 transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
+                        <span className="flex-1 min-w-0">
+                          <span className="font-semibold text-foreground break-words block">{path}</span>
+                          {m.responsibility && (
+                            <span className="text-muted-foreground text-[11px] leading-snug">{m.responsibility}</span>
+                          )}
+                        </span>
+                        {moduleLoading === path && <Activity className="w-3 h-3 text-primary animate-spin flex-shrink-0" />}
+                      </button>
+                      {isExpanded && (
+                        <div className="px-3 pb-3 pt-1 space-y-2 bg-muted/30 border-t border-border">
+                          {detail === null && (
+                            <p className="text-muted-foreground italic text-[11px]">No further detail available.</p>
+                          )}
+                          {detail && Array.isArray(detail.key_components) && detail.key_components.length > 0 && (
+                            <div className="space-y-1">
+                              <span className="text-[10px] font-semibold text-foreground">Key Components</span>
+                              <ul className="list-disc pl-4 space-y-0.5 text-muted-foreground">
+                                {detail.key_components.map((c, j) => (
+                                  <li key={j} className="break-words">{typeof c === 'string' ? c : (c.name || c.component)}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                          {detail && detail.data_flow && (
+                            <div className="space-y-1">
+                              <span className="text-[10px] font-semibold text-foreground">Data Flow</span>
+                              <p className="text-muted-foreground leading-relaxed whitespace-pre-wrap">
+                                {typeof detail.data_flow === 'string' ? detail.data_flow : JSON.stringify(detail.data_flow)}
+                              </p>
+                            </div>
+                          )}
+                          {detail && Array.isArray(detail.depends_on) && detail.depends_on.length > 0 && (
+                            <div className="space-y-1">
+                              <span className="text-[10px] font-semibold text-foreground">Depends On</span>
+                              <div className="flex flex-wrap gap-1.5">
+                                {detail.depends_on.map((d, j) => (
+                                  <span key={j} className="text-[10px] bg-muted text-muted-foreground px-1.5 py-0.5 rounded border border-border break-words">
+                                    {typeof d === 'string' ? d : (d.path || d.name)}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function CodebaseExplorer() {
   const [repos, setRepos] = useState([]);
   const [selectedRepo, setSelectedRepo] = useState('');
@@ -761,6 +1017,9 @@ export default function CodebaseExplorer() {
             </p>
           </div>
         )}
+
+        {/* Read-only project intelligence (brief / standards / modules) */}
+        {selectedRepo && <ProjectIntelligencePanel repo={selectedRepo} />}
 
         {/* Guided Code Tour segment for Diff Impact */}
         {activeTab === 'impact' && diffImpactResult && (

@@ -265,6 +265,48 @@ class Settings(BaseSettings):
     # a circuit breaker skips it after N consecutive guardrail refusals.
     cloudwatch_pipeline_llm_synthesis: bool = True
     cloudwatch_synthesis_guardrail_cooldown: int = 3   # consecutive refusals before skip
+    # Reliability (Phase 1). Cap concurrent CloudWatch Logs Insights queries so a
+    # wide fan-out (top_n drill-downs × log groups) can't trip StartQuery
+    # concurrency limits. Reduced-scope retry gives a failed analyzer one more
+    # chance over a halved window (transient errors only) before the run is
+    # marked partial. Per-analyzer cache TTLs let cheap-to-stale data (alarms,
+    # log-group discovery) cache longer than fast-moving error patterns.
+    cloudwatch_insights_max_concurrency: int = 3
+    cloudwatch_reduced_scope_retry: bool = True
+    cloudwatch_cache_ttl_alarms: int = 300
+    cloudwatch_cache_ttl_logs: int = 60
+    # Accuracy (Phase 2). Deterministic drill-down scoring ranks candidates by
+    # severity × volume/spike × evidence-grade instead of a flat z-score/count
+    # sort. Alarm history surfaces flapping alarms (DescribeAlarmHistory).
+    # Metrics discovery (ListMetrics) lets the agent find metrics for a log group
+    # without hand-written MetricDataQuery dicts. Insights query fix-up auto-adds
+    # a missing `| limit` clause instead of rejecting the query outright.
+    cloudwatch_drilldown_scoring: bool = True
+    cloudwatch_alarm_history: bool = True
+    cloudwatch_metrics_discovery: bool = True
+    cloudwatch_insights_query_fixup: bool = True
+    # Cost & token controls (Phase 3). Every run aggregates bytes scanned by
+    # Insights and estimates USD (insights_cost_per_gb). A soft per-run scan
+    # budget degrades remaining drill-downs to a sampled window once exceeded
+    # (recorded as budget_limited) rather than failing. A generous in-process
+    # token-bucket rate limiter on StartQuery only bites under heavy fan-out.
+    cloudwatch_max_gb_scanned_per_run: float = 5.0
+    cloudwatch_insights_cost_per_gb: float = 0.005
+    cloudwatch_ratelimit_startquery_rps: float = 5.0
+    # Feature breadth (Phase 4). Metrics are a first-class analysis type (uses
+    # ListMetrics discovery to build queries when none are hand-written). Time
+    # ranges beyond 24h are split into sequential buckets (newest-first, early
+    # stop once enough events are gathered). The hard cap defaults to 24h; raise
+    # cloudwatch_max_time_range_minutes (up to 10080 = 7d) to enable longer
+    # ranges — bucketing then keeps each Insights query within bucket_minutes.
+    cloudwatch_max_time_range_minutes: int = 1440
+    cloudwatch_bucket_minutes: int = 1440
+    # Multi-region fan-out (Phase 5). When a node lists more than one region the
+    # investigation runs per-region triage (bounded by this cap), namespaces all
+    # findings as "region:log_group", and merges into one evidence bundle for a
+    # single synthesis. One bad region degrades to partial coverage, not a failed
+    # run. Cross-account (assume-role) is intentionally out of scope here.
+    cloudwatch_max_regions_per_run: int = 3
 
     # Supervisor
     supervisor_max_retries: int = 1

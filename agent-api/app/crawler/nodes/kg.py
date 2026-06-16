@@ -110,7 +110,7 @@ class FilterChangedFiles(AsyncNode):
         }
 
     async def exec(self, prep_res: Dict[str, Any]) -> Dict[str, Any]:
-        from app.crawler.files import read_repo_file
+        from app.crawler.files import read_repo_files_bounded
         from app.crawler.kg.parser import detect_language
         from app.core.database import AsyncSessionLocal
         from sqlalchemy import text
@@ -119,11 +119,11 @@ class FilterChangedFiles(AsyncNode):
         repo = prep_res["repo"]
         paths: List[str] = prep_res["paths"]
 
+        # Read the parseable files with bounded parallelism instead of serially —
+        # on a large repo this is the dominant cost of the (cheap) skip-check.
+        supported_paths = [p for p in paths if detect_language(p) is not None]
         current: Dict[str, Tuple[str, str]] = {}
-        for path in paths:
-            if detect_language(path) is None:
-                continue
-            content = await read_repo_file(repo, path)
+        for path, content in await read_repo_files_bounded(repo, supported_paths):
             sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
             current[path] = (sha, content)
 

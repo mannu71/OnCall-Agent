@@ -30,6 +30,11 @@ from app.crawler.nodes.kg import (
     ResolveBareCallTargets,
     PersistGraphDelta,
 )
+from app.crawler.nodes.intelligence import (
+    SummarizeModules,
+    BuildProjectBrief,
+)
+from app.crawler.nodes.standards import ExtractStandards
 
 __all__ = [
     "FetchRepo",
@@ -53,6 +58,10 @@ __all__ = [
     "ParseFilesAST",
     "ResolveBareCallTargets",
     "PersistGraphDelta",
+    # intelligence nodes
+    "SummarizeModules",
+    "BuildProjectBrief",
+    "ExtractStandards",
     # trace nodes
     "_trace_mod",
     # semantic nodes

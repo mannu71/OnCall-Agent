@@ -47,6 +47,7 @@ class QueryKGForSymbol(AsyncNode):
     async def prep(self, shared: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "repo":   shared["repo"],
+            "repos":  shared.get("repos") or [shared["repo"]],
             "symbol": shared["symbol"],
             "kind":   shared.get("kind"),
             "limit":  shared.get("limit", 5),
@@ -61,9 +62,9 @@ class QueryKGForSymbol(AsyncNode):
             if prep_res["kind"]:
                 sql = """
                     SELECT name, kind, qualified_name, file_path,
-                           line_start, line_end, signature
+                           line_start, line_end, signature, repo_name
                     FROM kg_nodes
-                    WHERE repo_name = :r
+                    WHERE repo_name = ANY(:repos)
                       AND name = :s
                       AND kind = :k
                     ORDER BY exported DESC, line_start ASC
@@ -71,21 +72,21 @@ class QueryKGForSymbol(AsyncNode):
                 """
                 rows = await session.execute(
                     text(sql),
-                    {"r": prep_res["repo"], "s": prep_res["symbol"],
+                    {"repos": prep_res["repos"], "s": prep_res["symbol"],
                      "k": prep_res["kind"], "lim": prep_res["limit"]},
                 )
             else:
                 sql = """
                     SELECT name, kind, qualified_name, file_path,
-                           line_start, line_end, signature
+                           line_start, line_end, signature, repo_name
                     FROM kg_nodes
-                    WHERE repo_name = :r AND name = :s
+                    WHERE repo_name = ANY(:repos) AND name = :s
                     ORDER BY exported DESC, line_start ASC
                     LIMIT :lim
                 """
                 rows = await session.execute(
                     text(sql),
-                    {"r": prep_res["repo"], "s": prep_res["symbol"], "lim": prep_res["limit"]},
+                    {"repos": prep_res["repos"], "s": prep_res["symbol"], "lim": prep_res["limit"]},
                 )
 
             results = rows.fetchall()
@@ -94,7 +95,7 @@ class QueryKGForSymbol(AsyncNode):
 
         matches: List[Dict[str, Any]] = []
         for row in results:
-            name, kind, _qname, file_path, line_start, line_end, signature = row
+            name, kind, _qname, file_path, line_start, line_end, signature, repo_name = row
             # Match VerifyOnDisk shape so BuildFindResponse needs no changes.
             line_count_hint = max(line_end or line_start or 1, (line_start or 1) + 50)
             matches.append({
@@ -102,6 +103,7 @@ class QueryKGForSymbol(AsyncNode):
                 "line":        int(line_start or 1),
                 "kind":        kind,
                 "context":     (signature or "")[:200],
+                "_repo":       repo_name,
                 "_abs_path":   "",
                 "_line_count": line_count_hint,
             })
@@ -560,6 +562,7 @@ class BuildFindResponse(AsyncNode):
     async def prep(self, shared: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "repo": shared["repo"],
+            "repos": shared.get("repos") or [shared["repo"]],
             "symbol": shared["symbol"],
             "verified": shared["_verified_matches"],
             "limit": shared.get("limit", 5),
@@ -573,22 +576,28 @@ class BuildFindResponse(AsyncNode):
             relpath = match["file"]
             line_no = int(match["line"])
             line_count = match.get("_line_count", line_no)
+            # KG fast-path matches carry their own repo (multi-repo scope); the
+            # LLM fallback path produces single-repo matches against shared repo.
+            match_repo = match.get("_repo") or prep_res["repo"]
 
             # Window of ~40 lines centred on the definition
             window_start = max(1, line_no - 2)
             window_end = min(line_count, line_no + 37)
             handle = _make_body_handle(
-                prep_res["repo"], relpath, window_start, window_end
+                match_repo, relpath, window_start, window_end
             )
 
-            results.append({
+            entry = {
                 "file": relpath,
                 "line": line_no,
                 "kind": match.get("kind", "unknown"),
                 "context": str(match.get("context", ""))[:200],
                 "body_handle": handle,
                 "confidence": "verified",
-            })
+            }
+            if len(prep_res["repos"]) > 1:
+                entry["repo"] = match_repo
+            results.append(entry)
 
         return {"results": results, "found": len(results) > 0}
 

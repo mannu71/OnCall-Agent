@@ -112,6 +112,8 @@ async def index_workflow_repos(
         )
 
 
+
+
 async def recover_interrupted_indexing() -> None:
     """Re-fire indexing for workflows left mid-index after a process restart.
 

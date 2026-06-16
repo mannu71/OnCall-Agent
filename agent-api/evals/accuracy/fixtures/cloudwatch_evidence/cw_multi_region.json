@@ -1,0 +1,29 @@
+{
+  "data_quality": {
+    "coverage": "full",
+    "partial": false,
+    "regions": {"us-east-1": "full", "eu-west-1": "full"},
+    "failures": []
+  },
+  "alarms": {
+    "summary": {"total": 4, "in_alarm": 0, "ok": 4, "names": ["us-east-1:kyc-auth-5xx", "eu-west-1:kyc-auth-5xx"]}
+  },
+  "patterns": {
+    "unique_patterns": [
+      {
+        "normalized_pattern": "DynamoDB ProvisionedThroughputExceededException",
+        "occurrence_count": 120,
+        "affected_streams": 3,
+        "example_message": "2026-06-14T08:11:00Z ERROR ProvisionedThroughputExceededException on table kyc-profiles (requestId=req-Useast1Aa)",
+        "region": "us-east-1",
+        "first_seen": "2026-06-14T08:00:00Z",
+        "last_seen": "2026-06-14T08:35:00Z"
+      }
+    ],
+    "evidence_grade": "medium"
+  },
+  "anomalies": {
+    "anomalies": [],
+    "summary": {"total_anomalies": 0, "critical_severity": 0, "high_severity": 0}
+  }
+}

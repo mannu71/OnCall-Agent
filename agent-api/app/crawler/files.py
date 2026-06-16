@@ -466,6 +466,166 @@ async def read_repo_files_bounded(
 
 
 # ---------------------------------------------------------------------------
+# Generic coding-agent primitives — raw grep / list over a repo's files. These
+# encode NO language, framework, or cloud knowledge: they just expose the repo's
+# text to the agent (jailed under REPOS_BASE_PATH, honouring the same prune /
+# .gitignore rules as indexing). The agent supplies the pattern and reasons over
+# the results — exactly how a coding agent (ripgrep + read) works.
+# ---------------------------------------------------------------------------
+
+def _glob_match(relpath: str, pattern: str) -> bool:
+    norm = relpath.replace("\\", "/")
+    return fnmatch.fnmatch(norm, pattern) or fnmatch.fnmatch(norm.rsplit("/", 1)[-1], pattern)
+
+
+async def list_repo_files(
+    repo_name: str,
+    *,
+    glob: Optional[str] = None,
+    limit: int = 400,
+) -> List[str]:
+    """List a repo's files (relative paths), optionally filtered by a glob."""
+    paths = await crawl_file_paths(repo_name)
+    if glob:
+        paths = [p for p in paths if _glob_match(p, glob)]
+    return paths[: max(1, limit)]
+
+
+# Generic build/VCS dirs to skip when grepping — scan-scope noise, not
+# language-semantic knowledge (mirrors the indexing prune set).
+_GREP_EXCLUDE_DIRS = _BASE_PRUNE_DIRS | {
+    "bin", "obj", "dist", "build", "out", "publish", "target", "packages",
+    ".terraform", ".next", ".nuxt", "coverage", "TestResults",
+}
+
+
+async def grep_repo(
+    repo_name: str,
+    pattern: str,
+    *,
+    glob: Optional[str] = None,
+    ignore_case: bool = True,
+    max_results: int = 80,
+    timeout: float = 20.0,
+) -> List[Tuple[str, int, str]]:
+    """Regex-search a repo's file contents (like ripgrep). Returns (relpath,
+    line_no, line_text). Generic — no language/framework assumptions.
+
+    Shells out to ``grep`` (single fast native process, jailed to the repo dir,
+    terminated once ``max_results`` lines arrive or ``timeout`` elapses — so it
+    never hangs, returning partial results). Falls back to a bounded in-process
+    scan if ``grep`` isn't available.
+    """
+    directory, _jail = _repo_directory(repo_name)
+
+    # Prefer ripgrep (fast, .gitignore-aware), then GNU grep, then a Python scan.
+    rg_args = ["rg", "--line-number", "--no-heading", "--color=never", "--max-columns=400"]
+    if ignore_case:
+        rg_args.append("-i")
+    for d in _GREP_EXCLUDE_DIRS:
+        rg_args += ["-g", f"!**/{d}/**"]
+    if glob:
+        rg_args += ["-g", glob]
+    rg_args += ["-e", pattern, "."]
+
+    grep_args = ["grep", "-rnIE", "--binary-files=without-match"]
+    if ignore_case:
+        grep_args.append("-i")
+    for d in _GREP_EXCLUDE_DIRS:
+        grep_args.append(f"--exclude-dir={d}")
+    if glob:
+        grep_args.append(f"--include={glob}")
+    grep_args += ["--", pattern, "."]
+
+    for argv in (rg_args, grep_args):
+        res = await _run_search(argv, directory, max_results=max_results, timeout=timeout)
+        if res is not None:
+            return res
+    # Neither binary present — bounded in-process scan.
+    return await _grep_python_fallback(
+        repo_name, pattern, glob=glob, ignore_case=ignore_case, max_results=max_results,
+    )
+
+
+async def _run_search(
+    argv: List[str], cwd: str, *, max_results: int, timeout: float,
+) -> Optional[List[Tuple[str, int, str]]]:
+    """Run a grep/ripgrep command, parse ``path:line:text`` output. Returns the
+    matches, or None if the binary isn't installed (so the caller can fall back).
+    Time-bounded and capped at ``max_results`` — never hangs."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=cwd,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, NotImplementedError):
+        return None
+
+    out: List[Tuple[str, int, str]] = []
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    try:
+        assert proc.stdout is not None
+        while len(out) < max_results:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            if not raw:
+                break
+            s = raw.decode("utf-8", errors="replace").rstrip("\n")
+            parts = s.split(":", 2)
+            if len(parts) != 3:
+                continue
+            path_part, lineno, text = parts
+            rel = path_part[2:] if path_part.startswith("./") else path_part
+            out.append((rel.replace("\\", "/"), int(lineno) if lineno.isdigit() else 0,
+                        text.strip()[:300]))
+    finally:
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+async def _grep_python_fallback(
+    repo_name: str, pattern: str, *, glob: Optional[str], ignore_case: bool,
+    max_results: int, max_files: int = 2000,
+) -> List[Tuple[str, int, str]]:
+    """Bounded in-process grep — only used when the ``grep`` binary is absent."""
+    import re
+
+    flags = re.IGNORECASE if ignore_case else 0
+    try:
+        rx = re.compile(pattern, flags)
+    except re.error:
+        rx = re.compile(re.escape(pattern), flags)
+
+    paths = await crawl_file_paths(repo_name)
+    if glob:
+        paths = [p for p in paths if _glob_match(p, glob)]
+
+    out: List[Tuple[str, int, str]] = []
+    for relpath in paths[:max_files]:
+        if len(out) >= max_results:
+            break
+        try:
+            content = await read_repo_file(repo_name, relpath)
+        except Exception:  # noqa: BLE001
+            continue
+        for i, line in enumerate(content.splitlines(), start=1):
+            if rx.search(line):
+                out.append((relpath, i, line.strip()[:300]))
+                if len(out) >= max_results:
+                    break
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Public async entry point
 # ---------------------------------------------------------------------------
 

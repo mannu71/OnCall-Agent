@@ -75,61 +75,6 @@ def _make_key(fn_name: str, **kwargs: Any) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-async def cached_call(
-    fn_name: str,
-    fn: Callable[..., Any],
-    ttl_seconds: int = 120,
-    **kwargs: Any,
-) -> Any:
-    """Call *fn*(**kwargs) and cache the result for *ttl_seconds* seconds.
-
-    On a cache hit the stored result is returned immediately without calling
-    *fn*.  On a cache miss only one concurrent coroutine actually calls *fn*;
-    all others wait for that result (thundering-herd prevention).
-
-    Args:
-        fn_name: Logical name used as part of the cache key (e.g.
-            ``"watch_log_groups"``).
-        fn: Async callable to invoke on a cache miss.
-        ttl_seconds: Seconds to cache the result (default 120).  Pass 0 to
-            bypass the cache entirely (always call *fn*).
-        **kwargs: Arguments forwarded to *fn* and included in the cache key.
-            Exclude secrets / credentials from kwargs so they never affect
-            the key (bind them via closure inside *fn* instead).
-
-    Returns:
-        The result of *fn*(**kwargs), from cache or freshly computed.
-    """
-    if ttl_seconds <= 0:
-        return await fn(**kwargs)
-
-    key = _make_key(fn_name, **kwargs)
-
-    # Lazily create a per-slot lock.
-    async with _get_meta_lock():
-        if key not in _locks:
-            _locks[key] = asyncio.Lock()
-        slot_lock = _locks[key]
-
-    async with slot_lock:
-        entry = _store.get(key)
-        if entry is not None:
-            result, expiry = entry
-            remaining = expiry - time.monotonic()
-            if remaining > 0:
-                logger.debug(
-                    "cloudwatch_cache: HIT %s (%.0fs remaining)", fn_name, remaining
-                )
-                return result
-
-        # Cache miss — call the underlying function.
-        logger.debug("cloudwatch_cache: MISS %s — calling AWS API", fn_name)
-        result = await fn(**kwargs)
-        _store[key] = (result, time.monotonic() + ttl_seconds)
-        logger.debug("cloudwatch_cache: SET %s ttl=%ds", fn_name, ttl_seconds)
-        return result
-
-
 def invalidate(fn_name: Optional[str] = None) -> int:
     """Invalidate cache entries.
 
@@ -164,6 +109,37 @@ _fn_index: Dict[str, set] = {}
 
 _SWEEP_COUNTER = 0
 _SWEEP_EVERY = 50
+
+# ---------------------------------------------------------------------------
+# Hit/miss instrumentation (Phase 0)
+# ---------------------------------------------------------------------------
+# Process-wide counters so a run can report how effective the cache was. These
+# are observational only — they never alter cache behaviour.
+_HITS = 0
+_MISSES = 0
+
+
+def stats() -> Dict[str, Any]:
+    """Return cache effectiveness counters and current store size.
+
+    ``hit_rate`` is ``hits / (hits + misses)`` (0.0 when there has been no
+    traffic). Counters are process-wide and cumulative; call :func:`reset_stats`
+    to zero them at the start of a measured run.
+    """
+    total = _HITS + _MISSES
+    return {
+        "hits": _HITS,
+        "misses": _MISSES,
+        "hit_rate": (_HITS / total) if total else 0.0,
+        "entries": len(_store),
+    }
+
+
+def reset_stats() -> None:
+    """Zero the hit/miss counters (does not clear the cache store)."""
+    global _HITS, _MISSES
+    _HITS = 0
+    _MISSES = 0
 
 
 def _sweep_expired() -> int:
@@ -205,16 +181,19 @@ async def cached_call(  # noqa: F811  — intentional redefinition with index tr
         _fn_index[fn_name].add(key)
 
     async with slot_lock:
+        global _HITS, _MISSES
         entry = _store.get(key)
         if entry is not None:
             result, expiry = entry
             remaining = expiry - time.monotonic()
             if remaining > 0:
+                _HITS += 1
                 logger.debug(
                     "cloudwatch_cache: HIT %s (%.0fs remaining)", fn_name, remaining
                 )
                 return result
 
+        _MISSES += 1
         logger.debug("cloudwatch_cache: MISS %s — calling AWS API", fn_name)
         global _SWEEP_COUNTER
         _SWEEP_COUNTER += 1

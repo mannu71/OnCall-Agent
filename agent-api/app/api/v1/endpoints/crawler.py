@@ -29,6 +29,7 @@ class FindRequest(BaseModel):
     kind: Optional[str] = Field(None, description="Symbol type hint (function/class/method/constant).")
     limit: int = Field(5, ge=1, le=20)
     model_id: Optional[str] = None
+    repos: Optional[List[str]] = Field(None, description="Explicit list of repos to search across.")
 
 
 class BodyRequest(BaseModel):
@@ -42,6 +43,7 @@ class TraceRequest(BaseModel):
     direction: str = Field("callers", description="'callers' or 'callees'.")
     depth: int = Field(2, ge=1, le=5)
     model_id: Optional[str] = None
+    repos: Optional[List[str]] = Field(None, description="Explicit list of repos to trace across.")
 
 
 class SearchRequest(BaseModel):
@@ -106,6 +108,7 @@ async def find_symbol(body: FindRequest) -> Dict[str, Any]:
         kind=body.kind,
         limit=body.limit,
         model_id=body.model_id,
+        repos=body.repos,
     )
     _raise_on_error(result)
     return result
@@ -161,6 +164,7 @@ async def trace_path(body: TraceRequest) -> Dict[str, Any]:
         direction=body.direction,
         depth=body.depth,
         model_id=body.model_id,
+        repos=body.repos,
     )
     _raise_on_error(result)
     return result
@@ -276,3 +280,39 @@ async def post_diff_impact(repo: str, body: DiffImpactRequest) -> Dict[str, Any]
         return await crawler_service.diff_impact(repo, files=body.files, symbols=body.symbols)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Database walk failed: {exc}") from exc
+
+
+# ── Project-intelligence reads (repo_docs, migration 015) ────────────────────
+
+@router.get("/repos/{repo}/brief", summary="Project brief, domain model and architecture")
+async def get_brief(repo: str) -> Dict[str, Any]:
+    result = await crawler_service.get_project_brief(repo)
+    _raise_on_error(result, status=404)
+    return result
+
+
+@router.get("/repos/{repo}/standards", summary="Coding-conventions profile")
+async def get_standards(repo: str) -> Dict[str, Any]:
+    result = await crawler_service.get_coding_standards(repo)
+    _raise_on_error(result, status=404)
+    return result
+
+
+@router.get("/repos/{repo}/docs", summary="Module wiki docs (list, or one by path)")
+async def get_docs(
+    repo: str,
+    path: Optional[str] = Query(None, description="Module/directory path; omit to list all."),
+) -> Dict[str, Any]:
+    result = await crawler_service.get_module_docs(repo, path=path)
+    _raise_on_error(result, status=404)
+    return result
+
+
+@router.get("/repos/{repo}/feature", summary="Map a feature/flow to implementing modules")
+async def get_feature(
+    repo: str,
+    query: str = Query("", description="Feature/flow to locate; empty returns the full map."),
+) -> Dict[str, Any]:
+    result = await crawler_service.find_feature(repo, query)
+    _raise_on_error(result, status=404)
+    return result

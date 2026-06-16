@@ -455,38 +455,6 @@ export const agentApiClient = {
         return response.data;
     },
 
-    // ==================== CloudWatch Log Watch ====================
-
-    /**
-     * Test AWS CloudWatch connection
-     */
-    async testCloudWatchConnection(region, credentials) {
-        const response = await client.post('/api/v1/log-watch/test-connection', {
-            region,
-            credentials: {
-                aws_profile: credentials.awsProfile || null
-            }
-        });
-        return response.data;
-    },
-
-    /**
-     * Discover CloudWatch log groups by name prefix or tags.
-     * @param {string|undefined} prefix   - Log group name prefix
-     * @param {string} region             - AWS region (default us-east-1)
-     * @param {number} limit              - Max groups to return (default 50)
-     * @param {string|undefined} profile  - AWS CLI profile name (e.g. 'test-dev').
-     *   When provided the backend uses this profile instead of the default
-     *   Bedrock IAM user, matching the credentials used during workflow execution.
-     */
-    async discoverCloudWatchLogGroups(prefix, region = 'us-east-1', limit = 50, profile) {
-        const params = new URLSearchParams({ region, limit });
-        if (prefix) params.append('prefix', prefix);
-        if (profile) params.append('profile', profile);
-        const response = await client.get(`/api/v1/log-watch/discover-log-groups?${params}`);
-        return response.data;
-    },
-
     /**
      * List repositories discovered under REPOS_BASE_PATH (the read-only
      * docker volume mount from the host's repo root). Used by the
@@ -564,6 +532,47 @@ export const agentApiClient = {
         const response = await client.delete(
             `/api/v1/crawler/index/${encodeURIComponent(repo)}`
         );
+        return response.data;
+    },
+
+    // ==================== Project Intelligence (read-only) ====================
+
+    /**
+     * Fetch the project brief + architecture overview for an indexed repo.
+     * Returns the brief payload (e.g. { brief, architecture, domain_model }) or
+     * an { error } shape when no intelligence has been generated yet.
+     */
+    async getRepoBrief(repo) {
+        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/brief`);
+        return response.data;
+    },
+
+    /**
+     * Fetch the coding standards (naming, layout, frameworks, error_handling)
+     * inferred for an indexed repo.
+     */
+    async getRepoStandards(repo) {
+        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/standards`);
+        return response.data;
+    },
+
+    /**
+     * Fetch module docs for a repo. Without `path` returns the module list
+     * (path + responsibility); with `path` returns that module's detail
+     * (key_components / data_flow / depends_on).
+     */
+    async getRepoDocs(repo, path) {
+        const params = path ? { path } : undefined;
+        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/docs`, { params });
+        return response.data;
+    },
+
+    /**
+     * Locate where a feature lives in a repo. `query` is optional.
+     */
+    async getRepoFeature(repo, query) {
+        const params = query ? { query } : undefined;
+        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/feature`, { params });
         return response.data;
     },
 

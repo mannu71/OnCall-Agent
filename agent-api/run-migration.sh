@@ -41,6 +41,7 @@ MIGRATIONS=(
   "migrations/012_tool_approvals.sql"
   "migrations/013_background_jobs.sql"
   "migrations/014_gateway_assignments.sql"
+  "migrations/015_project_intelligence.sql"
 )
 
 for migration in "${MIGRATIONS[@]}"; do

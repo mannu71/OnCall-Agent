@@ -16,6 +16,113 @@ logger = logging.getLogger(__name__)
 _repo_map_cache = TTLCache(ttl_seconds=3600.0, maxsize=64)
 
 
+async def _resolve_repos(
+    repo: Optional[str] = None,
+    repos: Optional[List[str]] = None,
+) -> List[str]:
+    """Resolve a query scope to a deduplicated, ordered list of repo names.
+
+    Precedence: explicit ``repos`` list → single ``repo``.
+    """
+    out: List[str] = list(repos) if repos else ([repo] if repo else [])
+    seen: set = set()
+    return [r for r in out if r and not (r in seen or seen.add(r))]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generic coding-agent file tools — grep / read / list across repos. No language,
+# framework, or cloud knowledge: the agent supplies the pattern and reasons over
+# results, the way a coding agent uses ripgrep + read. Multi-repo/group aware.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def crawler_grep(
+    pattern: str,
+    repo: Optional[str] = None,
+    repos: Optional[List[str]] = None,
+    glob: Optional[str] = None,
+    ignore_case: bool = True,
+    max_results: int = 80,
+) -> Dict[str, Any]:
+    """Regex-search repository file contents (like ripgrep), across one repo,
+    an explicit list, or a group. Returns matches with repo/file/line/text.
+
+    Use this to find anything by its text — a URL, a queue/topic name, an env
+    key, a function call, a config value — in any language or stack.
+    """
+    from app.crawler.files import grep_repo
+
+    scope = await _resolve_repos(repo, repos)
+    if not scope:
+        return {"error": "no repo/repos/group resolved", "pattern": pattern}
+    per = max(5, max_results // max(1, len(scope)))
+    matches: List[Dict[str, Any]] = []
+    for r in scope:
+        if len(matches) >= max_results:
+            break
+        try:
+            for relpath, line_no, text in await grep_repo(
+                r, pattern, glob=glob, ignore_case=ignore_case, max_results=per,
+            ):
+                matches.append({"repo": r, "file": relpath, "line": line_no, "text": text})
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("crawler_grep: %s failed in %s: %s", pattern, r, exc)
+    return {"pattern": pattern, "repos": scope, "count": len(matches),
+            "matches": matches[:max_results]}
+
+
+async def crawler_read_file(
+    repo: str,
+    path: str,
+    start: Optional[int] = None,
+    end: Optional[int] = None,
+    max_lines: int = 400,
+) -> Dict[str, Any]:
+    """Read a repository file by path, returning numbered lines (optional range).
+
+    Use after crawler_grep / crawler_list_files to read the exact file the agent
+    found, in any language or config format.
+    """
+    from app.crawler.files import read_repo_file
+
+    try:
+        content = await read_repo_file(repo, path)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc), "repo": repo, "file": path}
+    lines = content.splitlines()
+    total = len(lines)
+    s = max(1, start or 1)
+    e = min(total, (end or (s + max_lines - 1)))
+    if e - s + 1 > max_lines:
+        e = s + max_lines - 1
+    body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(s, e + 1))
+    return {"repo": repo, "file": path, "start": s, "end": e,
+            "total_lines": total, "content": body}
+
+
+async def crawler_list_files(
+    repo: Optional[str] = None,
+    repos: Optional[List[str]] = None,
+    glob: Optional[str] = None,
+    limit: int = 400,
+) -> Dict[str, Any]:
+    """List repository files (relative paths), optionally filtered by a glob,
+    across one repo, an explicit list, or a group."""
+    from app.crawler.files import list_repo_files
+
+    scope = await _resolve_repos(repo, repos)
+    if not scope:
+        return {"error": "no repo/repos/group resolved"}
+    per = max(20, limit // max(1, len(scope)))
+    files: List[Dict[str, str]] = []
+    for r in scope:
+        try:
+            for relpath in await list_repo_files(r, glob=glob, limit=per):
+                files.append({"repo": r, "file": relpath})
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("crawler_list_files: %s failed: %s", r, exc)
+    return {"repos": scope, "count": len(files), "files": files[:limit]}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool 1: crawler_index_repo
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,12 +226,13 @@ async def crawler_find_symbol(
     kind: Optional[str] = None,
     limit: int = 5,
     model_id: Optional[str] = None,
+    repos: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Find where a symbol is defined in an indexed repository.
+    """Find where a symbol is defined in an indexed repository (or group of repos).
 
-    Uses the stored abstraction overview to narrow the search scope, then reads
-    candidate files and asks the LLM to locate the definition.  Every cited
-    (file, line) is verified on disk before being returned — no hallucinations.
+    Uses the knowledge-graph fast path (multi-repo when ``repos``/``group`` is
+    given) and falls back to the LLM scan against the primary ``repo``.  Every
+    cited (file, line) is verified on disk before being returned.
 
     Args:
         symbol:   Symbol name to find (function, class, constant, etc.).
@@ -132,17 +240,21 @@ async def crawler_find_symbol(
         kind:     Optional type hint: "function", "class", "method", "constant".
         limit:    Maximum number of results to return (default 5).
         model_id: LLM model override.
+        repos:    Optional explicit list of repos to search across.
+        group:    Optional repo-group name (resolved to its member repos).
 
     Returns:
         dict with keys: symbol, repo, found (bool), count, results.
-        Each result has: file, line, kind, context, body_handle, confidence.
-        Pass body_handle to crawler_get_body to retrieve the source lines.
+        Each result has: file, line, kind, context, body_handle, confidence,
+        and (multi-repo only) repo.
     """
     from app.crawler import run_flow
     from app.crawler.flows import find_symbol_flow
 
+    scope = await _resolve_repos(repo, repos)
     shared: Dict[str, Any] = {
-        "repo": repo,
+        "repo": repo or (scope[0] if scope else repo),
+        "repos": scope,
         "symbol": symbol,
         "kind": kind,
         "limit": limit,
@@ -208,8 +320,12 @@ async def crawler_trace_path(
     direction: str = "callers",
     depth: int = 2,
     model_id: Optional[str] = None,
+    repos: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Trace the call graph for a symbol — find who calls it or what it calls.
+
+    With ``repos``/``group`` the walk spans multiple repositories, so the call
+    graph continues across repo boundaries once cross-repo edges are linked.
 
     Args:
         symbol:    Symbol name to trace.
@@ -217,16 +333,21 @@ async def crawler_trace_path(
         direction: "callers" (who calls this) or "callees" (what it calls).
         depth:     Number of hops to trace (default 2).
         model_id:  LLM model override.
+        repos:     Optional explicit list of repos to trace across.
+        group:     Optional repo-group name (resolved to its member repos).
 
     Returns:
         dict with keys: symbol, repo, direction, total_edges, edges.
-        Each edge: {from, to, label, file, line, confidence, body_handle}.
+        Each edge: {from, to, label, file, line, confidence, body_handle,
+        from_repo?, to_repo?}.
     """
     from app.crawler import run_flow
     from app.crawler.flows import trace_path_flow
 
+    scope = await _resolve_repos(repo, repos)
     shared: Dict[str, Any] = {
-        "repo": repo,
+        "repo": repo or (scope[0] if scope else repo),
+        "repos": scope,
         "symbol": symbol,
         "direction": direction,
         "depth": depth,
@@ -339,15 +460,19 @@ async def crawler_callers(
     symbol: str,
     repo: str,
     depth: int = 2,
+    repos: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Find all callers of *symbol* (transitive, up to *depth* hops).
 
-    Pure recursive-CTE walk over ``kg_edges`` — no LLM involvement.
+    Pure recursive-CTE walk over ``kg_edges`` — no LLM involvement. Spans the
+    group's repos when ``repos``/``group`` is supplied.
 
     Args:
         symbol: Method/function name (bare or fully-qualified).
         repo:   Repository under REPOS_BASE_PATH.
         depth:  Maximum hop distance (clamped to 1..6, default 2).
+        repos:  Optional explicit list of repos to trace across.
+        group:  Optional repo-group name.
 
     Returns:
         dict {symbol, repo, direction='callers', total_edges, edges[]}
@@ -356,8 +481,10 @@ async def crawler_callers(
     from app.crawler import run_flow
     from app.crawler.flows import trace_path_flow
 
+    scope = await _resolve_repos(repo, repos)
     shared: Dict[str, Any] = {
-        "repo":      repo,
+        "repo":      repo or (scope[0] if scope else repo),
+        "repos":     scope,
         "symbol":    symbol,
         "direction": "callers",
         "depth":     depth,
@@ -377,6 +504,7 @@ async def crawler_callees(
     symbol: str,
     repo: str,
     depth: int = 2,
+    repos: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Find everything *symbol* calls, transitively up to *depth* hops.
 
@@ -386,6 +514,8 @@ async def crawler_callees(
         symbol: Method/function name (bare or fully-qualified).
         repo:   Repository under REPOS_BASE_PATH.
         depth:  Maximum hop distance (clamped to 1..6, default 2).
+        repos:  Optional explicit list of repos to trace across.
+        group:  Optional repo-group name.
 
     Returns:
         dict {symbol, repo, direction='callees', total_edges, edges[]}.
@@ -393,8 +523,10 @@ async def crawler_callees(
     from app.crawler import run_flow
     from app.crawler.flows import trace_path_flow
 
+    scope = await _resolve_repos(repo, repos)
     shared: Dict[str, Any] = {
-        "repo":      repo,
+        "repo":      repo or (scope[0] if scope else repo),
+        "repos":     scope,
         "symbol":    symbol,
         "direction": "callees",
         "depth":     depth,
@@ -413,45 +545,53 @@ async def crawler_callees(
 async def crawler_impact(
     symbol: str,
     repo: str,
+    repos: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Impact analysis: "if I change X, what else breaks?"
 
     Combines callers, test coverage, and inbound references into one report.
     Drives refactoring safety questions an agent can answer from the graph
-    alone — no LLM call.
+    alone — no LLM call. Spans a group's repos when ``repos``/``group`` is given,
+    so cross-repo callers (e.g. a frontend caller of a backend symbol) surface.
 
     Args:
         symbol: Method/function/class name (bare or fully-qualified).
         repo:   Repository under REPOS_BASE_PATH.
+        repos:  Optional explicit list of repos.
+        group:  Optional repo-group name.
 
     Returns:
         dict {symbol, repo, callers[], tests[], references[],
               caller_count, test_count, reference_count}.
-        Each entry: {from_qname, file, line, kind, confidence, body_handle}.
+        Each entry: {from_qname, file, line, kind, confidence, body_handle, repo}.
     """
     from app.core.database import AsyncSessionLocal
     from sqlalchemy import text
     from app.crawler.handles import make_body_handle
 
     suffix = f"%::{symbol}"
+    scope = await _resolve_repos(repo, repos)
+    if not scope:
+        scope = [repo]
 
     try:
         async with AsyncSessionLocal() as session:
             edges_sql = """
                 SELECT e.kind, e.source_qname, e.file_path, e.line, e.confidence,
+                       e.repo_name,
                        COALESCE(n.is_test, false) AS source_is_test
                 FROM kg_edges e
                 LEFT JOIN kg_nodes n
                   ON  n.repo_name      = e.repo_name
                   AND n.qualified_name = e.source_qname
-                WHERE e.repo_name = :r
+                WHERE e.repo_name = ANY(:repos)
                   AND (e.target_qname = :sym OR e.target_qname LIKE :suffix)
                 ORDER BY e.kind, e.file_path, e.line
                 LIMIT 1000
             """
             rows = await session.execute(
                 text(edges_sql),
-                {"r": repo, "sym": symbol, "suffix": suffix},
+                {"repos": scope, "sym": symbol, "suffix": suffix},
             )
             results = rows.fetchall()
 
@@ -459,7 +599,7 @@ async def crawler_impact(
         tests:      List[Dict[str, Any]] = []
         references: List[Dict[str, Any]] = []
 
-        for kind, from_qname, file_path, line, confidence, source_is_test in results:
+        for kind, from_qname, file_path, line, confidence, src_repo, source_is_test in results:
             entry = {
                 "from_qname": from_qname,
                 "file":       file_path,
@@ -467,13 +607,15 @@ async def crawler_impact(
                 "kind":       kind,
                 "confidence": confidence or "extracted",
             }
+            if len(scope) > 1:
+                entry["repo"] = src_repo
             if file_path and line:
                 entry["body_handle"] = make_body_handle(
-                    repo, file_path,
+                    src_repo, file_path,
                     max(1, int(line) - 2), int(line) + 10,
                 )
 
-            if kind == "calls":
+            if kind in ("calls", "calls_api"):
                 if source_is_test:
                     tests.append(entry)
                 else:
@@ -705,19 +847,157 @@ async def crawler_files(
         return {"error": str(exc), "repo": repo}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Project-intelligence tools — read the repo_docs rows produced by indexFlow's
+# SummarizeModules / BuildProjectBrief / ExtractStandards nodes (migration 015).
+# All are pure Postgres reads (no LLM): the intelligence is generated once at
+# index time and served cheaply thereafter.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _load_docs(
+    repo: str, doc_type: str, doc_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return repo_docs ``content`` dicts for *repo*/*doc_type* (optionally one path)."""
+    from app.core.database import AsyncSessionLocal
+    from sqlalchemy import text
+
+    sql = ("SELECT doc_path, content, generated_at FROM repo_docs "
+           "WHERE repo_name = :r AND doc_type = :t")
+    params: Dict[str, Any] = {"r": repo, "t": doc_type}
+    if doc_path is not None:
+        sql += " AND doc_path = :p"
+        params["p"] = doc_path
+    sql += " ORDER BY doc_path"
+    async with AsyncSessionLocal() as session:
+        rows = await session.execute(text(sql), params)
+        return [
+            {"doc_path": dp, "generated_at": ga.isoformat() if ga else None, **(c or {})}
+            for dp, c, ga in rows.fetchall()
+        ]
+
+
+async def crawler_project_brief(repo: str) -> Dict[str, Any]:
+    """Return the project brief, domain model and architecture narrative for *repo*.
+
+    This is the crawler's top-level understanding of the project — what it does,
+    its business domain, and how the system fits together. Call it to ground
+    yourself before reasoning about or changing code.
+
+    Returns ``{repo, brief, architecture, domain_model, generated_at}`` or
+    ``{error: "repo not indexed"}``.
+    """
+    try:
+        brief = await _load_docs(repo, "brief", "")
+        if not brief:
+            return {"error": "no project brief — repo not indexed or brief not generated",
+                    "repo": repo}
+        domain = await _load_docs(repo, "domain", "")
+        out = {"repo": repo, **brief[0]}
+        if domain:
+            out["domain_model"] = domain[0].get("domain_model", [])
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.error("crawler_project_brief failed (repo=%s): %s", repo, exc)
+        return {"error": str(exc), "repo": repo}
+
+
+async def crawler_module_doc(repo: str, path: Optional[str] = None) -> Dict[str, Any]:
+    """Return the wiki-style doc for a module/directory in *repo*.
+
+    With ``path`` omitted, returns the list of documented modules (path +
+    responsibility) so you can pick one. With ``path`` set, returns that module's
+    full doc (responsibility, key components, data flow, dependencies). ``path``
+    matches by exact directory or unique suffix.
+    """
+    try:
+        mods = await _load_docs(repo, "module")
+        if not mods:
+            return {"error": "no module docs — repo not indexed", "repo": repo}
+        if not path:
+            return {
+                "repo": repo,
+                "modules": [{"path": m["doc_path"], "responsibility": m.get("responsibility", "")}
+                            for m in mods],
+                "count": len(mods),
+            }
+        needle = path.replace("\\", "/").strip("/")
+        match = next((m for m in mods if m["doc_path"] == needle), None) \
+            or next((m for m in mods if m["doc_path"].endswith(needle)), None)
+        if match is None:
+            return {"error": f"no module doc for '{path}'", "repo": repo,
+                    "available": [m["doc_path"] for m in mods][:50]}
+        return {"repo": repo, **match}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("crawler_module_doc failed (repo=%s path=%s): %s", repo, path, exc)
+        return {"error": str(exc), "repo": repo}
+
+
+async def crawler_find_feature(repo: str, query: str) -> Dict[str, Any]:
+    """Map a user-facing feature/flow to the code that implements it.
+
+    Searches the stored feature map (deterministic substring match over feature
+    name, description and module list). Answers "where is X done?" semantically
+    without an LLM call.
+
+    Returns ``{repo, query, matches:[{feature, description, modules}]}``.
+    """
+    try:
+        feats_doc = await _load_docs(repo, "features", "")
+        if not feats_doc:
+            return {"error": "no feature map — repo not indexed", "repo": repo}
+        features = feats_doc[0].get("features", []) or []
+        needle = (query or "").strip().lower()
+        matches = []
+        for f in features:
+            if not isinstance(f, dict):
+                continue
+            hay = " ".join([
+                str(f.get("feature", "")), str(f.get("description", "")),
+                " ".join(str(m) for m in (f.get("modules", []) or [])),
+            ]).lower()
+            if not needle or needle in hay:
+                matches.append(f)
+        return {"repo": repo, "query": query, "count": len(matches),
+                "matches": matches or features}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("crawler_find_feature failed (repo=%s): %s", repo, exc)
+        return {"error": str(exc), "repo": repo}
+
+
+async def crawler_coding_standards(repo: str) -> Dict[str, Any]:
+    """Return *repo*'s coding-conventions profile.
+
+    Naming, file/folder layout, framework idioms, error handling, testing, and
+    the frontend-vs-backend patterns the codebase actually uses. CALL THIS BEFORE
+    writing or proposing code so your changes match the project's conventions.
+    """
+    try:
+        std = await _load_docs(repo, "standards", "")
+        if not std:
+            return {"error": "no coding-standards profile — repo not indexed", "repo": repo}
+        return {"repo": repo, **std[0]}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("crawler_coding_standards failed (repo=%s): %s", repo, exc)
+        return {"error": str(exc), "repo": repo}
+
+
 async def crawler_find_references(
     symbol: str,
     repo: str,
     limit: int = 20,
+    repos: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Find all references to *symbol* grouped by relation kind.
 
     Pure graph query — no LLM.  Useful for refactoring ("where is this used?").
+    Spans a group's repos when ``repos``/``group`` is given.
 
     Args:
         symbol: Method/function/class name (bare or fully-qualified).
         repo:   Repository under REPOS_BASE_PATH.
         limit:  Max results per relation kind (default 20).
+        repos:  Optional explicit list of repos.
+        group:  Optional repo-group name.
 
     Returns:
         dict {symbol, repo, calls, imports, inherits, implements, tested_by}
@@ -728,11 +1008,14 @@ async def crawler_find_references(
     from app.crawler.handles import make_body_handle
 
     suffix = f"%::{symbol}"
+    scope = await _resolve_repos(repo, repos)
+    if not scope:
+        scope = [repo]
 
     sql = """
-        SELECT kind, source_qname, file_path, line, confidence
+        SELECT kind, source_qname, file_path, line, confidence, repo_name
         FROM kg_edges
-        WHERE repo_name = :r
+        WHERE repo_name = ANY(:repos)
           AND (target_qname = :sym OR target_qname LIKE :suffix)
         ORDER BY kind, file_path, line
         LIMIT 1000
@@ -742,7 +1025,7 @@ async def crawler_find_references(
         async with AsyncSessionLocal() as session:
             rows = await session.execute(
                 text(sql),
-                {"r": repo, "sym": symbol, "suffix": suffix},
+                {"repos": scope, "sym": symbol, "suffix": suffix},
             )
             results = rows.fetchall()
 
@@ -750,7 +1033,7 @@ async def crawler_find_references(
             "calls": [], "imports_from": [], "inherits": [],
             "implements": [], "tested_by": [], "references": [],
         }
-        for kind, source_qname, file_path, line, confidence in results:
+        for kind, source_qname, file_path, line, confidence, src_repo in results:
             bucket = grouped.setdefault(kind, [])
             if len(bucket) >= limit:
                 continue
@@ -760,9 +1043,11 @@ async def crawler_find_references(
                 "line":       int(line) if line else None,
                 "confidence": confidence or "extracted",
             }
+            if len(scope) > 1:
+                entry["repo"] = src_repo
             if file_path and line:
                 entry["body_handle"] = make_body_handle(
-                    repo, file_path,
+                    src_repo, file_path,
                     max(1, int(line) - 2), int(line) + 10,
                 )
             bucket.append(entry)

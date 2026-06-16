@@ -40,8 +40,14 @@ class TraverseKGEdges(AsyncNode):
     """
 
     async def prep(self, shared: Dict[str, Any]) -> Dict[str, Any]:
+        # Multi-repo scope: ``repos`` (resolved from a group or explicit list) wins;
+        # falls back to the single ``repo`` for backward compatibility. Walking the
+        # union of a group's repos lets the call graph continue across repo
+        # boundaries once cross-repo edges are promoted (Phase 3).
+        repos = shared.get("repos") or [shared["repo"]]
         return {
             "repo":      shared["repo"],
+            "repos":     repos,
             "symbol":    shared["symbol"],
             "direction": shared.get("direction", "callers"),
             "depth":     int(shared.get("depth", 2)),
@@ -52,26 +58,28 @@ class TraverseKGEdges(AsyncNode):
         from sqlalchemy import text
 
         t0 = time.monotonic()
-        repo      = prep_res["repo"]
+        repos     = prep_res["repos"]
         symbol    = prep_res["symbol"]
         direction = prep_res["direction"]
         depth     = max(1, min(prep_res["depth"], 6))   # clamp to [1, 6] hops
 
         suffix_pattern = f"%::{symbol}"
 
+        # Multi-repo aware (``ANY(:repos)``) so a trace can span the repos the
+        # agent has connected; ``repo`` is surfaced per edge when >1 is in scope.
         if direction == "callers":
             sql = """
                 WITH RECURSIVE walk AS (
                     SELECT
                         e.source_qname AS from_q,
                         e.target_qname AS to_q,
+                        e.repo_name    AS repo,
                         e.file_path    AS file_path,
                         e.line         AS line,
-                        e.kind         AS kind,
                         e.confidence   AS confidence,
                         1              AS hop
                     FROM kg_edges e
-                    WHERE e.repo_name = :r
+                    WHERE e.repo_name = ANY(:repos)
                       AND e.kind = 'calls'
                       AND (e.target_qname = :sym OR e.target_qname LIKE :suffix)
 
@@ -80,18 +88,18 @@ class TraverseKGEdges(AsyncNode):
                     SELECT
                         e.source_qname,
                         e.target_qname,
+                        e.repo_name,
                         e.file_path,
                         e.line,
-                        e.kind,
                         e.confidence,
                         w.hop + 1
                     FROM kg_edges e
                     JOIN walk w ON e.target_qname = w.from_q
-                    WHERE e.repo_name = :r
+                    WHERE e.repo_name = ANY(:repos)
                       AND e.kind = 'calls'
                       AND w.hop < :d
                 )
-                SELECT DISTINCT from_q, to_q, file_path, line, kind, confidence, hop
+                SELECT DISTINCT from_q, to_q, repo, file_path, line, confidence, hop
                 FROM walk
                 ORDER BY hop, file_path, line
                 LIMIT 500
@@ -102,13 +110,13 @@ class TraverseKGEdges(AsyncNode):
                     SELECT
                         e.source_qname AS from_q,
                         e.target_qname AS to_q,
+                        e.repo_name    AS repo,
                         e.file_path    AS file_path,
                         e.line         AS line,
-                        e.kind         AS kind,
                         e.confidence   AS confidence,
                         1              AS hop
                     FROM kg_edges e
-                    WHERE e.repo_name = :r
+                    WHERE e.repo_name = ANY(:repos)
                       AND e.kind = 'calls'
                       AND (e.source_qname = :sym OR e.source_qname LIKE :suffix)
 
@@ -117,18 +125,18 @@ class TraverseKGEdges(AsyncNode):
                     SELECT
                         e.source_qname,
                         e.target_qname,
+                        e.repo_name,
                         e.file_path,
                         e.line,
-                        e.kind,
                         e.confidence,
                         w.hop + 1
                     FROM kg_edges e
                     JOIN walk w ON e.source_qname = w.to_q
-                    WHERE e.repo_name = :r
+                    WHERE e.repo_name = ANY(:repos)
                       AND e.kind = 'calls'
                       AND w.hop < :d
                 )
-                SELECT DISTINCT from_q, to_q, file_path, line, kind, confidence, hop
+                SELECT DISTINCT from_q, to_q, repo, file_path, line, confidence, hop
                 FROM walk
                 ORDER BY hop, file_path, line
                 LIMIT 500
@@ -137,18 +145,19 @@ class TraverseKGEdges(AsyncNode):
         async with AsyncSessionLocal() as session:
             rows = await session.execute(
                 text(sql),
-                {"r": repo, "sym": symbol, "suffix": suffix_pattern, "d": depth},
+                {"repos": repos, "sym": symbol, "suffix": suffix_pattern, "d": depth},
             )
             results = rows.fetchall()
 
         ms = int((time.monotonic() - t0) * 1000)
 
+        multi = len(repos) > 1
         edges: List[Dict[str, Any]] = []
         for row in results:
-            from_q, to_q, file_path, line, _kind, confidence, hop = row
+            from_q, to_q, repo, file_path, line, confidence, hop = row
             from_display = from_q.split("::")[-1] if "::" in from_q else from_q
             to_display   = to_q.split("::")[-1]   if "::" in to_q   else to_q
-            edges.append({
+            edge = {
                 "from":       from_display,
                 "to":         to_display,
                 "label":      "calls",
@@ -156,7 +165,11 @@ class TraverseKGEdges(AsyncNode):
                 "line":       int(line) if line else None,
                 "confidence": confidence or "extracted",
                 "hop":        int(hop),
-            })
+            }
+            # Label which repo a hop came from only when several are in scope.
+            if multi:
+                edge["repo"] = repo
+            edges.append(edge)
 
         return {"edges": edges, "ms": ms}
 
@@ -571,9 +584,14 @@ class BuildEdgeList(AsyncNode):
                 "line": line_no,
                 "confidence": edge.get("confidence", "unverified"),
             }
+            # When the trace spans repos, the edge carries which repo the hop
+            # came from; the body handle resolves against that repo.
+            if edge.get("repo"):
+                entry["repo"] = edge["repo"]
             if relpath and line_no:
+                handle_repo = edge.get("repo") or prep_res["repo"]
                 entry["body_handle"] = _make_body_handle(
-                    prep_res["repo"], relpath,
+                    handle_repo, relpath,
                     max(1, int(line_no) - 2), int(line_no) + 10,
                 )
             results.append(entry)

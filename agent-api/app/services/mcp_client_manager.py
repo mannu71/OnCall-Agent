@@ -134,6 +134,7 @@ class MCPClientManager:
         self.tools: Dict[str, List[str]] = {}  # server_id -> list of tool names
         self.tool_objects: Dict[str, Dict[str, Any]] = {}  # server_id -> {tool_name -> MCP Tool obj}
         self._exit_stacks: Dict[str, AsyncExitStack] = {}  # server_id -> exit stack
+        self.last_errors: Dict[str, str] = {}  # server_id -> last connection failure reason
     
     # Timeout (seconds) for the entire connect + initialize + list_tools sequence.
     # npx must download the package on first run, so allow generous time.
@@ -155,6 +156,9 @@ class MCPClientManager:
                 timeout=self.CONNECT_TIMEOUT,
             )
         except asyncio.TimeoutError:
+            self.last_errors[server_id] = (
+                f"connection timed out after {self.CONNECT_TIMEOUT}s"
+            )
             logger.error(
                 "MCP server %s connection timed out after %ss",
                 server_id, self.CONNECT_TIMEOUT,
@@ -187,9 +191,21 @@ class MCPClientManager:
             
             if not command:
                 raise ValueError(f"Server {server_id} missing 'command' in config")
-            
-            if command == 'npx':
-                command = '/usr/bin/npx'
+
+            # Resolve interpreter commands to an absolute path via PATH rather than
+            # hardcoding a location (apt installs npx at /usr/bin, nvm elsewhere).
+            # Fail fast with a clear message if the runtime is missing entirely.
+            if command in ('npx', 'node', 'npm'):
+                import shutil
+                resolved = shutil.which(command)
+                if not resolved:
+                    raise FileNotFoundError(
+                        f"'{command}' is not installed in this container — the MCP "
+                        f"server '{server_id}' cannot start. Install Node.js in the "
+                        f"agent-api image or reconfigure the server to use an "
+                        f"available command."
+                    )
+                command = resolved
             
             logger.info("MCP Config - Command: %s", command)
             logger.info("MCP Config - Args: %s", args)
@@ -260,6 +276,7 @@ class MCPClientManager:
             return True
                 
         except Exception as e:
+            self.last_errors[server_id] = f"{type(e).__name__}: {e}"
             logger.error("Failed to connect to MCP server %s: %s", server_id, e, exc_info=True)
             logger.error("Config was - command: %s, args: %s", config.get('command'), config.get('args'))
             # Clean up the exit stack if connection failed

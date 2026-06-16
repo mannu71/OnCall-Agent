@@ -28,6 +28,7 @@ async def crawler_find_symbol(
     kind: Optional[str] = None,
     limit: int = 5,
     model_id: Optional[str] = None,
+    repos: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     from app.services.crawler_service import crawler_service
 
@@ -37,6 +38,7 @@ async def crawler_find_symbol(
         kind=kind,
         limit=limit,
         model_id=model_id,
+        repos=repos,
     )
 
 
@@ -52,6 +54,7 @@ async def crawler_trace_path(
     direction: str = "callers",
     depth: int = 2,
     model_id: Optional[str] = None,
+    repos: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     from app.services.crawler_service import crawler_service
 
@@ -61,6 +64,7 @@ async def crawler_trace_path(
         direction=direction,
         depth=depth,
         model_id=model_id,
+        repos=repos,
     )
 
 
@@ -150,3 +154,64 @@ async def crawler_find_references(
     from app.services.crawler_service import crawler_service
 
     return await crawler_service.get_references(repo, symbol, limit=limit)
+
+
+# ── Project-intelligence delegates (repo_docs, migration 015) ────────────────
+
+async def crawler_project_brief(repo: str) -> Dict[str, Any]:
+    from app.services.crawler_service import crawler_service
+
+    return await crawler_service.get_project_brief(repo)
+
+
+async def crawler_module_doc(repo: str, path: Optional[str] = None) -> Dict[str, Any]:
+    from app.services.crawler_service import crawler_service
+
+    return await crawler_service.get_module_docs(repo, path=path)
+
+
+async def crawler_coding_standards(repo: str) -> Dict[str, Any]:
+    from app.services.crawler_service import crawler_service
+
+    return await crawler_service.get_coding_standards(repo)
+
+
+async def crawler_find_feature(repo: str, query: str) -> Dict[str, Any]:
+    from app.services.crawler_service import crawler_service
+
+    return await crawler_service.find_feature(repo, query)
+
+
+# Generic coding-agent file tools (grep / read / list) — delegate to flows.
+
+async def crawler_grep(
+    pattern: str,
+    repo: Optional[str] = None,
+    repos: Optional[List[str]] = None,
+    glob: Optional[str] = None,
+    ignore_case: bool = True,
+    max_results: int = 80,
+) -> Dict[str, Any]:
+    from app.services.crawler_flows import crawler_grep as _grep
+
+    return await _grep(pattern, repo=repo, repos=repos, glob=glob,
+                       ignore_case=ignore_case, max_results=max_results)
+
+
+async def crawler_read_file(
+    repo: str, path: str, start: Optional[int] = None, end: Optional[int] = None,
+) -> Dict[str, Any]:
+    from app.services.crawler_flows import crawler_read_file as _read
+
+    return await _read(repo, path, start=start, end=end)
+
+
+async def crawler_list_files(
+    repo: Optional[str] = None,
+    repos: Optional[List[str]] = None,
+    glob: Optional[str] = None,
+    limit: int = 400,
+) -> Dict[str, Any]:
+    from app.services.crawler_flows import crawler_list_files as _ls
+
+    return await _ls(repo=repo, repos=repos, glob=glob, limit=limit)

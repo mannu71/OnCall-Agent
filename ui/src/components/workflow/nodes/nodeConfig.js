@@ -216,7 +216,8 @@ export const nodeConfigurations = {
       if (data?.processing) return { text: 'Indexing...', class: 'processing' };
       if (data?.error) return { text: `Error: ${data.error.slice(0, 30)}...`, class: 'error' };
       const c = data?.repos?.length || 0;
-      return { text: `${c} repo${c !== 1 ? 's' : ''} configured`, class: 'ready' };
+      const text = `${c} repo${c !== 1 ? 's' : ''} configured`;
+      return { text, class: 'ready' };
     },
     getExtra: (data) => data?.lastIndexed ? {
       text: `Last indexed: ${new Date(data.lastIndexed).toLocaleTimeString()}`,

@@ -158,6 +158,105 @@ def _clean_log_line(msg: Any) -> str:
     return s
 
 
+def merge_region_evidence(per_region: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge per-region evidence bundles into one (Phase 5 multi-region).
+
+    Findings are namespaced ``region:log_group`` and tagged with their region so
+    the synthesis can attribute each to the right place and ID-grounding stays
+    unambiguous. Coverage is the worst across regions (any partial → partial,
+    all none → none) plus a per-region breakdown. Pure/deterministic.
+    """
+    merged: Dict[str, Any] = {}
+    patterns: List[Dict[str, Any]] = []
+    anomalies: List[Dict[str, Any]] = []
+    alarm_total = alarm_in_alarm = 0
+    alarm_names: List[str] = []
+    flapping: List[str] = []
+    failures: List[Dict[str, Any]] = []
+    per_region_cov: Dict[str, str] = {}
+    any_partial = False
+    coverages: List[str] = []
+
+    for region, ev in (per_region or {}).items():
+        if not isinstance(ev, dict):
+            continue
+        dq = ev.get("data_quality") or {}
+        cov = str(dq.get("coverage", "")).lower() or "full"
+        per_region_cov[region] = cov
+        coverages.append(cov)
+        if dq.get("partial"):
+            any_partial = True
+        for f in (dq.get("failures") or []):
+            failures.append({**f, "region": region})
+
+        pats = ((ev.get("patterns") or {}).get("unique_patterns")) or []
+        for p in pats:
+            if isinstance(p, dict):
+                patterns.append({**p, "region": region})
+        anoms = ((ev.get("anomalies") or {}).get("anomalies")) or []
+        for a in anoms:
+            if isinstance(a, dict):
+                lg = a.get("log_group")
+                anomalies.append({**a, "region": region,
+                                  "log_group": f"{region}:{lg}" if lg else region})
+        asum = ((ev.get("alarms") or {}).get("summary")) or {}
+        alarm_total += int(asum.get("total") or 0)
+        alarm_in_alarm += int(asum.get("in_alarm") or 0)
+        for n in (asum.get("names") or []):
+            alarm_names.append(f"{region}:{n}")
+        for n in (asum.get("flapping") or []):
+            flapping.append(f"{region}:{n}")
+
+    # Worst-of coverage.
+    if coverages and all(c == "none" for c in coverages):
+        overall = "none"
+    elif any_partial or any(c in ("partial", "none") for c in coverages):
+        overall = "partial"
+    else:
+        overall = "full"
+
+    merged["patterns"] = {"unique_patterns": patterns,
+                          "evidence_grade": "medium" if patterns else "none"}
+    merged["anomalies"] = {"anomalies": anomalies,
+                           "summary": {"total_anomalies": len(anomalies)}}
+    alarm_summary: Dict[str, Any] = {"total": alarm_total, "in_alarm": alarm_in_alarm,
+                                     "names": alarm_names}
+    if flapping:
+        alarm_summary["flapping"] = flapping
+    merged["alarms"] = {"summary": alarm_summary}
+    merged["data_quality"] = {
+        "coverage": overall,
+        "partial": overall != "full",
+        "regions": per_region_cov,
+        "failures": failures,
+    }
+    return merged
+
+
+def format_cost_footer(run_stats: Optional[Dict[str, Any]]) -> str:
+    """One-line scan-cost footer from run_stats (Phase 3).
+
+    Rendered onto the *output* shown to the engineer — never into the LLM
+    synthesis input (we don't want the model reasoning about its own cost).
+    Returns "" when nothing was scanned. Pure/deterministic for unit testing.
+    """
+    from app.config import settings
+
+    insights = (run_stats or {}).get("insights") or {}
+    bytes_scanned = float(insights.get("bytes_scanned") or 0.0)
+    queries = int(insights.get("queries") or 0)
+    if bytes_scanned <= 0 or queries <= 0:
+        return ""
+    gb = bytes_scanned / 1e9
+    usd = gb * float(settings.cloudwatch_insights_cost_per_gb)
+    note = ""
+    dq = (run_stats or {}).get("budget_limited")
+    if dq:
+        note = " — scan budget reached, later drill-downs were sampled"
+    return (f"\n\n---\n_Scan cost: {gb:.3f} GB across {queries} Insights "
+            f"{'query' if queries == 1 else 'queries'} (~${usd:.4f}){note}._")
+
+
 def build_synthesis_payload(evidence: Dict[str, Any]) -> Dict[str, Any]:
     """Compact evidence for the LLM synthesis — with REAL identifiers intact.
 
@@ -192,6 +291,8 @@ def build_synthesis_payload(evidence: Dict[str, Any]) -> Dict[str, Any]:
                 "example": _clean_log_line(p.get("example_message", ""))[:_ex_cap],
                 "first_seen": p.get("first_seen"),
                 "last_seen": p.get("last_seen"),
+                # region present only on multi-region merges (Phase 5)
+                **({"region": p["region"]} if p.get("region") else {}),
             }
             for p in uniq[:10] if isinstance(p, dict)
         ]
@@ -200,6 +301,19 @@ def build_synthesis_payload(evidence: Dict[str, Any]) -> Dict[str, Any]:
     if anomalies.get("anomalies"):
         out["anomalies"] = anomalies["anomalies"][:10]
         out["anomaly_summary"] = anomalies.get("summary")
+
+    # Metrics (Phase 2 fusion): include compact per-metric summaries so a quiet-
+    # logs / spiking-metric incident is visible to the synthesis. Raw per-point
+    # series are dropped — only the aggregate summary carries the signal.
+    metrics = evidence.get("metrics")
+    if isinstance(metrics, dict):
+        mmap = metrics.get("metrics") if isinstance(metrics.get("metrics"), dict) else None
+        if mmap:
+            out["metrics"] = [
+                {"label": (m.get("label") if isinstance(m, dict) else None) or qid,
+                 "summary": (m.get("summary") if isinstance(m, dict) else None)}
+                for qid, m in list(mmap.items())[:10]
+            ]
 
     # Drill-down samples give the model concrete raw context (with real IDs) to
     # reason about root cause.
@@ -235,6 +349,10 @@ def _clamp_severity_for_weak_evidence(parsed: Any, evidence: Dict[str, Any]) -> 
         dq = (evidence or {}).get("data_quality") or {}
         coverage = str(dq.get("coverage", "")).lower()
         sampled = bool(dq.get("sampled"))
+        # A reduced-scope retry (Phase 1) succeeds over a halved window, so
+        # coverage may still read 'full' while the evidence is genuinely partial.
+        # Treat the partial/reduced_scope flags as weak evidence too.
+        partial_flag = bool(dq.get("partial")) or bool(dq.get("reduced_scope"))
         grade = str(((evidence or {}).get("patterns") or {}).get("evidence_grade", "")).lower()
         alarm_summary = ((evidence or {}).get("alarms") or {}).get("summary") or {}
         in_alarm = int(alarm_summary.get("in_alarm") or 0) > 0
@@ -243,7 +361,7 @@ def _clamp_severity_for_weak_evidence(parsed: Any, evidence: Dict[str, Any]) -> 
             str(a.get("severity", "")).lower() in ("high", "critical")
             for a in anomalies if isinstance(a, dict)
         )
-        weak = coverage in ("partial", "none") or grade == "low" or sampled
+        weak = coverage in ("partial", "none") or grade == "low" or sampled or partial_flag
         if not (weak and not in_alarm and not strong_anomaly):
             return
         current = str(getattr(parsed, "severity", "") or "").lower()

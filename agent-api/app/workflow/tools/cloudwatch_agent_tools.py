@@ -318,6 +318,28 @@ class GetMetricStatisticsInput(BaseModel):
     )
 
 
+class DiscoverMetricsInput(BaseModel):
+    """Input for the cloudwatch_discover_metrics tool."""
+    namespace: Optional[str] = Field(
+        default=None,
+        description=(
+            "CloudWatch metric namespace to list, e.g. 'AWS/Lambda'. If omitted, "
+            "namespaces are inferred from log_group_names."
+        ),
+    )
+    log_group_names: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Log groups to infer namespaces/dimensions from, e.g. "
+            "['/aws/lambda/kyc-auth'] → AWS/Lambda FunctionName=kyc-auth."
+        ),
+    )
+    limit: int = Field(
+        default=50, ge=1, le=200,
+        description="Maximum metrics to return (default 50).",
+    )
+
+
 class ListAlarmsInput(BaseModel):
     """Input for the cloudwatch_list_alarms tool."""
     alarm_name_prefix: Optional[str] = Field(
@@ -373,6 +395,7 @@ def build_cloudwatch_agent_tools(
         get_metric_data,
         get_metric_statistics,
         list_metric_alarms,
+        discover_metrics,
     )
 
     _creds = credentials or {}
@@ -488,10 +511,14 @@ def build_cloudwatch_agent_tools(
     # Token-efficiency helpers.  These wrap raw MCP responses so the
     # agent observes compact aggregates rather than raw event blobs.
     # ──────────────────────────────────────────────────────────────────
-    MAX_MINUTES = 1440  # 24-hour hard cap on every time-range parameter
+    # Configurable hard cap (Phase 4) — defaults to 24h. Raising
+    # cloudwatch_max_time_range_minutes lets longer ranges through; watch_tools
+    # then buckets each Insights query to keep it within bucket_minutes.
+    from app.config import settings as _cw_settings
+    MAX_MINUTES = max(1, int(_cw_settings.cloudwatch_max_time_range_minutes))
 
     def _clamp(m: Any) -> int:
-        """Clamp a time-range value to [1, 1440] minutes, logging if clipped."""
+        """Clamp a time-range value to [1, MAX_MINUTES] minutes, logging if clipped."""
         try:
             mi = int(m)
         except (TypeError, ValueError):
@@ -707,12 +734,21 @@ def build_cloudwatch_agent_tools(
         budget = 2500 if drill_down else _NON_EVENT_TOKEN_BUDGET
         # Hard-cap to 24h to match the global window policy.
         hours = max(1, min(int(hours or 24), 24))
-        # Lint the Insights query before hitting AWS — a clear corrective hint
-        # costs nothing and saves an investigation iteration that a raw AWS
-        # ValidationException would otherwise burn.
-        _lint = lint_insights_query(query)
-        if _lint:
-            return f"Query not run — fix the Insights query first. {_lint}"
+        # Validate the Insights query before hitting AWS — a clear corrective
+        # hint costs nothing and saves an investigation iteration that a raw AWS
+        # ValidationException would otherwise burn. In fix-up mode (default) a
+        # missing `| limit` clause is injected rather than rejected; genuinely
+        # broken queries still hard-fail with a hint.
+        from app.config import settings as _settings
+        if _settings.cloudwatch_insights_query_fixup:
+            from app.workflow.tools.cloudwatch_drilldown import fixup_insights_query
+            query, _err = fixup_insights_query(query)
+            if _err:
+                return f"Query not run — fix the Insights query first. {_err}"
+        else:
+            _lint = lint_insights_query(query)
+            if _lint:
+                return f"Query not run — fix the Insights query first. {_lint}"
         try:
             from app.mcp.tools.search_tools import CloudWatchLogsSearchTools
         except ImportError:
@@ -818,6 +854,21 @@ def build_cloudwatch_agent_tools(
         )
         return _budget_json(result, "cloudwatch_get_metric_statistics")
 
+    # -- discover metrics --
+    async def _discover_metrics(
+        namespace: Optional[str] = None,
+        log_group_names: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> str:
+        result = await discover_metrics(
+            namespace=namespace,
+            log_group_names=log_group_names or log_groups,
+            region=_region,
+            credentials=_creds if _creds else None,
+            limit=limit,
+        )
+        return _budget_json(result, "cloudwatch_discover_metrics")
+
     # -- list alarms --
     async def _list_alarms(
         alarm_name_prefix: Optional[str] = None,
@@ -825,12 +876,14 @@ def build_cloudwatch_agent_tools(
         max_records: int = 100,
     ) -> str:
         import json
+        from app.config import settings as _settings
         result = await list_metric_alarms(
             alarm_name_prefix=alarm_name_prefix,
             state_value=state_value,
             region=_region,
             credentials=_creds if _creds else None,
             max_records=max_records,
+            include_history=_settings.cloudwatch_alarm_history,
         )
         return _budget_json(_summarise_alarms(result), "cloudwatch_list_alarms")
 
@@ -931,10 +984,23 @@ def build_cloudwatch_agent_tools(
             description=(
                 "List CloudWatch Metric Alarms. Use state_value='ALARM' to get only "
                 "currently firing alarms — this is typically the first call in any "
-                "incident investigation. Returns alarm state, threshold, metric, and "
-                "last state change time."
+                "incident investigation. Returns alarm state, threshold, metric, "
+                "last state change time, and flags flapping alarms (frequent state "
+                "changes in the last 24h)."
             ),
             args_schema=ListAlarmsInput,
+        ),
+        StructuredTool.from_function(
+            coroutine=_discover_metrics,
+            name="cloudwatch_discover_metrics",
+            description=(
+                "Discover which CloudWatch metrics exist for a service via ListMetrics. "
+                "Pass a namespace (e.g. 'AWS/Lambda') or log_group_names to infer it "
+                "(e.g. '/aws/lambda/kyc-auth' → AWS/Lambda FunctionName=kyc-auth). Use "
+                "this to find metric names/dimensions before cloudwatch_get_metric_data "
+                "instead of guessing them."
+            ),
+            args_schema=DiscoverMetricsInput,
         ),
     ]
 

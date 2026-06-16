@@ -110,6 +110,7 @@ export const WORKFLOW_TEMPLATES = [
       { id: 'ccinv_lm', type: 'language_model', x: 100, y: 128, name: 'Language Model', status: 'idle',
         params: { llm: '' } },
       { id: 'ccinv_tool', type: 'code_search_tool', x: 100, y: 460, name: 'Code Crawler', status: 'idle',
+        // Select one or more repos; the agent searches across all of them.
         params: { repos: '' } },
       { id: 'ccinv_agent', type: 'agent', x: 660, y: 200, name: 'Investigation Agent', status: 'idle',
         params: { maxIter: '10', system: CODE_INVESTIGATION_SYSTEM } },

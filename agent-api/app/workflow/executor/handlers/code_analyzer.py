@@ -138,6 +138,23 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
                 if hits is not None:
                     pre_summary_results[repo_name] = hits
 
+    # Project intelligence auto-context: give the agent the per-repo brief +
+    # coding standards at run start so it understands the project and writes code
+    # that fits, without needing a tool call first. Best-effort and compact
+    # (capped per repo); deeper detail is fetched on demand via the crawler tools.
+    project_briefs: Dict[str, Any] = {}
+    if all_indexed:
+        async def _ctx(repo_name: str) -> tuple[str, Any]:
+            try:
+                return repo_name, await crawler_service.get_project_context(repo_name)
+            except Exception as ce:  # noqa: BLE001
+                logger.debug("codeAnalyzer project-context failed for %s: %s", repo_name, ce)
+                return repo_name, None
+
+        for repo_name, ctx in await asyncio.gather(*[_ctx(rn) for rn in all_indexed]):
+            if ctx is not None:
+                project_briefs[repo_name] = ctx
+
     return {
         'status': 'success',
         'output': f'Repos ready: {", ".join(all_indexed)}',
@@ -145,4 +162,5 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
         'repos_indexed': all_indexed,
         'repos_config': repos,
         'pre_summary': pre_summary_results or None,
+        'project_brief': project_briefs or None,
     }

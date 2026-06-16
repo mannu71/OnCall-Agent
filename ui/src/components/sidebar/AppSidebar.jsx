@@ -5,9 +5,7 @@ import {
   Workflow,
   Calendar,
   Settings,
-  BarChart3,
   MessageSquare,
-  Eye,
   ChevronLeft,
   Network
 } from 'lucide-react'
@@ -45,12 +43,6 @@ const navigationItems = [
     icon: Calendar,
   },
   {
-    id: 'log-watch',
-    title: 'Log Watch',
-    path: '/log-watch',
-    icon: Eye,
-  },
-  {
     id: 'chat',
     title: 'Agent Chat',
     path: '/chat',
@@ -67,13 +59,6 @@ const navigationItems = [
     title: 'Codebase Explorer',
     path: '/explorer',
     icon: Network,
-  },
-  {
-    id: 'analytics',
-    title: 'Analytics',
-    path: '/analytics',
-    icon: BarChart3,
-    devOnly: true,
   },
   {
     id: 'settings',

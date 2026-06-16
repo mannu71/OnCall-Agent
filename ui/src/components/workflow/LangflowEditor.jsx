@@ -2272,7 +2272,7 @@ function MultiRepoSelect({ value, onChange }) {
   );
 }
             function ParamRow({ k, label, v, slotKind, onChange, selectOptions, slotAccept, onFileChange,
-                    slotAction, allParams, nodes, updateMultipleParams }) {
+                    slotAction, allParams, nodes, updateMultipleParams, slotPlaceholder }) {
   const [customKeys, setCustomKeys] = React.useState(() => new Set());
   const isCode      = slotKind === 'textarea';
   const isWeekday   = slotKind === 'weekday-select';
@@ -2570,7 +2570,7 @@ function MultiRepoSelect({ value, onChange }) {
             </div>
           : <input type={k === 'pat' || k === 'token' || slotKind === 'password' ? 'password' : 'text'}
               value={String(v ?? '')} onChange={e => onChange?.(k, e.target.value)}
-              placeholder="—"
+              placeholder={slotPlaceholder || '—'}
               style={{ ...baseStyle, color: v ? '#0f172a' : '#94a3b8' }} />
         }
       </div>
@@ -2767,6 +2767,7 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, workflo
                       allParams={node.params || {}}
                       nodes={nodes}
                       updateMultipleParams={updateMultipleParams}
+                      slotPlaceholder={slot.placeholder}
                       onFileChange={slot.kind === 'file-select'
                         ? (name, content) => onUpdateNode?.(node.id, {
                             params: { ...(node.params || {}), [slot.id]: name, sqlContent: content },

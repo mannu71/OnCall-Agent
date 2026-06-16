@@ -307,6 +307,206 @@ async def get_metric_statistics(
     }
 
 
+def detect_flapping(transition_count: int, min_transitions: int = 3) -> bool:
+    """A pure flapping test: True when an alarm changed state at least
+    *min_transitions* times in the observed window. Extracted for deterministic
+    unit testing of the Phase 2 alarm-history signal."""
+    return transition_count >= min_transitions
+
+
+@handle_exceptions
+async def get_alarm_history(
+    alarm_names: List[str],
+    hours: int = 24,
+    region: str = "us-east-1",
+    credentials: Optional[Dict[str, Any]] = None,
+    max_items_per_alarm: int = 50,
+    flapping_min_transitions: int = 3,
+) -> Dict[str, Any]:
+    """Fetch recent state-change history for specific alarms (DescribeAlarmHistory).
+
+    Only ``StateUpdate`` items are requested (the state transitions), bounded to
+    the last *hours* and *max_items_per_alarm* per alarm. An alarm that flips
+    state ``flapping_min_transitions`` or more times in the window is flagged as
+    flapping — a strong signal that it is noisy / a real instability rather than
+    a clean steady-state failure.
+
+    Returns ``{success, history: {alarm: [{state, reason, timestamp}, ...]},
+    flapping: [alarm, ...], transitions: {alarm: count}}``.
+    """
+    client = _get_metrics_client(region=region, credentials=credentials)
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(hours=max(1, hours))
+
+    history: Dict[str, List[Dict[str, Any]]] = {}
+    transitions: Dict[str, int] = {}
+    flapping: List[str] = []
+
+    for name in alarm_names[:50]:
+        response = await run_in_aws_pool(
+            lambda n=name: client.describe_alarm_history(
+                AlarmName=n,
+                HistoryItemType="StateUpdate",
+                StartDate=start_time,
+                EndDate=end_time,
+                MaxRecords=max_items_per_alarm,
+            ),
+        )
+        items: List[Dict[str, Any]] = []
+        for h in response.get("AlarmHistoryItems", []):
+            items.append({
+                "summary": h.get("HistorySummary"),
+                "timestamp": (
+                    h["Timestamp"].isoformat() if h.get("Timestamp") else None
+                ),
+            })
+        history[name] = items
+        transitions[name] = len(items)
+        if detect_flapping(len(items), flapping_min_transitions):
+            flapping.append(name)
+
+    return {
+        "success": True,
+        "history": history,
+        "transitions": transitions,
+        "flapping": flapping,
+        "window_hours": hours,
+        "region": region,
+    }
+
+
+def build_metric_queries_from_discovery(
+    discovery: Dict[str, Any], limit: int = 10, period_seconds: int = 300, stat: str = "Sum",
+) -> List[Dict[str, Any]]:
+    """Turn a :func:`discover_metrics` result into GetMetricData query dicts.
+
+    When the discovery inferred specific resources (dimension values) from log
+    groups, only metrics for those resources are included — otherwise the first
+    *limit* metrics in the namespace. Pure/deterministic for unit testing the
+    Phase 4 metrics-fusion path.
+    """
+    metrics = (discovery or {}).get("metrics") or []
+    inferred = (discovery or {}).get("inferred_targets") or []
+    wanted = {t.get("dimension_value") for t in inferred if t.get("dimension_value")}
+    queries: List[Dict[str, Any]] = []
+    for m in metrics:
+        dims = m.get("dimensions") or []
+        if wanted and not any(d.get("Value") in wanted for d in dims):
+            continue
+        label_dims = ",".join(str(d.get("Value", "")) for d in dims)
+        queries.append({
+            "Id": f"m{len(queries)}",
+            "Label": f"{m.get('metric_name')} ({label_dims})" if label_dims else str(m.get("metric_name")),
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": m.get("namespace"),
+                    "MetricName": m.get("metric_name"),
+                    "Dimensions": dims,
+                },
+                "Period": period_seconds,
+                "Stat": stat,
+            },
+        })
+        if len(queries) >= limit:
+            break
+    return queries
+
+
+@handle_exceptions
+async def discover_metrics(
+    namespace: Optional[str] = None,
+    log_group_names: Optional[List[str]] = None,
+    region: str = "us-east-1",
+    credentials: Optional[Dict[str, Any]] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Discover available CloudWatch metrics (ListMetrics) for a namespace or,
+    when *namespace* is omitted, inferred from the supplied log group names.
+
+    Lets the agent (and auto metrics-fusion) find the metrics that exist for a
+    service without a hand-written MetricDataQuery dict. Returns a compact list
+    of ``{namespace, metric_name, dimensions}`` plus the inferred targets so the
+    caller can build GetMetricData queries.
+    """
+    inferred: List[Dict[str, Any]] = []
+    namespaces: List[str] = []
+    if namespace:
+        namespaces = [namespace]
+    else:
+        for lg in (log_group_names or []):
+            ns_target = infer_namespace_from_log_group(lg)
+            if ns_target:
+                inferred.append(ns_target)
+                if ns_target["namespace"] not in namespaces:
+                    namespaces.append(ns_target["namespace"])
+
+    if not namespaces:
+        return {"success": True, "metrics": [], "inferred_targets": inferred,
+                "note": "No namespace given and none could be inferred from log groups."}
+
+    client = _get_metrics_client(region=region, credentials=credentials)
+    metrics: List[Dict[str, Any]] = []
+    for ns in namespaces:
+        response = await run_in_aws_pool(lambda n=ns: client.list_metrics(Namespace=n))
+        for m in response.get("Metrics", []):
+            metrics.append({
+                "namespace": m.get("Namespace"),
+                "metric_name": m.get("MetricName"),
+                "dimensions": [
+                    {"Name": d.get("Name"), "Value": d.get("Value")}
+                    for d in m.get("Dimensions", [])
+                ],
+            })
+            if len(metrics) >= limit:
+                break
+        if len(metrics) >= limit:
+            break
+
+    return {
+        "success": True,
+        "metrics": metrics,
+        "inferred_targets": inferred,
+        "namespaces": namespaces,
+        "region": region,
+    }
+
+
+# Map a log-group name prefix to its CloudWatch metric namespace + dimension.
+# Ordered longest/most-specific first so '/aws/lambda/' wins before a generic
+# fallback. Each entry: (log-group prefix, namespace, dimension name).
+_LOG_GROUP_NAMESPACE_MAP = (
+    ("/aws/lambda/", "AWS/Lambda", "FunctionName"),
+    ("/aws/rds/", "AWS/RDS", "DBInstanceIdentifier"),
+    ("/aws/apigateway/", "AWS/ApiGateway", "ApiName"),
+    ("/aws/ecs/", "AWS/ECS", "ServiceName"),
+    ("/aws/eks/", "AWS/EKS", "ClusterName"),
+    ("/aws/states/", "AWS/States", "StateMachineArn"),
+)
+
+
+def infer_namespace_from_log_group(log_group: str) -> Optional[Dict[str, Any]]:
+    """Infer the CloudWatch metric namespace + dimension for a log group name.
+
+    e.g. ``/aws/lambda/kyc-auth`` → ``{namespace: "AWS/Lambda",
+    dimension_name: "FunctionName", dimension_value: "kyc-auth"}``. Returns
+    ``None`` when the name doesn't match a known AWS service convention. Pure and
+    deterministic for unit testing the Phase 2 metrics-fusion inference.
+    """
+    name = (log_group or "").strip()
+    for prefix, namespace, dim_name in _LOG_GROUP_NAMESPACE_MAP:
+        if name.startswith(prefix):
+            resource = name[len(prefix):].strip("/")
+            if not resource:
+                return None
+            return {
+                "namespace": namespace,
+                "dimension_name": dim_name,
+                "dimension_value": resource,
+                "log_group": name,
+            }
+    return None
+
+
 @handle_exceptions
 async def list_metric_alarms(
     alarm_names: Optional[List[str]] = None,
@@ -315,6 +515,7 @@ async def list_metric_alarms(
     region: str = "us-east-1",
     credentials: Optional[Dict[str, Any]] = None,
     max_records: int = 100,
+    include_history: bool = False,
 ) -> Dict[str, Any]:
     """List CloudWatch Metric Alarms, optionally filtered by state.
 
@@ -392,15 +593,38 @@ async def list_metric_alarms(
         if state in state_counts:
             state_counts[state] += 1
 
+    summary: Dict[str, Any] = {
+        "total": len(alarms),
+        "in_alarm": state_counts["ALARM"],
+        "ok": state_counts["OK"],
+        "insufficient_data": state_counts["INSUFFICIENT_DATA"],
+    }
+
+    # Phase 2: surface flapping for currently-firing alarms. Bounded to ALARM
+    # alarms only (cheap, actionable) and best-effort — a history failure must
+    # never sink the alarms listing.
+    if include_history:
+        firing = [a.get("name") for a in alarms if a.get("state") == "ALARM" and a.get("name")]
+        if firing:
+            try:
+                hist = await get_alarm_history(
+                    alarm_names=firing, region=region, credentials=credentials,
+                )
+                if isinstance(hist, dict) and not hist.get("error"):
+                    flapping = hist.get("flapping") or []
+                    transitions = hist.get("transitions") or {}
+                    if flapping:
+                        summary["flapping"] = flapping
+                    for a in alarms:
+                        if a.get("name") in transitions:
+                            a["transitions_24h"] = transitions[a["name"]]
+            except Exception as exc:  # noqa: BLE001 — enrichment is best-effort
+                logger.debug("list_metric_alarms: history enrichment skipped: %s", exc)
+
     return {
         "success": True,
         "alarms": alarms,
-        "summary": {
-            "total": len(alarms),
-            "in_alarm": state_counts["ALARM"],
-            "ok": state_counts["OK"],
-            "insufficient_data": state_counts["INSUFFICIENT_DATA"],
-        },
+        "summary": summary,
         "filter": {
             "state_value": state_value,
             "alarm_name_prefix": alarm_name_prefix,
