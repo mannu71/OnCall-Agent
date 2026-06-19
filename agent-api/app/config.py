@@ -7,7 +7,7 @@ import os
 from functools import lru_cache
 from typing import Any, List, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,16 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
     log_format: str = "json"  # "json" or "text"
+
+    # ── Runtime profile (lightweight switch) ─────────────────────────────────
+    # APP_PROFILE=lite flips heavy features off by default (semantic memory,
+    # sandbox, CloudWatch auto-escalation/drilldown, startup indexing recovery)
+    # for a minimal footprint. Any explicit env var always wins. 'full' = today.
+    app_profile: str = Field(default="full", validation_alias="APP_PROFILE")
+    # Re-fire interrupted repo-indexing jobs on startup (crawler). Off under lite.
+    startup_indexing_recovery_enabled: bool = Field(
+        default=True, validation_alias="STARTUP_INDEXING_RECOVERY_ENABLED"
+    )
     
     # Database
     database_url: str = Field(
@@ -174,6 +184,16 @@ class Settings(BaseSettings):
     # Runtime retention / concurrency
     max_runtime_events: int = 500
     embedding_concurrency: int = 4
+    # Bedrock embedding model + output dimension. Titan Text Embeddings V2
+    # (amazon.titan-embed-text-v2:0) supports 256/512/1024 dims (1024 best
+    # quality) and is the account-enabled model; V1 (titan-embed-text-v1, 1536)
+    # is not enabled here. All embedding columns are vector(1024) (migration 019).
+    embedding_model_id: str = Field(
+        default="amazon.titan-embed-text-v2:0", validation_alias="EMBEDDING_MODEL_ID"
+    )
+    embedding_dimensions: int = Field(
+        default=1024, validation_alias="EMBEDDING_DIMENSIONS"
+    )
     code_correlation_concurrency: int = 5
 
     # Agent / tools / output limits
@@ -240,7 +260,165 @@ class Settings(BaseSettings):
     # DEFAULT_MAX_RESULT_SIZE_CHARS. Set to 0 to disable. Override via env.
     tool_output_max_chars: int = Field(default=50000, validation_alias="TOOL_OUTPUT_MAX_CHARS")
     skill_min_tool_calls: int = 3
+    # Confidence-gated distillation: a distilled skill scoring
+    # below this is saved as 'draft' (hidden from recall) until audited/proven.
+    skill_confidence_min: float = Field(
+        default=0.6, validation_alias="SKILL_CONFIDENCE_MIN"
+    )
+    # A draft skill with at least this many successful executions is auto-promoted
+    # to 'active' by the curator audit (proven-by-use).
+    skill_promote_success_count: int = Field(
+        default=2, validation_alias="SKILL_PROMOTE_SUCCESS_COUNT"
+    )
     guardrail_hard_stop: bool = False
+
+    # ── Bedrock fallback-chain routing ───────────────────────────────────────
+    # On a Bedrock ThrottlingException the runner walks a fallback chain
+    # (alt credential → alt region → fallback model) instead of hammering the
+    # same throttled target. Set False to restore the old single-target retry.
+    routing_fallback_enabled: bool = Field(
+        default=True, validation_alias="ROUTING_FALLBACK_ENABLED"
+    )
+    # Concrete AWS regions to fail over to, in order. Each must host the
+    # cross-region inference profile for the model; build_llm derives the
+    # us./eu./ap. prefix from the region. Comma-separated via env.
+    # Defaults to US regions only — most deployments' Bedrock credentials are
+    # US-scoped, and same-geography inference profiles avoid cross-region auth
+    # failures. Add eu-*/ap-* via env when the credentials have that access.
+    bedrock_fallback_regions: List[str] = Field(
+        default_factory=lambda: ["us-east-1", "us-west-2"],
+        validation_alias="BEDROCK_FALLBACK_REGIONS",
+    )
+    # Bedrock model IDs to fall back to (e.g. Sonnet → Haiku) after region
+    # failover is exhausted. Bare foundation-model IDs; the inference-profile
+    # prefix is added per region. Comma-separated via env.
+    bedrock_model_fallback: List[str] = Field(
+        default_factory=lambda: ["anthropic.claude-haiku-4-5-20251001-v1:0"],
+        validation_alias="BEDROCK_MODEL_FALLBACK",
+    )
+
+    # ── Bank-scoped semantic memory ──────────────────────────────────────────
+    # Learned, operational memory: auto-captured investigation findings recalled
+    # (hybrid FTS+vector) before each run, scoped per-repo + a shared global bank.
+    # Opt-in (default off) so it is a no-op until an operator enables it.
+    semantic_memory_enabled: bool = Field(
+        default=False, validation_alias="SEMANTIC_MEMORY_ENABLED"
+    )
+    # Retrieval mode: 'hybrid' (FTS+vector, best recall/lowest tokens), 'fts'
+    # (no embeddings — zero embed calls), or 'vector' (pure semantic).
+    memory_retrieval_mode: str = Field(
+        default="hybrid", validation_alias="MEMORY_RETRIEVAL_MODE"
+    )
+    # Token-budget guardrails (keep recall net-positive, not a per-turn leak):
+    memory_recall_k: int = Field(default=4, validation_alias="MEMORY_RECALL_K")
+    # Cosine threshold for the vector recall leg. Tuned for Titan V2, whose
+    # normalized embeddings score related text ~0.4–0.5 (lower than V1) — 0.6
+    # filtered everything. Hybrid RRF + the k-cap keep precision.
+    memory_recall_min_score: float = Field(
+        default=0.35, validation_alias="MEMORY_RECALL_MIN_SCORE"
+    )
+    memory_max_chars: int = Field(default=600, validation_alias="MEMORY_MAX_CHARS")
+    # Only auto-capture an investigation finding when confidence is at least this
+    # (avoids storing low-value/uncertain results). 0 captures everything.
+    memory_capture_min_confidence: float = Field(
+        default=0.6, validation_alias="MEMORY_CAPTURE_MIN_CONFIDENCE"
+    )
+
+    # ── Per-turn durable-fact extraction + audit loop ────────────────────────
+    # After each turn, extract a few DURABLE operational/session facts and store
+    # them in semantic_memory (conservative caps: a couple short facts per turn).
+    # Opt-in (default off) — a no-op until enabled. Reuses the existing store and
+    # its sha256 dedup, so it never duplicates infra.
+    memory_fact_extraction_enabled: bool = Field(
+        default=False, validation_alias="MEMORY_FACT_EXTRACTION_ENABLED"
+    )
+    memory_fact_max_per_turn: int = Field(
+        default=2, validation_alias="MEMORY_FACT_MAX_PER_TURN"
+    )
+    # The audit/consolidation pass (run by the curator) merges memories that
+    # state the same fact in different words. A SHA256 fingerprint of the store
+    # short-circuits the LLM call when nothing changed; a hard guard refuses any
+    # pass that would delete more than this fraction of memories.
+    memory_audit_enabled: bool = Field(
+        default=False, validation_alias="MEMORY_AUDIT_ENABLED"
+    )
+    memory_audit_max_delete_fraction: float = Field(
+        default=0.5, validation_alias="MEMORY_AUDIT_MAX_DELETE_FRACTION"
+    )
+
+    # ── PII pseudonymization (privacy boundary before Bedrock) ───────────────
+    # Detect PII in everything bound for the model and swap in stable, reversible
+    # placeholders ([EMAIL_1] …); the final answer is re-hydrated for the user.
+    # ON by default — this is a compliance control for a KYC product. Set the
+    # flag False to disable, or trim the entity set, without a redeploy.
+    pii_pseudonymization_enabled: bool = Field(
+        default=True, validation_alias="PII_PSEUDONYMIZATION_ENABLED"
+    )
+    pii_entity_types: List[str] = Field(
+        default_factory=lambda: ["EMAIL", "PHONE", "SSN", "CREDIT_CARD", "IP", "ACCOUNT_ID"],
+        validation_alias="PII_ENTITY_TYPES",
+    )
+    # NER-based PERSON/ADDRESS detection — off until validated (regex-only first).
+    pii_person_detection: bool = Field(
+        default=False, validation_alias="PII_PERSON_DETECTION"
+    )
+
+    # ── Plan → execute → verify agent loop ───────────────────────────────────
+    # When True, multi-step agents are instructed to draft a markdown task list,
+    # work it item-by-item, and close with a Verification section. Gated to
+    # multi-step mode so trivial single-tool runs are not bloated.
+    agent_planning_enabled: bool = Field(
+        default=True, validation_alias="AGENT_PLANNING_ENABLED"
+    )
+
+    # ── RAG-selected skills ──────────────────────────────────────────────────
+    # Auto-select relevant skills per query (reusing semantic recall) instead of
+    # requiring an explicit /slash-command invocation.
+    skill_rag_selection_enabled: bool = Field(
+        default=True, validation_alias="SKILL_RAG_SELECTION_ENABLED"
+    )
+    skill_rag_k: int = Field(default=2, validation_alias="SKILL_RAG_K")
+
+    # ── Self-improvement (hill-climbing) loop ────────────────────────────────
+    # OFF by default. When enabled, an on-demand analyzer samples recent execution
+    # traces and proposes prompt/tool/skill refinements as DRAFTS for operator
+    # approval — it never auto-applies anything.
+    self_improvement_enabled: bool = Field(
+        default=False, validation_alias="SELF_IMPROVEMENT_ENABLED"
+    )
+    self_improvement_sample: int = Field(
+        default=30, validation_alias="SELF_IMPROVEMENT_SAMPLE"
+    )
+
+    # ── Pinned-facts memory tier ─────────────────────────────────────────────
+    # An always-injected (not similarity-gated) memory tier on the existing
+    # semantic store (bank='pinned'), with a per-turn token budget.
+    pinned_facts_enabled: bool = Field(
+        default=True, validation_alias="PINNED_FACTS_ENABLED"
+    )
+    memory_turn_token_budget: int = Field(
+        default=800, validation_alias="MEMORY_TURN_TOKEN_BUDGET"
+    )
+    pinned_facts_max_tokens: int = Field(
+        default=400, validation_alias="PINNED_FACTS_MAX_TOKENS"
+    )
+    pinned_promote_recall_threshold: int = Field(
+        default=3, validation_alias="PINNED_PROMOTE_RECALL_THRESHOLD"
+    )
+
+    # ── Tool execution sandbox ───────────────────────────────────────────────
+    # Isolate shell/code-execution tools. Backends:
+    #   disabled  — no sandboxing (default; tools run in-process as before)
+    #   auto      — pick the best available for the OS (container > bwrap > seatbelt)
+    #   container — ephemeral Docker container (best for this Docker stack)
+    #   bwrap     — Linux bubblewrap
+    #   seatbelt  — macOS sandbox-exec
+    sandbox_backend: str = Field(default="disabled", validation_alias="SANDBOX_BACKEND")
+    sandbox_image: str = Field(default="python:3.12-slim", validation_alias="SANDBOX_IMAGE")
+    sandbox_timeout_seconds: int = Field(default=60, validation_alias="SANDBOX_TIMEOUT_SECONDS")
+    sandbox_memory: str = Field(default="512m", validation_alias="SANDBOX_MEMORY")
+    sandbox_cpus: str = Field(default="1", validation_alias="SANDBOX_CPUS")
+    sandbox_network: bool = Field(default=False, validation_alias="SANDBOX_NETWORK")
     cloudwatch_auto_drilldown: bool = True
     cloudwatch_metrics_fusion: bool = True
     # When True, the deterministic cloudwatchAnalyzer node auto-escalates to a
@@ -347,11 +525,51 @@ class Settings(BaseSettings):
         "cloudwatch_metrics_fusion",
         "otel_enabled",
         "aws_secrets_manager_enabled",
+        "sandbox_network",
+        "routing_fallback_enabled",
+        "semantic_memory_enabled",
+        "memory_fact_extraction_enabled",
+        "memory_audit_enabled",
         mode="before",
     )
     @classmethod
     def _parse_bool_fields(cls, value: Any) -> bool:
         return parse_env_bool(value)
+
+    @field_validator(
+        "bedrock_fallback_regions",
+        "bedrock_model_fallback",
+        mode="before",
+    )
+    @classmethod
+    def _parse_csv_list(cls, value: Any) -> Any:
+        """Accept a comma-separated string (env) or a real list (default)."""
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @model_validator(mode="after")
+    def _apply_lite_profile_defaults(self) -> "Settings":
+        """When APP_PROFILE=lite, flip heavy features off — unless explicitly set.
+
+        Only fields the operator did NOT provide (via env/.env, tracked by
+        ``model_fields_set``) are changed, so an explicit override always wins.
+        'full' (default) preserves today's behaviour exactly. No code is removed —
+        this only changes defaults for a minimal-footprint runtime.
+        """
+        if (self.app_profile or "full").lower() != "lite":
+            return self
+        lite_defaults = {
+            "semantic_memory_enabled": False,
+            "sandbox_backend": "disabled",
+            "cloudwatch_auto_escalate": False,
+            "cloudwatch_auto_drilldown": False,
+            "startup_indexing_recovery_enabled": False,
+        }
+        for name, value in lite_defaults.items():
+            if name not in self.model_fields_set:
+                setattr(self, name, value)
+        return self
 
     @property
     def async_database_url(self) -> str:

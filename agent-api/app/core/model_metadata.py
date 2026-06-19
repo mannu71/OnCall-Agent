@@ -512,6 +512,32 @@ def get_model_context_length_sync(
     return resolved
 
 
+def window_size_for_model(
+    model: str,
+    *,
+    default: int = 200_000,
+    config_context_length: int | None = None,
+) -> int:
+    """Best-effort context window (tokens) for *model*, for compaction sizing.
+
+    Sizes the compaction budget to the actual model rather than a fixed
+    constant, so long-context
+    models (e.g. 1M Claude) compact later and small ones (≤128K) compact in time.
+    Synchronous + offline (hardcoded table + config override only) so it is safe
+    on the hot path; returns *default* for an empty/unknown model.
+    """
+    if not model:
+        return default
+    try:
+        return get_model_context_length_sync(
+            model,
+            config_context_length=config_context_length,
+            enforce_minimum=False,
+        )
+    except Exception:  # noqa: BLE001 — sizing must never break the agent
+        return default
+
+
 def estimate_tokens_rough(text: str) -> int:
     """Rough token estimate (~4 chars/token) for pre-flight checks.
 

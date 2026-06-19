@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Any
 
 from sqlalchemy import select, delete
 
-from app.core.database import AsyncSessionLocal
+from app.infrastructure.persistence.base import BaseAsyncRepository
 from app.models.db_models import ModelKeyModel
 from app.services.credential_transformer import CredentialTransformer
 
@@ -40,34 +40,29 @@ def _provider_aliases(provider: str) -> List[str]:
     return list({provider, *aliases})
 
 
-class ModelKeyRepository:
+class ModelKeyRepository(BaseAsyncRepository):
     """Repository for model key (API credential) data access."""
-    
+
     def __init__(self):
         """Initialize model key repository."""
         logger.info("ModelKeyRepository initialized")
-    
+
     async def list_all(self, include_secrets: bool = False) -> List[Dict[str, Any]]:
-        """List all model keys.
-        
-        Args:
-            include_secrets: If True, include actual secret values
-            
-        Returns:
-            List of model key data
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(select(ModelKeyModel))
-            keys = result.scalars().all()
-            return [self._model_key_to_dict(k, include_secrets) for k in keys]
+        """List all model keys."""
+        keys = await self._all(select(ModelKeyModel))
+        return [self._model_key_to_dict(k, include_secrets) for k in keys]
     
     async def get_by_provider(self, provider: str, include_secrets: bool = False) -> Optional[Dict[str, Any]]:
-        """Get model key by provider.
-        
+        """Get the highest-priority enabled model key for *provider*.
+
+        With multi-credential support (migration 017) a provider may have several
+        rows; this returns the preferred one (enabled, lowest ``priority``) so all
+        existing single-credential callers keep working unchanged.
+
         Args:
             provider: Provider identifier
             include_secrets: If True, include actual secret values
-            
+
         Returns:
             Model key dict or None
         """
@@ -76,12 +71,28 @@ class ModelKeyRepository:
         # endpoint and the model-keys table can be edited independently
         # without breaking lookup.
         aliases = _provider_aliases(provider)
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(ModelKeyModel).where(ModelKeyModel.provider.in_(aliases))
-            )
-            k = result.scalars().first()
-            return self._model_key_to_dict(k, include_secrets) if k else None
+        k = await self._first(
+            select(ModelKeyModel)
+            .where(ModelKeyModel.provider.in_(aliases))
+            .where(ModelKeyModel.enabled.is_(True))
+            .order_by(ModelKeyModel.priority.asc(), ModelKeyModel.id.asc())
+        )
+        return self._model_key_to_dict(k, include_secrets) if k else None
+
+    async def list_by_provider(self, provider: str, include_secrets: bool = False,
+                               enabled_only: bool = True) -> List[Dict[str, Any]]:
+        """List all credentials for *provider*, ordered by selection priority.
+
+        Used by the fallback-chain router to gather alternate credentials to
+        rotate across when the preferred one is throttled.
+        """
+        aliases = _provider_aliases(provider)
+        stmt = select(ModelKeyModel).where(ModelKeyModel.provider.in_(aliases))
+        if enabled_only:
+            stmt = stmt.where(ModelKeyModel.enabled.is_(True))
+        stmt = stmt.order_by(ModelKeyModel.priority.asc(), ModelKeyModel.id.asc())
+        keys = await self._all(stmt)
+        return [self._model_key_to_dict(k, include_secrets) for k in keys]
 
     async def create(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new model key.
@@ -93,10 +104,13 @@ class ModelKeyRepository:
             Created model key data
         """
         normalized_data = CredentialTransformer.normalize_input(data)
-        
-        async with AsyncSessionLocal() as session:
+
+        async def _work(session):
             key = ModelKeyModel(
                 provider=normalized_data["provider"],
+                key_label=normalized_data.get("key_label") or "default",
+                priority=int(normalized_data.get("priority") or 100),
+                enabled=bool(normalized_data.get("enabled", True)),
                 api_key=normalized_data.get("api_key"),
                 secret_key=normalized_data.get("secret_key"),
                 endpoint=normalized_data.get("endpoint"),
@@ -109,9 +123,10 @@ class ModelKeyRepository:
                 updated_at=datetime.now(timezone.utc),
             )
             session.add(key)
-            await session.commit()
+            await session.flush()
             await session.refresh(key)
             return self._model_key_to_dict(key, include_secrets=True)
+        return await self._run(_work)
     
     async def update(self, provider: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Update an existing model key.
@@ -124,24 +139,30 @@ class ModelKeyRepository:
             Updated model key data or None if not found
         """
         normalized_data = CredentialTransformer.normalize_input(data)
-        
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(ModelKeyModel).where(ModelKeyModel.provider == provider)
-            )
-            key = result.scalar_one_or_none()
+
+        async def _work(session):
+            # A provider may now have several rows; update the preferred one
+            # (lowest priority). Multi-key management of specific labels is a
+            # separate concern from this back-compat single-provider update.
+            key = (await session.execute(
+                select(ModelKeyModel)
+                .where(ModelKeyModel.provider == provider)
+                .order_by(ModelKeyModel.priority.asc(), ModelKeyModel.id.asc())
+            )).scalars().first()
             if not key:
                 return None
-            
-            for field_name in ["api_key", "secret_key", "endpoint", "region",
+
+            for field_name in ["key_label", "priority", "enabled",
+                               "api_key", "secret_key", "endpoint", "region",
                                "access_key_id", "secret_access_key", "session_token", "description"]:
                 if field_name in normalized_data:
                     setattr(key, field_name, normalized_data[field_name])
-            
+
             key.updated_at = datetime.now(timezone.utc)
-            await session.commit()
+            await session.flush()
             await session.refresh(key)
             return self._model_key_to_dict(key, include_secrets=True)
+        return await self._run(_work)
     
     async def upsert(self, provider: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Insert or update a model key.
@@ -167,28 +188,19 @@ class ModelKeyRepository:
         Returns:
             True if deleted, False if not found
         """
-        async with AsyncSessionLocal() as session:
+        async def _work(session):
             result = await session.execute(
                 delete(ModelKeyModel).where(ModelKeyModel.provider == provider).returning(ModelKeyModel.id)
             )
-            deleted = result.scalar_one_or_none()
-            await session.commit()
-            return deleted is not None
-    
-    async def exists(self, provider: str) -> bool:
-        """Check if a model key exists.
-        
-        Args:
-            provider: Provider identifier
-            
-        Returns:
-            True if exists
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(ModelKeyModel.id).where(ModelKeyModel.provider == provider)
-            )
             return result.scalar_one_or_none() is not None
+        return await self._run(_work)
+
+    async def exists(self, provider: str) -> bool:
+        """Return True if a model key exists for *provider* (first match)."""
+        row = await self._first(
+            select(ModelKeyModel.id).where(ModelKeyModel.provider == provider)
+        )
+        return row is not None
     
     def _model_key_to_dict(
         self,
@@ -208,6 +220,9 @@ class ModelKeyRepository:
         """
         d = {
             "provider": key.provider,
+            "key_label": getattr(key, "key_label", "default"),
+            "priority": getattr(key, "priority", 100),
+            "enabled": getattr(key, "enabled", True),
             "has_api_key": bool(key.api_key),
             "has_secret_key": bool(key.secret_key),
             "has_access_credentials": bool(key.access_key_id and key.secret_access_key),

@@ -8,6 +8,9 @@ version = "1.0.0"
 description = "Lightweight workflow automation engine with real-time streaming"
 readme = "README.md"
 requires-python = ">=3.12"
+# CORE runtime deps only. Optional features live in [project.optional-dependencies]
+# below (crawler, openai). This is the source of truth; requirements-core.txt /
+# requirements-crawler.txt / requirements.txt mirror it for the Docker build.
 dependencies = [
     "fastapi==0.109.0",
     "uvicorn[standard]==0.27.0",
@@ -16,14 +19,16 @@ dependencies = [
     "pydantic>=2.7.4",
     "pydantic-settings>=2.3.4",
     "pyyaml>=6.0.1",
+    "pathspec>=0.11.0",
     "sse-starlette==1.8.2",
     "python-dateutil==2.8.2",
     "pytz==2023.3",
+    "tzdata>=2024.1",
     "httpx>=0.27.0",
     "boto3>=1.34.0",
+    "tiktoken>=0.7.0",
     "langchain>=1.2.0",
     "langchain-core>=1.2.0",
-    "langchain-openai>=1.1.0",
     "langchain-aws>=1.4.0",
     "langgraph>=1.1.0",
     "langgraph-prebuilt>=1.0.0",
@@ -33,7 +38,12 @@ dependencies = [
     "asyncpg>=0.29.0",
     "sqlalchemy>=2.0.0",
     "aiofiles==23.2.1",
-    "hypothesis>=6.152.0",
+    "cryptography>=42.0.0",
+]
+
+[project.optional-dependencies]
+# Code crawler / knowledge graph AST parsers (~10 native wheels, ~25 MB).
+crawler = [
     "tree-sitter>=0.22.0",
     "tree-sitter-typescript>=0.23.0",
     "tree-sitter-c-sharp>=0.23.0",
@@ -42,15 +52,20 @@ dependencies = [
     "tree-sitter-go>=0.23.0",
     "tree-sitter-rust>=0.23.0",
     "tree-sitter-ruby>=0.23.0",
+    "tree-sitter-python>=0.23.0",
+    "tree-sitter-javascript>=0.23.0",
 ]
-
-[project.optional-dependencies]
+# OpenAI / Azure-OpenAI LLM provider support (Bedrock is the default provider).
+openai = [
+    "langchain-openai>=1.1.0",
+]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21.0",
     "black>=23.0",
     "ruff>=0.1.0",
     "mypy>=1.0",
+    "hypothesis>=6.152.0",
 ]
 
 [tool.setuptools.packages.find]

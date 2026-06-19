@@ -3,11 +3,17 @@ import agentApiClient from '../services/agentApiClient';
 
 /** Max structural events kept in memory (tokens are tracked separately). */
 const MAX_EVENTS = 500;
+/** Max agent tool-call entries kept — long runs can emit thousands. */
+const MAX_TOOL_CALLS = 500;
+
+function capList(prev, item, max) {
+    const next = [...prev, item];
+    if (next.length <= max) return next;
+    return next.slice(next.length - max);
+}
 
 function capEvents(prev, event) {
-    const next = [...prev, event];
-    if (next.length <= MAX_EVENTS) return next;
-    return next.slice(next.length - MAX_EVENTS);
+    return capList(prev, event, MAX_EVENTS);
 }
 
 /**
@@ -110,13 +116,13 @@ export function useWorkflowStream(workflowName, enabled = true) {
             const handleToolCall = (event) => {
                 try {
                     const data = JSON.parse(event.data);
-                    setAgentToolCalls(prev => [...prev, {
+                    setAgentToolCalls(prev => capList(prev, {
                         type: 'call',
                         tool: data.data?.tool,
                         args: data.data?.args,
                         nodeId: data.data?.node_id,
                         timestamp: data.timestamp || new Date().toISOString()
-                    }]);
+                    }, MAX_TOOL_CALLS));
 
                     appendEvent({
                         ...data,
@@ -131,13 +137,13 @@ export function useWorkflowStream(workflowName, enabled = true) {
             const handleToolResult = (event) => {
                 try {
                     const data = JSON.parse(event.data);
-                    setAgentToolCalls(prev => [...prev, {
+                    setAgentToolCalls(prev => capList(prev, {
                         type: 'result',
                         tool: data.data?.tool,
                         result: data.data?.result,
                         nodeId: data.data?.node_id,
                         timestamp: data.timestamp || new Date().toISOString()
-                    }]);
+                    }, MAX_TOOL_CALLS));
 
                     appendEvent({
                         ...data,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from app.workflow.strategies.react.tool_setup import build_playbook_tools
@@ -18,6 +19,12 @@ def build_agent(
     session_id: Optional[str] = None,
     permission_mode: str = "default",
     execution_port: Any = None,
+    policies: Optional[List[Dict[str, Any]]] = None,
+    capabilities: Optional[List[str]] = None,
+    role_prompt: Optional[str] = None,
+    planning: bool = False,
+    filesystem: bool = False,
+    subagents: Optional[List[Dict[str, Any]]] = None,
 ) -> Any:
     """
     Build a LangGraph ReAct agent graph.
@@ -54,25 +61,39 @@ def build_agent(
         if hasattr(t, "name")
     )
 
-    # ── Role sentence ──────────────────────────────────────────────────
-    capabilities = []
+    # ── Resolve active capabilities (composable; see app.harness.capabilities) ──
+    # The investigation trio is derived from the runtime flags so existing
+    # workflows are unchanged; a profile may declare extra capability ids via
+    # ``capabilities`` (Phase 1), which append after the builtins in registry order.
+    from app.harness import capabilities as _caps
+    _active_ids: List[str] = []
     if has_db_tools:
-        capabilities.append("database and MCP tools")
+        _active_ids.append("database")
     if has_cloudwatch:
-        capabilities.append("AWS CloudWatch logs and metrics")
+        _active_ids.append("cloudwatch")
     if has_code_analyzer:
-        capabilities.append("source-code analysis")
+        _active_ids.append("code_analyzer")
+    for _cid in (capabilities or []):
+        if _cid not in _active_ids:
+            _active_ids.append(_cid)
+    active_caps = _caps.resolve(_active_ids)
 
-    if capabilities:
-        capability_str = ", ".join(capabilities)
-        role_sentence = (
-            f"You are an expert engineering assistant "
-            f"with access to {capability_str}. Adapt to whatever the user is "
-            f"trying to do — root-cause analysis, log retrieval, code inspection, "
-            f"code analysis, or general questions."
-        )
+    # ── Role sentence ──────────────────────────────────────────────────
+    if role_prompt:
+        # Profile-supplied full role override (Phase 1).
+        role_sentence = role_prompt
     else:
-        role_sentence = "You are an expert engineering assistant."
+        role_fragments = [c.role_fragment for c in active_caps if c.role_fragment]
+        if role_fragments:
+            capability_str = ", ".join(role_fragments)
+            role_sentence = (
+                f"You are an expert engineering assistant "
+                f"with access to {capability_str}. Adapt to whatever the user is "
+                f"trying to do — root-cause analysis, log retrieval, code inspection, "
+                f"code analysis, or general questions."
+            )
+        else:
+            role_sentence = "You are an expert engineering assistant."
 
     # ── System prompt assembly ─────────────────────────────────────────
     # CACHE CONTRACT: this prompt MUST stay deterministic given agent_config.
@@ -86,8 +107,11 @@ def build_agent(
     # § Doing tasks — shared discipline that governs every capability below.
     system_parts.append(
         "# Doing tasks\n"
-        "- Always reason step by step and call the available tools to get facts — never guess "
+        "- Reason step by step and call the available tools to get facts — never guess "
         "or invent data.\n"
+        "- The ONLY exception: if the user's message is purely a greeting, a thank-you, or "
+        "other small talk with nothing to investigate, just reply conversationally without "
+        "calling tools. Any actual question or task still uses the tools.\n"
         "- Answer exactly what was asked and back every claim with specific evidence from the "
         "tool results (repo/file/line, log_group/timestamp, table/column). Don't gold-plate or "
         "pad with unrequested analysis.\n"
@@ -97,6 +121,26 @@ def build_agent(
         "If you say you will do something, call the tool in the SAME turn. If a focused search "
         "finds nothing, say so plainly rather than inventing an answer or trailing off."
     )
+
+    # § Plan → execute → verify. Multi-step only, so trivial
+    # single-tool runs are not bloated. Gated on a stable config flag + agent_mode
+    # so the cache prefix stays deterministic per run (re-baseline evals on change).
+    try:
+        from app.config import settings as _settings
+        _planning_on = bool(getattr(_settings, "agent_planning_enabled", True))
+    except Exception:  # noqa: BLE001
+        _planning_on = True
+    if _planning_on and agent_mode == "multi":
+        system_parts.append(
+            "# Plan, then execute, then verify\n"
+            "- For a multi-step investigation, FIRST write a short markdown task list "
+            "(GitHub checkboxes: '- [ ] step') of the concrete steps you intend to take.\n"
+            "- Then work the list top to bottom, calling tools as you go. Keep it honest: "
+            "only check an item ('- [x]') once the tool evidence actually supports it.\n"
+            "- Close with a brief '## Verification' section confirming each item was done and "
+            "citing the evidence. Skip the plan for a trivial single-lookup question — it is a "
+            "tool for genuinely multi-step work, not ceremony."
+        )
 
     # § Using your tools — shared steering: prefer the specific tool, reuse work.
     system_parts.append(
@@ -110,89 +154,45 @@ def build_agent(
         "running manual tool calls — this reuses proven remediation steps and is faster."
     )
 
-    # DB-specific guidance only when SQL/MCP tools are actually present.
-    if has_db_tools:
-        system_parts.append(
-            "To find the right table, call db_list_tables(name_like='<keyword>'); if you know a "
-            "column/field but not its table, call db_search_columns(name_like='<column>'); then "
-            "db_describe_table('<table>') for just that table. Do NOT query information_schema "
-            "directly or list the entire schema (it wastes context). With multiple databases "
-            "connected, omit `server` to search all of them at once (results are labelled "
-            "[server]). IMPORTANT: if a filtered lookup returns nothing, broaden or drop the "
-            "name_like and retry before concluding the table/column does not exist — the "
-            "unfiltered list is complete. When querying data, prefer targeted queries over full "
-            "table scans: use WHERE clauses, date ranges, and LIMIT."
-        )
+    # ── Capability sections (registry-driven; stable order) ──────────────
+    # Each active capability contributes its system-prompt section in registry
+    # order (database → cloudwatch → code_analyzer → any profile extras). The
+    # text lives in app.harness.capabilities; this loop reproduces the previous
+    # inline ordering exactly so the Bedrock cache prefix is unchanged.
+    for _cap in active_caps:
+        if _cap.section:
+            system_parts.append(_cap.section)
 
-    # ── CloudWatch instructions (refine, don't redo) ──────────────────────
-    if has_cloudwatch:
+    # ── Deep-agent capability instructions (profile-gated, config-stable) ──────
+    if planning:
         system_parts.append(
-            "A deterministic CloudWatch log scan has ALREADY run — its results "
-            "(alarms, anomalies, error patterns, any drill-down, and a data_quality "
-            "coverage block) are in the 'Pre-computed CloudWatch Analysis' block at the "
-            "start of this query. Treat that as your starting evidence. Do NOT re-run the "
-            "full scan. Use the live tools only to VERIFY or DRILL DEEPER into specific "
-            "findings: cloudwatch_search_logs (drill_down=true) for raw events behind a "
-            "pattern/anomaly, cloudwatch_correlate_logs to trace one request across groups, "
-            "cloudwatch_discover_log_groups only if a referenced group is missing. "
-            "If the user gives a correlation id / request id / trace id (or the pre-computed "
-            "block is a 'correlation-lookup'), LEAD with cloudwatch_correlate_logs for that "
-            "id and build the cross-service timeline before anything else. "
-            "Cite log_group, timestamp, z_score/occurrence_count, and normalized_pattern. "
-            "Respect data_quality: if it reports partial/sampled results or failed groups, "
-            "say so and confirm with a targeted cloudwatch_search_logs before concluding; "
-            "if coverage is full and nothing was found, state that explicitly rather than "
-            "implying a problem."
+            "# Planning\n"
+            "You have write_todos and update_todo. For a genuinely multi-step task, call "
+            "write_todos FIRST with the concrete steps, then work the list top to bottom, "
+            "calling update_todo to mark each item in_progress then completed as the tool "
+            "evidence supports it. Skip the plan for a single-lookup question."
         )
-
-    # ── Code Analyzer instructions (compact) ──────────────────────────
-    if has_code_analyzer:
+    if filesystem:
         system_parts.append(
-            "Code analysis tools are available over the connected repositories. Fetch only what each "
-            "question needs — never read whole files or dump the codebase.\n"
-            "PROJECT INTELLIGENCE: a per-repo project brief (what it does, domain model, "
-            "architecture) and coding-standards summary may already be in your initial context. "
-            "Treat it as ground truth about the project. For more depth call crawler_project_brief(repo), "
-            "crawler_module_doc(repo, path) for how a module works, and crawler_find_feature(repo, query) "
-            "to map a feature/flow to its code. BEFORE writing or proposing any code, call "
-            "crawler_coding_standards(repo) and make your change match the project's naming, layout, "
-            "framework idioms and error-handling conventions.\n"
-            "GENERAL EXPLORATION: crawler_grep (regex/text over file contents), crawler_read_file (read "
-            "any file by path), and crawler_list_files work on ANY language, config, or IaC file — use "
-            "them when the symbol-graph tools don't cover what you need. To understand how connected "
-            "services relate (one service calling another's endpoint, or a queue/topic one publishes and "
-            "another consumes), investigate it yourself: grep across the connected repos for the evidence "
-            "(base URLs, route paths, queue/topic names, client usages), read the matching files, and "
-            "reason from what you find — do not assume a fixed set of integration channels.\n"
-            "MANDATORY drill-in: whenever a finding (a CloudWatch error pattern, stack trace, log "
-            "line, or alert) names a source location — a file path, file:line (e.g. "
-            "'ReportService.cs:427'), class, method, or symbol — you MUST confirm it in code before "
-            "stating a root cause. Call crawler_investigate_alert(<the error/stack trace>, repo) or "
-            "crawler_find_symbol(<symbol>, repo), then crawler_get_body(handle) to read the "
-            "responsible lines. Do NOT conclude root cause from the log text alone when the code is "
-            "reachable. Map the failing service to its repo by name (e.g. a "
-            "'compliance_kyc-protect-api' log group → the 'compliance-api' repo).\n"
-            "Tool-selection protocol:\n"
-            "1. LOCATE — if you know the symbol name, use crawler_find_symbol(symbol, repo) (exact, "
-            "fastest). If you only have a concept/description, use crawler_search_semantic(query, repo). "
-            "To orient in an unfamiliar repo, crawler_repo_map(repo, name_like=...) gives a cheap "
-            "names-only list. For an error/stack-trace/alert, crawler_investigate_alert(alert, repo).\n"
-            "2. READ — call crawler_get_body(handle) on a returned body_handle to confirm the code "
-            "before citing it. Never conclude from a name alone.\n"
-            "3. TRACE — crawler_trace_path(symbol, repo, direction='callers'|'callees', depth) to follow "
-            "the call graph once you have a symbol.\n"
-            "Only call crawler_index_repo(repo) if a repository appears unindexed. Pass the exact repo "
-            "name shown in the tool descriptions.\n"
-            "When you conclude, cite repo, file path, symbol and line number(s) as evidence.\n"
-            "Implement-feature protocol (when asked to ADD or CHANGE code, not just diagnose): "
-            "1. LOCATE the insertion point with crawler_find_symbol / crawler_repo_map. "
-            "2. READ the surrounding code with crawler_get_body so your change matches the existing "
-            "conventions. 3. APPLY: edit_file for surgical changes to an existing file (old_string "
-            "must be unique); create_file ONLY for a genuinely new file (it fails if the file already "
-            "exists). Keep the change minimal — no drive-by refactors. 4. AFTER applying, summarize "
-            "exactly what changed (file and lines) and tell the user to build/test — you cannot run "
-            "the build yourself."
+            "# Scratch filesystem\n"
+            "You have a session-scoped virtual filesystem (fs_write, fs_read, fs_ls, fs_grep). "
+            "When a tool returns a large result you only partly need, fs_write it to a file and "
+            "keep working from a short note, then fs_read/fs_grep just the part you need later. "
+            "This keeps your context lean. The files vanish when the run ends."
         )
+    if subagents:
+        _names = ", ".join(
+            f"delegate_to_{re.sub(r'[^a-z0-9]+', '_', str(s.get('name', '')).lower()).strip('_')}"
+            for s in subagents if isinstance(s, dict) and s.get("name")
+        )
+        if _names:
+            system_parts.append(
+                "# Delegation\n"
+                f"You can delegate scoped subtasks to specialized subagents ({_names}). Each runs "
+                "its own loop with a fresh context and returns only a concise summary. Use them "
+                "for separable parts of a larger task so your own context stays focused on "
+                "synthesis; they cannot delegate further."
+            )
 
     if instructions:
         system_parts.append(f"\nAdditional instructions:\n{instructions}")
@@ -209,36 +209,31 @@ def build_agent(
     playbook_tools = build_playbook_tools()
     all_tools = list(tools) + playbook_tools
 
-    # ── Per-tool permission gatekeeping (rules + ask-in-chat) ─────────────
-    # Wrap mutating tools so they are denied / require approval per policy.
-    # Read-only investigation tools pass through unchanged, so the model-facing
-    # schema (and the prompt-cache prefix) is preserved.
+    # ── Governance: declarative policy engine (single evaluation point) ───
+    # Resolve the workflow's policy set (or platform defaults when none) into a
+    # ResolvedPolicy, then apply tool gating + the universal output cap in one
+    # pass. Permission gate runs first so the model-facing schema (and the
+    # prompt-cache prefix) is preserved; read-only tools pass through unchanged.
+    # The resolved policy is stashed on a per-task contextvar so the runner can
+    # honour runtime quotas (cost ceiling, tool-call limit, loop guardrails).
     try:
-        from app.workflow.strategies.react.tool_permissions import wrap_tools_with_permissions
-        all_tools = wrap_tools_with_permissions(
-            all_tools, mode=permission_mode,
+        from app.core import policy as _policy
+        resolved = _policy.resolve_with_platform_defaults(policies)
+        _policy.set_current(resolved)
+        all_tools = _policy.apply_to_tools(
+            all_tools, resolved,
+            mode=permission_mode,
             execution_id=session_id, execution_port=execution_port,
         )
-        logger.info("ReactStrategy: tool permission gate active (mode=%s)", permission_mode)
-    except Exception as _perm_err:  # noqa: BLE001 — never break a run on the gate
-        logger.warning("ReactStrategy: tool permission wrap skipped (%s)", _perm_err)
-
-    # ── Universal tool-result cap (token safety-net) ──────────────────────
-    # Applied AFTER the permission wrap so the model-facing schema (and the
-    # prompt-cache prefix) is untouched. Caps any single StructuredTool result
-    # that lacks its own per-family cap (db/edit/playbook), so a large dump
-    # can't inflate input cost on every later ReAct iteration. MCP wrappers
-    # and already-capped results are skipped — see wrap_tools_with_output_cap.
-    try:
-        from app.config import settings as _settings
-        from app.workflow.strategies.react.tool_permissions import wrap_tools_with_output_cap
-        all_tools = wrap_tools_with_output_cap(all_tools, _settings.tool_output_max_chars)
         logger.info(
-            "ReactStrategy: tool-result cap active (max_chars=%d)",
-            _settings.tool_output_max_chars,
+            "ReactStrategy: policy engine active (mode=%s, ask=%d, deny=%d, cap=%s, "
+            "cost_ceiling=%s, max_tool_calls=%s)",
+            permission_mode, len(resolved.effective_ask_patterns()),
+            len(resolved.deny_patterns), resolved.output_cap_chars,
+            resolved.budget_cost_usd, resolved.max_tool_calls,
         )
-    except Exception as _cap_err:  # noqa: BLE001 — never break a run on the cap
-        logger.warning("ReactStrategy: tool-result cap skipped (%s)", _cap_err)
+    except Exception as _pol_err:  # noqa: BLE001 — never break a run on governance
+        logger.warning("ReactStrategy: policy engine skipped (%s)", _pol_err)
 
     # ── Prompt caching (provider-aware) ───────────────────────────────
     # AWS Bedrock (ChatBedrockConverse) is the only live provider. It does
@@ -297,6 +292,11 @@ def build_agent(
     # For Anthropic it also re-annotates the (possibly compacted) tail so the
     # growing conversation prefix bills at the cached rate.
     _compaction_session = session_id or "react-agent"
+    # Best-effort model id so compaction sizes its window to the actual model
+    # (long-context models compact later). Falls back to the 200K default.
+    _compaction_model = (
+        getattr(llm, "model_id", None) or getattr(llm, "model", None) or None
+    )
 
     async def _pre_model_hook(state: Dict[str, Any]) -> Dict[str, Any]:
         msgs = state.get("messages") or []
@@ -309,6 +309,7 @@ def build_agent(
             mgr = ContextCompactionManager(
                 transport=get_transport(),
                 session_id=_compaction_session,
+                model=_compaction_model,
             )
             out = await mgr.compact_if_needed(list(msgs))
         except Exception:  # noqa: BLE001 — compaction must never break a run

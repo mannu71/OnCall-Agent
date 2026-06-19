@@ -52,9 +52,20 @@ _REDACTED = "[REDACTED]"
 
 
 def _sanitize_credential(text: str) -> str:
-    """Replace credential-shaped strings in *text* with ``[REDACTED]``."""
+    """Scrub credentials, then pseudonymize PII, before MCP output reaches the LLM.
+
+    Credentials are redacted one-way; PII (email/phone/SSN/card/IP/account-id) is
+    swapped for reversible placeholders via the active session vault so the final
+    answer can be re-hydrated. Pseudonymization is a no-op when disabled or when
+    no session is bound, leaving legacy behaviour unchanged.
+    """
     for pattern in _CREDENTIAL_PATTERNS:
         text = pattern.sub(_REDACTED, text)
+    try:
+        from app.core.privacy import pseudonymize_active
+        text = pseudonymize_active(text)
+    except Exception:  # noqa: BLE001 — privacy must never break tool output
+        pass
     return text
 
 

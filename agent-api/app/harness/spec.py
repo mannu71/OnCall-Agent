@@ -10,7 +10,7 @@ permission policy, subagent depth).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -25,5 +25,22 @@ class AgentSpec:
     has_code_analyzer: bool = False
     permission_mode: str = "default"
     session_id: Optional[str] = None
+    # Declarative governance policy set (see ``app.core.policy``). When None the
+    # policy engine falls back to platform defaults (= pre-policy behaviour).
+    policies: Optional[List[Dict[str, Any]]] = None
+    # ── Configurable-agent layer (Phase 0+) ──────────────────────────────────
+    # Extra composable capability ids beyond the runtime-derived investigation
+    # trio (see ``app.harness.capabilities``). Empty = current behaviour.
+    capabilities: List[str] = field(default_factory=list)
+    # Profile-supplied full role-sentence override; None keeps the derived one.
+    role_prompt: Optional[str] = None
+    # Structured-output schema name (see ``output_registry``); None/"investigation"
+    # keeps the InvestigationReport default.
+    output_schema: Optional[str] = None
+    # Deep-agent feature flags / definitions (wired in later phases). Off/empty by
+    # default so the investigation path is unchanged.
+    planning: bool = False
+    filesystem: bool = False
+    subagents: List[Dict[str, Any]] = field(default_factory=list)
     # Carried for completeness / future use by the loop engine.
     metadata: Dict[str, Any] = field(default_factory=dict)

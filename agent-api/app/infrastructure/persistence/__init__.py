@@ -12,6 +12,8 @@ from app.infrastructure.persistence.app_settings_repository import AppSettingsRe
 from app.infrastructure.persistence.tool_approval_repository import ToolApprovalRepository
 from app.infrastructure.persistence.model_role_repository import ModelRoleRepository
 from app.infrastructure.persistence.mcp_role_repository import MCPRoleRepository
+from app.infrastructure.persistence.session_repository import SessionRepository
+from app.infrastructure.persistence.agent_profile_repository import AgentProfileRepository
 
 # Shared singletons — prefer injecting ``Repository()`` in tests.
 workflow_repository = WorkflowRepository()
@@ -23,6 +25,8 @@ app_settings_repository = AppSettingsRepository()
 tool_approval_repository = ToolApprovalRepository()
 model_role_repository = ModelRoleRepository()
 mcp_role_repository = MCPRoleRepository()
+session_repository = SessionRepository()
+agent_profile_repository = AgentProfileRepository()
 
 __all__ = [
     "WorkflowRepository",
@@ -34,6 +38,8 @@ __all__ = [
     "ToolApprovalRepository",
     "ModelRoleRepository",
     "MCPRoleRepository",
+    "SessionRepository",
+    "AgentProfileRepository",
     "workflow_repository",
     "execution_repository",
     "llm_config_repository",
@@ -43,4 +49,5 @@ __all__ = [
     "tool_approval_repository",
     "model_role_repository",
     "mcp_role_repository",
+    "session_repository",
 ]

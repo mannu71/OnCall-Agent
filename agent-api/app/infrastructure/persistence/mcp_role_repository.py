@@ -9,7 +9,7 @@ from typing import Dict, List
 
 from sqlalchemy import select, delete
 
-from app.core.database import AsyncSessionLocal
+from app.infrastructure.persistence.base import BaseAsyncRepository
 from app.models.db_models import MCPRoleAssignmentModel
 
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 VALID_MCP_ROLES = {"agent"}
 
 
-class MCPRoleRepository:
+class MCPRoleRepository(BaseAsyncRepository):
     """Repository for MCP role assignment data access."""
 
     def __init__(self):
@@ -42,13 +42,11 @@ class MCPRoleRepository:
             List of assigned server names.
         """
         self._validate_role(role)
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(MCPRoleAssignmentModel.server_name).where(
-                    MCPRoleAssignmentModel.role == role
-                )
+        return await self._all(
+            select(MCPRoleAssignmentModel.server_name).where(
+                MCPRoleAssignmentModel.role == role
             )
-            return list(result.scalars().all())
+        )
 
     async def set_for_role(self, role: str, names: List[str]) -> None:
         """Replace all assignments for a role with the given server names.
@@ -58,7 +56,8 @@ class MCPRoleRepository:
             names: New set of server names (replace-all semantics)
         """
         self._validate_role(role)
-        async with AsyncSessionLocal() as session:
+
+        async def _work(session):
             await session.execute(
                 delete(MCPRoleAssignmentModel).where(
                     MCPRoleAssignmentModel.role == role
@@ -67,14 +66,10 @@ class MCPRoleRepository:
             now = datetime.now(timezone.utc)
             # Deduplicate while preserving order; unique constraint is on (role, name).
             for name in dict.fromkeys(names):
-                session.add(
-                    MCPRoleAssignmentModel(
-                        role=role,
-                        server_name=name,
-                        created_at=now,
-                    )
-                )
-            await session.commit()
+                session.add(MCPRoleAssignmentModel(
+                    role=role, server_name=name, created_at=now,
+                ))
+        await self._run(_work)
 
     async def clear(self, role: str) -> bool:
         """Remove all assignments for a role.
@@ -86,15 +81,15 @@ class MCPRoleRepository:
             True if any assignment was removed, False if none existed.
         """
         self._validate_role(role)
-        async with AsyncSessionLocal() as session:
+
+        async def _work(session):
             result = await session.execute(
                 delete(MCPRoleAssignmentModel)
                 .where(MCPRoleAssignmentModel.role == role)
                 .returning(MCPRoleAssignmentModel.id)
             )
-            deleted = result.scalars().all()
-            await session.commit()
-            return len(deleted) > 0
+            return len(result.scalars().all()) > 0
+        return await self._run(_work)
 
     async def list_all(self) -> Dict[str, List[str]]:
         """List all MCP role assignments.
@@ -102,10 +97,8 @@ class MCPRoleRepository:
         Returns:
             Dictionary mapping role -> list of server names.
         """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(select(MCPRoleAssignmentModel))
-            rows = result.scalars().all()
-            grouped: Dict[str, List[str]] = {}
-            for row in rows:
-                grouped.setdefault(row.role, []).append(row.server_name)
-            return grouped
+        rows = await self._all(select(MCPRoleAssignmentModel))
+        grouped: Dict[str, List[str]] = {}
+        for row in rows:
+            grouped.setdefault(row.role, []).append(row.server_name)
+        return grouped

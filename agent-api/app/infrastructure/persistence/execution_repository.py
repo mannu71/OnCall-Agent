@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Any
 from sqlalchemy import select, delete
 
 from app.core.database import AsyncSessionLocal
+from app.infrastructure.persistence.base import BaseAsyncRepository
 from app.models.db_models import ExecutionModel
 
 logger = logging.getLogger(__name__)
@@ -14,8 +15,14 @@ ACTIVE_STATUSES = ("running", "pending")
 TERMINAL_STATUSES = ("success", "failed", "cancelled", "partial", "completed")
 
 
-class ExecutionRepository:
-    """Repository for execution history data access."""
+class ExecutionRepository(BaseAsyncRepository):
+    """Repository for execution history data access.
+
+    Read methods use the shared :class:`BaseAsyncRepository` helpers; the
+    multi-step write/lifecycle methods (save_batch, cancel_all_active, …) keep
+    their own ``AsyncSessionLocal`` sessions where the transaction spans several
+    statements.
+    """
     
     def __init__(self):
         """Initialize execution repository."""
@@ -46,28 +53,25 @@ class ExecutionRepository:
         self, workflow_name: str
     ) -> Optional[Dict[str, Any]]:
         """Return the most recent running execution for a workflow, if any."""
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(ExecutionModel)
-                .where(
-                    ExecutionModel.workflow_name == workflow_name,
-                    ExecutionModel.status.in_(ACTIVE_STATUSES),
-                )
-                .order_by(ExecutionModel.started_at.desc())
-                .limit(1)
+        row = await self._first(
+            select(ExecutionModel)
+            .where(
+                ExecutionModel.workflow_name == workflow_name,
+                ExecutionModel.status.in_(ACTIVE_STATUSES),
             )
-            row = result.scalar_one_or_none()
-            return self._execution_to_dict(row) if row else None
+            .order_by(ExecutionModel.started_at.desc())
+            .limit(1)
+        )
+        return self._execution_to_dict(row) if row else None
 
     async def list_active(self) -> List[Dict[str, Any]]:
         """List all executions currently marked as running or pending."""
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(ExecutionModel)
-                .where(ExecutionModel.status.in_(ACTIVE_STATUSES))
-                .order_by(ExecutionModel.started_at.desc())
-            )
-            return [self._execution_to_dict(row) for row in result.scalars().all()]
+        rows = await self._all(
+            select(ExecutionModel)
+            .where(ExecutionModel.status.in_(ACTIVE_STATUSES))
+            .order_by(ExecutionModel.started_at.desc())
+        )
+        return [self._execution_to_dict(row) for row in rows]
 
     async def mark_cancelled(
         self,
@@ -136,52 +140,30 @@ class ExecutionRepository:
         """
         try:
             execution_id_int = int(execution_id)
-            async with AsyncSessionLocal() as session:
-                result = await session.execute(
-                    select(ExecutionModel).where(ExecutionModel.id == execution_id_int)
-                )
-                execution = result.scalar_one_or_none()
-                return self._execution_to_dict(execution) if execution else None
         except (ValueError, TypeError):
             logger.error(f"Invalid execution ID: {execution_id}")
             return None
-    
+        execution = await self._one(
+            select(ExecutionModel).where(ExecutionModel.id == execution_id_int)
+        )
+        return self._execution_to_dict(execution) if execution else None
+
     async def list_by_workflow(self, workflow_name: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """List executions for a workflow.
-        
-        Args:
-            workflow_name: Workflow name to filter
-            limit: Maximum number to return
-            
-        Returns:
-            List of executions
-        """
-        async with AsyncSessionLocal() as session:
-            query = select(ExecutionModel).where(
-                ExecutionModel.workflow_name == workflow_name
-            ).order_by(ExecutionModel.started_at.desc()).limit(limit)
-            
-            result = await session.execute(query)
-            executions = result.scalars().all()
-            return [self._execution_to_dict(e) for e in executions]
-    
+        """List executions for a workflow (newest first)."""
+        executions = await self._all(
+            select(ExecutionModel)
+            .where(ExecutionModel.workflow_name == workflow_name)
+            .order_by(ExecutionModel.started_at.desc())
+            .limit(limit)
+        )
+        return [self._execution_to_dict(e) for e in executions]
+
     async def list_all(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """List all executions.
-        
-        Args:
-            limit: Maximum number to return
-            
-        Returns:
-            List of executions
-        """
-        async with AsyncSessionLocal() as session:
-            query = select(ExecutionModel).order_by(
-                ExecutionModel.started_at.desc()
-            ).limit(limit)
-            
-            result = await session.execute(query)
-            executions = result.scalars().all()
-            return [self._execution_to_dict(e) for e in executions]
+        """List all executions (newest first)."""
+        executions = await self._all(
+            select(ExecutionModel).order_by(ExecutionModel.started_at.desc()).limit(limit)
+        )
+        return [self._execution_to_dict(e) for e in executions]
     
     async def save(self, execution_data: Dict[str, Any]) -> Dict[str, Any]:
         """Save (insert or update) an execution record.

@@ -22,7 +22,7 @@ once and the better-scoring run is kept (``retried`` flagged on its rows).
 This deliberately bypasses ``assemble_base_tools`` / the tool router (a hermetic
 run can't do the STS credential pre-flight) — the router is covered by
 ``evals.harness_selftest``. We build the same tool families the strategy would
-and drive the same ``harness.build_agent`` → ``execute_agent`` path.
+and drive the same ``build_agent_from_spec`` → ``execute_agent`` path.
 
 Run:  python -m evals.accuracy.run_trajectory
 """
@@ -126,7 +126,7 @@ def _load_cases() -> List[Dict[str, Any]]:
 
 async def _attempt(case: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
     """Run one agent trajectory for *case*; return (rows, tool_call_count)."""
-    from app.harness import harness, AgentSpec
+    from app.harness import build_agent_from_spec, AgentSpec
     from app.workflow.strategies.react.hitl import make_checkpointer
     from app.workflow.strategies.react.agent_runner import execute_agent
 
@@ -167,7 +167,7 @@ async def _attempt(case: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
             has_code_analyzer=bool(code_cfg), permission_mode="auto_allow",
             session_id=case["id"])
         checkpointer = await make_checkpointer()
-        agent = harness.build_agent(spec, llm, tools, checkpointer=checkpointer)
+        agent = build_agent_from_spec(spec, llm, tools, checkpointer=checkpointer)
 
         query = case["question"]
         if case.get("precomputed_block") and recording is not None:

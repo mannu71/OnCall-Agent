@@ -124,6 +124,19 @@ def build_playbook_tools() -> List[Any]:
         issue_id: int = PydanticField(description="The integer ID of the known issue to update.")
         new_solution: str = PydanticField(description="Replacement solution text.")
 
+    class PinFactInput(BaseModel):
+        fact: str = PydanticField(
+            description=(
+                "A durable, high-value fact worth recalling in EVERY future "
+                "investigation (e.g. an environment quirk, an escalation owner, a "
+                "confirmed invariant). Keep it one concise sentence."
+            )
+        )
+        repo: Optional[str] = PydanticField(
+            default=None,
+            description="Repo name to scope the fact to; omit to pin it globally.",
+        )
+
     class ExecuteSkillInput(BaseModel):
         skill_name: str = PydanticField(
             description="Slug name of the skill to execute (as shown in the memory-context block)."
@@ -165,6 +178,20 @@ def build_playbook_tools() -> List[Any]:
         except Exception as exc:
             return f"patch_playbook failed: {exc}"
 
+    async def _pin_fact(fact: str, repo: Optional[str] = None) -> str:
+        try:
+            from app.config import settings
+            if not getattr(settings, "pinned_facts_enabled", True):
+                return "pin_fact is disabled in this environment."
+            from app.services.semantic_memory import semantic_memory
+            row_id = await semantic_memory.pin_fact(fact, repo=repo)
+            if row_id is None:
+                return "pin_fact: nothing stored (empty fact)."
+            scope = f"repo '{repo}'" if repo else "global"
+            return f"Pinned fact (id={row_id}, {scope}); it will be injected every turn."
+        except Exception as exc:
+            return f"pin_fact failed: {exc}"
+
     async def _execute_skill(skill_name: str, context: dict) -> str:
         """Run a named skill's steps against the live MCP tool set."""
         try:
@@ -193,6 +220,17 @@ def build_playbook_tools() -> List[Any]:
                 "Use this when you have found a better resolution than what is already recorded."
             ),
             args_schema=PatchPlaybookInput,
+        ),
+        StructuredTool.from_function(
+            coroutine=_pin_fact,
+            name="pin_fact",
+            description=(
+                "Pin a durable, high-value fact so it is injected into EVERY future "
+                "investigation's context (the always-on memory tier). Use sparingly "
+                "for facts that stay true across runs — not run-specific findings "
+                "(use save_playbook for those)."
+            ),
+            args_schema=PinFactInput,
         ),
         StructuredTool.from_function(
             coroutine=_execute_skill,

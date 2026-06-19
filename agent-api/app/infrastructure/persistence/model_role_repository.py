@@ -10,7 +10,7 @@ from typing import Dict, Optional
 
 from sqlalchemy import select, delete
 
-from app.core.database import AsyncSessionLocal
+from app.infrastructure.persistence.base import BaseAsyncRepository
 from app.models.db_models import ModelRoleAssignmentModel
 
 logger = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 VALID_ROLES = {"agent", "crawler", "subagent"}
 
 
-class ModelRoleRepository:
+class ModelRoleRepository(BaseAsyncRepository):
     """Repository for model role assignment data access."""
 
     def __init__(self):
@@ -39,10 +39,8 @@ class ModelRoleRepository:
         Returns:
             Dictionary mapping role -> llm_config_name for every assigned role.
         """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(select(ModelRoleAssignmentModel))
-            rows = result.scalars().all()
-            return {row.role: row.llm_config_name for row in rows}
+        rows = await self._all(select(ModelRoleAssignmentModel))
+        return {row.role: row.llm_config_name for row in rows}
 
     async def get(self, role: str) -> Optional[str]:
         """Get the LLM config name assigned to a role.
@@ -54,13 +52,11 @@ class ModelRoleRepository:
             The assigned llm_config_name, or None if unassigned.
         """
         self._validate_role(role)
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(ModelRoleAssignmentModel.llm_config_name).where(
-                    ModelRoleAssignmentModel.role == role
-                )
+        return await self._one(
+            select(ModelRoleAssignmentModel.llm_config_name).where(
+                ModelRoleAssignmentModel.role == role
             )
-            return result.scalar_one_or_none()
+        )
 
     async def upsert(self, role: str, config_name: str) -> None:
         """Insert or update the assignment for a role.
@@ -70,27 +66,23 @@ class ModelRoleRepository:
             config_name: Name of an existing LLM config
         """
         self._validate_role(role)
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
+
+        async def _work(session):
+            row = (await session.execute(
                 select(ModelRoleAssignmentModel).where(
                     ModelRoleAssignmentModel.role == role
                 )
-            )
-            row = result.scalar_one_or_none()
+            )).scalar_one_or_none()
             now = datetime.now(timezone.utc)
             if row:
                 row.llm_config_name = config_name
                 row.updated_at = now
             else:
-                session.add(
-                    ModelRoleAssignmentModel(
-                        role=role,
-                        llm_config_name=config_name,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-            await session.commit()
+                session.add(ModelRoleAssignmentModel(
+                    role=role, llm_config_name=config_name,
+                    created_at=now, updated_at=now,
+                ))
+        await self._run(_work)
 
     async def delete(self, role: str) -> bool:
         """Clear the assignment for a role.
@@ -102,12 +94,12 @@ class ModelRoleRepository:
             True if an assignment was removed, False if none existed.
         """
         self._validate_role(role)
-        async with AsyncSessionLocal() as session:
+
+        async def _work(session):
             result = await session.execute(
                 delete(ModelRoleAssignmentModel)
                 .where(ModelRoleAssignmentModel.role == role)
                 .returning(ModelRoleAssignmentModel.id)
             )
-            deleted = result.scalar_one_or_none()
-            await session.commit()
-            return deleted is not None
+            return result.scalar_one_or_none() is not None
+        return await self._run(_work)

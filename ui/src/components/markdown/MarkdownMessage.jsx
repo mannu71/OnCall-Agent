@@ -43,23 +43,23 @@ export function cleanLlmText(text) {
  */
 export const mdComponents = {
   // eslint-disable-next-line no-unused-vars
-  h1: ({node, ...p}) => <h1 className="text-xl font-bold text-slate-900 mt-4 mb-2" {...p} />,
+  h1: ({node, ...p}) => <h1 className="text-xl font-bold text-slate-900 dark:text-slate-100 mt-4 mb-2" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  h2: ({node, ...p}) => <h2 className="text-lg font-bold text-slate-800 mt-4 mb-2 border-b border-slate-200 pb-1" {...p} />,
+  h2: ({node, ...p}) => <h2 className="text-lg font-bold text-slate-800 dark:text-slate-100 mt-4 mb-2 border-b border-slate-200 dark:border-white/10 pb-1" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  h3: ({node, ...p}) => <h3 className="text-base font-semibold text-slate-800 mt-3 mb-1" {...p} />,
+  h3: ({node, ...p}) => <h3 className="text-base font-semibold text-slate-800 dark:text-slate-200 mt-3 mb-1" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  p: ({node, ...p}) => <p className="text-sm text-slate-900 mb-3 leading-relaxed" {...p} />,
+  p: ({node, ...p}) => <p className="text-sm text-slate-900 dark:text-slate-200 mb-3 leading-relaxed" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  strong: ({node, ...p}) => <strong className="font-semibold text-slate-900" {...p} />,
+  strong: ({node, ...p}) => <strong className="font-semibold text-slate-900 dark:text-slate-100" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  em: ({node, ...p}) => <em className="italic text-slate-700" {...p} />,
+  em: ({node, ...p}) => <em className="italic text-slate-700 dark:text-slate-300" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  ul: ({node, ...p}) => <ul className="list-disc list-inside mb-3 space-y-1 text-sm text-slate-900" {...p} />,
+  ul: ({node, ...p}) => <ul className="list-disc list-inside mb-3 space-y-1 text-sm text-slate-900 dark:text-slate-200" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  ol: ({node, ...p}) => <ol className="list-decimal list-inside mb-3 space-y-1 text-sm text-slate-900" {...p} />,
+  ol: ({node, ...p}) => <ol className="list-decimal list-inside mb-3 space-y-1 text-sm text-slate-900 dark:text-slate-200" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  li: ({node, ...p}) => <li className="text-sm text-slate-900 ml-2" {...p} />,
+  li: ({node, ...p}) => <li className="text-sm text-slate-900 dark:text-slate-200 ml-2" {...p} />,
   // react-markdown v10 removed the `inline` prop — detect block vs inline via a
   // `language-*` class or multi-line content so inline code stays inline.
   // eslint-disable-next-line no-unused-vars
@@ -67,25 +67,25 @@ export const mdComponents = {
     const text = String(children ?? '');
     const isBlock = /language-/.test(className || '') || text.includes('\n');
     return isBlock
-      ? <code className="block bg-slate-50 border border-slate-200 rounded p-3 text-xs font-mono overflow-auto whitespace-pre-wrap" {...p}>{children}</code>
-      : <code className="bg-slate-100 text-slate-800 px-1 py-0.5 rounded text-xs font-mono" {...p}>{children}</code>;
+      ? <code className="block bg-slate-50 dark:bg-white/[0.04] border border-slate-200 dark:border-white/10 text-slate-800 dark:text-slate-200 rounded p-3 text-xs font-mono overflow-auto whitespace-pre-wrap" {...p}>{children}</code>
+      : <code className="bg-slate-100 dark:bg-white/10 text-slate-800 dark:text-slate-200 px-1 py-0.5 rounded text-xs font-mono" {...p}>{children}</code>;
   },
   // eslint-disable-next-line no-unused-vars
   pre: ({node, ...p}) => <pre className="mb-3" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  table: ({node, ...p}) => <div className="overflow-x-auto mb-4"><table className="min-w-full text-sm border-collapse border border-slate-200" {...p} /></div>,
+  table: ({node, ...p}) => <div className="overflow-x-auto mb-4"><table className="min-w-full text-sm border-collapse border border-slate-200 dark:border-white/10" {...p} /></div>,
   // eslint-disable-next-line no-unused-vars
-  thead: ({node, ...p}) => <thead className="bg-slate-100" {...p} />,
+  thead: ({node, ...p}) => <thead className="bg-slate-100 dark:bg-white/[0.06]" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  th: ({node, ...p}) => <th className="px-3 py-2 text-left font-semibold text-slate-700 border border-slate-200 text-xs" {...p} />,
+  th: ({node, ...p}) => <th className="px-3 py-2 text-left font-semibold text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-white/10 text-xs" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  td: ({node, ...p}) => <td className="px-3 py-2 text-slate-900 border border-slate-200 text-xs" {...p} />,
+  td: ({node, ...p}) => <td className="px-3 py-2 text-slate-900 dark:text-slate-200 border border-slate-200 dark:border-white/10 text-xs" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  tr: ({node, ...p}) => <tr className="even:bg-slate-50" {...p} />,
+  tr: ({node, ...p}) => <tr className="even:bg-slate-50 dark:even:bg-white/[0.03]" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  blockquote: ({node, ...p}) => <blockquote className="border-l-4 border-blue-300 pl-4 italic text-slate-600 mb-3 text-sm" {...p} />,
+  blockquote: ({node, ...p}) => <blockquote className="border-l-4 border-blue-300 dark:border-blue-500/40 pl-4 italic text-slate-600 dark:text-slate-400 mb-3 text-sm" {...p} />,
   // eslint-disable-next-line no-unused-vars
-  hr: ({node, ...p}) => <hr className="border-slate-200 my-4" {...p} />,
+  hr: ({node, ...p}) => <hr className="border-slate-200 dark:border-white/10 my-4" {...p} />,
 };
 
 /**

@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.endpoints import (
+    agent_profiles,
     certificates,
     code_analyzer,
     crawler,
@@ -10,12 +11,14 @@ from app.api.v1.endpoints import (
     executions,
     gateway,
     health,
+    improvement,
     insights,
     jobs,
     llm_config,
     log_watch,
     mcp_config,
     model_keys,
+    sessions,
     settings,
     tools,
     trajectories,
@@ -42,3 +45,6 @@ api_router.include_router(tools.router)
 api_router.include_router(tools.node_schemas_router)
 api_router.include_router(jobs.router)
 api_router.include_router(gateway.router)
+api_router.include_router(sessions.router)
+api_router.include_router(agent_profiles.router)
+api_router.include_router(improvement.router)

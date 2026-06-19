@@ -1,5 +1,8 @@
-const API_ROOT = import.meta.env.VITE_AGENT_API_URL || 'http://localhost:8000';
-const API_BASE_URL = `${API_ROOT.replace(/\/$/, '')}/api/v1`;
+import { getApiBaseUrl } from './apiClient';
+
+// Single source of truth for the backend base URL (honours VITE_API_URL /
+// VITE_AGENT_API_URL). Previously built inline from VITE_AGENT_API_URL only.
+const API_BASE_URL = getApiBaseUrl();
 
 export const getModelKeys = async () => {
   try {

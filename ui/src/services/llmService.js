@@ -1,11 +1,15 @@
 // LLM Configuration Service
 // Manages loading and saving LLM configurations via API
 
+import { getApiBaseUrl } from './apiClient';
+
 let configCache = null;
 let cacheTimestamp = 0;
 const CACHE_TTL_MS = 5000;
 
-const API_BASE_URL = 'http://localhost:8000/api/v1';
+// Single source of truth for the backend base URL (honours VITE_API_URL /
+// VITE_AGENT_API_URL); replaces the former hardcoded localhost host.
+const API_BASE_URL = getApiBaseUrl();
 
 export const invalidateCache = () => {
   configCache = null;

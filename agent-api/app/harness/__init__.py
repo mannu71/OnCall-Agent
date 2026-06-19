@@ -26,50 +26,45 @@ from app.harness.envelopes import (
 from app.harness.spec import AgentSpec
 
 
-class AgentHarness:
-    """Cohesive facade over the ReAct agent runtime.
+def build_agent_from_spec(
+    spec: AgentSpec,
+    llm: Any,
+    tools: List[Any],
+    checkpointer: Any = None,
+    execution_port: Any = None,
+) -> Any:
+    """Build a LangGraph ReAct agent from an :class:`AgentSpec` + runtime objects.
 
-    Phase 2 introduces the seam: a single place to *build* an agent from an
-    :class:`AgentSpec` (replacing duplicated ``build_agent`` call sites) and to
-    *run* the bounded supervisor loop. It delegates to the proven
-    ``app.workflow.strategies.react`` internals rather than relocating them, so
-    the 100%-accuracy loop is preserved while callers gain one entry point.
+    Single entry point that unpacks the spec into the underlying
+    ``agent_builder.build_agent`` call, so the four-or-so call sites stay in sync.
     """
+    from app.workflow.strategies.react.agent_builder import build_agent as _build_agent
 
-    def build_agent(
-        self,
-        spec: AgentSpec,
-        llm: Any,
-        tools: List[Any],
-        checkpointer: Any = None,
-        execution_port: Any = None,
-    ) -> Any:
-        """Build a LangGraph ReAct agent from a spec + runtime objects."""
-        from app.workflow.strategies.react.agent_builder import build_agent as _build_agent
+    return _build_agent(
+        llm,
+        tools,
+        spec.agent_config,
+        has_cloudwatch=spec.has_cloudwatch,
+        has_code_analyzer=spec.has_code_analyzer,
+        checkpointer=checkpointer,
+        session_id=spec.session_id,
+        permission_mode=spec.permission_mode,
+        execution_port=execution_port,
+        policies=spec.policies,
+        capabilities=spec.capabilities,
+        role_prompt=spec.role_prompt,
+        planning=spec.planning,
+        filesystem=spec.filesystem,
+        subagents=spec.subagents,
+    )
 
-        return _build_agent(
-            llm,
-            tools,
-            spec.agent_config,
-            has_cloudwatch=spec.has_cloudwatch,
-            has_code_analyzer=spec.has_code_analyzer,
-            checkpointer=checkpointer,
-            session_id=spec.session_id,
-            permission_mode=spec.permission_mode,
-            execution_port=execution_port,
-        )
-
-
-# Module-level singleton — stateless, safe to share.
-harness = AgentHarness()
 
 __all__ = [
-    "AgentHarness",
     "AgentSpec",
     "NodeOutput",
     "ToolError",
     "ToolResult",
     "ToolStatus",
     "cap_text",
-    "harness",
+    "build_agent_from_spec",
 ]

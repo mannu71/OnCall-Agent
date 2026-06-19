@@ -11,12 +11,17 @@ class ExecutionEvent:
         self.event_type = event_type
         self.data = data
         self.timestamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        # Monotonic per-execution sequence number, assigned by the executor when
+        # the event is published. Lets a late-attaching SSE stream replay the
+        # buffered backlog and then dedupe live events it already saw.
+        self.seq: int = 0
 
     def dict(self):
         return {
             "event_type": self.event_type,
             "data": self.data,
             "timestamp": self.timestamp,
+            "seq": self.seq,
         }
 
     def to_sse(self) -> str:

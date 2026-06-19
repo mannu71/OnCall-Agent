@@ -124,6 +124,7 @@ async def execute_agent(
     thread_id: Optional[str] = None,
     execution_port: Optional[ExecutionPort] = None,
     conversation_history: Optional[list] = None,
+    retry_predicate: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Execute the LangGraph ReAct agent with the user's query.
@@ -254,11 +255,13 @@ async def execute_agent(
                     run_config,
                     execution_port,
                     max_retries=3,
+                    retry_on=retry_predicate,
                 )
             else:
                 result_state = await with_retry(
                     invoke_agent, agent, input_state, run_config,
                     max_retries=3,
+                    retry_on=retry_predicate,
                 )
     except Exception as exc:
         # Handle LangGraph HITL interrupt — surface to caller as a structured pause.
@@ -693,10 +696,24 @@ async def execute_agent_stream(
     accumulated_state: Dict[str, Any] = {"messages": []}
     msg_map: Dict[str, Any] = {}
 
+    # ── Governance policy (resolved at agent build time) ──────────────────
+    # Read the per-task ResolvedPolicy so the loop honours its loop-guardrail
+    # config and per-session tool-call ceiling. Absent (e.g. evals / legacy
+    # callers) → env-based guardrail config and no tool-call limit, i.e. today's
+    # behaviour.
+    _resolved_policy = None
+    try:
+        from app.core import policy as _policy_mod
+        _resolved_policy = _policy_mod.get_current()
+    except Exception:  # noqa: BLE001 — governance must never break a run
+        _resolved_policy = None
+
     # ── Guardrail controller — one per streaming invocation (= one turn) ─
     # Side-effect-free controller whose decisions (warn / block / halt)
     # are acted on by this runtime code.
-    guardrail = ToolCallGuardrailController()
+    _guardrail_config = getattr(_resolved_policy, "guardrail_config", None)
+    guardrail = ToolCallGuardrailController(_guardrail_config)
+    _tool_calls_count = 0
 
     try:
         async for event in agent.astream_events(input_state, config=run_config or {}, version="v2"):
@@ -744,6 +761,25 @@ async def execute_agent_stream(
                 tool_name = name or current_tool_name
                 current_tool_name = tool_name
                 current_tool_args = tool_input if isinstance(tool_input, dict) else {}
+
+                # ── Policy: per-session tool-call ceiling ─────────────
+                _tool_calls_count += 1
+                if _resolved_policy is not None:
+                    try:
+                        from app.core.policy.runtime import evaluate_tool_count
+                        _quota = evaluate_tool_count(_resolved_policy, _tool_calls_count)
+                        if _quota.blocks:
+                            logger_instance.warning(
+                                "ReactStrategy: policy tool-call ceiling hit before '%s' — %s",
+                                tool_name, _quota.reason,
+                                extra={"execution_id": execution_id},
+                            )
+                            try:
+                                await stream_callback.on_error(f"[Policy] {_quota.reason}")
+                            except Exception:
+                                pass
+                    except Exception:  # noqa: BLE001 — governance must never break a run
+                        pass
 
                 # ── Guardrail pre-check ───────────────────────────────
                 # before_call() is side-effect-free: it only reads state and

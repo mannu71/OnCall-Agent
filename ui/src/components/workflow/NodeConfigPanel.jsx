@@ -23,6 +23,9 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
   const [discoverPrefix, setDiscoverPrefix] = useState('');
   const [discoverError, setDiscoverError] = useState(null);
   const [discoverSearched, setDiscoverSearched] = useState(false);
+  // Agent profiles + output-schema catalog (loaded once for the agent node).
+  const [agentProfiles, setAgentProfiles] = useState([]);
+  const [outputSchemas, setOutputSchemas] = useState([]);
   const [timeInput, setTimeInput] = useState(() => {
     // Initialize time from startTime first (most reliable), then cronExpression, or default to current time
     if (node?.data?.startTime) {
@@ -49,6 +52,20 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
       }
     }
   }, [node?.id]); // ONLY depend on node ID, not node.data
+
+  // Load agent profiles + output-schema catalog once when configuring an agent.
+  useEffect(() => {
+    if (node?.type !== 'agent') return;
+    let cancelled = false;
+    (async () => {
+      const list = await agentApiClient.listAgentProfiles().catch(() => null);
+      const cat = await agentApiClient.getAgentProfileCatalog().catch(() => null);
+      if (cancelled) return;
+      if (list?.profiles) setAgentProfiles(list.profiles);
+      if (cat?.output_schemas) setOutputSchemas(cat.output_schemas);
+    })();
+    return () => { cancelled = true; };
+  }, [node?.id, node?.type]);
 
   if (!node) return null;
 
@@ -206,6 +223,61 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
               />
             </div>
             <div className="config-field">
+              <label htmlFor="agent-profile">Agent Profile</label>
+              <select
+                id="agent-profile"
+                value={config.profile || ''}
+                onChange={(e) => handleConfigChange('profile', e.target.value)}
+              >
+                <option value="">— None (investigation default) —</option>
+                {agentProfiles.map((p) => (
+                  <option key={p.name} value={p.name}>
+                    {p.name}{p.builtin ? ' (builtin)' : ''}
+                  </option>
+                ))}
+              </select>
+              <small style={{ color: '#666', fontSize: '11px' }}>
+                Pick a profile to configure what type of agent this is (role, output
+                shape, policies). Fields you set below override the profile.
+              </small>
+            </div>
+            <div className="config-field">
+              <label htmlFor="agent-output-schema">Structured Output</label>
+              <select
+                id="agent-output-schema"
+                value={config.outputSchema || ''}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  // Selecting a schema implies structured mode; clearing reverts to text.
+                  const newConfig = {
+                    ...config,
+                    outputSchema: v,
+                    outputMode: v ? 'structured' : 'text',
+                  };
+                  setConfig(newConfig);
+                  onUpdate(node.id, newConfig);
+                }}
+              >
+                <option value="">Text only (no structured output)</option>
+                {outputSchemas.map((s) => (
+                  <option key={s} value={s}>{s}</option>
+                ))}
+              </select>
+              <small style={{ color: '#666', fontSize: '11px' }}>
+                Return a validated JSON report in this shape alongside the prose.
+              </small>
+            </div>
+            <div className="config-field">
+              <label htmlFor="agent-role-prompt">Role Prompt (override)</label>
+              <textarea
+                id="agent-role-prompt"
+                value={config.rolePrompt || ''}
+                onChange={(e) => handleConfigChange('rolePrompt', e.target.value)}
+                placeholder="Optional: replace the agent's role sentence entirely"
+                rows={2}
+              />
+            </div>
+            <div className="config-field">
               <label htmlFor="agent-instructions">Instructions</label>
               <textarea
                 id="agent-instructions"
@@ -214,6 +286,41 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                 placeholder="Agent instructions and behavior"
                 rows={4}
               />
+            </div>
+            <div className="config-field">
+              <label>Deep-agent capabilities</label>
+              <label className="checkbox-label" style={{ display: 'block', marginTop: 4 }}>
+                <input
+                  type="checkbox"
+                  checked={!!config.planning}
+                  onChange={(e) => handleConfigChange('planning', e.target.checked)}
+                />{' '}Planning — give the agent a write_todos / update_todo task list
+              </label>
+              <label className="checkbox-label" style={{ display: 'block', marginTop: 4 }}>
+                <input
+                  type="checkbox"
+                  checked={!!config.filesystem}
+                  onChange={(e) => handleConfigChange('filesystem', e.target.checked)}
+                />{' '}Scratch filesystem — fs_write/read/grep for context offload
+              </label>
+            </div>
+            <div className="config-field">
+              <label htmlFor="agent-subagents">Subagents (advanced, JSON)</label>
+              <textarea
+                id="agent-subagents"
+                value={
+                  typeof config.subagents === 'string'
+                    ? config.subagents
+                    : (config.subagents ? JSON.stringify(config.subagents, null, 2) : '')
+                }
+                onChange={(e) => handleConfigChange('subagents', e.target.value)}
+                placeholder='[{"name":"code-specialist","role_prompt":"…","tools":["crawler_*"]}]'
+                rows={3}
+                style={{ fontFamily: 'monospace', fontSize: 12 }}
+              />
+              <small style={{ color: '#666', fontSize: '11px' }}>
+                Each entry becomes a delegate_to_&lt;name&gt; tool. Leave blank for none.
+              </small>
             </div>
           </>
         );
@@ -811,6 +918,24 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                 on high/critical severity, weak evidence, or a firing alarm. Shallow skips
                 drill-down (cheapest); Deep always drills the top findings and correlates
                 across services (slower, higher cost).
+              </small>
+            </div>
+
+            <div className="config-field">
+              <label htmlFor="tool-mode">Tool Mode</label>
+              <select
+                id="tool-mode"
+                value={config.toolMode || 'auto'}
+                onChange={(e) => handleConfigChange('toolMode', e.target.value)}
+              >
+                <option value="auto">Auto — pre-scan for investigations, skip for chit-chat (recommended)</option>
+                <option value="agent">Agent-driven — no pre-scan; the agent calls CloudWatch tools itself</option>
+                <option value="prescan">Always pre-scan — run the deterministic scan every turn</option>
+              </select>
+              <small style={{ color: '#666', fontSize: '11px' }}>
+                Auto skips the AWS scan when the message is a greeting or small talk, so the
+                agent just replies. Agent-driven lets the model decide when to query logs.
+                Always pre-scan keeps the legacy behaviour.
               </small>
             </div>
 

@@ -17,6 +17,7 @@ async def auto_learn(
     execution_start: "datetime",
     recall_hits: int,
     logger_instance: Any,
+    code_analyzer_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Persist what this execution found to the knowledge base.
 
@@ -100,7 +101,46 @@ async def auto_learn(
             extra={"execution_id": execution_id},
         )
 
-    # ── Phase 3: log failed tools (diagnostic only) ──────────────────
+    # ── Phase 4: semantic memory capture (opt-in, Phase 2 borrow) ────
+    # Store a confident, resolution-bearing finding into the bank-scoped
+    # semantic memory so future investigations recall it. Gated by the enable
+    # flag + a confidence floor so we don't bloat memory with uncertain runs.
+    try:
+        from app.config import settings
+        if settings.semantic_memory_enabled and final_answer.strip():
+            _conf = estimate_confidence(final_answer, result.get("tool_calls", []))
+            if _conf >= settings.memory_capture_min_confidence:
+                from app.services.semantic_memory import semantic_memory
+                from app.harness.context_builder import repos_from_code_analyzer
+
+                repos = repos_from_code_analyzer(code_analyzer_config)
+                _q = (user_query or "").strip().replace("\n", " ")
+                if len(_q) > 300:
+                    _q = _q[:300] + "…"
+                _ans = final_answer.strip()
+                if len(_ans) > 1200:
+                    _ans = _ans[:1200] + "…"
+                content = f"Issue: {_q}\nFinding: {_ans}"
+                mem_id = await semantic_memory.remember(
+                    content,
+                    repo=(repos[0] if repos else None),
+                    source="agent",
+                    importance=_conf,
+                    veracity=_conf,
+                )
+                logger_instance.info(
+                    "ReactStrategy: semantic memory captured (id=%s repo=%s conf=%.2f)",
+                    mem_id, (repos[0] if repos else "global"), _conf,
+                    extra={"execution_id": execution_id},
+                )
+    except Exception as _mem_err:
+        logger_instance.warning(
+            "ReactStrategy: semantic memory capture failed (non-fatal): %s",
+            redact(str(_mem_err)),
+            extra={"execution_id": execution_id},
+        )
+
+    # ── Phase 5: log failed tools (diagnostic only) ──────────────────
     try:
         failed_tools = collect_failed_tools(result)
         if failed_tools:

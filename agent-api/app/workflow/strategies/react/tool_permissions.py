@@ -178,8 +178,14 @@ def wrap_tools_with_permissions(
     mode: PermissionMode = "default",
     execution_id: Optional[str] = None,
     execution_port: Any = None,
+    ask_patterns=DEFAULT_ASK_PATTERNS,
+    deny_patterns=DEFAULT_DENY_PATTERNS,
 ) -> List[Any]:
     """Wrap each tool with its permission behavior. Returns a new list.
+
+    ``ask_patterns`` / ``deny_patterns`` default to the module constants so legacy
+    callers are unchanged; the policy engine
+    (:func:`app.core.policy.apply_to_tools`) passes resolved patterns instead.
 
     For ``ask`` tools, when an ``execution_port`` + ``execution_id`` are given the
     wrapper publishes a ``hitl_pause`` (approve/deny card in chat) and blocks on
@@ -193,7 +199,7 @@ def wrap_tools_with_permissions(
     wrapped: List[Any] = []
     for tool in tools:
         name = getattr(tool, "name", "") or ""
-        behavior = evaluate(name, mode)
+        behavior = evaluate(name, mode, ask_patterns=ask_patterns, deny_patterns=deny_patterns)
         if behavior == "allow":
             wrapped.append(tool)
             continue

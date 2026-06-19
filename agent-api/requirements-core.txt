@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE runtime dependencies — everything needed to run an agent (LLM + tools +
+# chat + persistence + CloudWatch). Optional feature deps live in sibling files:
+#   requirements-crawler.txt  — tree-sitter parsers (code crawler / KG)
+# and the `openai` extra (langchain-openai) is added only by requirements.txt.
+# Keep this list as the minimal footprint; pyproject.toml is the source of truth.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# Scheduler
+apscheduler==3.10.4
+
+# Data Validation
+pydantic>=2.7.4
+pydantic-settings>=2.3.4
+
+# YAML Processing
+pyyaml>=6.0.1
+
+# Gitignore-aware file crawling (used by code crawler walk; pure-python, tiny)
+pathspec>=0.11.0
+
+# SSE Support
+sse-starlette==1.8.2
+
+# Utilities
+python-dateutil==2.8.2
+pytz==2023.3
+# Complete IANA timezone database for zoneinfo — the slim base image lacks legacy
+# aliases (e.g. Asia/Calcutta, America/Buenos_Aires) that browsers still emit, so
+# ZoneInfo(name) raised and Settings → Timezone saves 400'd. tzdata is zoneinfo's
+# fallback source and ships the full alias set.
+tzdata>=2024.1
+
+# HTTP Client
+httpx>=0.27.0
+
+# AWS SDK for Bedrock and CloudWatch
+boto3>=1.34.0
+
+# Accurate token counting for CloudWatch sanitizer and budget enforcement
+# Falls back to char/4 heuristic if unavailable, but tiktoken is required
+# for precise budget cuts (char/4 drifts 15-40% on JSON-heavy payloads).
+tiktoken>=0.7.0
+
+# LangChain ecosystem (Bedrock is the primary provider; OpenAI is an opt-in extra)
+langchain>=1.2.0
+langchain-core>=1.2.0
+langchain-aws>=1.4.0
+langgraph>=1.1.0
+langgraph-prebuilt>=1.0.0
+
+# MCP (Model Context Protocol)
+mcp>=1.1.0
+
+# Vector Database (pgvector) + async/sync Postgres drivers
+psycopg2-binary>=2.9.9
+pgvector>=0.2.4
+asyncpg>=0.29.0
+sqlalchemy>=2.0.0
+
+# Async file operations
+aiofiles==23.2.1
+
+# Cryptography (for encrypted secrets / PAT)
+cryptography>=42.0.0

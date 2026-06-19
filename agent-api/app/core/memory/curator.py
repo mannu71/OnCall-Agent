@@ -220,56 +220,49 @@ async def run_curator() -> Dict[str, Any]:
         except Exception as exc:
             logger.debug("Curator: incident_clusters dormancy pass skipped — %s", exc)
 
-        # ── Code-analyzer: flag stale-entity RCA entries ──────────────────
-        try:
-            await session.execute(text("""
-                ALTER TABLE rca_history
-                    ADD COLUMN IF NOT EXISTS integrity_flag VARCHAR(50)
-            """))
-            await session.execute(text("""
-                ALTER TABLE rca_history
-                    ADD COLUMN IF NOT EXISTS root_cause_entity_ids JSONB
-            """))
-            rca_result = await session.execute(text("""
-                UPDATE rca_history r
-                   SET integrity_flag = 'stale_entities'
-                 WHERE integrity_flag IS NULL
-                   AND root_cause_entity_ids IS NOT NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM code_chunks c
-                        WHERE c.repo_name  = r.repo_name
-                          AND c.entity_id  = ANY(
-                              SELECT jsonb_array_elements_text(r.root_cause_entity_ids)
-                          )
-                   )
-            """))
-            rca_flagged = rca_result.rowcount or 0
-            if rca_flagged:
-                logger.info("Curator: flagged %d RCA(s) with stale entity IDs", rca_flagged)
-        except Exception as exc:
-            logger.debug("Curator: RCA integrity check skipped — %s", exc)
+        # NOTE: the former RCA-integrity and orphaned-investigation_memory passes
+        # were removed — they queried `code_chunks` (dropped in migration 007) plus
+        # `rca_history`/`investigation_memory` (never created), so they failed every
+        # run. rca_flagged/orphans_detected stay 0 to keep the run-record shape.
 
-        # ── Code-analyzer: mark orphaned investigation_memory entries ─────
+        # ── Semantic memory: promote frequently-recalled rows to pinned ───
+        # "episode → pinned" consolidation: a finding recalled often enough
+        # graduates into the always-injected pinned tier.
         try:
-            orphan_result = await session.execute(text("""
-                UPDATE investigation_memory im
-                   SET status = 'orphaned'
-                 WHERE im.status = 'active'
-                   AND im.entity_id IS NOT NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM code_chunks c
-                        WHERE c.repo_name = im.repo_name
-                          AND c.entity_id = im.entity_id
-                   )
-            """))
-            orphans_detected = orphan_result.rowcount or 0
-            if orphans_detected:
-                logger.info(
-                    "Curator: marked %d investigation_memory row(s) as orphaned",
-                    orphans_detected,
+            from app.config import settings as _settings
+            if getattr(_settings, "pinned_facts_enabled", True):
+                from app.services.semantic_memory import semantic_memory
+                pinned_promoted = await semantic_memory.promote_recurring_to_pinned(
+                    recall_threshold=getattr(_settings, "pinned_promote_recall_threshold", 3),
                 )
+                if pinned_promoted:
+                    logger.info("Curator: promoted %d memory row(s) to pinned", pinned_promoted)
         except Exception as exc:
-            logger.debug("Curator: orphan detection skipped — %s", exc)
+            logger.debug("Curator: pinned promotion skipped — %s", exc)
+
+        # ── Skills: self-curation audit (draft→published lifecycle) ──
+        # Promote proven drafts, archive shaky never-recalled drafts, dedupe
+        # near-duplicate titles. LLM-free; complements the SQL passes above.
+        try:
+            from app.core.skills.service import skill_service
+            skill_audit = await skill_service.audit()
+            if any(skill_audit.values()):
+                logger.info("Curator: skill audit — %s", skill_audit)
+        except Exception as exc:
+            logger.debug("Curator: skill audit skipped — %s", exc)
+
+        # ── Semantic memory: LLM audit / consolidation ──
+        # Merge memories stating the same fact in different words. A SHA256
+        # fingerprint short-circuits the LLM call when nothing changed, and a
+        # hard guard refuses any pass that would delete >50% of memories.
+        try:
+            from app.config import settings as _settings
+            if getattr(_settings, "memory_audit_enabled", False):
+                from app.services.semantic_memory import semantic_memory
+                audit_result = await semantic_memory.audit_and_consolidate()
+                logger.info("Curator: semantic memory audit — %s", audit_result)
+        except Exception as exc:
+            logger.debug("Curator: semantic memory audit skipped — %s", exc)
 
         # ── Nullify orphaned cluster representative_rca_id ────────────────
         try:

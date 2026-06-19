@@ -33,6 +33,84 @@ def _get_now_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
+def _node_containers(data: Any) -> List[Dict[str, Any]]:
+    """Candidate dicts that may hold node outputs (mirrors the FE extractor)."""
+    if not isinstance(data, dict):
+        return []
+    return [c for c in (data, data.get("result"), data.get("results"), data.get("output"))
+            if isinstance(c, dict)]
+
+
+def _extract_final_answer(data: Any) -> str:
+    """Dig the agent's final answer out of a node-keyed execute result.
+
+    Server-side mirror of ``extractFinalAnswer`` in agentApiClient.js so a
+    persisted assistant message matches what the chat renders.
+    """
+    if not data:
+        return ""
+    if isinstance(data, str):
+        return data
+    if isinstance(data.get("final_answer"), str) and data["final_answer"]:
+        return data["final_answer"]
+    for c in _node_containers(data):
+        for v in c.values():
+            if isinstance(v, dict) and isinstance(v.get("final_answer"), str) and v["final_answer"]:
+                return v["final_answer"]
+    if isinstance(data.get("output"), str) and data["output"].strip():
+        return data["output"]
+    best = ""
+    for c in _node_containers(data):
+        for v in c.values():
+            if isinstance(v, dict) and isinstance(v.get("output"), str) and len(v["output"]) > len(best):
+                best = v["output"]
+    return best
+
+
+def _extract_node_field(data: Any, field: str) -> Any:
+    """Return the first node value for *field* (e.g. privacy_redactions)."""
+    if not isinstance(data, dict):
+        return None
+    if data.get(field) is not None:
+        return data[field]
+    for c in _node_containers(data):
+        for v in c.values():
+            if isinstance(v, dict) and v.get(field) is not None:
+                return v[field]
+    return None
+
+
+async def _persist_chat_message(session_id: str, *, role: str, content: str,
+                                metadata: Optional[Dict[str, Any]] = None) -> None:
+    """Append one chat message, swallowing all errors (chat persistence is best-effort)."""
+    try:
+        from app.infrastructure.persistence import session_repository
+        await session_repository.append_message(
+            session_id, role=role, content=content, metadata=metadata
+        )
+    except Exception as exc:  # noqa: BLE001 — never fail a run over chat persistence
+        logger.warning("chat persistence: append %s failed (%s)", role, exc)
+
+
+async def _persist_assistant_turn(session_id: str, result_dict: Dict[str, Any]) -> None:
+    """Persist the assistant's final answer + UI metadata for a finished run."""
+    answer = _extract_final_answer(result_dict)
+    if not answer:
+        return
+    metadata = {
+        "input_tokens": result_dict.get("input_tokens", 0) or 0,
+        "output_tokens": result_dict.get("output_tokens", 0) or 0,
+        "total_tokens": result_dict.get("total_tokens", 0) or 0,
+    }
+    redactions = _extract_node_field(result_dict, "privacy_redactions")
+    if redactions:
+        metadata["privacy_redactions"] = redactions
+    skills = _extract_node_field(result_dict, "selected_skills")
+    if skills:
+        metadata["selected_skills"] = skills
+    await _persist_chat_message(session_id, role="assistant", content=answer, metadata=metadata)
+
+
 def _find_scheduler_node(nodes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Find the scheduler node in the nodes list.
 
@@ -351,6 +429,51 @@ async def create_workflow(
     return WorkflowResponse(**saved_workflow)
 
 
+@router.post("/import-spec", response_model=WorkflowResponse, status_code=status.HTTP_201_CREATED)
+async def import_agent_spec(
+    spec: Dict[str, Any] = Body(..., description="Declarative agent spec (see app.spec)"),
+    workflow_repo: WorkflowRepository = Depends(get_workflow_repo),
+):
+    """Import a declarative agent spec as a runnable workflow.
+
+    Validates the spec (policy allowlist, MCP resolvability, builtin/sub-agent
+    references) and converts it into the platform workflow schema, then creates
+    it through the same save path as a UI-built workflow.
+    """
+    from app.spec import SpecValidationError, spec_to_workflow_dict
+
+    try:
+        workflow_dict = spec_to_workflow_dict(spec)
+    except SpecValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"message": "spec validation failed", "errors": exc.errors},
+        )
+    except Exception as exc:  # malformed spec / pydantic error
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid spec: {exc}",
+        )
+
+    name = workflow_dict["name"]
+    if await workflow_repo.exists(name):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Workflow '{name}' already exists",
+        )
+
+    now = _get_now_timestamp()
+    _normalize_and_validate(workflow_dict)
+    _validate_orchestrator_nodes(workflow_dict)
+    _sync_scheduler_node(workflow_dict)
+    workflow_dict["created_at"] = now
+    workflow_dict["updated_at"] = now
+
+    saved_workflow = await workflow_repo.save(workflow_dict)
+    await workflow_scheduler.reload_workflows()
+    return WorkflowResponse(**saved_workflow)
+
+
 @router.put("/{workflow_name}", response_model=WorkflowResponse)
 async def update_workflow(
     workflow_name: str,
@@ -616,6 +739,7 @@ async def execute_workflow(
     input: Optional[str] = None,
     output_mode: Optional[str] = None,
     permission_mode: Optional[str] = None,
+    session_id: Optional[str] = None,
     inputs: Optional[Dict[str, Any]] = Body(None),
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
 ):
@@ -626,6 +750,11 @@ async def execute_workflow(
     ``inputs['user_query']`` so the agent's ReAct loop actually receives it
     (previously the chat's ``?input=`` was silently dropped because only the body
     was read).
+
+    When ``session_id`` is supplied (chat with a persisted session), the user
+    turn is recorded before the run and the assistant turn after it, so the
+    conversation survives a page refresh. With no ``session_id`` the behaviour is
+    unchanged — persistence is purely additive.
     """
     _typed_query = query or input
     if _typed_query:
@@ -643,7 +772,7 @@ async def execute_workflow(
             message=f"Workflow '{workflow_name}' not found",
             details={"workflow_name": workflow_name}
         )
-    
+
     # Check if already running (prevents duplicate executions)
     if await is_workflow_running(workflow_name):
         return {
@@ -651,6 +780,10 @@ async def execute_workflow(
             "workflow_name": workflow_name,
             "message": f"Workflow '{workflow_name}' is already running"
         }
+
+    # Persist the user turn up-front (best-effort; never blocks the run).
+    if session_id and _typed_query:
+        await _persist_chat_message(session_id, role="user", content=_typed_query)
 
     if background:
         task = asyncio.create_task(
@@ -666,9 +799,13 @@ async def execute_workflow(
         }
 
     result = await run_workflow(workflow, inputs=inputs, manual=True)
-    if isinstance(result, dict):
-        return result
-    return result.model_dump(mode="json")
+    result_dict = result if isinstance(result, dict) else result.model_dump(mode="json")
+
+    # Persist the assistant turn (final answer + token/privacy/skill metadata).
+    if session_id:
+        await _persist_assistant_turn(session_id, result_dict)
+
+    return result_dict
 
 
 @router.get("/{workflow_name}/stream")

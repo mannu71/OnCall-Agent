@@ -29,17 +29,39 @@ import {
   Cpu,
   CornerDownLeft,
   ChevronRight,
-  Info
+  ChevronDown,
+  Info,
+  Plus,
+  History,
+  Trash2,
+  Pin,
+  MessageSquare
 } from 'lucide-react';
 import { isAgentWorkflowValid } from '../utils/workflowValidation.js';
 import agentApiClient from '../services/agentApiClient.js';
 import MarkdownMessage from '../components/markdown/MarkdownMessage.jsx';
+import PlanChecklist from '../components/markdown/PlanChecklist.jsx';
+import PrivacyInsightsPanel from '../components/privacy/PrivacyInsightsPanel.jsx';
 import { formatClock } from '../lib/formatTime.js';
 
 // Client-side mirror of the backend trace_ids detector (cosmetic badge only —
 // the backend remains the source of truth for the correlation fast-path).
 const CORRELATION_ID_RE = /\b(1-[0-9a-f]{8}-[0-9a-f]{24}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9A-Z]{10,}:[0-9A-Fa-f]{8})\b/;
 const TIME_RANGE_HINT_RE = /\b(last|over|past|\d+\s*(m|min|mins|h|hr|hour|hours|d|day|days))\b/i;
+
+// Mirror of the backend conversational-intent heuristic (app/core/intent.py):
+// don't scope a greeting/thanks with a CloudWatch time range. Biased to False so
+// a real query is never mistaken for small talk.
+const SMALL_TALK_RE = /^\s*(hi|hii+|hey|hello|hiya|yo|sup|good\s*(morning|afternoon|evening)|greetings|thanks(\s*you)?|thank\s*you|thx|ty|cheers|ok(ay)?|cool|nice|great|got\s*it|bye|goodbye|see\s*ya|who\s*are\s*you|what\s*are\s*you|what\s*can\s*you\s*do|what\s*do\s*you\s*do|help|how\s*are\s*you)[\s!.,?]*$/i;
+const INVESTIGATION_HINT_RE = /\b(error|errors|fail|failed|failing|failure|exception|log|logs|trace|stack|crash|timeout|latency|slow|alarm|alert|5xx|4xx|500|503|throttl|outage|down|spike|spiking|anomaly|why|debug|investigate|root\s*cause|rca|repo|deploy|rollback|metric|cpu|memory|leak|query|database|sql|endpoint|api|status\s*code)\b/i;
+
+/** True only for clearly conversational messages (no investigation signal). */
+function isSmallTalk(text) {
+  const t = (text || '').trim();
+  if (!t || t.length > 64) return false;
+  if (INVESTIGATION_HINT_RE.test(t)) return false;
+  return SMALL_TALK_RE.test(t);
+}
 
 /** True when an agent workflow contains a CloudWatch node (so it can trace logs). */
 function agentHasCloudWatch(agent) {
@@ -56,6 +78,14 @@ const MESSAGE_TYPES = {
   AGENT: 'agent',
   SYSTEM: 'system'
 };
+
+// Fresh-conversation seed — a single welcome note, then real turns only.
+const welcomeMessage = () => ({
+  id: 'init-1',
+  type: MESSAGE_TYPES.SYSTEM,
+  content: 'Welcome! Select an agent from the sidebar, then ask it anything to get started.',
+  timestamp: new Date().toISOString(),
+});
 
 // Premium IconChip component for visual wow factor
 function IconChip({ tint = "red", children }) {
@@ -113,6 +143,67 @@ function FormattedText({ text, isUser }) {
   );
 }
 
+// Pretty-print tool args/results without throwing on cyclic / odd values.
+function safeJson(v) {
+  try {
+    return typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+  } catch {
+    return String(v);
+  }
+}
+
+/**
+ * Inline collapsible "step" card for a single tool invocation — the agent's
+ * work shown in the conversation flow (Cursor/Claude style). Collapsed by
+ * default; expands to reveal arguments + (truncated) result.
+ *
+ * step: { id, name, args, status:'running'|'done'|'error', result, durationMs }
+ */
+function AgentStep({ step }) {
+  const [open, setOpen] = useState(false);
+  const status = step.status || 'running';
+  const dur = step.durationMs != null ? `${(step.durationMs / 1000).toFixed(1)}s` : null;
+  const hasArgs = step.args && typeof step.args === 'object' && Object.keys(step.args).length > 0;
+  const hasResult = step.result != null && step.result !== '';
+  return (
+    <div className="rounded-lg border border-black/[0.07] dark:border-white/10 bg-black/[0.02] dark:bg-white/[0.04] overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left hover:bg-black/[0.03] dark:hover:bg-white/[0.06] transition-colors"
+      >
+        {open
+          ? <ChevronDown className="size-3.5 text-slate-400 dark:text-slate-500 shrink-0" />
+          : <ChevronRight className="size-3.5 text-slate-400 dark:text-slate-500 shrink-0" />}
+        <Terminal className="size-3.5 text-slate-400 dark:text-slate-500 shrink-0" />
+        <span className="font-mono text-[11.5px] font-medium text-slate-700 dark:text-slate-200 truncate">{step.name}</span>
+        <span className="ml-auto flex items-center gap-1.5 shrink-0">
+          {dur && <span className="text-[10px] text-slate-400 dark:text-slate-500 font-mono">{dur}</span>}
+          {status === 'running' && <Loader2 className="size-3.5 text-[#0a84ff] animate-spin" />}
+          {status === 'done' && <CheckCircle2 className="size-3.5 text-emerald-500" />}
+          {status === 'error' && <XCircle className="size-3.5 text-red-500" />}
+        </span>
+      </button>
+      {open && (hasArgs || hasResult) && (
+        <div className="px-2.5 pb-2 space-y-1.5 border-t border-black/[0.06] dark:border-white/10">
+          {hasArgs && (
+            <div>
+              <div className="text-[9px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500 mb-0.5 mt-1.5">Arguments</div>
+              <pre className="text-[10.5px] font-mono text-slate-600 dark:text-slate-300 bg-white dark:bg-black/30 border border-slate-200/70 dark:border-white/10 rounded p-1.5 overflow-x-auto whitespace-pre-wrap break-all">{safeJson(step.args)}</pre>
+            </div>
+          )}
+          {hasResult && (
+            <div>
+              <div className="text-[9px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500 mb-0.5 mt-1.5">Result</div>
+              <pre className="text-[10.5px] font-mono text-slate-600 dark:text-slate-300 bg-white dark:bg-black/30 border border-slate-200/70 dark:border-white/10 rounded p-1.5 overflow-x-auto whitespace-pre-wrap break-all max-h-48 overflow-y-auto">{safeJson(step.result)}</pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Chat() {
   const navigate = useNavigate();
   const messagesEndRef = useRef(null);
@@ -128,15 +219,41 @@ function Chat() {
   const [timeRange, setTimeRange] = useState('24h');
   const [agentSheetOpen, setAgentSheetOpen] = useState(false);
 
+  // Persistent chat sessions (migration 022). `sessionId` is created lazily on
+  // the first message of a fresh chat; resuming hydrates messages from the API.
+  const [sessions, setSessions] = useState([]);
+  const [sessionId, setSessionId] = useState(null);
+  const [sessionSheetOpen, setSessionSheetOpen] = useState(false);
+
+  // System-adaptive theme (native-macOS look). Dark mode is class-based
+  // (.dark) app-wide, so we scope it to the Chat root only — following the OS
+  // appearance via prefers-color-scheme without theming the rest of the app.
+  const [sysDark, setSysDark] = useState(
+    () => typeof window !== 'undefined'
+      && window.matchMedia
+      && window.matchMedia('(prefers-color-scheme: dark)').matches
+  );
+  useEffect(() => {
+    if (!window.matchMedia) return;
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = (e) => setSysDark(e.matches);
+    mq.addEventListener?.('change', onChange);
+    return () => mq.removeEventListener?.('change', onChange);
+  }, []);
+  // Toggle the class-based dark theme at the document root while the Chat page
+  // is mounted, so dark: styles also reach Radix portals (the privacy Sheet,
+  // selects) which render outside the Chat subtree. Reverted on unmount, so the
+  // restyle stays scoped to the Chat page.
+  useEffect(() => {
+    const root = document.documentElement;
+    const had = root.classList.contains('dark');
+    if (sysDark) root.classList.add('dark');
+    else root.classList.remove('dark');
+    return () => { if (!had) root.classList.remove('dark'); };
+  }, [sysDark]);
+
   // Conversation starts clean — a single welcome note, then real turns only.
-  const [messages, setMessages] = useState([
-    {
-      id: "init-1",
-      type: MESSAGE_TYPES.SYSTEM,
-      content: 'Welcome! Select an agent from the sidebar, then ask it anything to get started.',
-      timestamp: new Date().toISOString()
-    }
-  ]);
+  const [messages, setMessages] = useState([welcomeMessage()]);
 
   // Stepper timeline — populated live from real run events (empty until a run starts).
   const [traceSteps, setTraceSteps] = useState([]);
@@ -185,9 +302,10 @@ function Chat() {
 
   const { modelName, toolsCount, toolsList } = getAgentDetails();
 
-  // Load agent-type workflows
+  // Load agent-type workflows + past chat sessions
   useEffect(() => {
     loadAgents();
+    loadSessions();
   }, []);
 
   // Auto-scroll to bottom when new messages arrive
@@ -211,6 +329,91 @@ function Chat() {
       if (error.code === 'ERR_NETWORK' || error.message.includes('Network Error')) {
         console.warn('Cannot connect to Agent API. Please start the API server at http://localhost:8000');
       }
+    }
+  };
+
+  // ── Chat sessions ──────────────────────────────────────────────────────────
+  const loadSessions = async () => {
+    try {
+      setSessions(await agentApiClient.listSessions());
+    } catch (error) {
+      console.error('Error loading sessions:', error);
+    }
+  };
+
+  // Ensure a persisted session exists for the current chat; create lazily on the
+  // first turn so empty chats never clutter the history. Returns the session id.
+  const ensureSession = async (agent, firstMessage) => {
+    if (sessionId) return sessionId;
+    try {
+      const created = await agentApiClient.createSession({
+        title: (firstMessage || 'New chat').slice(0, 60),
+        workflowName: agent?.name || null,
+      });
+      setSessionId(created.id);
+      return created.id;
+    } catch (error) {
+      console.error('Error creating session:', error);
+      return null;  // persistence is best-effort — the turn still runs
+    }
+  };
+
+  const startNewChat = () => {
+    setSessionId(null);
+    setMessages([welcomeMessage()]);
+    setTraceSteps([]);
+    setTokens({ input: 0, output: 0, total: 0 });
+    setPendingApprovals([]);
+    setSessionSheetOpen(false);
+  };
+
+  // Resume a past conversation: hydrate its messages into the UI shape.
+  const resumeSession = async (id) => {
+    try {
+      const data = await agentApiClient.getSession(id);
+      const hydrated = (data.messages || []).map((m) => ({
+        id: `db-${m.id}`,
+        type: m.role === 'user' ? MESSAGE_TYPES.USER
+          : m.role === 'assistant' ? MESSAGE_TYPES.AGENT : MESSAGE_TYPES.SYSTEM,
+        content: m.content,
+        timestamp: m.created_at,
+        isMarkdown: m.role === 'assistant',
+        privacyRedactions: m.metadata?.privacy_redactions || [],
+        selectedSkills: m.metadata?.selected_skills || [],
+      }));
+      setSessionId(id);
+      setMessages(hydrated.length ? hydrated : [welcomeMessage()]);
+      setTraceSteps([]);
+      setTokens({ input: 0, output: 0, total: 0 });
+      // Re-select the agent this chat targeted, if still available.
+      if (data.workflow_name) {
+        const match = agents.find((a) => a.name === data.workflow_name);
+        if (match) setSelectedAgent(match);
+      }
+      setSessionSheetOpen(false);
+    } catch (error) {
+      console.error('Error resuming session:', error);
+    }
+  };
+
+  const deleteSession = async (id, e) => {
+    e?.stopPropagation();
+    try {
+      await agentApiClient.deleteSession(id);
+      if (id === sessionId) startNewChat();
+      await loadSessions();
+    } catch (error) {
+      console.error('Error deleting session:', error);
+    }
+  };
+
+  const togglePinSession = async (sess, e) => {
+    e?.stopPropagation();
+    try {
+      await agentApiClient.updateSession(sess.id, { isImportant: !sess.is_important });
+      await loadSessions();
+    } catch (error) {
+      console.error('Error pinning session:', error);
     }
   };
 
@@ -314,7 +517,7 @@ function Chat() {
     // when the user didn't already give one). Generic workflows get the raw text.
     const effectiveAgent = selectedAgent || agents[0];
     const scopeForCw = effectiveAgent && agentHasCloudWatch(effectiveAgent);
-    const question = (scopeForCw && !TIME_RANGE_HINT_RE.test(userMessage))
+    const question = (scopeForCw && !TIME_RANGE_HINT_RE.test(userMessage) && !isSmallTalk(userMessage))
       ? `${userMessage} (over the last ${timeRange})`
       : userMessage;
 
@@ -338,13 +541,16 @@ function Chat() {
 
   // Ask the agent a question
   const askAgent = async (agent, question) => {
+    // Ensure a persisted session exists so this turn is recorded against it.
+    const sid = await ensureSession(agent, question);
+
     // Reset trace logs for this turn
     setTraceSteps([
       { l: "think", t: "10ms", text: `Initializing agent run for: "${agent.name}"...` },
       { l: "think", t: "18ms", text: `Received request: "${question.substring(0, 50)}${question.length > 50 ? '...' : ''}"` }
     ]);
 
-    const thinkingId = addMessage(MESSAGE_TYPES.AGENT, `Starting agent...`, { isLoading: true, statusHistory: [] });
+    const thinkingId = addMessage(MESSAGE_TYPES.AGENT, '', { isLoading: true, statusHistory: [], steps: [], streaming: false });
     setIsLoading(true);
 
     // Dynamic metrics simulation
@@ -417,13 +623,61 @@ function Chat() {
         setMessages(prev => prev.map(m => m.id === thinkingId
           ? {
               ...m,
-              content: msg,
               statusHistory: [
                 ...((m.statusHistory) || []),
                 { type: 'thinking', message: msg, time: new Date().toLocaleTimeString() },
               ].slice(-8),
+              currentStatus: { message: msg },
             }
           : m));
+      };
+
+      // ── Live answer streaming (closure-local to this turn) ──────────────
+      // Tokens arrive rapidly over SSE; accumulate and flush on a ~40ms timer
+      // so React isn't re-rendered per token. The authoritative sync result
+      // overwrites this at the end, repairing any tokens dropped before the
+      // SSE stream attached (the backlog replay covers most, this covers the rest).
+      let streamedContent = '';
+      let flushTimer = null;
+      const flushStream = () => {
+        flushTimer = null;
+        // Only apply while the turn is live — a late timer must never clobber the
+        // authoritative final answer or an error message (both clear isLoading).
+        setMessages(prev => prev.map(m => (m.id === thinkingId && m.isLoading)
+          ? { ...m, content: streamedContent, streaming: true, isMarkdown: true }
+          : m));
+      };
+      const onToken = (tok) => {
+        if (!tok) return;
+        streamedContent += tok;
+        if (!flushTimer) flushTimer = setTimeout(flushStream, 40);
+      };
+
+      // ── Inline tool steps (collapsible cards in the conversation) ───────
+      const steps = [];
+      const syncSteps = () => setMessages(prev => prev.map(m =>
+        m.id === thinkingId ? { ...m, steps: [...steps] } : m));
+      const onStepCall = (name, args) => {
+        steps.push({ id: `${name}-${steps.length}`, name, args, status: 'running', startedAt: Date.now() });
+        syncSteps();
+      };
+      const onStepResult = (name, result) => {
+        for (let i = steps.length - 1; i >= 0; i--) {
+          if (steps[i].status === 'running' && steps[i].name === name) {
+            steps[i] = { ...steps[i], status: 'done', result, durationMs: Date.now() - steps[i].startedAt };
+            break;
+          }
+        }
+        syncSteps();
+      };
+      const onStepError = (err) => {
+        for (let i = steps.length - 1; i >= 0; i--) {
+          if (steps[i].status === 'running') {
+            steps[i] = { ...steps[i], status: 'error', result: err, durationMs: Date.now() - steps[i].startedAt };
+            break;
+          }
+        }
+        syncSteps();
       };
 
       // Conversation memory: replay prior completed turns so follow-ups keep
@@ -439,8 +693,10 @@ function Chat() {
 
       const result = await agentApiClient.runAgentStream(agent.name, question, {
         history,
-        onToolCall: (name) => { pushTrace('tool', `Calling ${name}…`); pushStatus(`Calling ${name}…`); },
-        onToolResult: (name) => pushTrace('tool', `${name} returned`),
+        sessionId: sid,
+        onToken,
+        onToolCall: (name, args) => { onStepCall(name, args); pushTrace('tool', `Calling ${name}…`); pushStatus(`Calling ${name}…`); },
+        onToolResult: (name, res) => { onStepResult(name, res); pushTrace('tool', `${name} returned`); },
         onNode: (nodeId, status) => pushTrace('think', `${nodeId} ${status}`),
         onStatus: (msg) => pushStatus(msg),
         onTokens: (t) => setTokens(t),
@@ -449,27 +705,42 @@ function Chat() {
           // Append (dedup by requestId — SSE can redeliver on reconnect).
           setPendingApprovals(prev => prev.some(x => x.requestId === p.requestId) ? prev : [...prev, p]);
         },
-        onError: (err) => pushTrace('answer', `Error: ${err}`),
+        onError: (err) => { onStepError(err); pushTrace('answer', `Error: ${err}`); },
       });
+
+      // Stop any pending streamed-text flush — the sync result is authoritative.
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
 
       // Pull the structured InvestigationReport (Data Query Mode) out of the raw
       // node results, if the run produced one.
       let structured = null;
+      let todos = null;
       try {
         const nodes = result?.raw?.results || {};
         for (const k of Object.keys(nodes)) {
           if (nodes[k] && nodes[k].structured_output) { structured = nodes[k].structured_output; break; }
         }
+        // Deep-agent plan checklist (planning capability), if the run produced one.
+        for (const k of Object.keys(nodes)) {
+          if (nodes[k] && Array.isArray(nodes[k].todos) && nodes[k].todos.length) {
+            todos = nodes[k].todos; break;
+          }
+        }
       } catch { /* ignore */ }
 
       setPendingApprovals([]);
       updateMessage(thinkingId, {
-        content: result.finalAnswer || 'Agent completed (no answer text returned).',
+        content: result.finalAnswer || streamedContent || 'Agent completed (no answer text returned).',
         isLoading: false,
+        streaming: false,
         isMarkdown: true,
         currentStatus: null,
         statusHistory: [],
         structured,
+        todos,
+        privacyRedactions: result.privacyRedactions || [],
+        selectedSkills: result.selectedSkills || [],
+        steps: [...steps],
       });
       pushTrace('answer', 'Returned final analysis + recommendations.');
 
@@ -495,6 +766,8 @@ function Chat() {
     } finally {
       setIsLoading(false);
       if (unsubscribe) unsubscribe();
+      // Refresh the session list so the new chat's title/count appear in history.
+      loadSessions();
     }
   };
 
@@ -528,9 +801,9 @@ function Chat() {
     if (isSystem) {
       return (
         <div key={message.id} className="flex justify-center my-4 animate-in fade-in duration-300">
-          <div className="bg-slate-100/80 backdrop-blur-sm border border-slate-200/50 rounded-full px-4 py-1.5 max-w-xl text-center shadow-sm flex items-center gap-2">
-            <Info className="size-3.5 text-slate-500" />
-            <span className="text-slate-600 font-sans text-xs leading-none">
+          <div className="bg-slate-100/80 dark:bg-white/[0.06] backdrop-blur-sm border border-slate-200/50 dark:border-white/10 rounded-full px-4 py-1.5 max-w-xl text-center shadow-sm flex items-center gap-2">
+            <Info className="size-3.5 text-slate-500 dark:text-slate-400" />
+            <span className="text-slate-600 dark:text-slate-300 font-sans text-xs leading-none">
               <FormattedText text={textContent} isUser={false} />
             </span>
           </div>
@@ -552,41 +825,95 @@ function Chat() {
             )}
           </div>
 
-          {/* Chat Bubble Card */}
+          {/* Chat Bubble Card — native-macOS look (system-blue user, card assistant) */}
           <div
-            className={`w-full transition-all duration-300 p-4 leading-relaxed font-sans text-[13.5px] select-text shadow-sm ${
-              isUser 
-                ? 'bg-[#0f172a] text-white rounded-2xl rounded-tr-sm' 
-                : 'bg-white text-slate-900 border border-slate-200/80 rounded-2xl rounded-tl-sm hover:border-slate-300/80 shadow-[0_1px_3px_0_rgb(15_23_42/0.04)]'
+            className={`w-full transition-all duration-300 p-4 leading-relaxed font-sans text-[13.5px] select-text ${
+              isUser
+                ? 'bg-[#0a84ff] text-white rounded-xl rounded-tr-sm shadow-[0_1px_2px_rgb(10_132_255/0.35)]'
+                : 'bg-white text-slate-900 border border-black/[0.07] rounded-xl rounded-tl-sm shadow-[0_1px_2px_rgb(0_0_0/0.06)] dark:bg-[#1c1c1e] dark:text-slate-100 dark:border-white/10 dark:shadow-none'
             }`}
           >
-            <div className="break-words">
-              {(!isUser && message.isMarkdown)
-                ? <MarkdownMessage content={textContent} />
-                : <div className="whitespace-pre-wrap"><FormattedText text={textContent} isUser={isUser} /></div>}
-            </div>
+            {/* Inline tool steps — the agent's work, shown as collapsible cards
+                above the answer (Cursor/Claude style). */}
+            {!isUser && message.steps && message.steps.length > 0 && (
+              <div className="mb-3 space-y-1.5">
+                {message.steps.map(s => <AgentStep key={s.id} step={s} />)}
+              </div>
+            )}
+
+            {/* Plan card — pinned task list (multi-step runs) */}
+            {!isUser && message.isMarkdown && textContent && (
+              <PlanChecklist content={textContent} />
+            )}
+
+            {textContent && (
+              <div className="break-words">
+                {(!isUser && message.isMarkdown)
+                  ? <MarkdownMessage content={textContent} />
+                  : <div className="whitespace-pre-wrap"><FormattedText text={textContent} isUser={isUser} /></div>}
+                {message.streaming && (
+                  <span className="inline-block w-[2px] h-[1em] ml-0.5 -mb-0.5 bg-primary/70 animate-pulse rounded-sm align-middle" />
+                )}
+              </div>
+            )}
+
+            {/* Privacy filter + auto-selected skills — transparency surfaces */}
+            {!isUser && ((message.privacyRedactions?.length > 0) || (message.selectedSkills?.length > 0)) && (
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                {message.privacyRedactions?.length > 0 && (
+                  <PrivacyInsightsPanel redactions={message.privacyRedactions} />
+                )}
+                {(message.selectedSkills || []).map((name) => (
+                  <span
+                    key={name}
+                    title="Skill auto-selected for this query"
+                    className="inline-flex items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2 py-0.5 text-xs font-medium text-violet-700 dark:border-violet-500/30 dark:bg-violet-500/10 dark:text-violet-300"
+                  >
+                    <Wrench className="h-3 w-3" />
+                    {name}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {/* Deep-agent plan checklist (planning capability) */}
+            {Array.isArray(message.todos) && message.todos.length > 0 && (
+              <div className="mt-3.5 rounded-xl border border-emerald-200/70 bg-emerald-50/40 dark:border-emerald-500/25 dark:bg-emerald-500/[0.07] p-3 text-[12px]">
+                <div className="flex items-center gap-1.5 mb-2 font-semibold text-emerald-700 dark:text-emerald-300 uppercase tracking-wide text-[10px]">
+                  <Terminal className="size-3.5" /> Plan
+                </div>
+                <ul className="space-y-1">
+                  {message.todos.map((t, i) => (
+                    <li key={i} className="flex items-start gap-2">
+                      <span>{t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : t.status === 'blocked' ? '⛔' : '⬜'}</span>
+                      <span className={t.status === 'completed' ? 'line-through opacity-70' : ''}>{t.text}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
             {/* Structured InvestigationReport card (Data Query Mode) */}
             {message.structured && (
-              <div className="mt-3.5 rounded-xl border border-indigo-200/70 bg-indigo-50/40 p-3 text-[12px]">
-                <div className="flex items-center gap-1.5 mb-2 font-semibold text-indigo-700 uppercase tracking-wide text-[10px]">
+              <div className="mt-3.5 rounded-xl border border-indigo-200/70 bg-indigo-50/40 dark:border-indigo-500/25 dark:bg-indigo-500/[0.07] p-3 text-[12px]">
+                <div className="flex items-center gap-1.5 mb-2 font-semibold text-indigo-700 dark:text-indigo-300 uppercase tracking-wide text-[10px]">
                   <Terminal className="size-3.5" /> Structured report
                   {message.structured.severity && (
-                    <span className="ml-1 px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 normal-case tracking-normal">{message.structured.severity}</span>
+                    <span className="ml-1 px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 dark:bg-indigo-500/20 dark:text-indigo-200 normal-case tracking-normal">{message.structured.severity}</span>
                   )}
                   {typeof message.structured.confidence === 'number' && (
-                    <span className="ml-auto text-indigo-400 normal-case tracking-normal">conf {Math.round(message.structured.confidence * 100)}%</span>
+                    <span className="ml-auto text-indigo-400 dark:text-indigo-400/80 normal-case tracking-normal">conf {Math.round(message.structured.confidence * 100)}%</span>
                   )}
                 </div>
                 {message.structured.root_cause && (
-                  <div className="mb-2"><span className="font-semibold text-slate-600">Root cause:</span> <span className="text-slate-700">{message.structured.root_cause}</span></div>
+                  <div className="mb-2"><span className="font-semibold text-slate-600 dark:text-slate-300">Root cause:</span> <span className="text-slate-700 dark:text-slate-200">{message.structured.root_cause}</span></div>
                 )}
                 {Array.isArray(message.structured.evidence) && message.structured.evidence.length > 0 && (
                   <div className="mb-2">
-                    <div className="font-semibold text-slate-600 mb-1">Evidence</div>
+                    <div className="font-semibold text-slate-600 dark:text-slate-300 mb-1">Evidence</div>
                     <ul className="space-y-0.5">
                       {message.structured.evidence.map((ev, i) => (
-                        <li key={i} className="font-mono text-[11px] text-slate-600">
+                        <li key={i} className="font-mono text-[11px] text-slate-600 dark:text-slate-400">
                           {ev.file}{ev.line ? `:${ev.line}` : ''}{ev.symbol ? ` — ${ev.symbol}` : ''}
                         </li>
                       ))}
@@ -595,8 +922,8 @@ function Chat() {
                 )}
                 {Array.isArray(message.structured.next_steps) && message.structured.next_steps.length > 0 && (
                   <div>
-                    <div className="font-semibold text-slate-600 mb-1">Next steps</div>
-                    <ul className="list-disc list-inside text-slate-600 space-y-0.5">
+                    <div className="font-semibold text-slate-600 dark:text-slate-300 mb-1">Next steps</div>
+                    <ul className="list-disc list-inside text-slate-600 dark:text-slate-300 space-y-0.5">
                       {message.structured.next_steps.map((s, i) => <li key={i}>{s}</li>)}
                     </ul>
                   </div>
@@ -661,12 +988,16 @@ function Chat() {
                     ))}
                   </div>
                 )}
-                <div className="flex items-center gap-2 bg-slate-50 border border-slate-100 rounded-lg p-2.5">
-                  <Loader2 className="size-4 animate-spin text-primary" />
-                  <span className="text-xs text-slate-500 font-medium">
-                    {message.currentStatus?.message || 'Executing agent workflows...'}
-                  </span>
-                </div>
+                {/* Generic spinner only before the answer streams in — once
+                    tokens flow, the caret + streamed text carry the activity. */}
+                {!message.streaming && !(message.steps && message.steps.length > 0) && (
+                  <div className="flex items-center gap-2 bg-slate-50 border border-slate-100 rounded-lg p-2.5">
+                    <Loader2 className="size-4 animate-spin text-primary" />
+                    <span className="text-xs text-slate-500 font-medium">
+                      {message.currentStatus?.message || 'Executing agent workflows...'}
+                    </span>
+                  </div>
+                )}
               </div>
             )}
 
@@ -690,13 +1021,13 @@ function Chat() {
   );
 
   return (
-    <div className="flex h-screen bg-slate-50 select-none overflow-hidden w-full max-w-full">
-      
+    <div className={`${sysDark ? 'dark ' : ''}flex h-screen bg-[#f5f5f7] dark:bg-[#161618] text-slate-800 dark:text-slate-100 select-none overflow-hidden w-full max-w-full`}>
+
       {/* Sub-Sidebar: Left - Agent List */}
-      <aside className="hidden md:flex w-[240px] lg:w-[280px] border-r border-slate-200 flex-col h-full bg-white flex-shrink-0">
+      <aside className="hidden md:flex w-[240px] lg:w-[280px] border-r border-black/[0.06] dark:border-white/10 flex-col h-full bg-white/70 dark:bg-[#1c1c1e]/70 backdrop-blur-xl flex-shrink-0">
         <div className="p-4 border-b border-slate-100 h-20 flex flex-col justify-center gap-0.5">
           <div className="flex items-center justify-between">
-            <h2 className="font-bold text-slate-800 text-sm tracking-wide">Agents</h2>
+            <h2 className="font-bold text-slate-800 dark:text-slate-100 text-sm tracking-wide">Agents</h2>
             <Button 
               size="icon" 
               variant="ghost" 
@@ -745,23 +1076,23 @@ function Chat() {
                     onClick={() => !isLoading && handleSelectAgent(agent)}
                     className={cn(
                       "w-full flex items-center justify-between px-3 py-3 rounded-xl transition-all duration-300 cursor-pointer border",
-                      isSelected 
-                        ? 'bg-red-50/40 text-slate-800 border-red-100/50 shadow-sm' 
-                        : 'text-slate-600 border-transparent hover:bg-slate-50/80',
+                      isSelected
+                        ? 'bg-[#0a84ff]/10 text-slate-800 dark:text-slate-100 border-[#0a84ff]/30'
+                        : 'text-slate-600 dark:text-slate-300 border-transparent hover:bg-black/[0.03] dark:hover:bg-white/[0.05]',
                       isLoading && 'opacity-65 cursor-not-allowed'
                     )}
                   >
                     <div className="flex items-center gap-3 flex-1 min-w-0">
                       <div className={cn(
                         "size-8 rounded-lg flex items-center justify-center flex-shrink-0 transition-colors",
-                        isSelected 
-                          ? 'bg-primary text-white shadow-md shadow-red-100' 
-                          : 'bg-slate-100 text-slate-500'
+                        isSelected
+                          ? 'bg-[#0a84ff] text-white shadow-sm shadow-[#0a84ff]/30'
+                          : 'bg-slate-100 dark:bg-white/[0.06] text-slate-500 dark:text-slate-400'
                       )}>
                         <Bot className="size-4" />
                       </div>
                       <div className="flex-1 text-left min-w-0">
-                        <div className="font-semibold text-xs text-slate-700 truncate flex items-center gap-1.5">
+                        <div className="font-semibold text-xs text-slate-700 dark:text-slate-200 truncate flex items-center gap-1.5">
                           <span className="truncate">{agent.name}</span>
                           {agentHasCloudWatch(agent) && (
                             <span className="shrink-0 text-[9px] font-semibold text-sky-700 bg-sky-50 border border-sky-100 rounded px-1 leading-4">CloudWatch</span>
@@ -807,10 +1138,10 @@ function Chat() {
       </aside>
 
       {/* Main Column: Chat Panel */}
-      <div className="flex-grow flex flex-col h-full bg-[#fafbfc] min-w-0 relative">
-        
+      <div className="flex-grow flex flex-col h-full bg-[#f5f5f7] dark:bg-[#161618] min-w-0 relative">
+
         {/* Top Header Bar */}
-        <header className="h-20 px-4 md:px-8 border-b border-slate-200/80 bg-white flex items-center justify-between flex-shrink-0 z-10 shadow-[0_1px_2px_0_rgba(15,23,42,0.01)]">
+        <header className="h-20 px-4 md:px-8 border-b border-black/[0.06] dark:border-white/10 bg-white/70 dark:bg-[#1c1c1e]/70 backdrop-blur-xl flex items-center justify-between flex-shrink-0 z-10">
           <div className="flex items-center gap-3 min-w-0">
             {/* Mobile agent picker (sidebar is hidden < md) */}
             <Sheet open={agentSheetOpen} onOpenChange={setAgentSheetOpen}>
@@ -849,7 +1180,7 @@ function Chat() {
               <Brain className="size-5" />
             </IconChip>
             <div className="min-w-0">
-              <h1 className="font-bold text-sm text-slate-800 tracking-wide truncate">
+              <h1 className="font-bold text-sm text-slate-800 dark:text-slate-100 tracking-wide truncate">
                 {selectedAgent ? selectedAgent.name : "Select an agent"}
               </h1>
               <p className="text-[11px] text-slate-400 font-medium flex items-center gap-1.5 mt-0.5 font-sans">
@@ -860,16 +1191,81 @@ function Chat() {
             </div>
           </div>
           
-          <Badge 
-            variant="success" 
-            className="px-2.5 py-0.5 rounded-full flex items-center gap-1.5 text-[11px] font-semibold transition-all duration-300"
-          >
-            <span className="relative flex size-1.5">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full size-1.5 bg-emerald-500"></span>
-            </span>
-            Online
-          </Badge>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={startNewChat}
+              title="Start a new chat"
+              className="h-8 rounded-lg text-xs font-semibold gap-1.5"
+            >
+              <Plus className="size-3.5" /> New chat
+            </Button>
+
+            {/* Conversation history (persisted sessions) */}
+            <Sheet open={sessionSheetOpen} onOpenChange={(o) => { setSessionSheetOpen(o); if (o) loadSessions(); }}>
+              <SheetTrigger asChild>
+                <Button variant="outline" size="icon" className="size-8 rounded-lg" title="Chat history">
+                  <History className="size-4" />
+                </Button>
+              </SheetTrigger>
+              <SheetContent side="right" className="w-[320px] p-0 gap-0">
+                <SheetHeader className="p-4 border-b border-slate-100 dark:border-white/10">
+                  <SheetTitle className="text-sm flex items-center gap-2">
+                    <MessageSquare className="size-4 text-primary" /> Conversations
+                  </SheetTitle>
+                </SheetHeader>
+                <div className="p-2 overflow-auto h-[calc(100vh-64px)]">
+                  {sessions.length === 0 ? (
+                    <p className="px-3 py-3 text-xs text-slate-500">No saved conversations yet. Ask an agent something to start one.</p>
+                  ) : sessions.map((s) => (
+                    <div
+                      key={s.id}
+                      onClick={() => resumeSession(s.id)}
+                      className={cn(
+                        'group w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-left cursor-pointer transition-colors',
+                        s.id === sessionId ? 'bg-[#0a84ff]/10' : 'hover:bg-black/[0.03] dark:hover:bg-white/[0.05]'
+                      )}
+                    >
+                      <MessageSquare className="size-4 text-slate-400 shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <div className="text-xs font-semibold text-slate-700 dark:text-slate-200 truncate">{s.title}</div>
+                        <div className="text-[10px] text-slate-400">{s.message_count} msgs · {formatClock(s.last_message_at || s.updated_at)}</div>
+                      </div>
+                      <button
+                        onClick={(e) => togglePinSession(s, e)}
+                        title={s.is_important ? 'Unpin' : 'Pin'}
+                        className={cn(
+                          'size-6 rounded-md flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity hover:bg-slate-100 dark:hover:bg-white/10',
+                          s.is_important && 'opacity-100 text-amber-500'
+                        )}
+                      >
+                        <Pin className="size-3.5" />
+                      </button>
+                      <button
+                        onClick={(e) => deleteSession(s.id, e)}
+                        title="Delete conversation"
+                        className="size-6 rounded-md flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10"
+                      >
+                        <Trash2 className="size-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </SheetContent>
+            </Sheet>
+
+            <Badge
+              variant="success"
+              className="px-2.5 py-0.5 rounded-full flex items-center gap-1.5 text-[11px] font-semibold transition-all duration-300"
+            >
+              <span className="relative flex size-1.5">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full size-1.5 bg-emerald-500"></span>
+              </span>
+              Online
+            </Badge>
+          </div>
         </header>
 
         {/* Scrollable Conversation Stream */}
@@ -961,7 +1357,7 @@ function Chat() {
 
         {/* Input tray panel */}
         <div className="p-4 md:p-8 pt-0 md:pt-0 bg-transparent flex-shrink-0 z-10">
-          <div className="bg-white border border-slate-200 rounded-2xl p-3 flex flex-col gap-3 shadow-md hover:border-slate-300/80 transition-colors focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
+          <div className="bg-white/80 dark:bg-[#1c1c1e]/80 backdrop-blur-xl border border-black/[0.08] dark:border-white/10 rounded-2xl p-3 flex flex-col gap-3 shadow-[0_4px_24px_rgb(0_0_0/0.06)] transition-colors focus-within:border-[#0a84ff]/60 focus-within:ring-2 focus-within:ring-[#0a84ff]/20">
             
             {/* Multi-line chat Textarea */}
             <Textarea 
@@ -972,7 +1368,7 @@ function Chat() {
               placeholder="Ask the agent to investigate, summarize, or run a workflow…"
               disabled={isLoading}
               rows={2}
-              className="w-full min-h-[44px] max-h-48 border-none outline-none resize-none bg-transparent placeholder:text-muted-foreground focus-visible:ring-0 focus-visible:ring-offset-0 p-1"
+              className="w-full min-h-[44px] max-h-48 border-none outline-none resize-none bg-transparent text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus-visible:ring-0 focus-visible:ring-offset-0 p-1"
             />
             
             {/* Input Footer row */}
@@ -1032,10 +1428,10 @@ function Chat() {
                 </span>
               </div>
               
-              <Button 
+              <Button
                 onClick={handleSendMessage}
                 disabled={!inputValue.trim() || isLoading}
-                className="h-8 px-4 rounded-xl text-xs font-semibold shadow-md shadow-primary/10 cursor-pointer"
+                className="h-8 px-4 rounded-xl text-xs font-semibold bg-[#0a84ff] hover:bg-[#0a84ff]/90 text-white shadow-sm shadow-[#0a84ff]/20 cursor-pointer"
               >
                 {isLoading ? (
                   <Loader2 className="animate-spin" data-icon="inline-start" />
@@ -1052,7 +1448,7 @@ function Chat() {
       </div>
 
       {/* Column 3: Run Inspector (Right panel) */}
-      <aside className="hidden xl:flex w-[300px] border-l border-slate-200 bg-white flex-col h-full overflow-hidden flex-shrink-0 z-10 shadow-[0_-1px_3px_rgba(15,23,42,0.01)] animate-in slide-in-from-right duration-300">
+      <aside className="hidden xl:flex w-[300px] border-l border-black/[0.06] dark:border-white/10 bg-white/70 dark:bg-[#1c1c1e]/70 backdrop-blur-xl flex-col h-full overflow-hidden flex-shrink-0 z-10 animate-in slide-in-from-right duration-300">
         
         {/* Header */}
         <div className="p-4 border-b border-slate-100 flex items-center h-20 justify-between">
@@ -1115,20 +1511,20 @@ function Chat() {
         </div>
 
         {/* Token metrics box (Monospace counters) */}
-        <div className="p-4 bg-slate-50 border-t border-slate-100 flex-shrink-0">
-          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3">Token metrics</div>
+        <div className="p-4 bg-black/[0.02] dark:bg-white/[0.03] border-t border-black/[0.06] dark:border-white/10 flex-shrink-0">
+          <div className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-3">Token metrics</div>
           <div className="grid grid-cols-3 gap-2 text-center">
-            <div className="bg-white p-2.5 rounded-xl border border-slate-200/60 shadow-sm flex flex-col justify-center">
+            <div className="bg-white dark:bg-white/[0.04] p-2.5 rounded-xl border border-black/[0.06] dark:border-white/10 flex flex-col justify-center">
               <div className="text-[9px] font-sans text-slate-400 uppercase font-semibold">Input</div>
-              <div className="font-semibold text-[13px] font-mono text-blue-600 tracking-tight mt-0.5 tabular-nums">{tokens.input.toLocaleString()}</div>
+              <div className="font-semibold text-[13px] font-mono text-[#0a84ff] tracking-tight mt-0.5 tabular-nums">{tokens.input.toLocaleString()}</div>
             </div>
-            <div className="bg-white p-2.5 rounded-xl border border-slate-200/60 shadow-sm flex flex-col justify-center">
+            <div className="bg-white dark:bg-white/[0.04] p-2.5 rounded-xl border border-black/[0.06] dark:border-white/10 flex flex-col justify-center">
               <div className="text-[9px] font-sans text-slate-400 uppercase font-semibold">Output</div>
-              <div className="font-semibold text-[13px] font-mono text-emerald-600 tracking-tight mt-0.5 tabular-nums">{tokens.output.toLocaleString()}</div>
+              <div className="font-semibold text-[13px] font-mono text-emerald-500 tracking-tight mt-0.5 tabular-nums">{tokens.output.toLocaleString()}</div>
             </div>
-            <div className="bg-white p-2.5 rounded-xl border border-slate-200/60 shadow-sm flex flex-col justify-center">
+            <div className="bg-white dark:bg-white/[0.04] p-2.5 rounded-xl border border-black/[0.06] dark:border-white/10 flex flex-col justify-center">
               <div className="text-[9px] font-sans text-slate-400 uppercase font-semibold">Total</div>
-              <div className="font-semibold text-[13px] font-mono text-slate-800 tracking-tight mt-0.5 tabular-nums">{tokens.total.toLocaleString()}</div>
+              <div className="font-semibold text-[13px] font-mono text-slate-800 dark:text-slate-100 tracking-tight mt-0.5 tabular-nums">{tokens.total.toLocaleString()}</div>
             </div>
           </div>
         </div>

@@ -5,63 +5,35 @@ from typing import Dict, List, Optional, Any
 
 from sqlalchemy import select, delete
 
-from app.core.database import AsyncSessionLocal
+from app.infrastructure.persistence.base import BaseAsyncRepository
 from app.models.db_models import MCPServerModel
 
 logger = logging.getLogger(__name__)
 
 
-class MCPConfigRepository:
+class MCPConfigRepository(BaseAsyncRepository):
     """Repository for MCP server configuration data access."""
-    
+
     def __init__(self):
         """Initialize MCP config repository."""
         logger.info("MCPConfigRepository initialized")
-    
+
     async def list_all(self, include_disabled: bool = False) -> List[Dict[str, Any]]:
-        """List all MCP servers.
-        
-        Args:
-            include_disabled: If True, include disabled servers
-            
-        Returns:
-            List of MCP server configurations
-        """
-        async with AsyncSessionLocal() as session:
-            query = select(MCPServerModel)
-            if not include_disabled:
-                query = query.where(MCPServerModel.enabled == True)
-            
-            result = await session.execute(query)
-            servers = result.scalars().all()
-            return [self._mcp_server_to_dict(server) for server in servers]
-    
+        """List all MCP servers (optionally including disabled ones)."""
+        query = select(MCPServerModel)
+        if not include_disabled:
+            query = query.where(MCPServerModel.enabled == True)
+        servers = await self._all(query)
+        return [self._mcp_server_to_dict(server) for server in servers]
+
     async def get_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        """Get MCP server by name.
-        
-        Args:
-            name: Server name
-            
-        Returns:
-            MCP server configuration or None if not found
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(MCPServerModel).where(MCPServerModel.name == name)
-            )
-            server = result.scalar_one_or_none()
-            return self._mcp_server_to_dict(server) if server else None
-    
+        """Get MCP server by name, or None if not found."""
+        server = await self._one(select(MCPServerModel).where(MCPServerModel.name == name))
+        return self._mcp_server_to_dict(server) if server else None
+
     async def create(self, server_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Create a new MCP server.
-        
-        Args:
-            server_data: Server configuration
-            
-        Returns:
-            Created server configuration
-        """
-        async with AsyncSessionLocal() as session:
+        """Create a new MCP server and return it."""
+        async def _work(session):
             server = MCPServerModel(
                 name=server_data["name"],
                 command=server_data["command"],
@@ -73,28 +45,20 @@ class MCPConfigRepository:
                 updated_at=datetime.now(timezone.utc)
             )
             session.add(server)
-            await session.commit()
+            await session.flush()
             await session.refresh(server)
             return self._mcp_server_to_dict(server)
-    
+        return await self._run(_work)
+
     async def update(self, name: str, server_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Update an MCP server.
-        
-        Args:
-            name: Server name
-            server_data: Updated server data
-            
-        Returns:
-            Updated server configuration or None if not found
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
+        """Update an MCP server by name; return it, or None if not found."""
+        async def _work(session):
+            server = (await session.execute(
                 select(MCPServerModel).where(MCPServerModel.name == name)
-            )
-            server = result.scalar_one_or_none()
+            )).scalar_one_or_none()
             if not server:
                 return None
-            
+
             if "command" in server_data:
                 server.command = server_data["command"]
             if "args" in server_data:
@@ -105,47 +69,28 @@ class MCPConfigRepository:
                 server.enabled = server_data["enabled"]
             if "description" in server_data:
                 server.description = server_data["description"]
-            
             if "name" in server_data and server_data["name"] != name:
                 server.name = server_data["name"]
-            
             server.updated_at = datetime.now(timezone.utc)
-            
-            await session.commit()
+
+            await session.flush()
             await session.refresh(server)
             return self._mcp_server_to_dict(server)
-    
+        return await self._run(_work)
+
     async def delete(self, name: str) -> bool:
-        """Delete an MCP server.
-        
-        Args:
-            name: Server name
-            
-        Returns:
-            True if deleted, False if not found
-        """
-        async with AsyncSessionLocal() as session:
+        """Delete an MCP server by name; return True if a row was removed."""
+        async def _work(session):
             result = await session.execute(
                 delete(MCPServerModel).where(MCPServerModel.name == name).returning(MCPServerModel.id)
             )
-            deleted = result.scalar_one_or_none()
-            await session.commit()
-            return deleted is not None
-    
-    async def exists(self, name: str) -> bool:
-        """Check if an MCP server exists.
-        
-        Args:
-            name: Server name
-            
-        Returns:
-            True if server exists, False otherwise
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(MCPServerModel.id).where(MCPServerModel.name == name)
-            )
             return result.scalar_one_or_none() is not None
+        return await self._run(_work)
+
+    async def exists(self, name: str) -> bool:
+        """Return True if an MCP server with *name* exists."""
+        row = await self._one(select(MCPServerModel.id).where(MCPServerModel.name == name))
+        return row is not None
     
     def _mcp_server_to_dict(self, server: MCPServerModel) -> Dict[str, Any]:
         """Convert MCP server model to dictionary."""

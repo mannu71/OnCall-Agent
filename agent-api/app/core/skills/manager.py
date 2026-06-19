@@ -10,6 +10,22 @@ import os
 
 logger = logging.getLogger(__name__)
 
+# Short, low-signal words ignored when scoring skill relevance.
+_STOPWORDS = frozenset({
+    "the", "a", "an", "to", "of", "in", "on", "for", "and", "or", "is", "are",
+    "with", "how", "do", "i", "my", "this", "that", "it", "be", "can", "what",
+})
+
+
+def _tokenize(text: str):
+    """Lowercase word tokens (≥3 chars, non-stopword) as a set, for overlap scoring."""
+    if not text:
+        return set()
+    return {
+        w for w in re.findall(r"[a-z0-9]+", text.lower())
+        if len(w) >= 3 and w not in _STOPWORDS
+    }
+
 
 @dataclass
 class Skill:
@@ -141,6 +157,30 @@ class SkillManager:
             setup_note=setup_note,
         )
     
+    def select_for_query(self, query: str, k: int = 2) -> List[Skill]:
+        """Return up to *k* skills most relevant to *query* (RAG-style auto-select).
+
+        Lexical relevance over each skill's name + description (token overlap,
+        weighted toward the name). Deterministic and dependency-free — no DB or
+        embedding call on the hot path. A future upgrade can swap in the Titan
+        embeddings used by semantic memory; the call site is stable.
+        """
+        if not self._loaded:
+            self.scan_skills()
+        q_tokens = _tokenize(query)
+        if not q_tokens or not self._skills:
+            return []
+        scored: List[tuple] = []
+        for skill in self._skills.values():
+            name_tokens = _tokenize(skill.name.replace("-", " ").replace("_", " "))
+            desc_tokens = _tokenize(skill.description)
+            # Name matches are strong signals; description matches are supporting.
+            score = 2.0 * len(q_tokens & name_tokens) + len(q_tokens & desc_tokens)
+            if score > 0:
+                scored.append((score, skill))
+        scored.sort(key=lambda s: s[0], reverse=True)
+        return [skill for _, skill in scored[: max(0, k)]]
+
     def resolve_command(self, command: str) -> Optional[Skill]:
         """Resolve /command to skill.
         

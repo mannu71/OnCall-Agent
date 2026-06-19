@@ -6,9 +6,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from app.config import settings
+from app.core import privacy
+from app.core.privacy.tool_wrap import wrap_tools_with_pseudonymization
 from app.core.redact import redact
 from app.core.supervisor import InvestigationSupervisor, SupervisorAction, SupervisorConfig
-from app.harness import harness
+from app.harness import build_agent_from_spec
 from app.harness.context_builder import (
     apply_synthesis_floor,
     build_recall_query,
@@ -26,7 +28,12 @@ from app.workflow.strategies.react.hitl import emit_hitl_pause, make_checkpointe
 from app.workflow.strategies.react.learning import auto_learn, exec_fallback
 from app.workflow.strategies.react.llm_factory import build_llm
 from app.workflow.strategies.react.streaming import StreamCallback
-from app.workflow.llm_config import resolve_llm_config_for_consumer_port
+from app.workflow.llm_config import (
+    resolve_llm_config_for_consumer_port,
+    resolve_llm_fallback_chain,
+    gather_alt_credentials,
+    throttle_target_for,
+)
 from app.workflow.strategies.react.workflow_config import (
     extract_agent_config,
     extract_cloudwatch_config,
@@ -39,6 +46,17 @@ from app.workflow.strategies.react.workflow_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _rehydrate_structured(obj: Any, session_id: Optional[str]) -> Any:
+    """Deep-rehydrate placeholder strings in a structured-output value."""
+    if isinstance(obj, str):
+        return privacy.rehydrate(obj, session_id)
+    if isinstance(obj, dict):
+        return {k: _rehydrate_structured(v, session_id) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_rehydrate_structured(v, session_id) for v in obj]
+    return obj
 
 
 class ReactStrategy(BaseStrategy):
@@ -87,6 +105,19 @@ class ReactStrategy(BaseStrategy):
 
         try:
             agent_config = extract_agent_config(workflow)
+            # Fold a referenced agent profile (if any) into the node config so the
+            # spec picks up its role prompt / output schema / policies / deep
+            # features. Node config always wins; no `profile` = unchanged. Best
+            # effort — a profile lookup never breaks a run.
+            try:
+                from app.infrastructure.persistence.agent_profile_repository import (
+                    agent_profile_repository,
+                )
+                agent_config = await agent_profile_repository.merge_into_agent_config(
+                    agent_config
+                )
+            except Exception as _prof_err:  # noqa: BLE001
+                logger.warning("ReactStrategy: profile merge skipped (%s)", _prof_err)
             llm_config = await resolve_llm_config_for_workflow(workflow)
 
             # Node-level gateway: resolve the models wired to the dedicated model
@@ -147,11 +178,12 @@ class ReactStrategy(BaseStrategy):
 
             # Prepend a knowledge-base recall block (similar past issues /
             # patterns / skills) so the agent starts with institutional memory.
-            augmented_query, recall_hits = await build_recall_query(
+            augmented_query, recall_hits, selected_skills = await build_recall_query(
                 user_query=user_query,
                 cloudwatch_config=cloudwatch_config,
                 logger_instance=logger_instance,
                 execution_id=execution_id,
+                code_analyzer_config=code_analyzer_config,
             )
 
             # Assemble the base action space (MCP + CloudWatch + crawler + DB
@@ -194,6 +226,15 @@ class ReactStrategy(BaseStrategy):
                 context=context,
             )
 
+            # ── PII pseudonymization (privacy boundary before Bedrock) ───────
+            # Bind this run's vault, then swap PII in everything bound for the
+            # model (query + all seeded context) for stable placeholders. Tool
+            # output produced inside the loop is scrubbed via the same vault
+            # (wrap below + MCP sanitize choke point). The final answer is
+            # re-hydrated before return. No-op when the feature is disabled.
+            privacy.bind_session(execution_id)
+            augmented_query = privacy.pseudonymize(augmented_query, execution_id)
+
             llm = build_llm(llm_config)
             # LLM-dependent extension tools (depth-1 delegate + gated edit),
             # added via the harness so it owns the complete action space.
@@ -205,6 +246,9 @@ class ReactStrategy(BaseStrategy):
                 execution_id=execution_id,
                 logger_instance=logger_instance,
             )
+            # Pseudonymize coroutine-tool output before it re-enters the LLM (MCP
+            # tools are scrubbed at their own choke point). No-op when disabled.
+            tools = wrap_tools_with_pseudonymization(tools)
             checkpointer = await make_checkpointer()
 
             # Declarative agent spec — single source of truth for building the
@@ -217,8 +261,19 @@ class ReactStrategy(BaseStrategy):
                 session_id=execution_id,
             )
 
+            # Expand any named-policy-set references (DB-backed) into inline
+            # entries before the agent is built. No-op when policies are inline
+            # or absent. Best-effort — never fails the run.
+            try:
+                from app.core import policy as _policy
+                spec.policies = await _policy.expand_policy_refs(spec.policies)
+            except Exception as _pol_exc:  # noqa: BLE001
+                logger_instance.warning(
+                    "ReactStrategy: policy-set expansion skipped (%s)", _pol_exc
+                )
+
             def _rebuild_agent():
-                return harness.build_agent(
+                return build_agent_from_spec(
                     spec, llm, tools, checkpointer=checkpointer,
                     execution_port=execution_port,
                 )
@@ -232,20 +287,69 @@ class ReactStrategy(BaseStrategy):
                 else None
             )
 
+            # ── Bedrock fallback-chain (Phase 1) ──────────────────────────
+            # On a throttle, fail over to an alternate credential → region →
+            # model instead of exhausting retries on the same target. The chain
+            # is computed once per run; cooled targets (from a prior throttle
+            # this process) are de-prioritised by the resolver.
+            _alt_creds = await gather_alt_credentials(llm_config)
+            _fallback_chain = resolve_llm_fallback_chain(
+                llm_config, alt_credentials=_alt_creds
+            )
+            # When a chain exists, let throttles bubble out of execute_agent's
+            # in-place retry immediately so the failover loop can switch target;
+            # pure-transient errors (502/timeout) still retry in place.
+            _retry_predicate = (
+                (lambda ce: ce.retryable and not ce.should_fallback)
+                if len(_fallback_chain) > 1 else None
+            )
+
             async def _run_agent(_agent, _query):
-                return await execute_agent(
-                    _agent,
-                    _query,
-                    logger_instance,
-                    execution_id,
-                    stream_callback,
-                    thread_id=execution_id,
-                    execution_port=execution_port,
-                    conversation_history=(
-                        (context.get("inputs") or {}).get("history")
-                        if isinstance(context, dict) else None
-                    ),
+                _history = (
+                    (context.get("inputs") or {}).get("history")
+                    if isinstance(context, dict) else None
                 )
+                last_exc: Optional[Exception] = None
+                for _idx, _candidate in enumerate(_fallback_chain):
+                    if _idx == 0:
+                        _cur = _agent
+                    else:
+                        from app.core import model_throttle_tracker as _throttle
+                        _tgt = throttle_target_for(_fallback_chain[_idx - 1])
+                        _throttle.mark_throttled(_tgt)
+                        logger_instance.warning(
+                            "ReactStrategy: LLM target throttled (%s/%s/%s) — failing over "
+                            "to candidate %d/%d (model=%s region=%s) [execution_id=%s]",
+                            _tgt.provider, _tgt.region, _tgt.model_id,
+                            _idx + 1, len(_fallback_chain),
+                            _candidate.get("model"), _candidate.get("region"),
+                            execution_id,
+                        )
+                        _cur = build_agent_from_spec(
+                            spec, build_llm(_candidate), tools,
+                            checkpointer=checkpointer, execution_port=execution_port,
+                        )
+                    try:
+                        return await execute_agent(
+                            _cur,
+                            _query,
+                            logger_instance,
+                            execution_id,
+                            stream_callback,
+                            thread_id=execution_id,
+                            execution_port=execution_port,
+                            conversation_history=_history,
+                            retry_predicate=_retry_predicate,
+                        )
+                    except Exception as _exc:  # noqa: BLE001 — decide failover vs raise
+                        from app.core.error_classifier import classify_error as _classify
+                        _ce = _classify(_exc)
+                        if _ce.should_fallback and _idx < len(_fallback_chain) - 1:
+                            last_exc = _exc
+                            continue
+                        raise
+                if last_exc is not None:
+                    raise last_exc
 
             # Bounded supervisor loop (run → score → retry/HITL/escalate) lives in
             # the harness now; it enforces iteration / wall-clock / token bounds.
@@ -277,7 +381,8 @@ class ReactStrategy(BaseStrategy):
             # investigation. Any failure here is logged and swallowed.
             try:
                 await auto_learn(
-                    user_query, result, execution_id, execution_start, recall_hits, logger_instance
+                    user_query, result, execution_id, execution_start, recall_hits,
+                    logger_instance, code_analyzer_config=code_analyzer_config,
                 )
             except Exception as _learn_call_err:
                 logger_instance.warning(
@@ -314,18 +419,44 @@ class ReactStrategy(BaseStrategy):
                 or (agent_config.get("params") or {}).get("outputMode")
                 or "text"
             ).lower()
+            # Resolve which structured schema to bind: the agent/profile may name
+            # one (outputSchema); unset defaults to InvestigationReport so existing
+            # workflows are unchanged. See output_registry.
+            _schema_name = str(
+                _ctx.get("output_schema")
+                or (_ctx.get("inputs") or {}).get("output_schema")
+                or agent_config.get("outputSchema")
+                or (agent_config.get("params") or {}).get("outputSchema")
+                or "investigation"
+            ).lower()
             structured_output = None
             if _output_mode == "structured" and (result.get("final_answer") or "").strip():
                 try:
-                    from app.workflow.strategies.react.output_schemas import InvestigationReport
-                    _struct_llm = llm.with_structured_output(InvestigationReport)
-                    _report = await _struct_llm.ainvoke(
-                        "Convert the following code-investigation answer into the structured "
-                        "report schema. Use ONLY facts present in the answer; cite file:line "
-                        "evidence exactly as written; do not invent fields.\n\n"
-                        f"User question:\n{user_query}\n\n"
-                        f"Investigation answer:\n{result.get('final_answer')}"
-                    )
+                    from app.workflow.strategies.react.output_registry import resolve_output_schema
+                    _schema_model = resolve_output_schema(_schema_name)
+                    _struct_llm = llm.with_structured_output(_schema_model)
+                    # This is another Bedrock call — keep it on placeholders. The
+                    # agent answer already contains placeholders; pseudonymize the
+                    # raw user question too. The whole result is re-hydrated below.
+                    # The investigation prompt is preserved verbatim (cache/eval
+                    # stability); other schemas use a schema-agnostic instruction.
+                    if _schema_name == "investigation":
+                        _struct_raw = (
+                            "Convert the following code-investigation answer into the structured "
+                            "report schema. Use ONLY facts present in the answer; cite file:line "
+                            "evidence exactly as written; do not invent fields.\n\n"
+                            f"User question:\n{user_query}\n\n"
+                            f"Investigation answer:\n{result.get('final_answer')}"
+                        )
+                    else:
+                        _struct_raw = (
+                            "Convert the following answer into the structured report schema. "
+                            "Use ONLY facts present in the answer; do not invent fields.\n\n"
+                            f"User question:\n{user_query}\n\n"
+                            f"Answer:\n{result.get('final_answer')}"
+                        )
+                    _struct_prompt = privacy.pseudonymize(_struct_raw, execution_id)
+                    _report = await _struct_llm.ainvoke(_struct_prompt)
                     structured_output = (
                         _report.model_dump() if hasattr(_report, "model_dump") else dict(_report)
                     )
@@ -341,12 +472,42 @@ class ReactStrategy(BaseStrategy):
             if mcp_manager:
                 await mcp_manager.disconnect_all()
 
+            # ── Re-hydrate placeholders for the user-facing surfaces ─────────
+            # The agent reasoned over placeholders; restore real PII in the final
+            # answer + structured output so the operator sees true values. The
+            # redaction summary is UI-safe (counts/placeholders/masked previews,
+            # never raw values). Then drop the vault so raw PII does not outlive
+            # the run. All no-ops when the feature is disabled.
+            _privacy_redactions = privacy.redaction_summary(execution_id)
+            final_answer = privacy.rehydrate(result.get("final_answer"), execution_id)
+            if structured_output:
+                structured_output = _rehydrate_structured(structured_output, execution_id)
+            privacy.drop_vault(execution_id)
+
+            # Deep-agent session scratch (todos + virtual FS). Capture the final
+            # plan for the UI, then drop both stores so nothing outlives the run.
+            _todos = []
+            try:
+                from app.workflow.strategies.react import planning_tools as _pl
+                _todos = _pl.get_todos(execution_id)
+                _pl.drop_session(execution_id)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from app.core import vfs as _vfs
+                _vfs.drop_session(execution_id)
+            except Exception:  # noqa: BLE001
+                pass
+
             return {
                 "type": "react",
                 "user_query": user_query,
-                "final_answer": result.get("final_answer"),
+                "final_answer": final_answer,
                 "structured_output": structured_output,
                 "output_mode": _output_mode,
+                "privacy_redactions": _privacy_redactions,
+                "todos": _todos,
+                "selected_skills": selected_skills,
                 "messages": result.get("messages", []),
                 "message_count": len(result.get("messages", [])),
                 "tool_calls": result.get("tool_calls", []),
@@ -370,6 +531,19 @@ class ReactStrategy(BaseStrategy):
                     await mcp_manager.disconnect_all()
                 except Exception:
                     pass
+            # Drop the vault so raw PII never outlives a failed run.
+            try:
+                privacy.drop_vault(execution_id)
+            except Exception:  # noqa: BLE001
+                pass
+            # Drop deep-agent session scratch (todos + virtual FS) too.
+            try:
+                from app.workflow.strategies.react import planning_tools as _pl
+                _pl.drop_session(execution_id)
+                from app.core import vfs as _vfs
+                _vfs.drop_session(execution_id)
+            except Exception:  # noqa: BLE001
+                pass
             fallback = exec_fallback(error, user_query, execution_id, logger_instance)
             if fallback is not None:
                 return fallback

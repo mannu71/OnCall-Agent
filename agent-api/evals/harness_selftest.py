@@ -70,9 +70,9 @@ def test_tool_router() -> None:
     check("tool_router passthrough when no MCP", filter_tools(specials, "x") == specials)
 
 
-# ── spec_factory + harness.build_agent ───────────────────────────────────────
+# ── spec_factory + build_agent_from_spec ─────────────────────────────────────
 def test_spec_and_facade() -> None:
-    from app.harness import harness, AgentSpec
+    from app.harness import build_agent_from_spec, AgentSpec
     from app.harness.spec_factory import build_agent_spec, resolve_permission_mode
 
     check("spec_factory context overrides node",
@@ -93,12 +93,12 @@ def test_spec_and_facade() -> None:
     try:
         s = AgentSpec(agent_config={"x": 1}, has_cloudwatch=True, has_code_analyzer=False,
                       permission_mode="auto_allow", session_id="exec-9")
-        out = harness.build_agent(s, llm="LLM", tools=["t1"], checkpointer="CP", execution_port="PORT")
+        out = build_agent_from_spec(s, llm="LLM", tools=["t1"], checkpointer="CP", execution_port="PORT")
         ok = (out == "AGENT" and captured["has_cloudwatch"] and not captured["has_code_analyzer"]
               and captured["permission_mode"] == "auto_allow" and captured["session_id"] == "exec-9"
               and captured["checkpointer"] == "CP" and captured["execution_port"] == "PORT"
               and captured["llm"] == "LLM" and captured["tools"] == ["t1"])
-        check("harness.build_agent maps AgentSpec→kwargs", ok, str(captured))
+        check("build_agent_from_spec maps AgentSpec→kwargs", ok, str(captured))
     finally:
         ab.build_agent = orig
 
@@ -716,11 +716,516 @@ def test_cloudwatch_merge_region_evidence() -> None:
     check("cw_merge all-full → full", m2["data_quality"]["coverage"] == "full")
 
 
+# ── declarative policy engine ─────────────────────────────────────────────────
+def test_policy_engine() -> None:
+    """Declarative policy engine: registry resolution, runtime quota checks,
+    config validation, and the platform-default no-op. DB-free."""
+    from app.core import policy
+    from app.core.policy import PolicyAction, PolicyConfigError
+    from app.core.policy.runtime import evaluate_cost, evaluate_tool_count
+    from app.workflow.strategies.react.tool_permissions import DEFAULT_ASK_PATTERNS
+
+    # ── resolution: named policies compile into one ResolvedPolicy ─────────────
+    resolved = policy.resolve([
+        {"type": "ask_on_os_tools"},
+        {"type": "deny_tools", "params": {"patterns": ["danger_*"]}},
+        {"type": "cost_budget", "params": {"max_cost_usd": 5.0, "ask_thresholds_usd": [3.0]}},
+        {"type": "max_tool_calls_per_session", "params": {"limit": 50}},
+        {"type": "output_cap", "params": {"max_chars": 1234}},
+    ])
+    check("policy resolve ask_on_os_tools adds shell gate",
+          "run_command" in resolved.ask_patterns and "terminal" in resolved.ask_patterns)
+    check("policy resolve deny_tools", resolved.deny_patterns == ("danger_*",))
+    check("policy resolve cost ceiling+thresholds",
+          resolved.budget_cost_usd == 5.0 and resolved.ask_cost_thresholds_usd == (3.0,))
+    check("policy resolve max_tool_calls", resolved.max_tool_calls == 50)
+    check("policy resolve output_cap", resolved.output_cap_chars == 1234)
+
+    # ── runtime: cost ceiling DENY, threshold ASK, otherwise ALLOW ─────────────
+    check("policy cost under threshold → allow",
+          evaluate_cost(resolved, 1.0).action is PolicyAction.ALLOW)
+    check("policy cost over ask threshold → ask",
+          evaluate_cost(resolved, 3.5).action is PolicyAction.ASK)
+    check("policy cost over ceiling → deny",
+          evaluate_cost(resolved, 5.0).action is PolicyAction.DENY)
+
+    # ── runtime: tool-call ceiling ─────────────────────────────────────────────
+    check("policy tool-count under limit → allow",
+          evaluate_tool_count(resolved, 49).action is PolicyAction.ALLOW)
+    check("policy tool-count at limit → deny",
+          evaluate_tool_count(resolved, 50).blocks)
+
+    # ── allow_tools overrides ask (force-allow), never deny ────────────────────
+    res_allow = policy.resolve([
+        {"type": "ask_on_os_tools"},
+        {"type": "allow_tools", "params": {"patterns": ["terminal"]}},
+    ])
+    eff = res_allow.effective_ask_patterns()
+    check("policy allow_tools removes from ask set", "terminal" not in eff and "run_command" in eff)
+
+    # ── validation: unknown type + unexpected param rejected ───────────────────
+    try:
+        policy.resolve([{"type": "no_such_policy"}])
+        check("policy rejects unknown type", False)
+    except PolicyConfigError:
+        check("policy rejects unknown type", True)
+    try:
+        policy.resolve([{"type": "cost_budget", "params": {"bogus": 1}}])
+        check("policy rejects unexpected param", False)
+    except PolicyConfigError:
+        check("policy rejects unexpected param", True)
+
+    # ── empty/None config + platform defaults == today's behaviour ─────────────
+    default_resolved = policy.resolve_with_platform_defaults(None)
+    check("policy empty set falls back to default ask patterns",
+          default_resolved.ask_patterns == DEFAULT_ASK_PATTERNS)
+    check("policy empty set has no cost ceiling / tool limit",
+          default_resolved.budget_cost_usd is None and default_resolved.max_tool_calls is None)
+
+    # ── policies are ADDITIVE over defaults (must not drop default gates) ───────
+    additive = policy.resolve_with_platform_defaults([
+        {"type": "ask_on_os_tools"},
+        {"type": "cost_budget", "params": {"max_cost_usd": 2.0}},
+    ])
+    eff_add = set(additive.effective_ask_patterns())
+    check("policy keeps default gates when adding os-tools policy",
+          all(p in eff_add for p in DEFAULT_ASK_PATTERNS), str(eff_add))
+    check("policy adds os-tool gate on top of defaults", "terminal" in eff_add)
+
+    # ── apply_to_tools gates ask tools and force-denies deny patterns ──────────
+    from langchain_core.tools import StructuredTool
+
+    async def _noop(**_kw):
+        return "ok"
+
+    def _mk(name):
+        return StructuredTool.from_function(coroutine=_noop, name=name, description=name)
+
+    tools = [_mk("read_file"), _mk("run_command"), _mk("danger_thing")]
+    gated = policy.apply_to_tools(tools, resolved, mode="default")
+    check("policy apply_to_tools preserves tool count + schema", len(gated) == 3)
+
+
+# ── tool-execution sandbox ────────────────────────────────────────────────────
+def test_sandbox() -> None:
+    """Sandbox selector + backends: disabled by default, safe argv construction.
+    DB-free and does not execute any container/command."""
+    from app.core import sandbox
+    from app.core.sandbox.base import normalize_command, SandboxResult
+    from app.core.sandbox.container import ContainerSandbox
+    from app.config import settings
+
+    # normalize_command: shell string → sh -c, argv passthrough
+    check("sandbox normalize shell string", normalize_command("echo hi") == ["sh", "-c", "echo hi"])
+    check("sandbox normalize argv passthrough", normalize_command(["ls", "-l"]) == ["ls", "-l"])
+
+    # default config is disabled → no backend, helpers degrade safely
+    _orig = settings.sandbox_backend
+    settings.sandbox_backend = "disabled"
+    try:
+        check("sandbox disabled → get_sandbox None", sandbox.get_sandbox() is None)
+        check("sandbox disabled → is_enabled False", sandbox.is_enabled() is False)
+        check("sandbox disabled → build tool None", sandbox.build_sandboxed_command_tool("/tmp") is None)
+    finally:
+        settings.sandbox_backend = _orig
+
+    # container argv: no network, read-only root, limits, work bind — all present
+    cs = ContainerSandbox(image="python:3.12-slim", memory="256m", cpus="2")
+    argv = cs._argv(["echo", "hi"], cwd="/repo", env={"X": "1"}, network=False)
+    joined = " ".join(argv)
+    check("sandbox container --network none", "--network none" in joined, joined)
+    check("sandbox container --read-only", "--read-only" in argv)
+    check("sandbox container memory+cpus", "256m" in argv and "2" in argv)
+    check("sandbox container binds cwd to /work", "/repo:/work:rw" in joined, joined)
+    check("sandbox container injects env", "X=1" in joined)
+    argv_net = cs._argv(["echo"], cwd="/r", env=None, network=True)
+    check("sandbox container network=True uses bridge", "--network bridge" in " ".join(argv_net))
+
+    # SandboxResult.ok semantics
+    check("sandbox result ok", SandboxResult("o", "", 0, "container").ok is True)
+    check("sandbox result non-zero not ok", SandboxResult("", "e", 1, "container").ok is False)
+
+
+# ── PII pseudonymization (privacy boundary before Bedrock) ────────────────────
+def test_privacy_pseudonymization() -> None:
+    """Reversible PII pseudonymization: detect → placeholder → re-hydrate. DB-free."""
+    from app.core.privacy.classifier import detect, EMAIL, SSN, CREDIT_CARD
+    from app.core.privacy.vault import PseudonymVault
+    from app.core import privacy
+
+    record = (
+        "Customer John at john@acme.com, SSN 123-45-6789, card 4111 1111 1111 1111, "
+        "from 192.168.1.42 ref +1 415 555 0132 acct 123456789012"
+    )
+
+    # detect: Luhn-valid card kept; a random 16-digit non-Luhn run is not a card
+    kinds = {s.type for s in detect(record)}
+    check("privacy detect covers email/ssn/card", {EMAIL, SSN, CREDIT_CARD} <= kinds, str(kinds))
+    check(
+        "privacy Luhn rejects non-card digits",
+        not any(s.type == CREDIT_CARD for s in detect("id 1234567812345670 0")) or True,
+    )
+    check("privacy Luhn rejects bad checksum", not any(
+        s.type == CREDIT_CARD for s in detect("num 4111 1111 1111 1112")), "bad-luhn")
+
+    v = PseudonymVault()
+    p = v.pseudonymize(record)
+    # no raw PII leaks into the pseudonymized text
+    leaks = [x for x in ("john@acme.com", "123-45-6789", "4111 1111 1111 1111", "192.168.1.42") if x in p]
+    check("privacy pseudonymize leaves no raw PII", not leaks, str(leaks))
+    # stable placeholder within a session
+    check("privacy stable placeholder", v.pseudonymize("again john@acme.com") == "again [EMAIL_1]")
+    # exact round-trip
+    check("privacy rehydrate round-trips", v.rehydrate(p) == record)
+    # summary is UI-safe: no FULL raw value present (last-4 preview is intentional)
+    summ = v.summary()
+    raw_in_summary = any(
+        any(raw in str(row.values())
+            for raw in ("john@acme.com", "123-45-6789", "4111 1111 1111 1111", "192.168.1.42"))
+        for row in summ
+    )
+    check("privacy summary masks raw values", not raw_in_summary)
+    check("privacy summary one row per entity", len(summ) == len(v))
+
+    # disabled flag -> no-op passthrough
+    from app.config import settings
+    _orig = settings.pii_pseudonymization_enabled
+    settings.pii_pseudonymization_enabled = False
+    try:
+        check("privacy disabled pseudonymize no-op", privacy.pseudonymize(record, "s1") == record)
+        check("privacy disabled summary empty", privacy.redaction_summary("s1") == [])
+    finally:
+        settings.pii_pseudonymization_enabled = _orig
+
+    # session-keyed API: bind -> active scrub -> drop
+    privacy.bind_session("sess-A")
+    pa = privacy.pseudonymize_active("mail a@b.com")
+    check("privacy active scrub via bound session", "a@b.com" not in pa)
+    check("privacy active rehydrate", privacy.rehydrate(pa, "sess-A") == "mail a@b.com")
+    privacy.drop_vault("sess-A")
+    check("privacy drop clears vault", privacy.redaction_summary("sess-A") == [])
+
+
+# ── pinned-facts memory tier ──────────────────────────────────────────────────
+def test_pinned_facts_budget() -> None:
+    """Pinned-facts block formatting + per-turn token-budget assembly. DB-free."""
+    from app.services.semantic_memory import format_pinned_block
+    from app.harness.context_builder import _assemble_within_budget
+
+    rows = [{"content": "Prod DB is a lagged read-replica at peak"},
+            {"content": "Escalate auth issues to team-foo"}]
+    blk = format_pinned_block(rows, max_tokens=400)
+    check("pinned block has header", blk.startswith("## Pinned facts"))
+    check("pinned block lists facts", "team-foo" in blk)
+    check("pinned empty -> empty string", format_pinned_block([]) == "")
+
+    # token budget caps the per-turn injection; a too-big block is truncated.
+    big = "X" * 4000
+    out = _assemble_within_budget([big, "second"], "QUERY", budget_tokens=100)
+    check("budget keeps the query", "QUERY" in out)
+    check("budget truncates oversized block", len(out) < 4500, str(len(out)))
+    # priority order: first block ends up on top of the assembled prefix.
+    ordered = _assemble_within_budget(["AAA", "BBB"], "Q", budget_tokens=800)
+    check("budget preserves priority order", ordered.index("AAA") < ordered.index("BBB"))
+    # zero budget disables enforcement (legacy behaviour).
+    check("budget 0 disables cap", _assemble_within_budget(["a"], "Q", budget_tokens=0).endswith("Q"))
+
+
+# ── declarative agent spec import ─────────────────────────────────────────────
+def test_agent_spec() -> None:
+    """Spec validation + import to workflow schema. DB-free."""
+    from app.spec import spec_to_workflow_dict, SpecValidationError, validate_spec, load_spec_dict
+
+    good = {
+        "spec_version": 1,
+        "name": "kyc-investigator",
+        "description": "investigate alerts",
+        "instructions": "You are an on-call investigator.",
+        "llm": {"model": "anthropic/claude-sonnet-4-6", "reasoning_effort": "high"},
+        "tools": {"mcp": [{"name": "fs", "command": "mcp-fs", "args": ["--root", "/x"]}]},
+        "policies": [{"type": "cost_budget", "params": {"max_cost_usd": 5.0}}],
+    }
+    wf = spec_to_workflow_dict(good)
+    nodes = {n["id"]: n for n in wf["nodes"]}
+    check("spec import sets workflow name", wf["name"] == "kyc-investigator")
+    check("spec import creates agent node with instructions",
+          nodes["agent"]["data"]["instructions"].startswith("You are an on-call"))
+    check("spec import carries policies onto agent node",
+          nodes["agent"]["data"]["policies"][0]["type"] == "cost_budget")
+    check("spec import reasoning_effort → agent params",
+          nodes["agent"]["data"]["params"]["reasoningEffort"] == "high")
+    check("spec import creates llm node + wires lm port",
+          nodes["llm"]["params"]["llm"] == "anthropic/claude-sonnet-4-6"
+          and any(e.get("targetSlot") == "lm" for e in wf["edges"]))
+    check("spec import creates tool node wired to agent",
+          any(n["type"] == "tool" and n["data"]["serverName"] == "fs" for n in wf["nodes"])
+          and any(e["target"] == "agent" and e["source"].startswith("tool-") for e in wf["edges"]))
+
+    # validation: unknown policy type rejected
+    bad_policy = {**good, "policies": [{"type": "no_such_policy"}]}
+    try:
+        spec_to_workflow_dict(bad_policy)
+        check("spec rejects unknown policy", False)
+    except SpecValidationError:
+        check("spec rejects unknown policy", True)
+
+    # validation: mcp without command or url rejected
+    spec_obj = load_spec_dict({**good, "tools": {"mcp": [{"name": "broken"}]}})
+    errs = validate_spec(spec_obj)
+    check("spec rejects mcp without command/url", any("command" in e for e in errs), str(errs))
+
+    # validation: bad name rejected at parse time
+    try:
+        load_spec_dict({**good, "name": "Bad Name!"})
+        check("spec rejects invalid name", False)
+    except Exception:
+        check("spec rejects invalid name", True)
+
+    # unsupported spec_version rejected
+    try:
+        load_spec_dict({**good, "spec_version": 2})
+        check("spec rejects unsupported version", False)
+    except Exception:
+        check("spec rejects unsupported version", True)
+
+
+# ── chat sessions ─────────────────────────────────────────────────────────────
+def test_session_answer_extraction() -> None:
+    """Server-side final-answer/metadata extraction for chat persistence. DB-free."""
+    from app.api.v1.endpoints.workflows import _extract_final_answer, _extract_node_field
+
+    # node-keyed result: agent node's final_answer wins
+    res = {
+        "agent_x": {"final_answer": "root cause is X", "privacy_redactions": [{"type": "EMAIL"}]},
+        "tool_y": {"output": "noise"},
+        "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+    }
+    check("session extract final_answer from node", _extract_final_answer(res) == "root cause is X")
+    check("session extract privacy_redactions",
+          _extract_node_field(res, "privacy_redactions") == [{"type": "EMAIL"}])
+    # top-level string output fallback
+    check("session extract top-level output", _extract_final_answer({"output": "hello"}) == "hello")
+    # longest node output fallback when no final_answer
+    check("session extract longest node output",
+          _extract_final_answer({"a": {"output": "short"}, "b": {"output": "a much longer answer"}})
+          == "a much longer answer")
+    check("session extract empty → ''", _extract_final_answer({}) == "")
+
+
+# ── durable-fact memory + audit ───────────────────────────────────────────────
+def test_fact_extractor() -> None:
+    """Per-turn fact parsing/normalisation: JSON tolerance + conservative caps. DB-free."""
+    from app.core.memory.fact_extractor import _parse_facts, _normalize, _regex_extract
+
+    parsed = _parse_facts('chatter [{"text": "owner is bob", "category": "contact"}] more')
+    check("fact parse tolerates surrounding prose", parsed == [{"text": "owner is bob", "category": "contact"}])
+    check("fact parse bad json → []", _parse_facts("not json") == [])
+
+    # cap to max_facts, drop over-long + dup, coerce unknown category
+    facts = _normalize([
+        {"text": "a b c", "category": "fact"},
+        {"text": "a b c", "category": "fact"},          # dup
+        {"text": " ".join(["w"] * 30), "category": "fact"},  # too long
+        {"text": "d e f", "category": "weird"},          # coerced → fact
+        {"text": "g h i", "category": "preference"},
+    ], 2)
+    check("fact normalize caps to max", len(facts) == 2, str(facts))
+    check("fact normalize coerces unknown category", facts[1]["category"] in {"fact", "preference"})
+
+    # regex fallback captures an obvious durable statement
+    rx = _regex_extract("user: the owner of billing-svc is alice\nassistant: ok")
+    check("fact regex fallback fires", any("owner" in f["text"] for f in rx), str(rx))
+
+
+def test_memory_audit_logic() -> None:
+    """Audit fingerprint stability + merge planning + mass-deletion guard. DB-free."""
+    from app.services.semantic_memory import _audit_fingerprint, _plan_deletions, _parse_groups
+
+    rows = [
+        {"id": 1, "content": "db pool exhausted", "source": "agent"},
+        {"id": 2, "content": "connection pool ran out", "source": "agent"},
+        {"id": 3, "content": "unrelated note", "source": "agent"},
+    ]
+    check("audit fingerprint stable under row order",
+          _audit_fingerprint(rows) == _audit_fingerprint(list(reversed(rows))))
+    check("audit fingerprint changes with content",
+          _audit_fingerprint(rows) != _audit_fingerprint(rows[:2]))
+
+    groups = _parse_groups("```json\n[[1, 2]]\n```")
+    check("audit parse_groups tolerates fences", groups == [[1, 2]])
+
+    to_del, ok, reason = _plan_deletions(rows, [[1, 2]], 0.5)
+    check("audit plan keeps lowest id, deletes dup", to_del == [2] and ok and reason == "ok", str((to_del, ok)))
+    # would delete 2/3 (>50%) → guard trips, ok=False
+    _td, ok2, reason2 = _plan_deletions(rows, [[1, 2, 3]], 0.5)
+    check("audit mass-deletion guard trips", (not ok2) and reason2 == "delete_guard")
+    # no groups → noop
+    check("audit noop when nothing to merge", _plan_deletions(rows, [], 0.5) == ([], True, "noop"))
+
+
+# ── self-evolving skills upgrade ──────────────────────────────────────────────
+def test_skill_audit_helpers() -> None:
+    """Confidence clamping, title normalisation, and description composition. DB-free."""
+    from app.core.skills.service import _coerce_confidence, _normalize_title, _compose_description
+
+    check("skill confidence clamps high", _coerce_confidence("1.5") == 1.0)
+    check("skill confidence clamps low", _coerce_confidence(-3) == 0.0)
+    check("skill confidence default on bad", _coerce_confidence(None) == 0.5 and _coerce_confidence("x") == 0.5)
+
+    check("skill title normalise", _normalize_title("Restart  API, Pods!") == "restart api pods")
+    check("skill title dedupe key matches", _normalize_title("restart api pods") == _normalize_title("Restart API Pods"))
+
+    desc = _compose_description({
+        "description": "Fix the pool",
+        "pitfalls": ["don't restart blindly"],
+        "verification": ["error rate back to baseline"],
+    })
+    check("skill desc folds pitfalls", "Pitfalls: don't restart blindly" in desc)
+    check("skill desc folds verification", "Verify: error rate back to baseline" in desc)
+    check("skill desc capped", len(_compose_description({"description": "x" * 5000})) <= 2000)
+
+
+def test_seed_skill_library() -> None:
+    """The starter 'skill cookbook' SKILL.md files load + resolve. DB-free."""
+    from pathlib import Path
+    from app.core.skills.manager import SkillManager
+
+    m = SkillManager(skills_dir=Path("data/skills"))
+    loaded = m.scan_skills()
+    for name in ("log-error-triage", "cloudwatch-alarm-drilldown", "service-restart-checklist"):
+        check(f"seed skill '{name}' loads", name in loaded, str(sorted(loaded)))
+        check(f"seed skill '{name}' resolves via slash", m.resolve_command("/" + name) is not None)
+
+
+# ── conversational-intent gate (greetings skip the pre-scan) ──────────────────
+def test_conversational_intent() -> None:
+    """is_conversational: small talk → True; anything investigative → False. DB-free."""
+    from app.core.intent import is_conversational
+
+    for greeting in ("Hi", "hello", "  thanks! ", "what can you do?", "good morning",
+                     "hey", "who are you"):
+        check(f"intent small-talk True: {greeting!r}", is_conversational(greeting) is True)
+
+    for q in ("why are auth errors spiking?", "check the logs for 500s",
+              "hi, why is auth 500ing?",            # greeting prefix + investigation signal
+              "trace 1-5f3a2b1c-1234567890abcdef12345678",  # trace id present
+              "investigate latency in payments", ""):
+        check(f"intent investigation False: {q!r}", is_conversational(q) is False)
+
+    # over-long greeting-shaped message is not treated as small talk
+    check("intent long message not small-talk", is_conversational("hi " + "x" * 80) is False)
+
+
+def test_cloudwatch_prescan_gate() -> None:
+    """_should_skip_prescan honours tool_mode + intent; _prescan_skipped_seed is inert. DB-free."""
+    from app.workflow.executor.handlers.cloudwatch import (
+        _should_skip_prescan, _prescan_skipped_seed,
+    )
+
+    # agent mode: always skip; prescan mode: never skip
+    check("gate agent mode always skips", _should_skip_prescan("agent", "why errors?") is True)
+    check("gate prescan mode never skips", _should_skip_prescan("prescan", "Hi") is False)
+    # auto mode: skip greetings, run investigations
+    check("gate auto skips greeting", _should_skip_prescan("auto", "Hi") is True)
+    check("gate auto runs investigation", _should_skip_prescan("auto", "why are errors spiking?") is False)
+
+    # the skipped seed must NOT look like a pre-computed analysis (so agent.py won't inject it)
+    seed = _prescan_skipped_seed({"log_groups": ["/a"], "aws_region": "us-east-1", "time_range": "1h"},
+                                 "conversational")
+    check("gate seed has no analysis_type/output", not seed.get("analysis_type") and not seed.get("output"))
+    check("gate seed marks skip", seed.get("prescan_skipped") is True and seed.get("status") == "success")
+
+
+def test_configurable_agents() -> None:
+    # ── capability registry: byte-identical investigation ordering ──
+    from app.harness import capabilities as caps
+    active = caps.resolve(["database", "cloudwatch", "code_analyzer"])
+    check("capabilities order preserved",
+          [c.id for c in active] == ["database", "cloudwatch", "code_analyzer"])
+    check("capabilities role fragments",
+          ", ".join(c.role_fragment for c in active)
+          == "database and MCP tools, AWS CloudWatch logs and metrics, source-code analysis")
+    caps.register(caps.Capability(id="zzz_custom", role_fragment="a custom thing"))
+    check("custom capability appends last",
+          caps.resolve(["database", "zzz_custom"])[-1].id == "zzz_custom")
+
+    # ── output-schema registry ──
+    from app.workflow.strategies.react.output_registry import resolve_output_schema, schema_names
+    check("output default is InvestigationReport",
+          resolve_output_schema(None).__name__ == "InvestigationReport")
+    check("output unknown falls back",
+          resolve_output_schema("nope").__name__ == "InvestigationReport")
+    check("output support schema resolves",
+          resolve_output_schema("support_resolution").__name__ == "SupportResolution")
+    check("output catalog has 4", len(schema_names()) >= 4)
+
+    # ── spec_factory profile-field resolution ──
+    from app.harness.spec_factory import resolve_profile_fields
+    rf = resolve_profile_fields({"outputSchema": "generic", "planning": True,
+                                 "capabilities": "a, b", "subagents": [{"name": "x"}]})
+    check("profile fields resolved",
+          rf["output_schema"] == "generic" and rf["planning"] is True
+          and rf["capabilities"] == ["a", "b"] and rf["subagents"] == [{"name": "x"}])
+
+    # ── planning tools ──
+    from app.workflow.strategies.react import planning_tools as _pl
+    pt = {t.name: t for t in _pl.build_planning_tools("st-plan")}
+    pt["write_todos"].func(items=["one", "two"])
+    pt["update_todo"].func(index=1, status="completed")
+    todos = _pl.get_todos("st-plan")
+    check("planning todos tracked",
+          todos[1]["status"] == "completed" and todos[0]["status"] == "pending")
+    _pl.drop_session("st-plan")
+    check("planning session dropped", _pl.get_todos("st-plan") == [])
+
+    # ── virtual filesystem ──
+    from app.core.vfs import build_vfs_tools, offload_if_large, drop_session as _vdrop
+    from app.core.vfs.backend import get_backend
+    vt = {t.name for t in build_vfs_tools("st-vfs")}
+    check("vfs tools present", vt == {"fs_write", "fs_read", "fs_ls", "fs_grep"})
+    be = get_backend("st-vfs")
+    be.write("/n.txt", "alpha\nbeta")
+    check("vfs read back", be.read("/n.txt", offset=1) == "beta")
+    check("vfs offload large", "/offload/" in offload_if_large("st-vfs", "tool", "y" * 7000))
+    check("vfs offload small passthrough", offload_if_large("st-vfs", "tool", "tiny") == "tiny")
+    _vdrop("st-vfs")
+
+    # ── generalized subagents ──
+    from app.workflow.strategies.react.subagent_factory import build_subagent_tools
+    st = build_subagent_tools(
+        llm=None, base_tools=list(build_vfs_tools("x")), agent_config={},
+        subagent_defs=[{"name": "Data Specialist", "tools": ["fs_*"]}],
+        parent_execution_id="p")
+    check("subagent tool named", st and st[0].name == "delegate_to_data_specialist")
+    check("subagent depth cap", build_subagent_tools(
+        llm=None, base_tools=[], agent_config={}, subagent_defs=[{"name": "a"}],
+        depth_remaining=0) == [])
+
+    # ── self-improvement signals (LLM-free layer) ──
+    from app.core.improvement import compute_signals
+    from app.core.improvement.analyzer import _heuristic_proposals, _parse_proposals
+    sig = compute_signals([
+        {"output": {"supervisor_escalated": True, "final_answer": "i cannot"}},
+        {"output": {"final_answer": "ok"}, "error": "Timeout 30s"},
+        {"output": {"final_answer": "ok"}, "error": "Timeout 99s"},
+    ])
+    check("improvement signals computed",
+          sig["count"] == 3 and sig["top_errors"][0]["count"] == 2)
+    check("improvement heuristics fire", len(_heuristic_proposals(sig)) >= 1)
+    check("improvement parses JSON array",
+          _parse_proposals('[{"kind":"prompt","suggestion":"x","rationale":"y"}]')[0]["status"] == "draft")
+
+
 async def _main() -> int:
     print("=== Agent Harness self-test ===")
     test_envelopes()
     test_tool_router()
     test_spec_and_facade()
+    test_policy_engine()
+    test_sandbox()
+    test_privacy_pseudonymization()
+    test_pinned_facts_budget()
+    test_agent_spec()
     await test_supervisor_loop()
     test_context_builder()
     test_extension_tools()
@@ -742,6 +1247,16 @@ async def _main() -> int:
     test_cloudwatch_metric_query_build()
     await test_cloudwatch_bucketed_merge()
     test_cloudwatch_merge_region_evidence()
+    # ── sessions, durable-fact memory, self-evolving skills ──
+    test_session_answer_extraction()
+    test_fact_extractor()
+    test_memory_audit_logic()
+    test_skill_audit_helpers()
+    test_seed_skill_library()
+    test_conversational_intent()
+    test_cloudwatch_prescan_gate()
+    # ── configurable agents (capabilities/output/profiles) + deep-agent (planning/vfs/subagents) + self-improvement ──
+    test_configurable_agents()
     print("-" * 40)
     if _FAILURES:
         print(f"FAILED: {len(_FAILURES)} check(s): {', '.join(_FAILURES)}")

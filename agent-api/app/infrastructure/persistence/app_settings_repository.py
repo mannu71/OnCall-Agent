@@ -5,13 +5,13 @@ from typing import Dict, Optional
 
 from sqlalchemy import select
 
-from app.core.database import AsyncSessionLocal
+from app.infrastructure.persistence.base import BaseAsyncRepository
 from app.models.db_models import AppSettingModel
 
 logger = logging.getLogger(__name__)
 
 
-class AppSettingsRepository:
+class AppSettingsRepository(BaseAsyncRepository):
     """Repository for runtime-editable scalar app settings.
 
     Backed by the ``app_settings`` table (see migration 011). Values are stored
@@ -23,35 +23,25 @@ class AppSettingsRepository:
 
     async def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
         """Return the value for *key*, or *default* if unset."""
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(AppSettingModel).where(AppSettingModel.key == key)
-            )
-            row = result.scalar_one_or_none()
-            return row.value if row is not None else default
+        row = await self._one(select(AppSettingModel).where(AppSettingModel.key == key))
+        return row.value if row is not None else default
 
     async def set(self, key: str, value: str) -> None:
         """Insert or update *key* with *value* (upsert)."""
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
+        async def _work(session):
+            row = (await session.execute(
                 select(AppSettingModel).where(AppSettingModel.key == key)
-            )
-            row = result.scalar_one_or_none()
+            )).scalar_one_or_none()
             if row is None:
-                session.add(
-                    AppSettingModel(
-                        key=key,
-                        value=value,
-                        updated_at=datetime.now(timezone.utc),
-                    )
-                )
+                session.add(AppSettingModel(
+                    key=key, value=value, updated_at=datetime.now(timezone.utc),
+                ))
             else:
                 row.value = value
                 row.updated_at = datetime.now(timezone.utc)
-            await session.commit()
+        await self._run(_work)
 
     async def all(self) -> Dict[str, str]:
         """Return all settings as a dict."""
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(select(AppSettingModel))
-            return {row.key: row.value for row in result.scalars().all()}
+        rows = await self._all(select(AppSettingModel))
+        return {row.key: row.value for row in rows}

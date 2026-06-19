@@ -5,13 +5,13 @@ from typing import Dict, List, Optional, Any
 
 from sqlalchemy import select, delete
 
-from app.core.database import AsyncSessionLocal
+from app.infrastructure.persistence.base import BaseAsyncRepository
 from app.models.db_models import WorkflowModel
 
 logger = logging.getLogger(__name__)
 
 
-class WorkflowRepository:
+class WorkflowRepository(BaseAsyncRepository):
     """Repository for workflow data access using PostgreSQL database."""
     
     def __init__(self):
@@ -44,23 +44,19 @@ class WorkflowRepository:
         Returns:
             Workflow if found, None otherwise
         """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(WorkflowModel).where(WorkflowModel.name == workflow_name)
-            )
-            workflow = result.scalar_one_or_none()
-            return self._workflow_to_dict(workflow) if workflow else None
-    
+        workflow = await self._one(
+            select(WorkflowModel).where(WorkflowModel.name == workflow_name)
+        )
+        return self._workflow_to_dict(workflow) if workflow else None
+
     async def list_all(self) -> List[Dict[str, Any]]:
         """List all workflows.
-        
+
         Returns:
             List of all workflows
         """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(select(WorkflowModel))
-            workflows = result.scalars().all()
-            return [self._workflow_to_dict(w) for w in workflows]
+        workflows = await self._all(select(WorkflowModel))
+        return [self._workflow_to_dict(w) for w in workflows]
     
     async def save(self, workflow_data: Dict[str, Any], original_name: Optional[str] = None) -> Dict[str, Any]:
         """Save or update workflow.
@@ -73,12 +69,12 @@ class WorkflowRepository:
             Saved workflow data
         """
         name = original_name or workflow_data.get("name")
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
+
+        async def _work(session):
+            workflow = (await session.execute(
                 select(WorkflowModel).where(WorkflowModel.name == name)
-            )
-            workflow = result.scalar_one_or_none()
-            
+            )).scalar_one_or_none()
+
             if workflow:
                 # Update existing
                 for key, value in workflow_data.items():
@@ -99,10 +95,11 @@ class WorkflowRepository:
                     updated_at=datetime.now(timezone.utc)
                 )
                 session.add(workflow)
-            
-            await session.commit()
+
+            await session.flush()
             await session.refresh(workflow)
             return self._workflow_to_dict(workflow)
+        return await self._run(_work)
     
     async def delete(self, workflow_identifier: str) -> bool:
         """Delete workflow by name or numeric ID.
@@ -117,7 +114,7 @@ class WorkflowRepository:
         Returns:
             True if deleted, False if not found.
         """
-        async with AsyncSessionLocal() as session:
+        async def _work(session):
             result = await session.execute(
                 delete(WorkflowModel)
                 .where(WorkflowModel.name == workflow_identifier)
@@ -128,7 +125,6 @@ class WorkflowRepository:
                 try:
                     wid = int(workflow_identifier)
                 except (TypeError, ValueError):
-                    await session.commit()
                     return False
                 result = await session.execute(
                     delete(WorkflowModel)
@@ -136,41 +132,36 @@ class WorkflowRepository:
                     .returning(WorkflowModel.id)
                 )
                 deleted = result.scalar_one_or_none()
-            await session.commit()
             return deleted is not None
+        return await self._run(_work)
 
     async def exists(self, workflow_identifier: str) -> bool:
         """Check if a workflow exists by name or numeric ID."""
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(WorkflowModel.id).where(WorkflowModel.name == workflow_identifier)
-            )
-            if result.scalar_one_or_none() is not None:
-                return True
-            try:
-                wid = int(workflow_identifier)
-            except (TypeError, ValueError):
-                return False
-            result = await session.execute(
-                select(WorkflowModel.id).where(WorkflowModel.id == wid)
-            )
-            return result.scalar_one_or_none() is not None
-    
+        if await self._one(
+            select(WorkflowModel.id).where(WorkflowModel.name == workflow_identifier)
+        ) is not None:
+            return True
+        try:
+            wid = int(workflow_identifier)
+        except (TypeError, ValueError):
+            return False
+        return await self._one(
+            select(WorkflowModel.id).where(WorkflowModel.id == wid)
+        ) is not None
+
     async def get_workflow_by_id(self, workflow_id: int) -> Optional[Dict[str, Any]]:
         """Get workflow by ID.
-        
+
         Args:
             workflow_id: Workflow ID
-            
+
         Returns:
             Workflow if found, None otherwise
         """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(WorkflowModel).where(WorkflowModel.id == workflow_id)
-            )
-            workflow = result.scalar_one_or_none()
-            return self._workflow_to_dict(workflow) if workflow else None
+        workflow = await self._one(
+            select(WorkflowModel).where(WorkflowModel.id == workflow_id)
+        )
+        return self._workflow_to_dict(workflow) if workflow else None
     
     async def get_sql_files_for_workflow(self, workflow_name: str) -> List[str]:
         """Get SQL files for a workflow.

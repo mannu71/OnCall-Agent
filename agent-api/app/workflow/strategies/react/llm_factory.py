@@ -42,7 +42,14 @@ def build_llm(llm_config: Dict[str, Any]) -> Any:
     base_url = llm_config.get("base_url")
 
     if provider == "openai":
-        from langchain_openai import ChatOpenAI
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError as exc:  # core-only / runtime-slim omits this extra
+            raise RuntimeError(
+                "provider='openai' requires the optional 'openai' extra "
+                "(langchain-openai), which is not installed in this (slim) image. "
+                "Install it with: pip install '.[openai]', or use a Bedrock LLM node."
+            ) from exc
         kwargs: Dict[str, Any] = {
             "model": model,
             "temperature": temperature,
@@ -146,7 +153,14 @@ def build_llm(llm_config: Dict[str, Any]) -> Any:
         )
 
     if provider in ("azure", "azure_openai"):
-        from langchain_openai import AzureChatOpenAI
+        try:
+            from langchain_openai import AzureChatOpenAI
+        except ImportError as exc:  # core-only / runtime-slim omits this extra
+            raise RuntimeError(
+                "provider='azure' requires the optional 'openai' extra "
+                "(langchain-openai), which is not installed in this (slim) image. "
+                "Install it with: pip install '.[openai]', or use a Bedrock LLM node."
+            ) from exc
         kwargs: Dict[str, Any] = {
             "azure_deployment": model,
             "temperature": temperature,

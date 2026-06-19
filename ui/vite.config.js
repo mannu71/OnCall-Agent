@@ -35,6 +35,18 @@ export default defineConfig({
           'react-vendor': ['react', 'react-dom', 'react-router-dom'],
           'workflow': ['reactflow'],
           'markdown': ['react-markdown', 'remark-gfm'],
+          // Radix primitives are ~300-500KB combined; split out of the main bundle.
+          'radix': [
+            '@radix-ui/react-collapsible',
+            '@radix-ui/react-dialog',
+            '@radix-ui/react-dropdown-menu',
+            '@radix-ui/react-icons',
+            '@radix-ui/react-label',
+            '@radix-ui/react-select',
+            '@radix-ui/react-separator',
+            '@radix-ui/react-slot',
+            '@radix-ui/react-tooltip',
+          ],
         },
       },
     },

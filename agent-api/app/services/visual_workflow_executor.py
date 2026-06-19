@@ -11,6 +11,8 @@ from app.core.workflow_concurrency import workflow_semaphore
 from app.services.execution_state import execution_state
 from app.services.mcp_client_manager import MCPClientManager
 from app.workflow.executor.events import ExecutionEvent
+from app.workflow.executor.graph import build_execution_graph, execute_nodes_bfs
+from app.workflow.executor.result import build_result
 from app.workflow.executor.sanitize import sanitize_results
 # Streaming subsystem (extracted) — re-exported for backwards compatibility.
 from app.workflow.executor.streaming import (  # noqa: F401
@@ -51,11 +53,29 @@ class VisualWorkflowExecutor:
             entry = self.active_executions.get(execution_id)
             if entry is None:
                 return
+            # Stamp a monotonic per-execution sequence so a late-attaching SSE
+            # stream can replay this backlog and dedupe live events by seq.
+            seq = entry.get('_event_seq', 0) + 1
+            entry['_event_seq'] = seq
+            event.seq = seq
             events = entry.setdefault('events', [])
             events.append(event.dict())
             cap = settings.max_runtime_events
             if len(events) > cap:
                 del events[:-cap]
+
+    async def get_buffered_events(self, execution_id: str) -> List[Dict[str, Any]]:
+        """Return a snapshot of the buffered events for *execution_id*.
+
+        Each item is an ``ExecutionEvent.dict()`` (already carrying ``seq``).
+        Used by the SSE adapter to replay the backlog to a stream that attached
+        after the run started. Empty when the execution is unknown/cleaned up.
+        """
+        async with self._state_lock:
+            entry = self.active_executions.get(execution_id)
+            if entry is None:
+                return []
+            return list(entry.get('events', []))
 
     async def _mark_node_completed(self, execution_id: str, node_id: str) -> None:
         """Record a completed node under the state lock.
@@ -161,9 +181,9 @@ class VisualWorkflowExecutor:
                 if not nodes:
                     raise ValueError("Workflow has no nodes to execute")
 
-                adjacency, start_nodes, parents_of, node_map = self._build_execution_graph(nodes, edges)
-                executed, execution_results = await self._execute_nodes_bfs(
-                    execution_id, adjacency, start_nodes, parents_of, node_map
+                adjacency, start_nodes, parents_of, node_map = build_execution_graph(nodes, edges)
+                executed, execution_results = await execute_nodes_bfs(
+                    self._execute_node, adjacency, start_nodes, parents_of, node_map, execution_id,
                 )
 
                 failed_nodes = [
@@ -178,13 +198,13 @@ class VisualWorkflowExecutor:
                         error_msg = node_result.get('error', 'Unknown error')
                         error_messages.append(f"{node_id}: {error_msg}")
 
-                    result = self._build_result(
+                    result = build_result(
                         execution_id, "failed", start_time, len(executed),
                         sanitized_results=sanitize_results(execution_results),
                         error=f"Node(s) failed: {'; '.join(error_messages)}"
                     )
                 else:
-                    result = self._build_result(
+                    result = build_result(
                         execution_id, "success", start_time, len(executed),
                         sanitized_results=sanitize_results(execution_results)
                     )
@@ -209,7 +229,7 @@ class VisualWorkflowExecutor:
                 })
 
             except Exception as e:
-                result = self._build_result(execution_id, "failed", start_time, error=str(e))
+                result = build_result(execution_id, "failed", start_time, error=str(e))
                 logger.error(f"Workflow execution failed: {execution_id} - {e}")
 
                 if execution_id in self.active_executions:
@@ -232,25 +252,6 @@ class VisualWorkflowExecutor:
                 await self.cleanup_execution(execution_id)
 
             return result
-    
-    @staticmethod
-    def _build_execution_graph(nodes, edges):
-        """Backwards-compat delegator — see app.workflow.executor.graph.build_execution_graph."""
-        from app.workflow.executor.graph import build_execution_graph
-        return build_execution_graph(nodes, edges)
-
-    async def _execute_nodes_bfs(self, execution_id, adjacency, start_nodes, parents_of, node_map):
-        """Backwards-compat delegator — see app.workflow.executor.graph.execute_nodes_bfs."""
-        from app.workflow.executor.graph import execute_nodes_bfs
-        return await execute_nodes_bfs(
-            self._execute_node, adjacency, start_nodes, parents_of, node_map, execution_id,
-        )
-    
-    @staticmethod
-    def _build_result(execution_id, status, start_time, nodes_executed=0, sanitized_results=None, error=None):
-        """Backwards-compat delegator — see app.workflow.executor.result.build_result."""
-        from app.workflow.executor.result import build_result
-        return build_result(execution_id, status, start_time, nodes_executed, sanitized_results, error)
 
     async def _persist_execution(self, result: Dict[str, Any], workflow: Dict[str, Any], execution_id: str):
         """Save execution result to storage (delegates to app.workflow.executor.result)."""

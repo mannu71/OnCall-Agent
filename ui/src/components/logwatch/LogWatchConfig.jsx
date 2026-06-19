@@ -5,29 +5,22 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
-import { 
-    Plus, 
-    Trash2, 
-    Play, 
-    RefreshCw, 
+import {
+    Plus,
+    Trash2,
+    Play,
+    RefreshCw,
     Search
 } from 'lucide-react';
-
-const API_BASE_URL = 'http://localhost:8000/api/v1';
+import { logWatchService } from '@/services/logWatchService';
+import { Empty } from '@/components/ui/empty';
+import { SEVERITY_BADGE_CLASS, ALERT_STATUS_BADGE_CLASS } from '@/lib/statusStyles';
 
 // Severity Badge Component
 // eslint-disable-next-line react/prop-types
 function SeverityBadge({ severity }) {
-    const configs = {
-        critical: 'bg-red-100 text-red-800 hover:bg-red-100',
-        high: 'bg-orange-100 text-orange-800 hover:bg-orange-100',
-        medium: 'bg-yellow-100 text-yellow-800 hover:bg-yellow-100',
-        low: 'bg-blue-100 text-blue-800 hover:bg-blue-100',
-        info: 'bg-green-100 text-green-800 hover:bg-green-100'
-    };
-
     return (
-        <Badge variant="secondary" className={configs[severity] || configs.info}>
+        <Badge variant="secondary" className={SEVERITY_BADGE_CLASS[severity] || SEVERITY_BADGE_CLASS.info}>
             {severity?.toUpperCase() || 'INFO'}
         </Badge>
     );
@@ -36,15 +29,8 @@ function SeverityBadge({ severity }) {
 // Status Badge Component
 // eslint-disable-next-line react/prop-types
 function StatusBadge({ status }) {
-    const configs = {
-        new: 'bg-red-100 text-red-800 hover:bg-red-100',
-        acknowledged: 'bg-orange-100 text-orange-800 hover:bg-orange-100',
-        resolved: 'bg-green-100 text-green-800 hover:bg-green-100',
-        dismissed: 'bg-gray-100 text-gray-800 hover:bg-gray-100'
-    };
-
     return (
-        <Badge variant="secondary" className={configs[status] || configs.new}>
+        <Badge variant="secondary" className={ALERT_STATUS_BADGE_CLASS[status] || ALERT_STATUS_BADGE_CLASS.new}>
             {status?.toUpperCase() || 'NEW'}
         </Badge>
     );
@@ -124,8 +110,7 @@ export default function LogWatchConfig() {
     // API Functions
     const fetchAlerts = async () => {
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/alerts`);
-            const data = await response.json();
+            const data = await logWatchService.getAlerts();
             if (data.success) {
                 setAlerts(data.alerts);
             }
@@ -136,8 +121,7 @@ export default function LogWatchConfig() {
 
     const fetchAlertSummary = async () => {
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/alerts/summary`);
-            const data = await response.json();
+            const data = await logWatchService.getAlertSummary();
             if (data.success) {
                 setAlertSummary(data.summary);
             }
@@ -148,8 +132,7 @@ export default function LogWatchConfig() {
 
     const fetchKnownIssues = async () => {
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/known-issues`);
-            const data = await response.json();
+            const data = await logWatchService.getKnownIssues();
             if (data.success) {
                 setKnownIssues(data.issues);
             }
@@ -160,8 +143,7 @@ export default function LogWatchConfig() {
 
     const fetchPatterns = async () => {
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/patterns`);
-            const data = await response.json();
+            const data = await logWatchService.getPatterns();
             setPatterns(data);
         } catch (error) {
             console.error('Error fetching patterns:', error);
@@ -170,8 +152,7 @@ export default function LogWatchConfig() {
 
     const fetchBaselines = async () => {
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/baselines`);
-            const data = await response.json();
+            const data = await logWatchService.getBaselines();
             setBaselines(data);
         } catch (error) {
             console.error('Error fetching baselines:', error);
@@ -182,15 +163,10 @@ export default function LogWatchConfig() {
     const handleWatchLogs = async () => {
         setLoading(true);
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/watch`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    ...watchForm,
-                    log_group_names: watchForm.log_group_names.filter(g => g.trim())
-                })
+            const data = await logWatchService.watch({
+                ...watchForm,
+                log_group_names: watchForm.log_group_names.filter(g => g.trim())
             });
-            const data = await response.json();
             setWatchResults(data);
         } catch (error) {
             console.error('Error watching logs:', error);
@@ -203,16 +179,11 @@ export default function LogWatchConfig() {
     const handleDetectAnomalies = async () => {
         setLoading(true);
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/detect-anomalies`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    log_group_names: watchForm.log_group_names.filter(g => g.trim()),
-                    time_range_minutes: watchForm.time_range_minutes,
-                    sensitivity: 'medium'
-                })
+            const data = await logWatchService.detectAnomalies({
+                log_group_names: watchForm.log_group_names.filter(g => g.trim()),
+                time_range_minutes: watchForm.time_range_minutes,
+                sensitivity: 'medium'
             });
-            const data = await response.json();
             setAnomalyResults(data);
         } catch (error) {
             console.error('Error detecting anomalies:', error);
@@ -223,12 +194,7 @@ export default function LogWatchConfig() {
     // Create Alert
     const handleCreateAlert = async () => {
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/alerts`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(alertForm)
-            });
-            const data = await response.json();
+            const data = await logWatchService.createAlert(alertForm);
             if (data.success) {
                 fetchAlerts();
                 fetchAlertSummary();
@@ -242,12 +208,7 @@ export default function LogWatchConfig() {
     // Acknowledge Alert
     const handleAcknowledgeAlert = async (alertId) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/alerts/${alertId}/acknowledge`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ acknowledged_by: 'ui-user' })
-            });
-            const data = await response.json();
+            const data = await logWatchService.acknowledgeAlert(alertId, { acknowledged_by: 'ui-user' });
             if (data.success) {
                 fetchAlerts();
             }
@@ -259,12 +220,7 @@ export default function LogWatchConfig() {
     // Resolve Alert
     const handleResolveAlert = async (alertId) => {
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/alerts/${alertId}/resolve`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ resolved_by: 'ui-user', resolution: 'Resolved via UI' })
-            });
-            const data = await response.json();
+            const data = await logWatchService.resolveAlert(alertId, { resolved_by: 'ui-user', resolution: 'Resolved via UI' });
             if (data.success) {
                 fetchAlerts();
                 fetchAlertSummary();
@@ -277,12 +233,7 @@ export default function LogWatchConfig() {
     // Add Pattern
     const handleAddPattern = async () => {
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/patterns`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(patternForm)
-            });
-            const data = await response.json();
+            const data = await logWatchService.addPattern(patternForm);
             if (data.id) {
                 fetchPatterns();
             }
@@ -295,24 +246,19 @@ export default function LogWatchConfig() {
     // Add Baseline
     const handleAddBaseline = async () => {
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/baselines`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    metric_name: baselineForm.metric_name,
-                    log_group: baselineForm.log_group,
-                    normal_range: {
-                        min: baselineForm.normal_range_min,
-                        max: baselineForm.normal_range_max
-                    },
-                    thresholds: {
-                        warning: baselineForm.threshold_warning,
-                        critical: baselineForm.threshold_critical
-                    },
-                    time_window: baselineForm.time_window
-                })
+            const data = await logWatchService.addBaseline({
+                metric_name: baselineForm.metric_name,
+                log_group: baselineForm.log_group,
+                normal_range: {
+                    min: baselineForm.normal_range_min,
+                    max: baselineForm.normal_range_max
+                },
+                thresholds: {
+                    warning: baselineForm.threshold_warning,
+                    critical: baselineForm.threshold_critical
+                },
+                time_window: baselineForm.time_window
             });
-            const data = await response.json();
             if (data.id) {
                 fetchBaselines();
             }
@@ -325,15 +271,10 @@ export default function LogWatchConfig() {
     // Add Known Issue
     const handleAddKnownIssue = async () => {
         try {
-            const response = await fetch(`${API_BASE_URL}/log-watch/known-issues`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    ...issueForm,
-                    symptoms: issueForm.symptoms.filter(s => s.trim())
-                })
+            const data = await logWatchService.addKnownIssue({
+                ...issueForm,
+                symptoms: issueForm.symptoms.filter(s => s.trim())
             });
-            const data = await response.json();
             if (data.success) {
                 fetchKnownIssues();
             }
@@ -469,8 +410,8 @@ export default function LogWatchConfig() {
                                 <TableBody>
                                     {alerts.length === 0 ? (
                                         <TableRow>
-                                            <TableCell colSpan={8} className="text-center text-muted-foreground py-8">
-                                                No alerts found
+                                            <TableCell colSpan={8} className="p-0">
+                                                <Empty title="No alerts found" description="Active alerts will appear here once log watching detects an issue." />
                                             </TableCell>
                                         </TableRow>
                                     ) : (

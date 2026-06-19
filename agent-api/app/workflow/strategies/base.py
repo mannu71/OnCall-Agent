@@ -22,7 +22,7 @@ class BaseStrategy(ABC):
     - RouterStrategy: Semantic routing between agents
 
     SQL orchestration runs via ``workflow/executor/handlers/orchestrator.py``
-    and ``services/sql_pipeline/``, not through WorkflowEngine strategies.
+    and ``services/sql_pipeline/``.
     """
     
     def __init__(self):

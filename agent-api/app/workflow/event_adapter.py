@@ -43,6 +43,8 @@ async def execution_event_stream(
     """
     from app.services.visual_workflow_executor import visual_executor
 
+    # Subscribe BEFORE snapshotting the backlog so events published in the gap
+    # land in the queue (and get deduped by seq below) rather than being lost.
     queue = visual_executor.subscribe_to_events(execution_id)
     loop = asyncio.get_event_loop()
 
@@ -52,6 +54,23 @@ async def execution_event_stream(
             f"event: connected\n"
             f"data: {json.dumps({'execution_id': execution_id, 'workflow_name': workflow_name})}\n\n"
         )
+
+        # Replay any backlog buffered before this stream attached. The by-name
+        # stream polls up to 10s for the run to start, so without this the
+        # opening llm_token / tool_call events (and a fast run's terminal event)
+        # would never reach the client. Track the high-water seq so the live
+        # loop skips events already replayed here.
+        last_seq = 0
+        replayed_terminal = False
+        for d in await visual_executor.get_buffered_events(execution_id):
+            yield f"event: {d['event_type']}\ndata: {json.dumps(d)}\n\n"
+            s = d.get("seq") or 0
+            if s > last_seq:
+                last_seq = s
+            if d["event_type"] in _TERMINAL_EVENTS:
+                replayed_terminal = True
+        if replayed_terminal:
+            return  # run already finished — finally block emits stream_end
 
         deadline = loop.time() + STREAM_TIMEOUT_SECONDS
         last_heartbeat = loop.time()
@@ -78,6 +97,13 @@ async def execution_event_stream(
                 )
             except asyncio.TimeoutError:
                 continue  # loop around → emit heartbeat if needed
+
+            # Skip events already delivered via the backlog replay above.
+            s = getattr(event, "seq", 0) or 0
+            if s and last_seq and s <= last_seq:
+                continue
+            if s > last_seq:
+                last_seq = s
 
             yield event.to_sse()
 

@@ -42,6 +42,19 @@ async def assemble_base_tools(
 
     expired_creds_msg: Optional[str] = None
 
+    # Query-aware gate: a purely conversational turn (e.g. "Hi") needs no logs, so
+    # skip binding CloudWatch tools — this also skips the STS credential pre-flight
+    # that would otherwise abort the whole turn on an expired token. Real queries
+    # still bind the tools (and still get the expired-creds guard).
+    from app.core.intent import is_conversational
+    if cloudwatch_config and is_conversational(user_query):
+        logger_instance.info(
+            "ReactStrategy: conversational turn — skipping CloudWatch tool binding (exec=%s)",
+            execution_id,
+            extra={"execution_id": execution_id},
+        )
+        cloudwatch_config = None
+
     if cloudwatch_config:
         try:
             from app.core.aws_credentials import resolve_aws_credentials
@@ -177,32 +190,72 @@ def add_extension_tools(
 ) -> List[Any]:
     """Append the LLM-dependent extension tools (delegate + edit), in place.
 
-    Added only when code tools are present: the depth-1 sub-agent delegate tool
-    (built from a snapshot of the current tools, so it never includes itself or
-    the edit tool) and the gated code-edit tool. Returns the same list for
-    call-site convenience.
+    Two groups are appended here:
+
+    1. **Code path** (only when code tools are present): the depth-1
+       ``delegate_investigation`` tool (built from a snapshot of the current
+       tools, so it never includes itself or the edit tool) and the gated
+       code-edit tool — unchanged behaviour.
+    2. **Deep-agent capabilities** (gated by the agent profile flags resolved from
+       ``agent_config``): planning (write_todos), virtual filesystem (fs_*), and
+       generalized named subagents (delegate_to_<name>). All OFF by default, so an
+       agent that opts into none of them gets the exact previous tool set.
+
+    Returns the same list for call-site convenience.
     """
-    if not code_analyzer_config:
-        return tools
-
-    # On-demand subagent delegation (depth-1). The sub-agent is built from a
-    # snapshot WITHOUT this tool, so it cannot fan out further.
-    try:
-        from app.workflow.strategies.react.subagent import build_delegate_tool
-        tools.append(
-            build_delegate_tool(
-                llm, list(tools), agent_config, parent_execution_id=execution_id,
+    if code_analyzer_config:
+        # On-demand subagent delegation (depth-1). The sub-agent is built from a
+        # snapshot WITHOUT this tool, so it cannot fan out further.
+        try:
+            from app.workflow.strategies.react.subagent import build_delegate_tool
+            tools.append(
+                build_delegate_tool(
+                    llm, list(tools), agent_config, parent_execution_id=execution_id,
+                )
             )
-        )
-    except Exception as _de:  # noqa: BLE001
-        logger_instance.warning("ReactStrategy: delegate tool skipped (%s)", _de)
+        except Exception as _de:  # noqa: BLE001
+            logger_instance.warning("ReactStrategy: delegate tool skipped (%s)", _de)
 
-    # Code-edit tool (apply fixes). Gated as 'ask' by the permission layer, so
-    # every edit needs operator approval.
+        # Code-edit tool (apply fixes). Gated as 'ask' by the permission layer, so
+        # every edit needs operator approval.
+        try:
+            from app.workflow.strategies.react.edit_tools import build_edit_tools
+            tools.extend(build_edit_tools())
+        except Exception as _ee:  # noqa: BLE001
+            logger_instance.warning("ReactStrategy: edit tool skipped (%s)", _ee)
+
+    # ── Deep-agent capabilities (profile-gated, off by default) ───────────────
     try:
-        from app.workflow.strategies.react.edit_tools import build_edit_tools
-        tools.extend(build_edit_tools())
-    except Exception as _ee:  # noqa: BLE001
-        logger_instance.warning("ReactStrategy: edit tool skipped (%s)", _ee)
+        from app.harness.spec_factory import resolve_profile_fields
+        _flags = resolve_profile_fields(agent_config)
+    except Exception:  # noqa: BLE001
+        _flags = {"planning": False, "filesystem": False, "subagents": []}
+
+    if _flags.get("planning"):
+        try:
+            from app.workflow.strategies.react.planning_tools import build_planning_tools
+            tools.extend(build_planning_tools(execution_id))
+        except Exception as _pe:  # noqa: BLE001
+            logger_instance.warning("ReactStrategy: planning tools skipped (%s)", _pe)
+
+    if _flags.get("filesystem"):
+        try:
+            from app.core.vfs import build_vfs_tools, bind_session
+            bind_session(execution_id)
+            tools.extend(build_vfs_tools(execution_id))
+        except Exception as _fe:  # noqa: BLE001
+            logger_instance.warning("ReactStrategy: vfs tools skipped (%s)", _fe)
+
+    if _flags.get("subagents"):
+        try:
+            from app.workflow.strategies.react.subagent_factory import build_subagent_tools
+            tools.extend(
+                build_subagent_tools(
+                    llm, list(tools), agent_config, _flags["subagents"],
+                    parent_execution_id=execution_id,
+                )
+            )
+        except Exception as _se:  # noqa: BLE001
+            logger_instance.warning("ReactStrategy: subagent tools skipped (%s)", _se)
 
     return tools

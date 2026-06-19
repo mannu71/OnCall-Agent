@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Any
 
 from sqlalchemy import select, delete, update
 
-from app.core.database import AsyncSessionLocal
+from app.infrastructure.persistence.base import BaseAsyncRepository
 from app.models.db_models import LLMConfigModel
 from app.services.credential_transformer import CredentialTransformer
 from app.services.provider_schema_registry import ProviderSchema
@@ -13,60 +13,31 @@ from app.services.provider_schema_registry import ProviderSchema
 logger = logging.getLogger(__name__)
 
 
-class LLMConfigRepository:
+class LLMConfigRepository(BaseAsyncRepository):
     """Repository for LLM configuration data access."""
-    
+
     def __init__(self):
         """Initialize LLM config repository."""
         logger.info("LLMConfigRepository initialized")
-    
+
     async def list_all(self) -> Dict[str, Dict[str, Any]]:
-        """List all LLM configurations.
-        
-        Returns:
-            Dictionary of LLM configurations keyed by name
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(select(LLMConfigModel))
-            configs = result.scalars().all()
-            return {
-                config.name: self._llm_config_to_dict(config)
-                for config in configs
-            }
-    
+        """List all LLM configurations keyed by name."""
+        configs = await self._all(select(LLMConfigModel))
+        return {config.name: self._llm_config_to_dict(config) for config in configs}
+
     async def get_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        """Get LLM configuration by name.
-        
-        Args:
-            name: Configuration name
-            
-        Returns:
-            LLM config dict or None
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(LLMConfigModel).where(LLMConfigModel.name == name)
-            )
-            config = result.scalar_one_or_none()
-            return self._llm_config_to_dict(config) if config else None
-    
+        """Get LLM configuration by name, or None."""
+        config = await self._one(select(LLMConfigModel).where(LLMConfigModel.name == name))
+        return self._llm_config_to_dict(config) if config else None
+
     async def create(self, config_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Create a new LLM configuration.
-        
-        Args:
-            config_data: Configuration data
-            
-        Returns:
-            Created configuration dict
-        """
-        async with AsyncSessionLocal() as session:
+        """Create a new LLM configuration and return it."""
+        async def _work(session):
             use_for_embeddings = config_data.get("use_for_embeddings") or config_data.get("useForEmbeddings", False)
-            
             if use_for_embeddings:
                 await session.execute(
                     update(LLMConfigModel).values(use_for_embeddings=False)
                 )
-            
             config = LLMConfigModel(
                 name=config_data["name"],
                 provider=config_data["provider"],
@@ -84,35 +55,25 @@ class LLMConfigRepository:
                 updated_at=datetime.now(timezone.utc),
             )
             session.add(config)
-            await session.commit()
+            await session.flush()
             await session.refresh(config)
             return self._llm_config_to_dict(config)
-    
+        return await self._run(_work)
+
     async def update(self, name: str, config_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Update an existing LLM configuration.
-        
-        Args:
-            name: Configuration name
-            config_data: Fields to update
-            
-        Returns:
-            Updated configuration dict or None
-        """
-        async with AsyncSessionLocal() as session:
+        """Update an existing LLM configuration; return it, or None."""
+        async def _work(session):
             use_for_embeddings = config_data.get("use_for_embeddings") or config_data.get("useForEmbeddings")
-            
             if use_for_embeddings:
                 await session.execute(
                     update(LLMConfigModel).values(use_for_embeddings=False)
                 )
-            
-            result = await session.execute(
+            config = (await session.execute(
                 select(LLMConfigModel).where(LLMConfigModel.name == name)
-            )
-            config = result.scalar_one_or_none()
+            )).scalar_one_or_none()
             if not config:
                 return None
-            
+
             field_map = {
                 "provider": "provider",
                 "model": "model",
@@ -132,14 +93,14 @@ class LLMConfigRepository:
             for json_key, col_name in field_map.items():
                 if json_key in config_data:
                     setattr(config, col_name, config_data[json_key])
-            
             if "name" in config_data and config_data["name"] != name:
                 config.name = config_data["name"]
-            
             config.updated_at = datetime.now(timezone.utc)
-            await session.commit()
+
+            await session.flush()
             await session.refresh(config)
             return self._llm_config_to_dict(config)
+        return await self._run(_work)
     
     async def upsert(self, name: str, config_data: Dict[str, Any]) -> Dict[str, Any]:
         """Insert or update LLM configuration by name.
@@ -165,38 +126,25 @@ class LLMConfigRepository:
         Returns:
             True if deleted, False if not found
         """
-        async with AsyncSessionLocal() as session:
+        async def _work(session):
             result = await session.execute(
                 delete(LLMConfigModel).where(LLMConfigModel.name == name).returning(LLMConfigModel.id)
             )
-            deleted = result.scalar_one_or_none()
-            await session.commit()
-            return deleted is not None
-    
-    async def exists(self, name: str) -> bool:
-        """Check if LLM configuration exists.
-        
-        Args:
-            name: Configuration name
-            
-        Returns:
-            True if exists
-        """
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(LLMConfigModel.id).where(LLMConfigModel.name == name)
-            )
             return result.scalar_one_or_none() is not None
+        return await self._run(_work)
+
+    async def exists(self, name: str) -> bool:
+        """Return True if an LLM configuration named *name* exists."""
+        row = await self._one(select(LLMConfigModel.id).where(LLMConfigModel.name == name))
+        return row is not None
 
     async def find_existing_names(self, names: List[str]) -> set[str]:
         """Return the subset of *names* that already exist in the DB."""
         if not names:
             return set()
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(LLMConfigModel.name).where(LLMConfigModel.name.in_(names))
-            )
-            return set(result.scalars().all())
+        return set(await self._all(
+            select(LLMConfigModel.name).where(LLMConfigModel.name.in_(names))
+        ))
 
     async def mark_discovered_existing(
         self, discovered: List[Dict[str, Any]], *, key: str = "name"

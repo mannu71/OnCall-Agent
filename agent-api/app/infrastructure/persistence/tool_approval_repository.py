@@ -10,13 +10,13 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select, update
 
-from app.core.database import AsyncSessionLocal
+from app.infrastructure.persistence.base import BaseAsyncRepository
 from app.models.db_models import ToolApprovalModel
 
 logger = logging.getLogger(__name__)
 
 
-class ToolApprovalRepository:
+class ToolApprovalRepository(BaseAsyncRepository):
     """Durable audit trail for ``ask`` tool permission gates."""
 
     async def record_pending(
@@ -28,7 +28,7 @@ class ToolApprovalRepository:
     ) -> None:
         """Insert a ``pending`` row before the agent blocks on approval."""
         try:
-            async with AsyncSessionLocal() as session:
+            async def _work(session):
                 session.add(ToolApprovalModel(
                     execution_id=str(execution_id),
                     request_id=str(request_id),
@@ -37,7 +37,7 @@ class ToolApprovalRepository:
                     decision="pending",
                     created_at=datetime.now(timezone.utc),
                 ))
-                await session.commit()
+            await self._run(_work)
         except Exception as exc:  # noqa: BLE001 — audit must never break HITL
             logger.warning(
                 "ToolApprovalRepository.record_pending failed (exec=%s req=%s): %s",
@@ -55,7 +55,7 @@ class ToolApprovalRepository:
     ) -> None:
         """Update the row with the resolved decision (approved|denied|timeout)."""
         try:
-            async with AsyncSessionLocal() as session:
+            async def _work(session):
                 await session.execute(
                     update(ToolApprovalModel)
                     .where(
@@ -69,7 +69,7 @@ class ToolApprovalRepository:
                         decided_at=datetime.now(timezone.utc),
                     )
                 )
-                await session.commit()
+            await self._run(_work)
         except Exception as exc:  # noqa: BLE001 — audit must never break HITL
             logger.warning(
                 "ToolApprovalRepository.record_decision failed (exec=%s req=%s): %s",
@@ -79,13 +79,12 @@ class ToolApprovalRepository:
     async def list_for_execution(self, execution_id: str) -> List[Dict[str, Any]]:
         """Return all approval records for an execution (newest first)."""
         try:
-            async with AsyncSessionLocal() as session:
-                result = await session.execute(
-                    select(ToolApprovalModel)
-                    .where(ToolApprovalModel.execution_id == str(execution_id))
-                    .order_by(ToolApprovalModel.created_at.desc())
-                )
-                return [self._to_dict(r) for r in result.scalars().all()]
+            rows = await self._all(
+                select(ToolApprovalModel)
+                .where(ToolApprovalModel.execution_id == str(execution_id))
+                .order_by(ToolApprovalModel.created_at.desc())
+            )
+            return [self._to_dict(r) for r in rows]
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "ToolApprovalRepository.list_for_execution failed (exec=%s): %s",

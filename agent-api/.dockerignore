@@ -23,4 +23,5 @@ htmlcov
 .DS_Store
 README.md
 tests/
+evals/
 docker-compose.yml

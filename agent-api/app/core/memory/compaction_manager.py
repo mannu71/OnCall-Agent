@@ -124,7 +124,9 @@ class ContextCompactionManager:
     keep_recent_tokens:
         Minimum recent history to keep outside the summary (default 20_000).
     summarization_model:
-        Model id for the LLM summarization call.
+        Model id for the LLM summarization call. When None (default), it is
+        resolved lazily from the user's configured model (Settings → LLM Configs,
+        via the DB) — no model is hardcoded.
     compaction_threshold_fraction:
         Fraction of ``window_size - reserve_tokens`` at which compaction
         triggers (default 0.85 — compact when 85% of the budget is used).
@@ -135,14 +137,23 @@ class ContextCompactionManager:
         transport: Any,
         *,
         session_id: str = "default",
-        window_size: int = 200_000,
+        window_size: Optional[int] = None,
+        model: Optional[str] = None,
         reserve_tokens: int = 16_384,
         keep_recent_tokens: int = 20_000,
-        summarization_model: str = "anthropic/claude-3-5-haiku-latest",
+        summarization_model: Optional[str] = None,
         compaction_threshold_fraction: float = 0.85,
     ) -> None:
         self._transport = transport
         self._session_id = session_id
+        # Model-aware window: an explicit window_size wins; otherwise derive from
+        # *model* (best-effort, offline); otherwise the historical 200K default.
+        if window_size is None:
+            if model:
+                from app.core.model_metadata import window_size_for_model
+                window_size = window_size_for_model(model)
+            else:
+                window_size = 200_000
         self._window_size = window_size
         self._reserve_tokens = reserve_tokens
         self._keep_recent_tokens = keep_recent_tokens
@@ -190,7 +201,7 @@ class ContextCompactionManager:
             reserve_tokens=self._reserve_tokens,
             keep_recent_tokens=self._keep_recent_tokens,
             prior_summary=prior_summary,
-            summarization_model=self._summarization_model,
+            summarization_model=await self._resolve_summarization_model(),
         )
 
         await self._save_summary(new_summary)
@@ -203,6 +214,29 @@ class ContextCompactionManager:
         )
 
         return compacted
+
+    async def _resolve_summarization_model(self) -> str:
+        """Resolve the summarization model from user config (no hardcoded model).
+
+        Uses an explicitly-provided model if given; otherwise resolves the user's
+        configured model from the DB (Settings → LLM Configs), with the same
+        Bedrock inference-profile remapping the agent uses. Resolved once, cached.
+        """
+        if self._summarization_model:
+            return self._summarization_model
+        try:
+            from app.crawler.call_llm import _resolve_llm_config
+            cfg = await _resolve_llm_config()
+            self._summarization_model = cfg["model"]
+        except Exception as exc:  # noqa: BLE001 — never break compaction
+            logger.warning(
+                "ContextCompactionManager[%s]: could not resolve summarization "
+                "model from config (%s)", self._session_id, exc,
+            )
+            # Last resort: the configured crawler/default model id from settings.
+            from app.config import settings as _settings
+            self._summarization_model = _settings.crawler_model
+        return self._summarization_model
 
     def get_current_summary(self) -> Optional[StructuredSummary]:
         """Return the persisted summary for this session, if any."""

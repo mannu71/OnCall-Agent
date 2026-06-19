@@ -105,16 +105,20 @@ async def lifespan(app: FastAPI):
     # Re-fire any repo indexing that was interrupted by a previous restart so
     # workflows don't stay stuck on indexing_status='indexing' forever. The
     # in-process indexer task dies with the process; this heals on next boot.
-    try:
-        # Reap background jobs left 'running' by a previous process, then re-fire
-        # any workflows still stuck mid-index so they self-heal.
-        from app.services.background_jobs import background_job_store
-        from app.crawler.background_indexer import recover_interrupted_indexing
+    # Skipped under APP_PROFILE=lite (crawler-light deployments).
+    if settings.startup_indexing_recovery_enabled:
+        try:
+            # Reap background jobs left 'running' by a previous process, then re-fire
+            # any workflows still stuck mid-index so they self-heal.
+            from app.services.background_jobs import background_job_store
+            from app.crawler.background_indexer import recover_interrupted_indexing
 
-        await background_job_store.reap_orphans()
-        await recover_interrupted_indexing()
-    except Exception as e:
-        logger.warning(f"Indexing recovery skipped: {e}")
+            await background_job_store.reap_orphans()
+            await recover_interrupted_indexing()
+        except Exception as e:
+            logger.warning(f"Indexing recovery skipped: {e}")
+    else:
+        logger.info("Startup indexing recovery disabled (APP_PROFILE=lite or flag off)")
 
     # Populate the tool registry (built-in + MCP-discovered) so the catalog is
     # available via GET /api/v1/tools. Discovery-only in Phase 1; never fatal.

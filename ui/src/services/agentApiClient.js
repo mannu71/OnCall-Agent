@@ -65,6 +65,37 @@ export function extractFinalAnswer(data) {
     return best;
 }
 
+export function extractPrivacyRedactions(data) {
+    // The agent node returns `privacy_redactions`: a UI-safe list of
+    // { type, placeholder, preview } rows (never raw values) describing the PII
+    // pseudonymized before the turn reached Bedrock. Prefer the agent node's.
+    if (!data || typeof data !== 'object') return [];
+    if (Array.isArray(data.privacy_redactions)) return data.privacy_redactions;
+    for (const c of _nodeContainers(data)) {
+        for (const v of Object.values(c)) {
+            if (v && typeof v === 'object' && Array.isArray(v.privacy_redactions)) {
+                return v.privacy_redactions;
+            }
+        }
+    }
+    return [];
+}
+
+export function extractSelectedSkills(data) {
+    // `selected_skills`: names of markdown skills the agent auto-selected (RAG)
+    // for this query, surfaced as a badge so the selection is visible.
+    if (!data || typeof data !== 'object') return [];
+    if (Array.isArray(data.selected_skills)) return data.selected_skills;
+    for (const c of _nodeContainers(data)) {
+        for (const v of Object.values(c)) {
+            if (v && typeof v === 'object' && Array.isArray(v.selected_skills)) {
+                return v.selected_skills;
+            }
+        }
+    }
+    return [];
+}
+
 export function extractTokens(data) {
     if (!data || typeof data !== 'object') return null;
     if (data.input_tokens != null || data.output_tokens != null || data.total_tokens != null) {
@@ -144,6 +175,9 @@ export const agentApiClient = {
         if (o.userQuery) params.query = o.userQuery;
         if (o.outputMode) params.output_mode = o.outputMode;
         if (o.permissionMode) params.permission_mode = o.permissionMode;
+        // When a persisted chat session is active, the backend records the user
+        // and assistant turns against it so the conversation survives a refresh.
+        if (o.sessionId) params.session_id = o.sessionId;
         // Conversation memory: prior turns sent in the body as inputs.history so
         // follow-up questions keep context across messages.
         const body = (Array.isArray(o.history) && o.history.length)
@@ -229,17 +263,58 @@ export const agentApiClient = {
         // 2) Synchronous run → the response carries the authoritative result.
         try {
             const data = await this.executeWorkflow(workflowName, {
-                background: false, userQuery, history: h.history,
+                background: false, userQuery, history: h.history, sessionId: h.sessionId,
             });
             if (data && data.status === 'already_running') {
                 throw new Error(`Agent "${workflowName}" is already running. Wait for it to finish.`);
             }
             const finalAnswer = extractFinalAnswer(data);
             const tokens = extractTokens(data);
-            return { finalAnswer, tokens, raw: data };
+            const privacyRedactions = extractPrivacyRedactions(data);
+            const selectedSkills = extractSelectedSkills(data);
+            return { finalAnswer, tokens, privacyRedactions, selectedSkills, raw: data };
         } finally {
             if (es) { try { es.close(); } catch { /* noop */ } }
         }
+    },
+
+    // ==================== Chat Sessions ====================
+
+    /** List chat sessions (metadata only), most-recently-active first. */
+    async listSessions({ includeArchived = false, limit = 100 } = {}) {
+        const response = await client.get('/api/v1/sessions', {
+            params: { include_archived: includeArchived, limit },
+        });
+        return response.data;
+    },
+
+    /** Create a new (empty) chat session. */
+    async createSession({ title = 'New chat', workflowName = null, model = null } = {}) {
+        const response = await client.post('/api/v1/sessions', {
+            title, workflow_name: workflowName, model,
+        });
+        return response.data;
+    },
+
+    /** Fetch one session with its hydrated message history. */
+    async getSession(sessionId) {
+        const response = await client.get(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
+        return response.data;
+    },
+
+    /** Rename / archive / pin a session (any subset of fields). */
+    async updateSession(sessionId, { title, archived, isImportant } = {}) {
+        const body = {};
+        if (title !== undefined) body.title = title;
+        if (archived !== undefined) body.archived = archived;
+        if (isImportant !== undefined) body.is_important = isImportant;
+        const response = await client.patch(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, body);
+        return response.data;
+    },
+
+    /** Delete a session and all its messages. */
+    async deleteSession(sessionId) {
+        await client.delete(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
     },
 
     /**
@@ -509,6 +584,42 @@ export const agentApiClient = {
      */
     async listCrawlerRepos() {
         const response = await client.get('/api/v1/crawler/repos');
+        return response.data;
+    },
+
+    // ==================== Agent Profiles ====================
+    // Reusable agent profiles let a user configure any type of agent
+    // (support, data-analysis, …) — see migration 025_agent_profiles.
+
+    async listAgentProfiles() {
+        const response = await client.get('/api/v1/agent-profiles');
+        return response.data; // { success, profiles: [...] }
+    },
+
+    /** Building blocks for the profile editor: output schemas + capability ids. */
+    async getAgentProfileCatalog() {
+        const response = await client.get('/api/v1/agent-profiles/catalog');
+        return response.data; // { success, output_schemas, capabilities }
+    },
+
+    async getAgentProfile(name) {
+        const response = await client.get(`/api/v1/agent-profiles/${encodeURIComponent(name)}`);
+        return response.data;
+    },
+
+    /** Create or update a (non-builtin) agent profile. */
+    async saveAgentProfile(name, body) {
+        const response = await client.put(
+            `/api/v1/agent-profiles/${encodeURIComponent(name)}`,
+            body,
+        );
+        return response.data;
+    },
+
+    async deleteAgentProfile(name) {
+        const response = await client.delete(
+            `/api/v1/agent-profiles/${encodeURIComponent(name)}`,
+        );
         return response.data;
     },
 

@@ -62,6 +62,9 @@ Schema:
   "title":            "<human-readable title, max 120 chars>",
   "description":      "<one paragraph describing when to use this skill>",
   "trigger_patterns": ["<3-5 short phrases that indicate this skill is relevant>"],
+  "confidence":       0.0,
+  "pitfalls":         ["<optional failure modes / gotchas>"],
+  "verification":     ["<optional ways to confirm success>"],
   "steps": [
     {
       "order":          1,
@@ -80,6 +83,8 @@ Rules:
 - If a step requires human judgement and no tool, set tool to null.
 - Keep steps concrete and specific — not "check the logs" but "call cloudwatch_get_logs with log_group={log_group}".
 - Maximum 10 steps.
+- confidence is 0.0–1.0: how reliably this generalises to future incidents. A
+  one-off or shaky procedure scores low (<0.6); a clean, repeatable fix scores high.
 """
 
 _DISTILL_USER = """\
@@ -246,16 +251,23 @@ class SkillService:
         # Ensure steps are sorted by order
         steps = sorted(steps, key=lambda s: s.get("order", 99))
 
+        # Confidence-gated activation: a low-confidence distillation lands as
+        # 'draft' (excluded from recall) until proven.
+        confidence = _coerce_confidence(skill_dict.get("confidence"))
+        status = "active" if confidence >= settings.skill_confidence_min else "draft"
+        description = _compose_description(skill_dict)
+
         async with AsyncSessionLocal() as session:
             stmt = pg_insert(SkillModel).values(
                 name             = name,
                 title            = title,
-                description      = (skill_dict.get("description") or "")[:2000],
+                description      = description,
                 trigger_patterns = skill_dict.get("trigger_patterns") or [],
                 steps            = steps,
                 workflow_name    = skill_dict.get("workflow_name"),
                 source           = "distilled",
-                status           = "active",
+                status           = status,
+                confidence       = confidence,
                 success_count    = 0,
                 recall_count     = 0,
                 created_at       = datetime.now(timezone.utc),
@@ -264,11 +276,12 @@ class SkillService:
                 index_elements=["name"],
                 set_={
                     "title":            title,
-                    "description":      (skill_dict.get("description") or "")[:2000],
+                    "description":      description,
                     "trigger_patterns": skill_dict.get("trigger_patterns") or [],
                     "steps":            steps,
                     "source":           "distilled",
-                    "status":           "active",
+                    "status":           status,
+                    "confidence":       confidence,
                     "updated_at":       datetime.now(timezone.utc),
                 },
             ).returning(SkillModel.id)
@@ -595,6 +608,92 @@ class SkillService:
             return None
 
     # ------------------------------------------------------------------
+    # Audit / curation (the "weekly curator" promised in this module's docstring)
+    # ------------------------------------------------------------------
+
+    async def audit(self) -> Dict[str, int]:
+        """Self-curate the skills table (draft→published lifecycle).
+
+        Four deterministic, LLM-free passes:
+          1. **Promote proven drafts** — a draft with enough successful runs
+             graduates to 'active' (proven-by-use).
+          2. **Archive shaky drafts** — a low-confidence draft that has never
+             been recalled is archived (it never earned its place).
+          3. **Dedupe near-duplicate titles** — among active skills sharing a
+             normalised title, keep the most-used and archive the rest.
+          4. Records an ``audit_verdict`` on each touched row.
+
+        Returns counts per pass. Safe to run repeatedly (idempotent verdicts).
+        """
+        from sqlalchemy import select, update
+        from app.models.db_models import SkillModel
+        from app.core.database import AsyncSessionLocal
+
+        promoted = archived = deduped = 0
+        now = datetime.now(timezone.utc)
+        promote_threshold = settings.skill_promote_success_count
+
+        try:
+            async with AsyncSessionLocal() as session:
+                # 1. Promote proven drafts.
+                res = await session.execute(
+                    update(SkillModel)
+                    .where(
+                        SkillModel.status == "draft",
+                        SkillModel.success_count >= promote_threshold,
+                    )
+                    .values(status="active", audit_verdict="promoted", updated_at=now)
+                )
+                promoted = res.rowcount or 0
+
+                # 2. Archive shaky, never-recalled drafts.
+                res = await session.execute(
+                    update(SkillModel)
+                    .where(
+                        SkillModel.status == "draft",
+                        SkillModel.recall_count == 0,
+                        SkillModel.confidence < settings.skill_confidence_min,
+                    )
+                    .values(status="archived", audit_verdict="archived", updated_at=now)
+                )
+                archived = res.rowcount or 0
+
+                # 3. Dedupe near-duplicate titles among active skills.
+                active = (
+                    await session.execute(
+                        select(SkillModel).where(SkillModel.status == "active")
+                    )
+                ).scalars().all()
+                by_title: Dict[str, List[SkillModel]] = {}
+                for s in active:
+                    key = _normalize_title(s.title)
+                    by_title.setdefault(key, []).append(s)
+                for dupes in by_title.values():
+                    if len(dupes) < 2:
+                        continue
+                    # Keep the most-used (recall+success); archive the others.
+                    dupes.sort(
+                        key=lambda s: (s.recall_count or 0) + (s.success_count or 0),
+                        reverse=True,
+                    )
+                    for victim in dupes[1:]:
+                        victim.status = "archived"
+                        victim.audit_verdict = "deduped"
+                        victim.updated_at = now
+                        deduped += 1
+
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001 — audit is best-effort
+            logger.warning("SkillService.audit: failed — %s", exc)
+
+        if promoted or archived or deduped:
+            logger.info(
+                "SkillService.audit: promoted=%d archived=%d deduped=%d",
+                promoted, archived, deduped,
+            )
+        return {"promoted": promoted, "archived": archived, "deduped": deduped}
+
+    # ------------------------------------------------------------------
     # Getters
     # ------------------------------------------------------------------
 
@@ -711,6 +810,36 @@ class SkillService:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _normalize_title(title: str) -> str:
+    """Lowercase, strip punctuation/extra space — for near-duplicate detection."""
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", (title or "").lower())).strip()
+
+
+def _coerce_confidence(value: Any) -> float:
+    """Clamp a model-provided confidence to [0,1]; default 0.5 when missing/bad."""
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def _compose_description(skill_dict: Dict[str, Any]) -> str:
+    """Build the stored description, folding in pitfalls/verification sections.
+
+    The skills table has no separate columns for these, so they ride along in
+    the description (capped) — keeping the richer schema without a migration
+    that the execution loop would have to learn about.
+    """
+    parts = [(skill_dict.get("description") or "").strip()]
+    pitfalls = [str(p).strip() for p in (skill_dict.get("pitfalls") or []) if str(p).strip()]
+    verification = [str(v).strip() for v in (skill_dict.get("verification") or []) if str(v).strip()]
+    if pitfalls:
+        parts.append("Pitfalls: " + "; ".join(pitfalls))
+    if verification:
+        parts.append("Verify: " + "; ".join(verification))
+    return "\n".join(p for p in parts if p)[:2000]
+
+
 def _slugify(text: str) -> str:
     """Convert *text* to a lowercase snake_case slug."""
     text = text.lower().strip()
@@ -764,6 +893,8 @@ def _skill_to_dict(skill: Any) -> Dict[str, Any]:
         "workflow_name":    skill.workflow_name,
         "source":           skill.source,
         "status":           skill.status,
+        "confidence":       float(skill.confidence) if skill.confidence is not None else None,
+        "audit_verdict":    skill.audit_verdict,
         "success_count":    skill.success_count or 0,
         "recall_count":     skill.recall_count or 0,
         "last_used_at":     skill.last_used_at.isoformat() if skill.last_used_at else None,

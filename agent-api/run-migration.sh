@@ -42,6 +42,16 @@ MIGRATIONS=(
   "migrations/013_background_jobs.sql"
   "migrations/014_gateway_assignments.sql"
   "migrations/015_project_intelligence.sql"
+  "migrations/016_policy_sets.sql"
+  "migrations/017_model_keys_multikey.sql"
+  "migrations/018_semantic_memory.sql"
+  "migrations/019_embeddings_titan_v2.sql"
+  "migrations/020_pinned_facts.sql"
+  "migrations/021_drop_atropos.sql"
+  "migrations/022_chat_sessions.sql"
+  "migrations/023_skill_confidence.sql"
+  "migrations/024_drop_known_issues_leftover.sql"
+  "migrations/025_agent_profiles.sql"
 )
 
 for migration in "${MIGRATIONS[@]}"; do

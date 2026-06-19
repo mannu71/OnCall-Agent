@@ -11,7 +11,8 @@ def build_node_result(value: Dict[str, Any]) -> Dict[str, Any]:
                   'input_tokens', 'output_tokens', 'total_tokens',
                   'final_answer', 'structured_output', 'output_mode',
                   'tool_calls', 'provider', 'message_count', 'user_query',
-                  'messages', 'ungrounded_ids'):
+                  'messages', 'ungrounded_ids', 'privacy_redactions',
+                  'selected_skills'):
         if field in value:
             node_result[field] = value[field]
 

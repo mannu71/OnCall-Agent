@@ -63,7 +63,7 @@ def build_delegate_tool(
     _sub_tools = [t for t in base_tools if getattr(t, "name", "") != "delegate_investigation"]
 
     async def _delegate(subtask: str, repo: Optional[str] = None, focus: Optional[str] = None) -> str:
-        from app.harness import AgentSpec, harness
+        from app.harness import AgentSpec, build_agent_from_spec
         from app.workflow.strategies.react.agent_runner import execute_agent
         from app.workflow.strategies.react.hitl import make_checkpointer
 
@@ -137,7 +137,7 @@ def build_delegate_tool(
                 permission_mode="auto_allow",
                 session_id=sub_id,
             )
-            sub_agent = harness.build_agent(sub_spec, sub_llm, _sub_tools, checkpointer=cp)
+            sub_agent = build_agent_from_spec(sub_spec, sub_llm, _sub_tools, checkpointer=cp)
             result = await execute_agent(
                 sub_agent, q, logger, execution_id=sub_id, thread_id=sub_id,
             )

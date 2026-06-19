@@ -200,10 +200,11 @@ async def crawler_grep(
 
 async def crawler_read_file(
     repo: str, path: str, start: Optional[int] = None, end: Optional[int] = None,
+    with_anchors: bool = False,
 ) -> Dict[str, Any]:
     from app.services.crawler_flows import crawler_read_file as _read
 
-    return await _read(repo, path, start=start, end=end)
+    return await _read(repo, path, start=start, end=end, with_anchors=with_anchors)
 
 
 async def crawler_list_files(

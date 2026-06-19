@@ -76,11 +76,15 @@ async def crawler_read_file(
     start: Optional[int] = None,
     end: Optional[int] = None,
     max_lines: int = 400,
+    with_anchors: bool = False,
 ) -> Dict[str, Any]:
     """Read a repository file by path, returning numbered lines (optional range).
 
     Use after crawler_grep / crawler_list_files to read the exact file the agent
-    found, in any language or config format.
+    found, in any language or config format. Set ``with_anchors=True`` to prefix
+    each line with a hashline anchor ``L<n>#<hash>`` (instead of ``<n>:``) so the
+    line can be cited to edit_file's start_anchor/end_anchor for a drift-tolerant
+    edit.
     """
     from app.crawler.files import read_repo_file
 
@@ -94,7 +98,13 @@ async def crawler_read_file(
     e = min(total, (end or (s + max_lines - 1)))
     if e - s + 1 > max_lines:
         e = s + max_lines - 1
-    body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(s, e + 1))
+    if with_anchors:
+        from app.workflow.strategies.react.hashline import line_hash
+        body = "\n".join(
+            f"L{i}#{line_hash(lines[i - 1])}: {lines[i - 1]}" for i in range(s, e + 1)
+        )
+    else:
+        body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(s, e + 1))
     return {"repo": repo, "file": path, "start": s, "end": e,
             "total_lines": total, "content": body}
 

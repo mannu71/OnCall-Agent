@@ -100,8 +100,17 @@ def _read_cw_config(node: Dict[str, Any]) -> Dict[str, Any]:
     if not regions:
         regions = [_primary_region]
 
+    # How the node behaves on each turn:
+    #   auto    — deterministic pre-scan for investigations, skipped for chit-chat (default)
+    #   agent   — never pre-scan; the agent calls the bound CloudWatch tools itself
+    #   prescan — always pre-scan (legacy always-on behaviour)
+    tool_mode = str(_pick("tool_mode", "toolMode", "auto")).strip().lower()
+    if tool_mode not in ("auto", "agent", "prescan"):
+        tool_mode = "auto"
+
     return {
         "log_groups":         log_groups,
+        "tool_mode":          tool_mode,
         "aws_region":         _primary_region,
         "regions":            regions,
         "aws_profile":        _pick("profile", "awsProfile", None),
@@ -118,6 +127,51 @@ def _read_cw_config(node: Dict[str, Any]) -> Dict[str, Any]:
         "severity_excludes":      _parse_severity_excludes(
             _pick("severity_excludes", "severityExcludes", None) or data.get("severityExcludes")
         ),
+    }
+
+
+def _user_query_from_context(context: Dict[str, Any]) -> str:
+    """Best-effort extraction of the user's chat message from the run context."""
+    return (
+        (context.get("inputs") or {}).get("user_query")
+        or context.get("user_query")
+        or ""
+    )
+
+
+def _should_skip_prescan(tool_mode: str, user_query: str) -> bool:
+    """Decide whether to skip the deterministic pre-scan for this turn.
+
+    * ``agent``   → always skip (agent drives the bound tools itself).
+    * ``prescan`` → never skip (always run the pipeline).
+    * ``auto``    → skip only for clearly conversational turns.
+    """
+    if tool_mode == "agent":
+        return True
+    if tool_mode == "prescan":
+        return False
+    from app.core.intent import is_conversational
+    return is_conversational(user_query)
+
+
+def _prescan_skipped_seed(cfg: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    """A no-op CloudWatch result for a skipped pre-scan.
+
+    Deliberately carries no ``analysis_type``/``output`` so the agent handler does
+    NOT inject a 'Pre-computed CloudWatch Analysis' block — the agent sees a clean
+    turn with the live CloudWatch tools still bound and decides for itself.
+    """
+    return {
+        "status":        "success",
+        "tool_provider": "cloudwatch",
+        "prescan_skipped": True,
+        "skipped_reason":  reason,
+        "analysis_type":   None,
+        "output":          "",
+        "log_groups":           cfg.get("log_groups") or [],
+        "log_groups_analyzed":  cfg.get("log_groups") or [],
+        "region":               cfg.get("aws_region"),
+        "time_range":           cfg.get("time_range"),
     }
 
 
@@ -163,6 +217,16 @@ async def execute_tool_provider(executor, node: Dict[str, Any], context: Dict[st
     """
     cfg = _read_cw_config(node)
     log_groups = cfg["log_groups"]
+
+    # Query-aware gate: skip the credentialed pre-scan for agent mode or a purely
+    # conversational turn (e.g. "Hi"). The agent still has the live CloudWatch
+    # tools bound by ReactStrategy, so it can investigate on demand.
+    user_query = _user_query_from_context(context)
+    if _should_skip_prescan(cfg["tool_mode"], user_query):
+        reason = "agent_mode" if cfg["tool_mode"] == "agent" else "conversational"
+        logger.info("cloudwatch_tool: skipping pre-scan (mode=%s, reason=%s)",
+                    cfg["tool_mode"], reason)
+        return _prescan_skipped_seed(cfg, reason)
 
     if not log_groups:
         logger.warning(
@@ -286,6 +350,16 @@ async def execute_tool_provider(executor, node: Dict[str, Any], context: Dict[st
 @register("cloudwatchAnalyzer")
 async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     """Execute CloudWatch Analyzer node via ``LogWatchService``."""
+    # Same query-aware gate as the new node: skip the scan for agent mode or a
+    # conversational turn so a greeting never triggers an AWS call.
+    _cfg = _read_cw_config(node)
+    _user_query = _user_query_from_context(context)
+    if _should_skip_prescan(_cfg["tool_mode"], _user_query):
+        reason = "agent_mode" if _cfg["tool_mode"] == "agent" else "conversational"
+        logger.info("cloudwatchAnalyzer: skipping scan (mode=%s, reason=%s)",
+                    _cfg["tool_mode"], reason)
+        return _prescan_skipped_seed(_cfg, reason)
+
     node_data = node.get('data', {})
     log_groups = node_data.get('logGroups', [])
     time_range = node_data.get('timeRange', '1h')

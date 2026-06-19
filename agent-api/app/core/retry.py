@@ -43,6 +43,7 @@ async def with_retry(
     *args: Any,
     max_retries: int = 3,
     on_retry: Callable[[int, ClassifiedError], Coroutine[Any, Any, None]] | None = None,
+    retry_on: Callable[[ClassifiedError], bool] | None = None,
     **kwargs: Any,
 ) -> T:
     """Call an async function with automatic retry on transient errors.
@@ -53,6 +54,11 @@ async def with_retry(
         max_retries: Maximum number of retry attempts.
         on_retry: Optional async callback ``(attempt, classified_error)`` invoked
                   before each retry (for logging / metrics).
+        retry_on: Optional predicate ``(classified_error) -> bool`` deciding
+                  whether to retry in place. Defaults to ``classified.retryable``.
+                  Pass a stricter predicate to let an *outer* failover loop handle
+                  certain errors immediately instead of sleeping through retries
+                  here (e.g. exclude ``should_fallback`` throttles).
         **kwargs: Keyword args forwarded to *fn*.
 
     Returns:
@@ -70,7 +76,8 @@ async def with_retry(
             last_error = exc
             classified = classify_error(exc)
 
-            if not classified.retryable or attempt >= max_retries:
+            _should_retry = retry_on(classified) if retry_on else classified.retryable
+            if not _should_retry or attempt >= max_retries:
                 raise
 
             wait = jittered_backoff(attempt=attempt)

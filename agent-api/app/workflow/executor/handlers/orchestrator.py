@@ -2,7 +2,7 @@
 
 Delegates to ``app.services.sql_pipeline.run_pipeline``.  The legacy
 ``OrchestratorStrategy`` class was removed; do not reintroduce a parallel
-WorkflowEngine strategy for SQL workflows.
+strategy for SQL workflows.
 """
 import logging
 from typing import Any, Dict, List

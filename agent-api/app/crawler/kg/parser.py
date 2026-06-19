@@ -145,7 +145,15 @@ def _get_parser(lang: str):
         try:
             parser = loader()
         except ImportError as exc:
-            logger.warning("kg.parser: tree-sitter module for '%s' not installed: %s", lang, exc)
+            # Core-only / runtime-slim installs omit the tree-sitter wheels. The
+            # crawler degrades gracefully (no AST parse) — install the optional
+            # extra to enable it:  pip install -e '.[crawler]'  (or the full image).
+            logger.warning(
+                "kg.parser: tree-sitter parser for '%s' unavailable — code crawler "
+                "AST parsing disabled. Install the 'crawler' extra to enable it "
+                "(pip install '.[crawler]'). Detail: %s",
+                lang, exc,
+            )
             _PARSER_CACHE[lang] = None  # type: ignore[assignment]
             return None
         _PARSER_CACHE[lang] = parser

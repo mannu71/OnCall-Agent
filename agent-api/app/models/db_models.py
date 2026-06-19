@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -13,11 +14,17 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import declarative_base
 from pgvector.sqlalchemy import Vector
 
 # Import Base from database module
 from app.core.database import Base
+
+
+def _utcnow() -> datetime:
+    """Return the current UTC time (timezone-aware)."""
+    return datetime.now(timezone.utc)
 
 # ---------------------------------------------------------------------------
 # Migration note
@@ -112,11 +119,23 @@ class LLMConfigModel(Base):
 
 
 class ModelKeyModel(Base):
-    """Provider-level API key storage model."""
+    """Provider-level API key storage model.
+
+    Multiple rows per provider are allowed (migration 017): each is a distinct
+    credential identified by ``key_label`` that the fallback-chain router can
+    rotate across when one is throttled. ``priority`` orders selection (lower
+    first); ``enabled`` toggles a credential without deleting it.
+    """
     __tablename__ = "model_keys"
+    __table_args__ = (
+        UniqueConstraint("provider", "key_label", name="model_keys_provider_label_key"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    provider = Column(String(100), unique=True, nullable=False)
+    provider = Column(String(100), nullable=False)
+    key_label = Column(String(100), nullable=False, default="default")
+    priority = Column(Integer, nullable=False, default=100)
+    enabled = Column(Boolean, nullable=False, default=True)
     api_key = Column(String(500))
     secret_key = Column(String(500))
     endpoint = Column(String(500))
@@ -127,6 +146,82 @@ class ModelKeyModel(Base):
     description = Column(Text)
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
+
+
+class SemanticMemoryModel(Base):
+    """Bank-scoped semantic memory (migration 018).
+
+    Learned, operational memory captured while operating the system — distinct
+    from the static, code-derived ``repo_docs`` intelligence. ``bank='repo'``
+    rows are scoped to one ``repo_name``; ``bank='global'`` rows (repo_name NULL)
+    are visible to every investigation. Recall is hybrid FTS + vector.
+    """
+    __tablename__ = "semantic_memory"
+    __table_args__ = (
+        Index("idx_semantic_memory_bank_repo", "bank", "repo_name"),
+    )
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    bank = Column(String(16), nullable=False, default="repo")
+    repo_name = Column(String(255))
+    content = Column(Text, nullable=False)
+    content_sha256 = Column(String(64), nullable=False)
+    embedding = Column(Vector(1024))
+    search_vector = Column(TSVECTOR)
+    source = Column(String(32), nullable=False, default="agent")
+    importance = Column(Float, nullable=False, default=0.5)
+    veracity = Column(Float, nullable=False, default=0.5)
+    created_at = Column(DateTime(timezone=True))
+    last_recalled_at = Column(DateTime(timezone=True))
+    recall_count = Column(Integer, nullable=False, default=0)
+
+
+class ChatSessionModel(Base):
+    """A persistent chat conversation (migration 022).
+
+    One row per conversation, holding only *metadata* — the messages live in
+    ``chat_messages`` and are hydrated on demand when a session is opened. This
+    keeps the session list cheap to load at boot even with thousands of rows.
+    """
+    __tablename__ = "chat_sessions"
+
+    id = Column(String(36), primary_key=True)  # app-generated uuid4
+    title = Column(String(255), nullable=False, default="New chat")
+    workflow_name = Column(String(255))
+    model = Column(String(255))
+    archived = Column(Boolean, nullable=False, default=False)
+    is_important = Column(Boolean, nullable=False, default=False)
+    message_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+    last_message_at = Column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("idx_chat_sessions_active", "archived", "last_message_at"),
+    )
+
+
+class ChatMessageModel(Base):
+    """A single message within a chat session (migration 022).
+
+    Cascade-deletes with its parent session. ``metadata`` carries the UI-side
+    enrichments (tool steps, token counts, privacy redactions, trace) so a
+    resumed conversation renders exactly as it did live.
+    """
+    __tablename__ = "chat_messages"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    session_id = Column(String(36), nullable=False, index=True)  # FK → chat_sessions.id
+    role = Column(String(16), nullable=False)  # user | assistant | system
+    content = Column(Text, nullable=False, default="")
+    # 'metadata' is reserved on the SQLAlchemy declarative Base, so map the
+    # column under a non-reserved attribute name.
+    meta = Column("metadata", JSON)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (
+        Index("idx_chat_messages_session", "session_id", "created_at"),
+    )
 
 
 class MCPServerModel(Base):
@@ -154,7 +249,7 @@ class LogPatternModel(Base):
     pattern_type = Column(String(50), nullable=False)
     severity = Column(Integer, default=1)
     description = Column(Text)
-    embedding = Column(Vector(1536))
+    embedding = Column(Vector(1024))
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
 
@@ -170,7 +265,7 @@ class KnowledgeEntryModel(Base):
     solution = Column(Text)          # Resolution text
     category = Column(String(100))   # Workflow domain or topic
     source = Column(String(50), default="manual")  # manual | agent | verified | skill
-    embedding = Column(Vector(1536))
+    embedding = Column(Vector(1024))
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
 
@@ -216,6 +311,12 @@ class SkillModel(Base):
     # Lifecycle
     status = Column(String(50), default="active")
     # active | draft | archived
+
+    # Confidence (0..1) from the distillation LLM. Below the configured
+    # threshold a distilled skill is saved as 'draft' (hidden from recall).
+    confidence = Column(Float)
+    # Last curator decision: kept | demoted | promoted | archived (migration 023).
+    audit_verdict = Column(String(16))
 
     # Usage counters (updated by SkillService)
     success_count = Column(Integer, default=0)
@@ -279,11 +380,6 @@ class AlertModel(Base):
 # ---------------------------------------------------------------------------
 # (v1 SCIP code-intelligence tables removed — dropped in migration 007)
 # ---------------------------------------------------------------------------
-
-
-def _utcnow() -> datetime:
-    """Return the current UTC time (timezone-aware)."""
-    return datetime.now(timezone.utc)
 
 
 class BackgroundJobModel(Base):
@@ -355,6 +451,47 @@ class AppSettingModel(Base):
 
     key = Column(String(128), primary_key=True)
     value = Column(Text)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
+class PolicySetModel(Base):
+    """A named, reusable governance policy set for the declarative policy engine.
+
+    ``policies`` is the JSON list of policy entries (see ``app/core/policy``); a
+    workflow references a set by name and the engine expands it at agent-build
+    time. See migration ``016_policy_sets.sql`` and
+    ``app/infrastructure/persistence/policy_set_repository.py``.
+    """
+    __tablename__ = "policy_sets"
+
+    name = Column(String(128), primary_key=True)
+    description = Column(Text)
+    policies = Column(JSON, nullable=False, default=list)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
+class AgentProfileModel(Base):
+    """A named, reusable agent profile (see migration ``025_agent_profiles.sql``).
+
+    Lets a user configure any *type* of agent — role sentence, composable
+    capabilities, output schema, default governance policies and deep-agent
+    features — independent of the workflow graph. An agent node references one by
+    name (``agent_config.profile``) and the executor merges these fields under any
+    explicit node overrides. See ``app/infrastructure/persistence/agent_profile_repository.py``.
+    """
+    __tablename__ = "agent_profiles"
+
+    name = Column(String(128), primary_key=True)
+    description = Column(Text)
+    role_prompt = Column(Text)
+    capabilities = Column(JSON, nullable=False, default=list)
+    default_tools = Column(JSON, nullable=False, default=list)
+    output_schema = Column(String(64))
+    default_policies = Column(JSON, nullable=False, default=list)
+    deep_features = Column(JSON, nullable=False, default=dict)
+    builtin = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 
 

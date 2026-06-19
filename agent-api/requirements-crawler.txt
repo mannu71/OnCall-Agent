@@ -1,0 +1,17 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CRAWLER extra — tree-sitter AST parsers for the code crawler / knowledge graph.
+# ~10 native wheels (~25 MB). Optional: a core-only install runs fine without
+# these (app/crawler/kg/parser.py degrades gracefully — parsing returns None and
+# logs a hint to install this extra). Install with the full image / `[crawler]`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+tree-sitter>=0.22.0
+tree-sitter-typescript>=0.23.0
+tree-sitter-c-sharp>=0.23.0
+tree-sitter-java>=0.23.0
+tree-sitter-kotlin>=0.3.0
+tree-sitter-go>=0.23.0
+tree-sitter-rust>=0.23.0
+tree-sitter-ruby>=0.23.0
+tree-sitter-python>=0.23.0
+tree-sitter-javascript>=0.23.0

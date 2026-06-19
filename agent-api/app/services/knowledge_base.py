@@ -47,15 +47,25 @@ def _is_auth_error(exc: Exception) -> bool:
 class EmbeddingService:
     """Service for generating embeddings using AWS Bedrock."""
 
-    def __init__(self, region: Optional[str] = None):
+    def __init__(self, region: Optional[str] = None,
+                 model_id: Optional[str] = None,
+                 dimensions: Optional[int] = None):
         """Initialize embedding service.
 
         Args:
             region: AWS region for Bedrock. When omitted, resolved from the app
                 settings / DB model-keys store at first use (same source the
                 chat LLM uses) instead of a hardcoded default.
+            model_id: Bedrock embedding model. Defaults to
+                ``settings.embedding_model_id`` (Titan V2).
+            dimensions: Output vector dimension. Defaults to
+                ``settings.embedding_dimensions`` (1024). Only honoured by Titan
+                V2 (``titan-embed-text-v2``); V1 ignores it.
         """
+        from app.config import settings
         self.region = region
+        self.model_id = model_id or settings.embedding_model_id
+        self.dimensions = int(dimensions or settings.embedding_dimensions)
         self._client = None
 
     def _reset_client(self) -> None:
@@ -114,14 +124,20 @@ class EmbeddingService:
             text: Text to embed
 
         Returns:
-            Embedding vector (1536 dimensions for Titan)
+            Embedding vector (1024 dimensions for Titan V2)
         """
         from app.core.thread_pools import run_in_aws_pool
 
         max_tokens = 8000
         if len(text) > max_tokens:
             text = text[:max_tokens]
-        body = json.dumps({'inputText': text})
+        # Titan V2 accepts dimensions + normalize; V1 accepts only inputText
+        # (extra keys are rejected), so include them only for V2.
+        payload = {'inputText': text}
+        if 'v2' in self.model_id:
+            payload['dimensions'] = self.dimensions
+            payload['normalize'] = True
+        body = json.dumps(payload)
 
         last_exc: Optional[Exception] = None
         for attempt in range(2):
@@ -129,7 +145,7 @@ class EmbeddingService:
             try:
                 response = await run_in_aws_pool(
                     lambda: client.invoke_model(
-                        modelId='amazon.titan-embed-text-v1',
+                        modelId=self.model_id,
                         body=body,
                     )
                 )
@@ -249,9 +265,9 @@ class KnowledgeBaseService:
             
             query_str = """
                 SELECT id, name, pattern, pattern_type, severity, description,
-                       1 - (embedding <=> :embedding::vector) as similarity
+                       1 - (embedding <=> CAST(:embedding AS vector)) as similarity
                 FROM log_patterns
-                WHERE 1 - (embedding <=> :embedding::vector) > :threshold
+                WHERE 1 - (embedding <=> CAST(:embedding AS vector)) > :threshold
                 ORDER BY similarity DESC
                 LIMIT :limit
             """
@@ -516,9 +532,9 @@ class KnowledgeBaseService:
             
             query_str = f"""
                 SELECT id, title, description, symptoms, solution, category,
-                       1 - (embedding <=> :embedding::vector) as similarity
+                       1 - (embedding <=> CAST(:embedding AS vector)) as similarity
                 FROM knowledge_entries
-                WHERE 1 - (embedding <=> :embedding::vector) > :threshold
+                WHERE 1 - (embedding <=> CAST(:embedding AS vector)) > :threshold
                 {category_filter}
                 ORDER BY similarity DESC
                 LIMIT :limit

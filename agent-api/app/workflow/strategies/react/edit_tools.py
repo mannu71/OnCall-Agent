@@ -43,17 +43,30 @@ def build_edit_tools() -> List[Any]:
         repo: str = PydanticField(description="Repository name under REPOS_BASE_PATH.")
         file: str = PydanticField(description="Repository-relative path of the file to edit.")
         old_string: str = PydanticField(
+            default="",
             description="Exact existing text to replace — must appear EXACTLY ONCE in the file. "
                         "Copy it verbatim (read with crawler_get_body first), include enough "
-                        "surrounding context to be unique.")
+                        "surrounding context to be unique. Omit when using start_anchor instead.")
         new_string: str = PydanticField(description="Replacement text.")
+        start_anchor: str = PydanticField(
+            default="",
+            description="HASHLINE alternative to old_string: anchor of the first line to replace, "
+                        "as 'L<line>#<hash>' copied from a crawler_get_body/crawler_read_file read "
+                        "with with_anchors=true (e.g. 'L42#a1b2c3d4'). Robust to whitespace drift "
+                        "and duplicate lines. When set, old_string is ignored.")
+        end_anchor: str = PydanticField(
+            default="",
+            description="HASHLINE optional end anchor (inclusive) for a multi-line span. Omit for a "
+                        "single-line edit. Same 'L<line>#<hash>' format as start_anchor.")
 
-    async def _edit_file(repo: str, file: str, old_string: str, new_string: str) -> str:
+    async def _edit_file(repo: str, file: str, new_string: str, old_string: str = "",
+                         start_anchor: str = "", end_anchor: str = "") -> str:
         import asyncio
         from app.core.security import check_path, PathJailError
 
         root = settings.repos_base_path
         abs_path = os.path.join(root, repo, file)
+        use_hashline = bool(start_anchor.strip())
 
         def _do() -> dict:
             check_path(abs_path, root)
@@ -64,13 +77,33 @@ def build_edit_tools() -> List[Any]:
                 pass
             with open(abs_path, encoding="utf-8-sig", errors="replace") as f:
                 content = f.read()
+
+            if use_hashline:
+                # Hashline path: locate by content-hash anchor (drift-tolerant,
+                # fails clean if the anchored line changed).
+                from app.workflow.strategies.react.hashline import apply_edit, HashlineError
+                try:
+                    res = apply_edit(content, start_anchor, new_string,
+                                     end_anchor=end_anchor or None)
+                except HashlineError as he:
+                    return {"error": str(he), "file": file}
+                with open(abs_path, "w", encoding="utf-8") as f:
+                    f.write(res.updated)
+                return {"ok": True, "file": file, "replaced": 1,
+                        "lines_removed": res.removed, "lines_added": res.added,
+                        "span": f"L{res.start_line}-L{res.end_line}",
+                        "new_size": len(res.updated)}
+
+            if not old_string:
+                return {"error": "provide either old_string or start_anchor", "file": file}
             count = content.count(old_string)
             if count == 0:
                 return {"error": "old_string not found in file (copy it verbatim, with context)",
                         "file": file}
             if count > 1:
                 return {"error": f"old_string is not unique ({count} matches) — add more surrounding "
-                                 f"context so it matches exactly once", "file": file}
+                                 f"context so it matches exactly once, or use start_anchor "
+                                 f"(hashline) to disambiguate by line", "file": file}
             updated = content.replace(old_string, new_string, 1)
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(updated)
@@ -136,11 +169,15 @@ def build_edit_tools() -> List[Any]:
         coroutine=_edit_file,
         name="edit_file",
         description=(
-            "Apply a fix by replacing an exact snippet in a source file (surgical str-replace). "
-            "WHEN TO USE: you have LOCATED the bug and want to apply the fix. First read the exact "
-            "text with crawler_get_body, then pass old_string (must be unique in the file) and "
-            "new_string. This MODIFIES code on disk and REQUIRES operator approval. WHEN NOT TO USE: "
-            "for investigation — use the read-only crawler tools; to create a brand-new file — use "
+            "Apply a fix by replacing code in a source file. Two ways to target the edit: "
+            "(1) str-replace — pass old_string (must appear EXACTLY once) + new_string; or "
+            "(2) HASHLINE (more robust) — read with crawler_read_file(with_anchors=true) to get "
+            "'L<line>#<hash>' anchors, then pass start_anchor (and end_anchor for a multi-line "
+            "span) + new_string. Hashline tolerates whitespace drift and duplicate lines and "
+            "fails cleanly if the anchored line changed, so prefer it for edits in files with "
+            "repeated snippets. WHEN TO USE: you have LOCATED the bug and want to apply the fix. "
+            "This MODIFIES code on disk and REQUIRES operator approval. WHEN NOT TO USE: for "
+            "investigation — use the read-only crawler tools; to create a brand-new file — use "
             "create_file. After editing, tell the user to build/test (the agent cannot run the "
             "build itself)."
         ),

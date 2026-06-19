@@ -590,6 +590,159 @@ async def resolve_llm_config_for_role(role: str) -> Dict[str, Any]:
     return resolved.to_dict()
 
 
+# ─── Fallback-chain routing (Phase 1) ─────────────────────────────────────────
+
+# Cross-region inference-profile prefixes added by build_llm. Stripped here so a
+# region-failover candidate carries the bare foundation-model ID and build_llm can
+# re-derive the correct prefix for the new region.
+_INFERENCE_PROFILE_PREFIXES = ("us.", "eu.", "ap.")
+
+
+def _bare_bedrock_model(model: str) -> str:
+    """Drop any leading inference-profile prefix (``us.``/``eu.``/``ap.``)."""
+    for p in _INFERENCE_PROFILE_PREFIXES:
+        if model.startswith(p):
+            return model[len(p):]
+    return model
+
+
+def _key_id_for(cfg: Dict[str, Any]) -> str:
+    """Stable, non-secret identifier for the credential a config uses.
+
+    Derives a masked tag from the access key first so the *same* credential
+    always maps to the same throttle-target id whether it arrived as the
+    enriched primary config (no ``key_label``) or as a multi-key DB row (with
+    one). Falls back to ``key_label`` for non-AWS providers, then ``default``.
+    """
+    ak = cfg.get("access_key_id")
+    if ak:
+        return f"...{str(ak)[-4:]}"
+    label = cfg.get("key_label")
+    if label:
+        return str(label)
+    return "default"
+
+
+async def gather_alt_credentials(resolved: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """Return credential overlays for *resolved*'s provider beyond the primary.
+
+    Bedrock only: reads the multi-key rows (migration 017) and returns one
+    overlay dict per *other* enabled credential, ordered by priority. Each
+    overlay carries just the credential fields so it can be merged onto the
+    primary config (same model/region) by the fallback-chain resolver.
+    """
+    provider = (resolved.get("provider") or "").lower()
+    if provider not in _BEDROCK_PROVIDERS:
+        return []
+    try:
+        rows = await model_key_repository.list_by_provider(
+            "AWS Bedrock", include_secrets=True, enabled_only=True
+        )
+    except Exception as e:  # noqa: BLE001 — failover must never break the run
+        logger.warning("Could not list Bedrock credentials for failover: %s", e)
+        return []
+
+    primary_id = _key_id_for(resolved)
+    alts: list[Dict[str, Any]] = []
+    for r in rows:
+        ak = r.get("access_key_id")
+        if not (ak and r.get("secret_access_key")):
+            continue  # only rotatable explicit-credential rows
+        if f"...{str(ak)[-4:]}" == primary_id:
+            continue  # already the primary
+        overlay = {
+            "access_key_id": ak,
+            "secret_access_key": r.get("secret_access_key"),
+            "session_token": r.get("session_token"),
+            "key_label": r.get("key_label"),
+        }
+        if r.get("region"):
+            overlay["region"] = r["region"]
+        alts.append(overlay)
+    return alts
+
+
+def throttle_target_for(cfg: Dict[str, Any]):
+    """Build the :class:`ThrottleTarget` identifying *cfg*'s routable endpoint."""
+    from app.core.model_throttle_tracker import ThrottleTarget
+    return ThrottleTarget(
+        provider=(cfg.get("provider") or "").lower(),
+        region=cfg.get("region") or "",
+        model_id=_bare_bedrock_model(cfg.get("model") or ""),
+        key_id=_key_id_for(cfg),
+    )
+
+
+def resolve_llm_fallback_chain(
+    primary: Dict[str, Any],
+    *,
+    alt_credentials: Optional[Sequence[Dict[str, Any]]] = None,
+    fallback_regions: Optional[Sequence[str]] = None,
+    fallback_models: Optional[Sequence[str]] = None,
+    enabled: Optional[bool] = None,
+) -> list[Dict[str, Any]]:
+    """Expand a resolved LLM config into an ordered list of failover candidates.
+
+    Order: primary → same model on alternate credentials →
+    same model in alternate regions → fallback models in the primary region.
+    Region/model failover apply to Bedrock only; alternate-credential rotation
+    applies to any provider when *alt_credentials* are supplied.
+
+    The list is de-duplicated by throttle-target identity and then re-ordered so
+    targets currently in a cooldown window (see :mod:`model_throttle_tracker`)
+    sink to the back — they are still tried as a last resort, never dropped.
+
+    Pure and synchronous (no DB / network) so it is trivially unit-testable; the
+    caller gathers any *alt_credentials* and passes them in.
+    """
+    from app.core import model_throttle_tracker as throttle
+
+    if enabled is None:
+        enabled = settings.routing_fallback_enabled
+    if not enabled:
+        return [primary]
+
+    provider = (primary.get("provider") or "").lower()
+    chain: list[Dict[str, Any]] = [primary]
+
+    # 2. Same model + region, alternate credentials.
+    for cred in (alt_credentials or []):
+        chain.append({**primary, **cred})
+
+    if provider in _BEDROCK_PROVIDERS:
+        base_model = _bare_bedrock_model(primary.get("model") or "")
+        primary_region = primary.get("region") or _DEFAULT_REGION
+
+        # 3. Same model, alternate regions (bare model so build_llm re-prefixes).
+        regions = (fallback_regions if fallback_regions is not None
+                   else settings.bedrock_fallback_regions)
+        for r in regions:
+            if r and r != primary_region:
+                chain.append({**primary, "model": base_model, "region": r})
+
+        # 4. Fallback models, primary region.
+        models = (fallback_models if fallback_models is not None
+                  else settings.bedrock_model_fallback)
+        for fm in models:
+            if fm and _bare_bedrock_model(fm) != base_model:
+                chain.append({**primary, "model": fm})
+
+    # De-dupe by target identity, preserving first-seen order.
+    seen: set = set()
+    deduped: list[Dict[str, Any]] = []
+    for c in chain:
+        key = throttle_target_for(c).as_key()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(c)
+
+    # Ready targets first (stable), cooled targets appended last.
+    ready = [c for c in deduped if not throttle.is_cooled(throttle_target_for(c))]
+    cooled = [c for c in deduped if throttle.is_cooled(throttle_target_for(c))]
+    return ready + cooled
+
+
 # ─── Small coercion helpers ───────────────────────────────────────────────────
 
 

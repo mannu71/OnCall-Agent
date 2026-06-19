@@ -1,9 +1,9 @@
 """
 Compaction algorithm for the agent memory loop.
 
-Ports the pi coding agent's compaction strategy: walk backwards from the
-newest message, accumulate estimated tokens, then summarize everything
-older into a StructuredSummary that survives across multiple compactions.
+Walk backwards from the newest message, accumulate estimated tokens, then
+summarize everything older into a StructuredSummary that survives across
+multiple compactions.
 
 Usage
 -----
@@ -391,9 +391,12 @@ async def compact(
     reserve_tokens: int = 16_384,
     keep_recent_tokens: int = 20_000,
     prior_summary: Optional[StructuredSummary] = None,
-    summarization_model: str = "anthropic/claude-3-5-haiku-latest",
+    summarization_model: Optional[str] = None,
 ) -> Tuple[List[BaseMessage], StructuredSummary]:
-    """Compact a message list using the pi coding agent's algorithm.
+    """Compact a message list down to a structured summary + recent tail.
+
+    ``summarization_model`` must be supplied by the caller (resolved from the
+    user's configured model); no model is hardcoded here.
 
     Parameters
     ----------
@@ -424,6 +427,11 @@ async def compact(
         If no compaction was needed, messages is returned unchanged and
         new_summary reflects cumulative tracking with an empty summary body.
     """
+    if not summarization_model:
+        raise ValueError(
+            "compact(): summarization_model is required — resolve it from the "
+            "user's configured model before calling (no model is hardcoded)."
+        )
     if not messages:
         # Edge case: nothing to compact
         empty_summary = StructuredSummary(

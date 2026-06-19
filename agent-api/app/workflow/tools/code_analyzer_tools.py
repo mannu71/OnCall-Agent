@@ -207,6 +207,11 @@ def build_crawler_tools(
         path: str = PydanticField(..., description="File path relative to the repo root.")
         start: Optional[int] = PydanticField(None, description="First line (1-based) to read.")
         end: Optional[int] = PydanticField(None, description="Last line to read.")
+        with_anchors: bool = PydanticField(
+            False,
+            description="Prefix each line with a hashline anchor 'L<n>#<hash>' (instead of '<n>:') "
+                        "so it can be cited to edit_file start_anchor/end_anchor for a robust, "
+                        "drift-tolerant edit. Set True only when about to edit this file.")
 
     class _ListFilesInput(BaseModel):
         repo: Optional[str] = PydanticField(None, description="Repo to list. Omit to list across all connected repos.")
@@ -318,9 +323,11 @@ def build_crawler_tools(
         return _cap(json.dumps(result, default=str))
 
     async def _read_file_tool(repo: str, path: str, start: Optional[int] = None,
-                              end: Optional[int] = None) -> str:
+                              end: Optional[int] = None, with_anchors: bool = False) -> str:
         import json
-        return _cap(json.dumps(await _read_file(repo, path, start=start, end=end), default=str))
+        return _cap(json.dumps(
+            await _read_file(repo, path, start=start, end=end, with_anchors=with_anchors),
+            default=str))
 
     async def _list_files_tool(repo: Optional[str] = None, glob: Optional[str] = None,
                                limit: int = 400) -> str:

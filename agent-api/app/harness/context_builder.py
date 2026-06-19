@@ -18,16 +18,74 @@ from typing import Any, Dict, Optional, Tuple
 from app.core.redact import redact
 
 
+def repos_from_code_analyzer(code_analyzer_config: Optional[Dict[str, Any]]) -> list:
+    """Pull repo names out of a code-analyzer config for memory bank scoping."""
+    if not code_analyzer_config:
+        return []
+    repos = code_analyzer_config.get("repos") or []
+    names = []
+    for r in repos:
+        name = r.get("name") if isinstance(r, dict) else (r if isinstance(r, str) else None)
+        if name:
+            names.append(str(name))
+    return names
+
+
 async def build_recall_query(
     *,
     user_query: str,
     cloudwatch_config: Optional[Dict[str, Any]],
     logger_instance: Any,
     execution_id: Optional[str],
-) -> Tuple[str, int]:
-    """Return ``(augmented_query, recall_hits)`` with a KB recall block prepended."""
+    code_analyzer_config: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, int, list]:
+    """Return ``(augmented_query, recall_hits, selected_skills)`` with blocks prepended.
+
+    Prepends, in priority order under a per-turn token budget: (a) always-injected
+    pinned facts, (b) bank-scoped learned semantic memory (when enabled), (c) the
+    KB recall block (issues/patterns/skills), and (d) RAG-auto-selected markdown
+    skills. ``selected_skills`` is the list of auto-selected skill names (for the
+    UI badge). Every leg is best-effort — a failure never blocks the run.
+    """
+    from app.config import settings
     recall_hits = 0
-    augmented_query = user_query
+    repos = repos_from_code_analyzer(code_analyzer_config)
+    # Memory blocks in priority order: pinned (always) > learned semantic > KB.
+    # Assembled under a per-turn token budget below.
+    blocks: list[str] = []
+
+    # ── (a) Pinned facts — always injected, NOT similarity-gated ─────────────
+    try:
+        if getattr(settings, "pinned_facts_enabled", True):
+            from app.services.semantic_memory import semantic_memory, format_pinned_block
+            _pinned = await semantic_memory.list_pinned(repo=repos or None)
+            _pinned_block = format_pinned_block(_pinned)
+            if _pinned_block:
+                recall_hits += len(_pinned)
+                blocks.append(_pinned_block)
+    except Exception as _pin_err:  # noqa: BLE001 — best-effort
+        logger_instance.warning(
+            "ReactStrategy: pinned-facts recall failed (non-fatal): %s",
+            redact(str(_pin_err)),
+            extra={"execution_id": execution_id},
+        )
+
+    # ── (b) Learned semantic memory (Phase 2, opt-in) ────────────────────────
+    try:
+        if settings.semantic_memory_enabled:
+            from app.services.semantic_memory import semantic_memory, format_recall_block
+            _mem = await semantic_memory.recall(user_query, repo=repos or None)
+            _mem_block = format_recall_block(_mem)
+            if _mem_block:
+                recall_hits += len(_mem)
+                blocks.append(_mem_block)
+    except Exception as _mem_err:  # noqa: BLE001 — memory recall is best-effort
+        logger_instance.warning(
+            "ReactStrategy: semantic memory recall failed (non-fatal): %s",
+            redact(str(_mem_err)),
+            extra={"execution_id": execution_id},
+        )
+
     try:
         from app.services.knowledge_base import knowledge_base as _kb
         from app.workflow.strategies.react.helpers import build_recall_context
@@ -46,17 +104,70 @@ async def build_recall_query(
                         _patterns.append(_p)
                         seen.add(_p.get("id"))
         _skills = await _kb.recall_skills_for_agent(user_query, limit=3)
-        recall_hits = len(_issues) + len(_patterns) + len(_skills)
+        recall_hits += len(_issues) + len(_patterns) + len(_skills)
         recall_block = build_recall_context(_issues, _patterns, _skills)
         if recall_block:
-            augmented_query = f"{recall_block}\n\n---\n\n{user_query}"
+            blocks.append(recall_block)
     except Exception as _recall_err:  # noqa: BLE001 — recall is best-effort
         logger_instance.warning(
             "ReactStrategy: KB recall failed (non-fatal): %s",
             redact(str(_recall_err)),
             extra={"execution_id": execution_id},
         )
-    return augmented_query, recall_hits
+
+    # ── (c) RAG-auto-selected markdown skills ────────────────────────────────
+    selected_skills: list[str] = []
+    try:
+        if getattr(settings, "skill_rag_selection_enabled", True):
+            from app.core.skills import get_default_skill_manager
+            _mgr = get_default_skill_manager()
+            _hits = _mgr.select_for_query(user_query, k=getattr(settings, "skill_rag_k", 2))
+            if _hits:
+                selected_skills = [s.name for s in _hits]
+                lines = ["## Suggested skills (auto-selected for this query)"]
+                for s in _hits:
+                    lines.append(f"- **{s.name}** — {s.description} (invoke with execute_skill)")
+                blocks.append("\n".join(lines))
+                recall_hits += len(_hits)
+    except Exception as _skill_err:  # noqa: BLE001 — skill recall is best-effort
+        logger_instance.warning(
+            "ReactStrategy: skill auto-selection failed (non-fatal): %s",
+            redact(str(_skill_err)),
+            extra={"execution_id": execution_id},
+        )
+
+    augmented_query = _assemble_within_budget(
+        blocks, user_query,
+        budget_tokens=getattr(settings, "memory_turn_token_budget", 800),
+    )
+    return augmented_query, recall_hits, selected_skills
+
+
+def _assemble_within_budget(blocks: list, user_query: str, *, budget_tokens: int) -> str:
+    """Prepend memory *blocks* (priority order) to the query within a token budget.
+
+    Greedily include whole blocks until the budget (chars/4 heuristic) is reached;
+    a partially-fitting block is truncated rather than dropped so the highest
+    item still contributes (bounded per-turn memory injection).
+    """
+    augmented = user_query
+    if not blocks:
+        return augmented
+    used = 0
+    kept: list[str] = []
+    for block in blocks:
+        cost = len(block) // 4
+        if not budget_tokens or used + cost <= budget_tokens:
+            kept.append(block)
+            used += cost
+        else:
+            remaining = max(0, budget_tokens - used) * 4
+            if remaining > 80:  # only worth a partial block if it carries signal
+                kept.append(block[:remaining].rstrip() + "…")
+            break
+    for block in reversed(kept):  # reversed → first block ends up on top
+        augmented = f"{block}\n\n---\n\n{augmented}"
+    return augmented
 
 
 def seed_context_blocks(

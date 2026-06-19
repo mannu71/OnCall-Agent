@@ -2,10 +2,8 @@
 
 Visual (node-based) workflows MUST run through ``VisualWorkflowExecutor`` and
 ``workflow/executor/handlers``. Legacy task-based workflows (shell/python
-tasks) run through ``TaskExecutor`` via the scheduler.
-
-``WorkflowEngine`` is not a supported entry point for visual workflows; handlers
-invoke individual strategies (e.g. ``ReactStrategy``) as needed.
+tasks) run through ``TaskExecutor`` via the scheduler. Handlers invoke
+individual strategies (e.g. ``ReactStrategy``) as needed.
 """
 from __future__ import annotations
 
