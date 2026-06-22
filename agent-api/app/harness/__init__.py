@@ -56,6 +56,7 @@ def build_agent_from_spec(
         planning=spec.planning,
         filesystem=spec.filesystem,
         subagents=spec.subagents,
+        sandbox=spec.sandbox,
     )
 
 

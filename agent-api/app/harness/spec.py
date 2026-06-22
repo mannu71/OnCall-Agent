@@ -42,5 +42,9 @@ class AgentSpec:
     planning: bool = False
     filesystem: bool = False
     subagents: List[Dict[str, Any]] = field(default_factory=list)
+    # Per-workflow capability toggles (default off). ``auto_learn`` gates the
+    # post-run learning loop; ``sandbox`` wires the isolated run_command tool.
+    auto_learn: bool = False
+    sandbox: bool = False
     # Carried for completeness / future use by the loop engine.
     metadata: Dict[str, Any] = field(default_factory=dict)

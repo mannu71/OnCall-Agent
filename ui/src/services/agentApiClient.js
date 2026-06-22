@@ -623,6 +623,29 @@ export const agentApiClient = {
         return response.data;
     },
 
+    // ==================== Skills ====================
+    // DB-backed executable skills (+ read-only filesystem skills).
+
+    async listSkills() {
+        const response = await client.get('/api/v1/skills');
+        return response.data; // { success, db: [...], filesystem: [...] }
+    },
+
+    async createSkill(body) {
+        const response = await client.post('/api/v1/skills', body);
+        return response.data;
+    },
+
+    async deleteSkill(name) {
+        const response = await client.delete(`/api/v1/skills/${encodeURIComponent(name)}`);
+        return response.data;
+    },
+
+    async deleteAllSkills() {
+        const response = await client.delete('/api/v1/skills?confirm=true');
+        return response.data;
+    },
+
     /**
      * Force a full rebuild of a repository index (bypasses the skip-if-unchanged
      * SHA check). Returns the refreshed repo overview.

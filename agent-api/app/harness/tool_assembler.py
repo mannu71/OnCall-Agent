@@ -238,13 +238,15 @@ def add_extension_tools(
         except Exception as _pe:  # noqa: BLE001
             logger_instance.warning("ReactStrategy: planning tools skipped (%s)", _pe)
 
-    if _flags.get("filesystem"):
-        try:
-            from app.core.vfs import build_vfs_tools, bind_session
-            bind_session(execution_id)
-            tools.extend(build_vfs_tools(execution_id))
-        except Exception as _fe:  # noqa: BLE001
-            logger_instance.warning("ReactStrategy: vfs tools skipped (%s)", _fe)
+    # Scratch filesystem is ALWAYS available — it's a harmless, session-scoped,
+    # in-memory store (bounded; dropped at run end) that lets the agent offload
+    # large tool outputs instead of bloating context. No toggle: every agent gets it.
+    try:
+        from app.core.vfs import build_vfs_tools, bind_session
+        bind_session(execution_id)
+        tools.extend(build_vfs_tools(execution_id))
+    except Exception as _fe:  # noqa: BLE001
+        logger_instance.warning("ReactStrategy: vfs tools skipped (%s)", _fe)
 
     if _flags.get("subagents"):
         try:
@@ -257,5 +259,29 @@ def add_extension_tools(
             )
         except Exception as _se:  # noqa: BLE001
             logger_instance.warning("ReactStrategy: subagent tools skipped (%s)", _se)
+
+    # Sandboxed shell access (opt-in). Only added when the workflow turns it on
+    # AND a sandbox backend is actually configured/available on the host — so a
+    # toggle with no SANDBOX_BACKEND is a safe no-op. The run_command tool is
+    # gated 'ask' by the policy engine, giving HITL + isolation defense-in-depth.
+    if _flags.get("sandbox"):
+        try:
+            from app.core import sandbox as _sandbox
+            if _sandbox.is_enabled():
+                import tempfile
+                _cwd = tempfile.mkdtemp(prefix=f"sbx-{execution_id or 'run'}-")
+                _cmd_tool = _sandbox.build_sandboxed_command_tool(_cwd)
+                if _cmd_tool is not None:
+                    tools.append(_cmd_tool)
+                    logger_instance.info(
+                        "ReactStrategy: sandboxed run_command tool enabled (cwd=%s)", _cwd
+                    )
+            else:
+                logger_instance.info(
+                    "ReactStrategy: sandbox requested but no backend configured "
+                    "(set SANDBOX_BACKEND) — skipping run_command tool"
+                )
+        except Exception as _sbe:  # noqa: BLE001
+            logger_instance.warning("ReactStrategy: sandbox tool skipped (%s)", _sbe)
 
     return tools

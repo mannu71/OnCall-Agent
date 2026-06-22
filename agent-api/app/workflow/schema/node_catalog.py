@@ -41,6 +41,12 @@ NODE_SCHEMAS: Dict[str, Dict[str, Any]] = {
              "desc": "Structured-output schema name (investigation|generic|support_resolution|data_analysis)."},
             {"name": "capabilities", "dialect_keys": ["capabilities"], "required": False,
              "type": "list", "desc": "Extra composable capability ids."},
+            {"name": "autoLearn", "dialect_keys": ["autoLearn", "auto_learn"], "required": False,
+             "type": "bool",
+             "desc": "Opt-in: after each run, distill skills/memory from the trajectory."},
+            {"name": "sandbox", "dialect_keys": ["sandbox"], "required": False,
+             "type": "bool",
+             "desc": "Opt-in: give the agent an isolated run_command shell (needs a sandbox backend)."},
         ],
     },
     "language_model": {
@@ -78,6 +84,17 @@ NODE_SCHEMAS: Dict[str, Dict[str, Any]] = {
         "params": [
             {"name": "repos", "dialect_keys": ["repos"], "required": True,
              "type": "list", "desc": "Indexed repositories to search (≥1 required)."},
+        ],
+    },
+    "vector_memory": {
+        "category": "Memory",
+        "label": "Vector Memory",
+        "params": [
+            {"name": "collection", "dialect_keys": ["collection"], "required": False,
+             "type": "string",
+             "desc": "Optional repo/collection scope for recall (blank = global)."},
+            {"name": "topK", "dialect_keys": ["topK", "top_k"], "required": False,
+             "type": "number", "desc": "Max memories to recall (default 5)."},
         ],
     },
     "tool": {

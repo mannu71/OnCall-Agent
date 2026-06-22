@@ -7,7 +7,8 @@ import {
   Settings,
   MessageSquare,
   ChevronLeft,
-  Network
+  Network,
+  Wrench
 } from 'lucide-react'
 
 import {
@@ -59,6 +60,12 @@ const navigationItems = [
     title: 'Codebase Explorer',
     path: '/explorer',
     icon: Network,
+  },
+  {
+    id: 'skills',
+    title: 'Skills',
+    path: '/skills',
+    icon: Wrench,
   },
   {
     id: 'settings',

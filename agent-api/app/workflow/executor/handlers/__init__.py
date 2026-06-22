@@ -30,3 +30,4 @@ from . import language_model  # noqa: E402,F401  — new LangflowEditor 'languag
 from . import router  # noqa: E402,F401  — new LangflowEditor 'router' node type
 from . import wiki  # noqa: E402,F401  — new Wiki output node type
 from . import code_analyzer  # noqa: E402,F401
+from . import vector_memory  # noqa: E402,F401  — semantic recall node

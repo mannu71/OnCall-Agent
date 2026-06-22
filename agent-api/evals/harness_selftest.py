@@ -182,10 +182,13 @@ def test_context_builder() -> None:
 def test_extension_tools() -> None:
     from app.harness.tool_assembler import add_extension_tools
     log = logging.getLogger("t")
-    # no code_analyzer_config → no extensions
+    # No code_analyzer_config → no delegate/edit tools, but the scratch filesystem
+    # (fs_*) is ALWAYS added (it's unconditional now), so base is preserved + fs_*.
     out = add_extension_tools(tools=["base"], llm="LLM", agent_config={}, code_analyzer_config=None,
                               execution_id="e", logger_instance=log)
-    check("add_extension_tools noop without code config", out == ["base"])
+    _names0 = [getattr(t, "name", t) for t in out]
+    check("add_extension_tools keeps base + always adds vfs",
+          "base" in _names0 and "fs_write" in _names0 and "fs_grep" in _names0, str(_names0))
     # with code config → appends delegate (+ edit, best-effort)
     out2 = add_extension_tools(tools=[], llm="LLM", agent_config={"instructions": "x"},
                                code_analyzer_config={"repos": []}, execution_id="e", logger_instance=log)
@@ -1216,6 +1219,38 @@ def test_configurable_agents() -> None:
           _parse_proposals('[{"kind":"prompt","suggestion":"x","rationale":"y"}]')[0]["status"] == "draft")
 
 
+async def test_file_skills() -> None:
+    # File-backed SkillService: create/list/get/recall/execute/audit/delete, no DB.
+    import tempfile, json as _json
+    from app.config import settings as _s
+    _s.skills_store_dir = tempfile.mkdtemp(prefix="skselftest_")
+    from app.core.skills.service import SkillService, _skill_path
+    from app.core.skills import service as _svc_mod
+    svc = SkillService()
+
+    s = await svc.create_manual(name="Restart Pods", title="Restart",
+                                trigger_patterns=["pods crashing"],
+                                steps=[{"order": 1, "description": "noop", "tool": None}])
+    check("file skill create slug+source", s["name"] == "restart_pods" and s["source"] == "manual")
+    check("file skill written to disk", _skill_path("restart_pods").exists())
+    check("file skill list", len(await svc.list_skills(status="all")) == 1)
+    check("file skill recall", bool(await svc.recall("the pods crashing again")))
+    res = await svc.execute("restart_pods", context={})
+    disk = _json.loads(_skill_path("restart_pods").read_text("utf-8"))
+    check("file skill execute bumps counters in file",
+          res.success and disk["recall_count"] == 1 and disk["success_count"] == 1)
+    # audit promotes a proven draft
+    await svc.create_manual(name="draft_one", title="D", steps=[])
+    _svc_mod._CACHE["draft_one"]["status"] = "draft"
+    _svc_mod._CACHE["draft_one"]["success_count"] = 5
+    _svc_mod._write_record(_svc_mod._CACHE["draft_one"])
+    a = await svc.audit()
+    check("file skill audit promotes draft", a["promoted"] >= 1)
+    check("file skill delete", (await svc.delete("restart_pods")) and not _skill_path("restart_pods").exists())
+    await svc.delete_all()
+    check("file skill delete_all clears store", (await svc.list_skills(status="all")) == [])
+
+
 async def _main() -> int:
     print("=== Agent Harness self-test ===")
     test_envelopes()
@@ -1257,6 +1292,8 @@ async def _main() -> int:
     test_cloudwatch_prescan_gate()
     # ── configurable agents (capabilities/output/profiles) + deep-agent (planning/vfs/subagents) + self-improvement ──
     test_configurable_agents()
+    # ── file-backed skills (no DB) ──
+    await test_file_skills()
     print("-" * 40)
     if _FAILURES:
         print(f"FAILED: {len(_FAILURES)} check(s): {', '.join(_FAILURES)}")

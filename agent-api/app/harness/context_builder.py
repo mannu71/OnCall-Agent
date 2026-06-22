@@ -207,6 +207,11 @@ def seed_context_blocks(
         block = cap_context_block("Anomaly-Code Correlation", anomaly_correlation)
         augmented_query = f"{block}{augmented_query}"
 
+    vector_memory_context = context.get("vector_memory_context")
+    if vector_memory_context:
+        block = cap_context_block("Recalled Memory", vector_memory_context)
+        augmented_query = f"{block}{augmented_query}"
+
     return augmented_query, cw_synthesis
 
 

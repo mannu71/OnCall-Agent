@@ -20,6 +20,7 @@ from app.api.v1.endpoints import (
     model_keys,
     sessions,
     settings,
+    skills,
     tools,
     trajectories,
     workflows,
@@ -48,3 +49,4 @@ api_router.include_router(gateway.router)
 api_router.include_router(sessions.router)
 api_router.include_router(agent_profiles.router)
 api_router.include_router(improvement.router)
+api_router.include_router(skills.router)

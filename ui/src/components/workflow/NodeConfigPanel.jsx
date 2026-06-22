@@ -303,6 +303,25 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
                   onChange={(e) => handleConfigChange('filesystem', e.target.checked)}
                 />{' '}Scratch filesystem — fs_write/read/grep for context offload
               </label>
+              <label className="checkbox-label" style={{ display: 'block', marginTop: 4 }}>
+                <input
+                  type="checkbox"
+                  checked={!!config.autoLearn}
+                  onChange={(e) => handleConfigChange('autoLearn', e.target.checked)}
+                />{' '}Auto-learn — distill skills/memory from each run (opt-in)
+              </label>
+              <label className="checkbox-label" style={{ display: 'block', marginTop: 4 }}>
+                <input
+                  type="checkbox"
+                  checked={!!config.sandbox}
+                  onChange={(e) => handleConfigChange('sandbox', e.target.checked)}
+                />{' '}Sandbox — isolated run_command shell
+              </label>
+              {config.sandbox && (
+                <small style={{ color: '#92400e', fontSize: '11px', display: 'block', marginTop: 2 }}>
+                  Requires a sandbox backend configured on the server (SANDBOX_BACKEND); otherwise this is a no-op.
+                </small>
+              )}
             </div>
             <div className="config-field">
               <label htmlFor="agent-subagents">Subagents (advanced, JSON)</label>

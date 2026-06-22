@@ -15,6 +15,7 @@ const Settings = lazy(() => import('./pages/Settings'));
 const Workflow = lazy(() => import('./pages/workflow'));
 const Chat = lazy(() => import('./pages/Chat'));
 const CodebaseExplorer = lazy(() => import('./pages/CodebaseExplorer'));
+const Skills = lazy(() => import('./pages/Skills'));
 
 // Use HashRouter for Electron, BrowserRouter for web
 const Router = window.electronAPI ? HashRouter : BrowserRouter;
@@ -60,6 +61,7 @@ const AppRoutes = () => {
               <Route path="/incidents" element={<PlaceholderPage title="Incidents" />} />
               <Route path="/workflow" element={<Workflow />} />
               <Route path="/explorer" element={<CodebaseExplorer />} />
+              <Route path="/skills" element={<Skills />} />
               <Route path="/alerts" element={<PlaceholderPage title="Alerts" />} />
               <Route path="/emergency" element={<PlaceholderPage title="Emergency Contact" />} />
               <Route path="/settings" element={<Settings />} />

@@ -191,3 +191,65 @@
     background: rgba(148, 163, 184, 0.6); 
   }
 }
+/* ── Chat redesign: scoped tokens, density + keyframes ──────────────────────
+   Additive only. Derived from existing brand/slate tokens; no palette change. */
+:root {
+  --chat-max: 820px;
+  /* density defaults (comfortable) — overridden by .chat-density-* below */
+  --msg-pad: 1rem;
+  --msg-gap: 1.25rem;
+}
+.chat-density-compact    { --msg-pad: 0.625rem; --msg-gap: 0.6rem; }
+.chat-density-comfortable{ --msg-pad: 1rem;     --msg-gap: 1.25rem; }
+.chat-density-spacious   { --msg-pad: 1.25rem;  --msg-gap: 1.75rem; }
+
+@keyframes chat-msg-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.chat-msg-enter { animation: chat-msg-enter 0.28s cubic-bezier(0.4,0,0.2,1) both; }
+
+/* Agent-thread node dot pulse (running step) */
+@keyframes chat-thread-pulse {
+  0%,100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--primary) 45%, transparent); }
+  50%     { box-shadow: 0 0 0 5px color-mix(in srgb, var(--primary) 0%, transparent); }
+}
+.chat-thread-pulse { animation: chat-thread-pulse 1.4s ease-in-out infinite; }
+
+/* Synapse pulse travelling down the thread line while a run is live */
+@keyframes chat-synapse-travel {
+  0%   { top: 0; opacity: 0; }
+  15%  { opacity: 1; }
+  85%  { opacity: 1; }
+  100% { top: 100%; opacity: 0; }
+}
+.chat-synapse { animation: chat-synapse-travel 1.6s linear infinite; }
+
+/* Composer send button states */
+@keyframes chat-send-launch {
+  0%   { transform: translate(0,0) rotate(0); }
+  40%  { transform: translate(2px,-2px) rotate(8deg); }
+  100% { transform: translate(0,0) rotate(0); }
+}
+.chat-send-launch { animation: chat-send-launch 0.45s ease-out; }
+@keyframes chat-siren {
+  0%,100% { transform: scale(1); opacity: 1; }
+  50%     { transform: scale(0.82); opacity: 0.7; }
+}
+.chat-siren { animation: chat-siren 0.9s ease-in-out infinite; }
+@keyframes chat-quarter-turn {
+  0%   { transform: rotate(0); }
+  100% { transform: rotate(360deg); }
+}
+.chat-quarter-turn { animation: chat-quarter-turn 1s steps(4) infinite; }
+
+/* Thinking ellipsis */
+@keyframes chat-thinking-dots {
+  0%,20%   { content: '.'; }
+  40%      { content: '..'; }
+  60%,100% { content: '...'; }
+}
+.chat-thinking-dots::after { content: '.'; animation: chat-thinking-dots 1.4s steps(1) infinite; }
+
+/* Smooth collapsible (max-height) for thinking / sources */
+.chat-collapsible { overflow: hidden; transition: max-height 0.28s cubic-bezier(0.4,0,0.2,1); }

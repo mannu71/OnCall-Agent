@@ -1,21 +1,30 @@
-"""Skill system — reusable, executable resolution procedures.
+"""Skill system — reusable, executable resolution procedures (FILE-backed).
 
 Skills are the executable layer on top of the knowledge base.  Where a
 knowledge entry records *what was learned*, a skill records *how to act*.
 
+Storage
+-------
+Skills are stored as **one JSON file per skill** under ``settings.skills_store_dir``
+(default ``data/skills_store/<name>.json``), fronted by a process-wide in-memory
+cache. There is NO database table involved on the hot paths (recall / execute /
+list / create / delete) — this removes per-turn DB round-trips. The only method
+that still touches the DB is :meth:`promote`, which reads the source
+``knowledge_entries`` row. A one-time, best-effort importer migrates any rows from
+the legacy ``skills`` table into files on first use (no-op when the table is empty
+or absent). ``name`` (a slug) is the identity / filename.
+
 Lifecycle
 ---------
 1. **Distillation** — after a high-quality investigation, the LLM converts the
-   trajectory into a structured skill (name, trigger_patterns, ordered steps)
-   and saves it to the ``skills`` table.
-2. **Recall** — at investigation start, vector similarity against trigger_patterns
+   trajectory into a structured skill and saves it as a file.
+2. **Recall** — at investigation start, keyword matching against trigger_patterns
    surfaces relevant skills as context injected into the agent prompt.
 3. **Execution** — the agent calls ``execute_skill(name, context)`` to run a
    skill's steps in order against the live MCP tool set.
 4. **Promotion** — an engineer (or the curator) can promote a knowledge_entry
-   with ``source="agent"`` into a first-class skill.
-5. **Curation** — the weekly curator archives skills with zero recent usage and
-   consolidates near-duplicate skills via LLM.
+   into a first-class skill.
+5. **Curation** — the curator archives shaky drafts and consolidates duplicates.
 
 Skill step schema
 -----------------
@@ -35,12 +44,15 @@ are substituted from the execution context dict before the tool is called.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import re
-import string
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import settings
@@ -101,6 +113,121 @@ _MIN_TOOL_CALLS = settings.skill_min_tool_calls
 
 
 # ---------------------------------------------------------------------------
+# File store (module-level, shared by every SkillService instance)
+# ---------------------------------------------------------------------------
+# A process-wide cache keyed by skill name. Reads serve from the cache after an
+# incremental, mtime-based rescan (cheap; keeps multiple workers roughly in sync
+# since os.replace bumps the file mtime). Writes are atomic (temp + os.replace).
+
+_CACHE: Dict[str, Dict[str, Any]] = {}
+_MTIMES: Dict[str, float] = {}
+_WRITE_LOCK = asyncio.Lock()
+_MIGRATED = False
+
+
+def _store_dir() -> Path:
+    d = Path(getattr(settings, "skills_store_dir", "data/skills_store"))
+    return d
+
+
+def _skill_path(name: str) -> Path:
+    return _store_dir() / f"{name}.json"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _scan_store() -> None:
+    """Incrementally refresh the cache from disk (mtime-based; drops deletions)."""
+    d = _store_dir()
+    if not d.exists():
+        # Nothing on disk yet — keep whatever's cached from writes this process.
+        return
+    seen: set[str] = set()
+    for f in d.glob("*.json"):
+        name = f.stem
+        seen.add(name)
+        try:
+            mt = f.stat().st_mtime
+        except OSError:
+            continue
+        if _MTIMES.get(name) == mt and name in _CACHE:
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            _CACHE[name] = _normalize_record(data, name=name)
+            _MTIMES[name] = mt
+        except Exception as exc:  # noqa: BLE001 — a bad file must not break the store
+            logger.debug("skills store: failed to read %s: %s", f, exc)
+    for name in list(_CACHE):
+        if name not in seen:
+            _CACHE.pop(name, None)
+            _MTIMES.pop(name, None)
+
+
+def _write_record(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Atomically persist a skill record and update the cache. Returns the record."""
+    rec = _normalize_record(rec)
+    name = rec["name"]
+    d = _store_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    path = _skill_path(name)
+    tmp = d / f".{name}.{uuid.uuid4().hex}.tmp"
+    tmp.write_text(json.dumps(rec, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+    _CACHE[name] = rec
+    try:
+        _MTIMES[name] = path.stat().st_mtime
+    except OSError:
+        pass
+    return rec
+
+
+def _remove_record(name: str) -> bool:
+    existed = name in _CACHE or _skill_path(name).exists()
+    try:
+        _skill_path(name).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("skills store: failed to delete %s: %s", name, exc)
+    _CACHE.pop(name, None)
+    _MTIMES.pop(name, None)
+    return existed
+
+
+async def _migrate_db_skills_once() -> None:
+    """One-time best-effort import of legacy DB skills into files (no-op if empty)."""
+    global _MIGRATED
+    if _MIGRATED:
+        return
+    _MIGRATED = True
+    try:
+        from sqlalchemy import select
+        from app.models.db_models import SkillModel
+        from app.core.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as session:
+            rows = (await session.execute(select(SkillModel))).scalars().all()
+        imported = 0
+        for row in rows:
+            name = row.name
+            if not name or _skill_path(name).exists():
+                continue
+            _write_record(_orm_to_record(row))
+            imported += 1
+        if imported:
+            logger.info("skills store: migrated %d legacy DB skill(s) to files", imported)
+    except Exception as exc:  # noqa: BLE001 — DB missing/down must never break skills
+        logger.debug("skills store: DB migration skipped (%s)", exc)
+
+
+async def _ensure_store() -> None:
+    """Run the one-time DB import, then refresh the cache from disk."""
+    await _migrate_db_skills_once()
+    _scan_store()
+
+
+# ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
 
@@ -145,7 +272,7 @@ class SkillExecutionResult:
 # ---------------------------------------------------------------------------
 
 class SkillService:
-    """Manages skill distillation, recall, execution, and curation.
+    """Manages skill distillation, recall, execution, and curation (file-backed).
 
     Args:
         llm:  Optional LangChain LLM used for distillation and promotion.
@@ -240,15 +367,10 @@ class SkillService:
         skill_dict: Dict[str, Any],
         execution_id: str,
     ) -> Dict[str, Any]:
-        """Insert or update the skill in the DB."""
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-        from app.models.db_models import SkillModel
-        from app.core.database import AsyncSessionLocal
-
+        """Insert or update the skill file (distilled source)."""
         name  = _slugify(skill_dict.get("name", ""))[:60]
-        title = skill_dict.get("title", name)[:255]
+        title = (skill_dict.get("title") or name)[:255]
         steps = skill_dict.get("steps") or []
-        # Ensure steps are sorted by order
         steps = sorted(steps, key=lambda s: s.get("order", 99))
 
         # Confidence-gated activation: a low-confidence distillation lands as
@@ -257,49 +379,35 @@ class SkillService:
         status = "active" if confidence >= settings.skill_confidence_min else "draft"
         description = _compose_description(skill_dict)
 
-        async with AsyncSessionLocal() as session:
-            stmt = pg_insert(SkillModel).values(
-                name             = name,
-                title            = title,
-                description      = description,
-                trigger_patterns = skill_dict.get("trigger_patterns") or [],
-                steps            = steps,
-                workflow_name    = skill_dict.get("workflow_name"),
-                source           = "distilled",
-                status           = status,
-                confidence       = confidence,
-                success_count    = 0,
-                recall_count     = 0,
-                created_at       = datetime.now(timezone.utc),
-                updated_at       = datetime.now(timezone.utc),
-            ).on_conflict_do_update(
-                index_elements=["name"],
-                set_={
-                    "title":            title,
-                    "description":      description,
-                    "trigger_patterns": skill_dict.get("trigger_patterns") or [],
-                    "steps":            steps,
-                    "source":           "distilled",
-                    "status":           status,
-                    "confidence":       confidence,
-                    "updated_at":       datetime.now(timezone.utc),
-                },
-            ).returning(SkillModel.id)
-
-            result = await session.execute(stmt)
-            skill_id = result.scalar_one()
-            await session.commit()
+        async with _WRITE_LOCK:
+            await _ensure_store()
+            existing = _CACHE.get(name)
+            now = _now_iso()
+            rec = {
+                "name":             name,
+                "title":            title,
+                "description":      description,
+                "trigger_patterns": skill_dict.get("trigger_patterns") or [],
+                "steps":            steps,
+                "workflow_name":    skill_dict.get("workflow_name"),
+                "source":           "distilled",
+                "status":           status,
+                "confidence":       confidence,
+                # preserve counters/lineage/created_at across re-distillation
+                "audit_verdict":    (existing or {}).get("audit_verdict"),
+                "success_count":    int((existing or {}).get("success_count") or 0),
+                "recall_count":     int((existing or {}).get("recall_count") or 0),
+                "last_used_at":     (existing or {}).get("last_used_at"),
+                "promoted_from_id": (existing or {}).get("promoted_from_id"),
+                "created_at":       (existing or {}).get("created_at") or now,
+                "updated_at":       now,
+            }
+            _write_record(rec)
 
         logger.info(
-            "SkillService: skill '%s' upserted (id=%s, execution_id=%s)",
-            name, skill_id, execution_id,
+            "SkillService: skill '%s' upserted (file, execution_id=%s)", name, execution_id,
         )
-        return {
-            "id":    skill_id,
-            "name":  name,
-            "title": title,
-            "steps": len(steps),
-        }
+        return {"id": name, "name": name, "title": title, "steps": len(steps)}
 
     # ------------------------------------------------------------------
     # Recall
@@ -310,13 +418,7 @@ class SkillService:
         query: str,
         limit: int = 3,
     ) -> List[Dict[str, Any]]:
-        """Return up to *limit* active skills whose trigger_patterns match *query*.
-
-        Uses both keyword matching (fast, no embedding needed) and optionally
-        vector similarity if pgvector is available.
-
-        Returns list of skill dicts suitable for injecting into the agent prompt.
-        """
+        """Return up to *limit* active skills whose trigger_patterns match *query*."""
         try:
             return await self._keyword_recall(query, limit)
         except Exception as exc:
@@ -328,48 +430,37 @@ class SkillService:
         query: str,
         limit: int,
     ) -> List[Dict[str, Any]]:
-        from sqlalchemy import select
-        from app.models.db_models import SkillModel
-        from app.core.database import AsyncSessionLocal
-
+        await _ensure_store()
         query_lower = query.lower()
 
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(SkillModel)
-                .where(SkillModel.status == "active")
-                .order_by(SkillModel.recall_count.desc())
-                .limit(50)  # narrow in Python after loading
-            )
-            all_skills = result.scalars().all()
-
-        matched: List[Tuple[SkillModel, int]] = []
-        for skill in all_skills:
-            patterns = skill.trigger_patterns or []
+        matched: List[Tuple[Dict[str, Any], int]] = []
+        for skill in _CACHE.values():
+            if skill.get("status") != "active":
+                continue
+            patterns = skill.get("trigger_patterns") or []
             score = 0
             for p in patterns:
                 try:
                     if re.search(p, query, re.IGNORECASE):
                         score += 2
                 except re.error:
-                    if p.lower() in query_lower:
+                    if str(p).lower() in query_lower:
                         score += 1
-            # Also check title/description keyword overlap
-            if skill.title.lower() in query_lower:
+            if (skill.get("title") or "").lower() in query_lower:
                 score += 1
             if score > 0:
                 matched.append((skill, score))
 
-        matched.sort(key=lambda x: x[1], reverse=True)
+        matched.sort(key=lambda x: (x[1], x[0].get("recall_count") or 0), reverse=True)
 
         return [
             {
-                "id":    s.id,
-                "name":  s.name,
-                "title": s.title,
-                "description": s.description,
-                "trigger_patterns": s.trigger_patterns,
-                "steps": s.steps,
+                "id":    s["name"],
+                "name":  s["name"],
+                "title": s.get("title"),
+                "description": s.get("description"),
+                "trigger_patterns": s.get("trigger_patterns"),
+                "steps": s.get("steps"),
                 "score": score,
             }
             for s, score in matched[:limit]
@@ -393,9 +484,6 @@ class SkillService:
                          in step ``args_template`` values.
             mcp_manager: Live MCPClientManager instance.  When None, tool steps
                          are described but not executed.
-
-        Returns:
-            SkillExecutionResult
         """
         skill = await self._load_skill(skill_name)
         if skill is None:
@@ -407,7 +495,7 @@ class SkillService:
 
         # If the skill delegates to a workflow, return guidance but don't execute
         if skill.get("workflow_name"):
-            await self._increment_recall(skill["id"])
+            await self._bump_counters(skill_name, success=False)
             return SkillExecutionResult(
                 skill_name=skill_name,
                 success=True,
@@ -452,9 +540,7 @@ class SkillService:
             s.success or s.skipped for s in step_results
         )
 
-        if overall_success:
-            await self._increment_success(skill["id"])
-        await self._increment_recall(skill["id"])
+        await self._bump_counters(skill_name, success=overall_success)
 
         return SkillExecutionResult(
             skill_name=skill_name,
@@ -482,7 +568,6 @@ class SkillService:
                 output="[reasoning step — no tool required]",
             )
 
-        # Resolve args placeholders
         args = _resolve_args(args_tmpl, context)
 
         if mcp_manager is None:
@@ -493,7 +578,6 @@ class SkillService:
                 output=f"[dry-run] would call {tool_name}({args})",
             )
 
-        # Find which server exposes this tool
         server_id = _find_server(tool_name, mcp_manager)
         if server_id is None:
             return SkillStepResult(
@@ -525,7 +609,7 @@ class SkillService:
             )
 
     # ------------------------------------------------------------------
-    # Promotion
+    # Promotion (reads knowledge_entries from the DB; writes a skill file)
     # ------------------------------------------------------------------
 
     async def promote(
@@ -534,19 +618,9 @@ class SkillService:
         steps: List[Dict[str, Any]],
         name: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Promote a knowledge_entry to a formal executable skill.
-
-        Args:
-            knowledge_entry_id: ID of the KnowledgeEntryModel to promote.
-            steps:              Explicit step list for the skill.
-            name:               Optional slug override (auto-derived from title otherwise).
-
-        Returns:
-            Saved skill dict or None on failure.
-        """
+        """Promote a knowledge_entry to a formal executable skill (file-backed)."""
         from sqlalchemy import select
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-        from app.models.db_models import KnowledgeEntryModel, SkillModel
+        from app.models.db_models import KnowledgeEntryModel
         from app.core.database import AsyncSessionLocal
 
         try:
@@ -557,132 +631,105 @@ class SkillService:
                     )
                 )
                 entry = result.scalar_one_or_none()
-                if entry is None:
-                    logger.warning(
-                        "SkillService.promote: knowledge_entry id=%d not found",
-                        knowledge_entry_id,
-                    )
-                    return None
-
-                skill_name = _slugify(name or entry.title)[:60]
-                trigger_patterns = (
-                    [str(s) for s in (entry.symptoms or [])][:5]
-                    or [entry.title.lower()]
+            if entry is None:
+                logger.warning(
+                    "SkillService.promote: knowledge_entry id=%d not found", knowledge_entry_id,
                 )
+                return None
 
-                stmt = pg_insert(SkillModel).values(
-                    name             = skill_name,
-                    title            = entry.title[:255],
-                    description      = entry.description[:2000] if entry.description else "",
-                    trigger_patterns = trigger_patterns,
-                    steps            = steps,
-                    source           = "promoted",
-                    status           = "active",
-                    success_count    = 0,
-                    recall_count     = 0,
-                    promoted_from_id = knowledge_entry_id,
-                    created_at       = datetime.now(timezone.utc),
-                    updated_at       = datetime.now(timezone.utc),
-                ).on_conflict_do_update(
-                    index_elements=["name"],
-                    set_={
-                        "steps":      steps,
-                        "status":     "active",
-                        "source":     "promoted",
-                        "updated_at": datetime.now(timezone.utc),
-                    },
-                ).returning(SkillModel.id)
+            skill_name = _slugify(name or entry.title)[:60]
+            trigger_patterns = (
+                [str(s) for s in (entry.symptoms or [])][:5]
+                or [entry.title.lower()]
+            )
 
-                result2 = await session.execute(stmt)
-                skill_id = result2.scalar_one()
-                await session.commit()
+            async with _WRITE_LOCK:
+                await _ensure_store()
+                existing = _CACHE.get(skill_name)
+                now = _now_iso()
+                rec = {
+                    "name":             skill_name,
+                    "title":            entry.title[:255],
+                    "description":      entry.description[:2000] if entry.description else "",
+                    "trigger_patterns": trigger_patterns,
+                    "steps":            steps,
+                    "workflow_name":    (existing or {}).get("workflow_name"),
+                    "source":           "promoted",
+                    "status":           "active",
+                    "confidence":       (existing or {}).get("confidence"),
+                    "audit_verdict":    (existing or {}).get("audit_verdict"),
+                    "success_count":    int((existing or {}).get("success_count") or 0),
+                    "recall_count":     int((existing or {}).get("recall_count") or 0),
+                    "last_used_at":     (existing or {}).get("last_used_at"),
+                    "promoted_from_id": knowledge_entry_id,
+                    "created_at":       (existing or {}).get("created_at") or now,
+                    "updated_at":       now,
+                }
+                _write_record(rec)
 
             logger.info(
-                "SkillService: promoted knowledge_entry %d → skill '%s' (id=%d)",
-                knowledge_entry_id, skill_name, skill_id,
+                "SkillService: promoted knowledge_entry %d → skill '%s' (file)",
+                knowledge_entry_id, skill_name,
             )
-            return {"id": skill_id, "name": skill_name, "title": entry.title}
+            return {"id": skill_name, "name": skill_name, "title": entry.title}
 
         except Exception as exc:
             logger.warning("SkillService.promote: failed — %s", exc)
             return None
 
     # ------------------------------------------------------------------
-    # Audit / curation (the "weekly curator" promised in this module's docstring)
+    # Audit / curation
     # ------------------------------------------------------------------
 
     async def audit(self) -> Dict[str, int]:
-        """Self-curate the skills table (draft→published lifecycle).
+        """Self-curate the skill files (draft→published lifecycle).
 
-        Four deterministic, LLM-free passes:
-          1. **Promote proven drafts** — a draft with enough successful runs
-             graduates to 'active' (proven-by-use).
-          2. **Archive shaky drafts** — a low-confidence draft that has never
-             been recalled is archived (it never earned its place).
-          3. **Dedupe near-duplicate titles** — among active skills sharing a
-             normalised title, keep the most-used and archive the rest.
-          4. Records an ``audit_verdict`` on each touched row.
-
-        Returns counts per pass. Safe to run repeatedly (idempotent verdicts).
+        Deterministic, LLM-free passes (idempotent verdicts):
+          1. Promote proven drafts (success_count >= threshold) → active.
+          2. Archive shaky, never-recalled, low-confidence drafts.
+          3. Dedupe near-duplicate titles among active skills (keep most-used).
         """
-        from sqlalchemy import select, update
-        from app.models.db_models import SkillModel
-        from app.core.database import AsyncSessionLocal
-
         promoted = archived = deduped = 0
-        now = datetime.now(timezone.utc)
         promote_threshold = settings.skill_promote_success_count
-
         try:
-            async with AsyncSessionLocal() as session:
+            async with _WRITE_LOCK:
+                await _ensure_store()
+                now = _now_iso()
+
                 # 1. Promote proven drafts.
-                res = await session.execute(
-                    update(SkillModel)
-                    .where(
-                        SkillModel.status == "draft",
-                        SkillModel.success_count >= promote_threshold,
-                    )
-                    .values(status="active", audit_verdict="promoted", updated_at=now)
-                )
-                promoted = res.rowcount or 0
+                for rec in list(_CACHE.values()):
+                    if rec.get("status") == "draft" and (rec.get("success_count") or 0) >= promote_threshold:
+                        rec = {**rec, "status": "active", "audit_verdict": "promoted", "updated_at": now}
+                        _write_record(rec)
+                        promoted += 1
 
                 # 2. Archive shaky, never-recalled drafts.
-                res = await session.execute(
-                    update(SkillModel)
-                    .where(
-                        SkillModel.status == "draft",
-                        SkillModel.recall_count == 0,
-                        SkillModel.confidence < settings.skill_confidence_min,
-                    )
-                    .values(status="archived", audit_verdict="archived", updated_at=now)
-                )
-                archived = res.rowcount or 0
+                for rec in list(_CACHE.values()):
+                    if (
+                        rec.get("status") == "draft"
+                        and (rec.get("recall_count") or 0) == 0
+                        and (rec.get("confidence") or 0.0) < settings.skill_confidence_min
+                    ):
+                        rec = {**rec, "status": "archived", "audit_verdict": "archived", "updated_at": now}
+                        _write_record(rec)
+                        archived += 1
 
                 # 3. Dedupe near-duplicate titles among active skills.
-                active = (
-                    await session.execute(
-                        select(SkillModel).where(SkillModel.status == "active")
-                    )
-                ).scalars().all()
-                by_title: Dict[str, List[SkillModel]] = {}
-                for s in active:
-                    key = _normalize_title(s.title)
-                    by_title.setdefault(key, []).append(s)
+                by_title: Dict[str, List[Dict[str, Any]]] = {}
+                for rec in _CACHE.values():
+                    if rec.get("status") == "active":
+                        by_title.setdefault(_normalize_title(rec.get("title") or ""), []).append(rec)
                 for dupes in by_title.values():
                     if len(dupes) < 2:
                         continue
-                    # Keep the most-used (recall+success); archive the others.
                     dupes.sort(
-                        key=lambda s: (s.recall_count or 0) + (s.success_count or 0),
+                        key=lambda r: (r.get("recall_count") or 0) + (r.get("success_count") or 0),
                         reverse=True,
                     )
                     for victim in dupes[1:]:
-                        victim.status = "archived"
-                        victim.audit_verdict = "deduped"
-                        victim.updated_at = now
+                        victim = {**victim, "status": "archived", "audit_verdict": "deduped", "updated_at": now}
+                        _write_record(victim)
                         deduped += 1
-
-                await session.commit()
         except Exception as exc:  # noqa: BLE001 — audit is best-effort
             logger.warning("SkillService.audit: failed — %s", exc)
 
@@ -699,96 +746,121 @@ class SkillService:
 
     async def get_skill(self, name: str) -> Optional[Dict[str, Any]]:
         """Return the skill dict for *name*, or None."""
-        skill = await self._load_skill(name)
-        return skill
+        return await self._load_skill(name)
 
     async def list_skills(
         self,
         status: str = "active",
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
-        """List skills filtered by status."""
-        from sqlalchemy import select
-        from app.models.db_models import SkillModel
-        from app.core.database import AsyncSessionLocal
-
+        """List skills filtered by status ('all' lists every status)."""
         try:
-            async with AsyncSessionLocal() as session:
-                q = (
-                    select(SkillModel)
-                    .where(SkillModel.status == status)
-                    .order_by(SkillModel.recall_count.desc())
-                    .limit(limit)
-                )
-                result = await session.execute(q)
-                skills = result.scalars().all()
-            return [_skill_to_dict(s) for s in skills]
+            await _ensure_store()
+            items = list(_CACHE.values())
+            if status and status != "all":
+                items = [s for s in items if s.get("status") == status]
+            items.sort(key=lambda s: s.get("recall_count") or 0, reverse=True)
+            return [_skill_to_dict(s) for s in items[:limit]]
         except Exception as exc:
             logger.debug("SkillService.list_skills: %s", exc)
             return []
 
     # ------------------------------------------------------------------
+    # Manual CRUD (UI-driven)
+    # ------------------------------------------------------------------
+
+    async def create_manual(
+        self,
+        *,
+        name: str,
+        title: str = "",
+        description: str = "",
+        trigger_patterns: Optional[List[str]] = None,
+        steps: Optional[List[Dict[str, Any]]] = None,
+        workflow_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create (or overwrite) an operator-authored skill (source='manual')."""
+        slug = _slugify(name)[:60]
+        async with _WRITE_LOCK:
+            await _ensure_store()
+            existing = _CACHE.get(slug)
+            now = _now_iso()
+            rec = {
+                "name":             slug,
+                "title":            title or name,
+                "description":      description or "",
+                "trigger_patterns": trigger_patterns or [],
+                "steps":            steps or [],
+                "workflow_name":    workflow_name,
+                "source":           "manual",
+                "status":           "active",
+                "confidence":       1.0,
+                "audit_verdict":    (existing or {}).get("audit_verdict"),
+                "success_count":    int((existing or {}).get("success_count") or 0),
+                "recall_count":     int((existing or {}).get("recall_count") or 0),
+                "last_used_at":     (existing or {}).get("last_used_at"),
+                "promoted_from_id": (existing or {}).get("promoted_from_id"),
+                "created_at":       (existing or {}).get("created_at") or now,
+                "updated_at":       now,
+            }
+            out = _write_record(rec)
+        logger.info("SkillService.create_manual: saved '%s' (file)", slug)
+        return _skill_to_dict(out)
+
+    async def delete(self, name: str) -> bool:
+        """Hard-delete a skill file by name. Returns True if it existed."""
+        async with _WRITE_LOCK:
+            await _ensure_store()
+            removed = _remove_record(name)
+        if removed:
+            logger.info("SkillService.delete: removed '%s' (file)", name)
+        return removed
+
+    async def delete_all(self) -> int:
+        """Hard-delete every skill file. Returns the count removed."""
+        async with _WRITE_LOCK:
+            await _ensure_store()
+            names = list(_CACHE.keys())
+            for name in names:
+                _remove_record(name)
+        logger.info("SkillService.delete_all: removed %d skill(s) (files)", len(names))
+        return len(names)
+
+    # ------------------------------------------------------------------
     # Counters
     # ------------------------------------------------------------------
 
-    async def _increment_success(self, skill_id: int) -> None:
-        from sqlalchemy import update
-        from app.models.db_models import SkillModel
-        from app.core.database import AsyncSessionLocal
-
+    async def _bump_counters(self, name: str, *, success: bool) -> None:
+        """Increment recall (+ success) counters with a single atomic file write."""
         try:
-            async with AsyncSessionLocal() as session:
-                await session.execute(
-                    update(SkillModel)
-                    .where(SkillModel.id == skill_id)
-                    .values(
-                        success_count=SkillModel.success_count + 1,
-                        last_used_at=datetime.now(timezone.utc),
-                        updated_at=datetime.now(timezone.utc),
-                    )
-                )
-                await session.commit()
+            async with _WRITE_LOCK:
+                await _ensure_store()
+                rec = _CACHE.get(name)
+                if rec is None:
+                    return
+                now = _now_iso()
+                rec = {
+                    **rec,
+                    "recall_count": int(rec.get("recall_count") or 0) + 1,
+                    "success_count": int(rec.get("success_count") or 0) + (1 if success else 0),
+                    "last_used_at": now,
+                    "updated_at": now,
+                }
+                _write_record(rec)
         except Exception as exc:
-            logger.debug("SkillService._increment_success: %s", exc)
-
-    async def _increment_recall(self, skill_id: int) -> None:
-        from sqlalchemy import update
-        from app.models.db_models import SkillModel
-        from app.core.database import AsyncSessionLocal
-
-        try:
-            async with AsyncSessionLocal() as session:
-                await session.execute(
-                    update(SkillModel)
-                    .where(SkillModel.id == skill_id)
-                    .values(
-                        recall_count=SkillModel.recall_count + 1,
-                        last_used_at=datetime.now(timezone.utc),
-                    )
-                )
-                await session.commit()
-        except Exception as exc:
-            logger.debug("SkillService._increment_recall: %s", exc)
+            logger.debug("SkillService._bump_counters(%s): %s", name, exc)
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
     async def _load_skill(self, name: str) -> Optional[Dict[str, Any]]:
-        from sqlalchemy import select
-        from app.models.db_models import SkillModel
-        from app.core.database import AsyncSessionLocal
-
         try:
-            async with AsyncSessionLocal() as session:
-                result = await session.execute(
-                    select(SkillModel).where(
-                        SkillModel.name == name,
-                        SkillModel.status != "archived",
-                    )
-                )
-                skill = result.scalar_one_or_none()
-            return _skill_to_dict(skill) if skill else None
+            await _ensure_store()
+            rec = _CACHE.get(name)
+            if rec is None or rec.get("status") == "archived":
+                return None
+            return _skill_to_dict(rec)
         except Exception as exc:
             logger.debug("SkillService._load_skill(%s): %s", name, exc)
             return None
@@ -824,12 +896,7 @@ def _coerce_confidence(value: Any) -> float:
 
 
 def _compose_description(skill_dict: Dict[str, Any]) -> str:
-    """Build the stored description, folding in pitfalls/verification sections.
-
-    The skills table has no separate columns for these, so they ride along in
-    the description (capped) — keeping the richer schema without a migration
-    that the execution loop would have to learn about.
-    """
+    """Build the stored description, folding in pitfalls/verification sections."""
     parts = [(skill_dict.get("description") or "").strip()]
     pitfalls = [str(p).strip() for p in (skill_dict.get("pitfalls") or []) if str(p).strip()]
     verification = [str(v).strip() for v in (skill_dict.get("verification") or []) if str(v).strip()]
@@ -857,9 +924,7 @@ def _resolve_args(
     for key, val in args_template.items():
         if isinstance(val, str) and "{" in val:
             try:
-                resolved[key] = val.format_map(
-                    _SafeDict(context)
-                )
+                resolved[key] = val.format_map(_SafeDict(context))
             except Exception:
                 resolved[key] = val
         else:
@@ -881,10 +946,35 @@ def _find_server(tool_name: str, mcp_manager: Any) -> Optional[str]:
     return None
 
 
-def _skill_to_dict(skill: Any) -> Dict[str, Any]:
-    """Convert a SkillModel ORM row to a plain dict."""
+def _normalize_record(d: Dict[str, Any], name: Optional[str] = None) -> Dict[str, Any]:
+    """Fill a stored/loaded skill dict with all expected keys; id == name."""
+    nm = d.get("name") or name or "unnamed_skill"
     return {
-        "id":               skill.id,
+        "id":               nm,
+        "name":             nm,
+        "title":            d.get("title") or nm,
+        "description":      d.get("description") or "",
+        "trigger_patterns": d.get("trigger_patterns") or [],
+        "steps":            d.get("steps") or [],
+        "workflow_name":    d.get("workflow_name"),
+        "source":           d.get("source") or "manual",
+        "status":           d.get("status") or "active",
+        "confidence":       d.get("confidence"),
+        "audit_verdict":    d.get("audit_verdict"),
+        "success_count":    int(d.get("success_count") or 0),
+        "recall_count":     int(d.get("recall_count") or 0),
+        "last_used_at":     d.get("last_used_at"),
+        "promoted_from_id": d.get("promoted_from_id"),
+        "created_at":       d.get("created_at"),
+        "updated_at":       d.get("updated_at"),
+    }
+
+
+def _orm_to_record(skill: Any) -> Dict[str, Any]:
+    """Convert a legacy SkillModel ORM row to a file record (for migration)."""
+    def _iso(v: Any) -> Optional[str]:
+        return v.isoformat() if hasattr(v, "isoformat") and v else None
+    return _normalize_record({
         "name":             skill.name,
         "title":            skill.title,
         "description":      skill.description,
@@ -894,14 +984,21 @@ def _skill_to_dict(skill: Any) -> Dict[str, Any]:
         "source":           skill.source,
         "status":           skill.status,
         "confidence":       float(skill.confidence) if skill.confidence is not None else None,
-        "audit_verdict":    skill.audit_verdict,
+        "audit_verdict":    getattr(skill, "audit_verdict", None),
         "success_count":    skill.success_count or 0,
         "recall_count":     skill.recall_count or 0,
-        "last_used_at":     skill.last_used_at.isoformat() if skill.last_used_at else None,
+        "last_used_at":     _iso(skill.last_used_at),
         "promoted_from_id": skill.promoted_from_id,
-        "created_at":       skill.created_at.isoformat() if skill.created_at else None,
-        "updated_at":       skill.updated_at.isoformat() if skill.updated_at else None,
-    }
+        "created_at":       _iso(skill.created_at),
+        "updated_at":       _iso(skill.updated_at),
+    })
+
+
+def _skill_to_dict(skill: Any) -> Dict[str, Any]:
+    """Normalize a stored dict (or legacy ORM row) to the canonical skill dict."""
+    if isinstance(skill, dict):
+        return _normalize_record(skill)
+    return _orm_to_record(skill)
 
 
 # ---------------------------------------------------------------------------

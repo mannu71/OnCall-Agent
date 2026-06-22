@@ -25,6 +25,7 @@ def build_agent(
     planning: bool = False,
     filesystem: bool = False,
     subagents: Optional[List[Dict[str, Any]]] = None,
+    sandbox: bool = False,
 ) -> Any:
     """
     Build a LangGraph ReAct agent graph.
@@ -172,13 +173,22 @@ def build_agent(
             "calling update_todo to mark each item in_progress then completed as the tool "
             "evidence supports it. Skip the plan for a single-lookup question."
         )
-    if filesystem:
+    # Scratch filesystem is always available (no toggle). Keep this section
+    # unconditional so the prompt matches the always-present fs_* tools.
+    system_parts.append(
+        "# Scratch filesystem\n"
+        "You have a session-scoped virtual filesystem (fs_write, fs_read, fs_ls, fs_grep). "
+        "When a tool returns a large result you only partly need, fs_write it to a file and "
+        "keep working from a short note, then fs_read/fs_grep just the part you need later. "
+        "This keeps your context lean. The files vanish when the run ends."
+    )
+    if sandbox:
         system_parts.append(
-            "# Scratch filesystem\n"
-            "You have a session-scoped virtual filesystem (fs_write, fs_read, fs_ls, fs_grep). "
-            "When a tool returns a large result you only partly need, fs_write it to a file and "
-            "keep working from a short note, then fs_read/fs_grep just the part you need later. "
-            "This keeps your context lean. The files vanish when the run ends."
+            "# Sandboxed shell\n"
+            "You have run_command, which executes a shell command inside an isolated "
+            "sandbox (no network by default; writes confined to a scratch working "
+            "directory). Use it for safe, self-contained commands; it returns "
+            "stdout/stderr/exit_code. It requires operator approval before each run."
         )
     if subagents:
         _names = ", ".join(

@@ -377,18 +377,26 @@ class ReactStrategy(BaseStrategy):
                 execution_id=execution_id,
             )
 
-            # Post-run learning is best-effort and must never sink a successful
-            # investigation. Any failure here is logged and swallowed.
-            try:
-                await auto_learn(
-                    user_query, result, execution_id, execution_start, recall_hits,
-                    logger_instance, code_analyzer_config=code_analyzer_config,
-                )
-            except Exception as _learn_call_err:
-                logger_instance.warning(
-                    "ReactStrategy: auto_learn failed (non-fatal): %s",
-                    redact(str(_learn_call_err)),
-                    extra={"execution_id": execution_id},
+            # Post-run learning is OPT-IN per workflow (agent node `autoLearn`).
+            # Off by default so a run never writes to skills/memory unless the
+            # workflow asked for it. ``spec.auto_learn`` already parsed the toggle
+            # (string 'true'/'false') correctly. Best-effort — never sinks a run.
+            if spec.auto_learn:
+                try:
+                    await auto_learn(
+                        user_query, result, execution_id, execution_start, recall_hits,
+                        logger_instance, code_analyzer_config=code_analyzer_config,
+                    )
+                except Exception as _learn_call_err:
+                    logger_instance.warning(
+                        "ReactStrategy: auto_learn failed (non-fatal): %s",
+                        redact(str(_learn_call_err)),
+                        extra={"execution_id": execution_id},
+                    )
+            else:
+                logger_instance.debug(
+                    "ReactStrategy: auto-learn off for this workflow (execution_id=%s)",
+                    execution_id,
                 )
 
             if execution_id is not None:
@@ -419,18 +427,28 @@ class ReactStrategy(BaseStrategy):
                 or (agent_config.get("params") or {}).get("outputMode")
                 or "text"
             ).lower()
-            # Resolve which structured schema to bind: the agent/profile may name
-            # one (outputSchema); unset defaults to InvestigationReport so existing
-            # workflows are unchanged. See output_registry.
-            _schema_name = str(
+            # Resolve which structured schema the agent/profile explicitly chose
+            # (outputSchema). Blank = none chosen. See output_registry.
+            _chosen_schema = str(
                 _ctx.get("output_schema")
                 or (_ctx.get("inputs") or {}).get("output_schema")
                 or agent_config.get("outputSchema")
                 or (agent_config.get("params") or {}).get("outputSchema")
-                or "investigation"
-            ).lower()
+                or ""
+            ).lower().strip()
+            # Structured output runs when EITHER the legacy outputMode=='structured'
+            # flag is set OR a concrete schema was picked in the node dropdown. When
+            # only the legacy flag is set (no schema), default to investigation so
+            # pre-existing workflows are unchanged.
+            _want_structured = (
+                _output_mode == "structured"
+                or (_chosen_schema not in ("", "text", "none"))
+            )
+            _schema_name = _chosen_schema or "investigation"
+            if _want_structured:
+                _output_mode = "structured"  # report accurately downstream
             structured_output = None
-            if _output_mode == "structured" and (result.get("final_answer") or "").strip():
+            if _want_structured and (result.get("final_answer") or "").strip():
                 try:
                     from app.workflow.strategies.react.output_registry import resolve_output_schema
                     _schema_model = resolve_output_schema(_schema_name)

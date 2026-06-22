@@ -379,6 +379,14 @@ class Settings(BaseSettings):
     )
     skill_rag_k: int = Field(default=2, validation_alias="SKILL_RAG_K")
 
+    # ── Skill storage (file-based; no DB) ────────────────────────────────────
+    # Executable skills (distilled + user-created) are stored as one JSON file
+    # per skill here. Markdown guidance skills (SkillManager) live under skills_dir.
+    skills_store_dir: str = Field(
+        default="data/skills_store", validation_alias="SKILLS_STORE_DIR"
+    )
+    skills_dir: str = Field(default="data/skills", validation_alias="SKILLS_DIR")
+
     # ── Self-improvement (hill-climbing) loop ────────────────────────────────
     # OFF by default. When enabled, an on-demand analyzer samples recent execution
     # traces and proposes prompt/tool/skill refinements as DRAFTS for operator

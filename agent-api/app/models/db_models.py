@@ -277,10 +277,10 @@ KnownIssueModel = KnowledgeEntryModel
 class SkillModel(Base):
     """Executable skill — a structured, reusable resolution procedure.
 
-    Skills are either distilled automatically from completed investigations
-    or authored manually.  The agent can call a skill by name via the
-    ``execute_skill`` tool, which runs the ``steps`` in order against the
-    live MCP tool set.
+    DEPRECATED / UNUSED: skills are now FILE-backed (one JSON per skill under
+    ``settings.skills_store_dir``); see ``app.core.skills.service``. This model
+    is retained only so the legacy ``skills`` table remains importable for the
+    one-time file migration. Do not add new reads/writes against it.
     """
     __tablename__ = "skills"
 

@@ -130,6 +130,25 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
         )
 
     # ------------------------------------------------------------------
+    # Cross-node data: collect results from upstream Vector Memory nodes
+    # (semantic recall) so the agent starts with relevant remembered facts.
+    # ------------------------------------------------------------------
+    mem_results = {}
+    for key, value in context.items():
+        if isinstance(value, dict) and value.get('memory_recall_type') and value.get('output'):
+            mem_results[key] = {
+                'memory_recall_type': value.get('memory_recall_type'),
+                'output': value.get('output'),
+                'count': value.get('count'),
+            }
+    if mem_results:
+        strategy_context['vector_memory_context'] = mem_results
+        logger.info(
+            "Agent node: injecting %d upstream Vector Memory result(s) into context",
+            len(mem_results),
+        )
+
+    # ------------------------------------------------------------------
     # Anomaly-code correlation: when both CW and Code Analyzer results are
     # present, cross-reference anomaly messages with code chunk names and
     # inject the correlation into strategy_context for the agent's initial

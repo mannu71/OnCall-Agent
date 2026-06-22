@@ -58,6 +58,17 @@ def _as_str_list(value: Any) -> List[str]:
     return []
 
 
+def _as_bool(value: Any) -> bool:
+    """Truthy parse that respects UI toggles stored as the STRING 'true'/'false'.
+
+    The LangflowEditor toggle writes ``String(!!on)`` → 'true'|'false', so a plain
+    ``bool('false')`` would wrongly be True. Treat the usual falsy strings as off.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
 def resolve_profile_fields(agent_config: Dict[str, Any]) -> Dict[str, Any]:
     """Resolve the configurable-agent fields (capabilities / role / output schema /
     deep-agent flags) from agent node config + its ``params`` mirror.
@@ -80,9 +91,11 @@ def resolve_profile_fields(agent_config: Dict[str, Any]) -> Dict[str, Any]:
         "capabilities": _as_str_list(_pick("capabilities")),
         "role_prompt": _pick("rolePrompt", "role_prompt") or None,
         "output_schema": _pick("outputSchema", "output_schema") or None,
-        "planning": bool(_pick("planning")),
-        "filesystem": bool(_pick("filesystem")),
+        "planning": _as_bool(_pick("planning")),
+        "filesystem": _as_bool(_pick("filesystem")),
         "subagents": _coerce_subagents(_pick("subagents")),
+        "auto_learn": _as_bool(_pick("autoLearn", "auto_learn")),
+        "sandbox": _as_bool(_pick("sandbox")),
     }
 
 
@@ -124,4 +137,6 @@ def build_agent_spec(
         planning=profile["planning"],
         filesystem=profile["filesystem"],
         subagents=profile["subagents"],
+        auto_learn=profile["auto_learn"],
+        sandbox=profile["sandbox"],
     )
