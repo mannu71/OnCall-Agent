@@ -299,4 +299,32 @@ def add_extension_tools(
         except Exception as _sbe:  # noqa: BLE001
             logger_instance.warning("ReactStrategy: sandbox tool skipped (%s)", _sbe)
 
+    # Verify tool (edit→verify→fix loop). Added only when a verify_command is
+    # configured AND a sandbox backend is available — so a command with no
+    # SANDBOX_BACKEND is a safe no-op. Runs the fixed command against the real
+    # repo dir; gated 'ask' by the policy engine (it executes code).
+    _verify_cmd = _flags.get("verify_command")
+    if _verify_cmd:
+        try:
+            from app.core import sandbox as _sandbox
+            if _sandbox.is_enabled():
+                from app.workflow.strategies.react.verify_tools import build_verify_tool
+                _verify_tool = build_verify_tool(
+                    _verify_cmd,
+                    image=_flags.get("verify_image"),
+                    timeout=_flags.get("verify_timeout"),
+                )
+                if _verify_tool is not None:
+                    tools.append(_verify_tool)
+                    logger_instance.info(
+                        "ReactStrategy: run_verify tool enabled (command=%s)", _verify_cmd
+                    )
+            else:
+                logger_instance.info(
+                    "ReactStrategy: verify_command set but no sandbox backend configured "
+                    "(set SANDBOX_BACKEND) — skipping run_verify tool"
+                )
+        except Exception as _vte:  # noqa: BLE001
+            logger_instance.warning("ReactStrategy: verify tool skipped (%s)", _vte)
+
     return tools

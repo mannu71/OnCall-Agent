@@ -379,19 +379,38 @@ class MCPClientManager:
             logger.debug("Arguments: %s", arguments)
 
             from app.core.telemetry import tool_span
-            session = self.connections[server_id]['session']
 
             async def _call_tool():
+                # Always read session fresh — if reconnect replaced it we use the new one.
+                session = self.connections[server_id]['session']
                 async with tool_span(tool_name):
                     if timeout_secs:
-                        from datetime import timedelta
                         return await asyncio.wait_for(
                             session.call_tool(tool_name, arguments),
                             timeout=timeout_secs,
                         )
                     return await session.call_tool(tool_name, arguments)
 
-            result = await with_retry(_call_tool, max_retries=2)
+            async def _call_with_reconnect():
+                try:
+                    return await _call_tool()
+                except (BrokenPipeError, ConnectionResetError, EOFError, OSError) as exc:
+                    # The MCP server process died (common for npx servers after a long
+                    # idle or mid-run OOM). Try to reconnect once before giving up.
+                    logger.warning(
+                        "MCP server '%s' pipe broken (%s) — attempting reconnect",
+                        server_id, exc,
+                    )
+                    config = (self.connections.get(server_id) or {}).get('config')
+                    if config:
+                        await self.disconnect_server(server_id)
+                        reconnected = await self.connect_server(server_id, config)
+                        if reconnected:
+                            logger.info("MCP server '%s' reconnected — retrying tool call", server_id)
+                            return await _call_tool()
+                    raise  # re-raise if we couldn't reconnect
+
+            result = await with_retry(_call_with_reconnect, max_retries=2)
             
             logger.info("Tool '%s' executed successfully", tool_name)
 

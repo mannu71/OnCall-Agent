@@ -75,6 +75,7 @@ def build_agent_from_spec(
         filesystem=spec.filesystem,
         subagents=spec.subagents,
         sandbox=spec.sandbox,
+        verify=bool(getattr(spec, "verify_command", None)),
     )
 
 

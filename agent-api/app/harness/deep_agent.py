@@ -73,6 +73,7 @@ def build_deep_agent(
         planning=getattr(spec, "planning", False),
         filesystem=getattr(spec, "filesystem", False),
         sandbox=getattr(spec, "sandbox", False),
+        verify=bool(getattr(spec, "verify_command", None)),
         subagents=getattr(spec, "subagents", None),
     )
 

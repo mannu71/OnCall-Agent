@@ -9,6 +9,12 @@ echo "Rebuilding Docker Image (Data Safe)"
 echo "========================================"
 echo ""
 
+# Build the codegraph engine image first — agent-api's Dockerfile bakes its
+# binary in via `COPY --from=codegraph:latest`, so it must exist beforehand.
+echo "[0/5] Building codegraph engine image..."
+docker build -t codegraph:latest ./codegraph
+echo ""
+
 # Change to agent-api directory
 cd agent-api
 

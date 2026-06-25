@@ -22,6 +22,7 @@ def compose_system_prompt(
     planning: bool = False,
     filesystem: bool = False,
     sandbox: bool = False,
+    verify: bool = False,
     subagents: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Assemble the deterministic system prompt (the Bedrock cachePoint prefix).
@@ -186,6 +187,16 @@ def compose_system_prompt(
             "sandbox (no network by default; writes confined to a scratch working "
             "directory). Use it for safe, self-contained commands; it returns "
             "stdout/stderr/exit_code. It requires operator approval before each run."
+        )
+    if verify:
+        system_parts.append(
+            "# Verify your changes\n"
+            "After you edit_file or create_file, call run_verify(repo) to run the project's "
+            "configured checks (tests/typecheck/lint) against your edit. If it returns a non-zero "
+            "exit_code, READ the stderr/stdout tail, fix the code with another edit, and run_verify "
+            "again — repeat until it passes (exit_code 0) before you give your final answer. Don't "
+            "claim a fix works until run_verify is green; if it stays red after a reasonable number "
+            "of attempts, report the remaining failure and what you tried."
         )
     if subagents:
         _names = ", ".join(

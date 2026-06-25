@@ -220,6 +220,13 @@ async def crawler_index_repo(
 
     try:
         await run_flow("indexFlow", index_flow, shared)
+        # Invalidate the file-paths cache so subsequent crawler_list_files calls
+        # reflect any newly-added files in the freshly-indexed repo.
+        try:
+            from app.crawler.files import _file_paths_cache
+            _file_paths_cache.clear(prefix=f"paths:{repo}")
+        except Exception:  # noqa: BLE001
+            pass
         return shared.get("response", {})
     except Exception as exc:
         logger.error("crawler_index_repo failed for '%s': %s", repo, exc)

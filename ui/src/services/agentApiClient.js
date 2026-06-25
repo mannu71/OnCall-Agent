@@ -539,6 +539,38 @@ export const agentApiClient = {
         return response.data;
     },
 
+    // ==================== CloudWatch Log Watch ====================
+
+    /**
+     * Test AWS CloudWatch connection
+     */
+    async testCloudWatchConnection(region, credentials) {
+        const response = await client.post('/api/v1/log-watch/test-connection', {
+            region,
+            credentials: {
+                aws_profile: credentials.awsProfile || null,
+            },
+        });
+        return response.data;
+    },
+
+    /**
+     * Discover CloudWatch log groups by name prefix or tags.
+     * @param {string|undefined} prefix   - Log group name prefix
+     * @param {string} region             - AWS region (default us-east-1)
+     * @param {number} limit              - Max groups to return (default 50)
+     * @param {string|undefined} profile  - AWS CLI profile name (e.g. 'test-dev').
+     *   When provided the backend uses this profile instead of the default
+     *   Bedrock IAM user, matching the credentials used during workflow execution.
+     */
+    async discoverCloudWatchLogGroups(prefix, region = 'us-east-1', limit = 50, profile) {
+        const params = { region, limit };
+        if (prefix) params.prefix = prefix;
+        if (profile) params.profile = profile;
+        const response = await client.get('/api/v1/log-watch/discover-log-groups', { params });
+        return response.data;
+    },
+
     /**
      * List repositories discovered under REPOS_BASE_PATH (the read-only
      * docker volume mount from the host's repo root). Used by the

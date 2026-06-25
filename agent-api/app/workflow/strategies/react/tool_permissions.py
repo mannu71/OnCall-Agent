@@ -40,6 +40,7 @@ DEFAULT_ASK_PATTERNS = (
     "create_file",   # NOTE: the "*_create" suffix glob below does NOT match this
     "apply_patch",
     "run_command",
+    "run_verify",
     "*_write",
     "*_delete",
     "*_update",

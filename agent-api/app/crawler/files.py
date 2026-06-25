@@ -26,6 +26,13 @@ from typing import List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
+# TTL cache for crawl_file_paths — the walk is O(repo size) and takes 10-15s
+# on large repos. Within an agent run the file tree is stable, so cache the
+# sorted path list for 5 minutes per repo. Invalidated implicitly on TTL expiry
+# or explicitly via clear("paths:<repo>") after an index run.
+from app.core.ttl_cache import TTLCache as _TTLCache
+_file_paths_cache = _TTLCache(ttl_seconds=300.0, maxsize=32)
+
 # ---------------------------------------------------------------------------
 # Include / exclude glob patterns (applied to file relpaths)
 # ---------------------------------------------------------------------------
@@ -418,8 +425,25 @@ async def crawl_file_paths(
     max_file_size: int = _DEFAULT_MAX_FILE_SIZE,
     max_files: int = _DEFAULT_MAX_FILES,
 ) -> List[str]:
-    """Return sorted relative paths under *repo_name* without loading file bodies."""
+    """Return sorted relative paths under *repo_name* without loading file bodies.
+
+    Results are cached for 5 minutes per repo (the walk is 10-15 s on large repos
+    and the file tree is stable within an agent run).  Custom include/exclude
+    patterns bypass the cache so callers with non-default patterns still get a
+    fresh walk.
+    """
     directory, repos_root = _repo_directory(repo_name)
+
+    # Cache only the default-pattern case — custom patterns are rare (indexing)
+    # and changing include/exclude would produce a different path list anyway.
+    use_cache = (include_patterns is None and exclude_patterns is None)
+    cache_key = f"paths:{repo_name}"
+    if use_cache:
+        cached = _file_paths_cache.get(cache_key)
+        if cached is not None:
+            logger.debug("crawl_file_paths: cache hit for '%s' (%d files)", repo_name, len(cached))
+            return cached
+
     inc = include_patterns if include_patterns is not None else _DEFAULT_INCLUDE
     exc = exclude_patterns if exclude_patterns is not None else _DEFAULT_EXCLUDE
     prune_dirs = _BASE_PRUNE_DIRS | _detect_prune_dirs(directory)
@@ -428,8 +452,11 @@ async def crawl_file_paths(
         _crawl_paths_sync, directory, repos_root, inc, exc,
         max_file_size, max_files, prune_dirs,
     )
-    logger.info("Indexed paths for '%s': %d files (content not loaded)", repo_name, len(paths))
-    return sorted(paths)
+    result = sorted(paths)
+    logger.info("Indexed paths for '%s': %d files (content not loaded)", repo_name, len(result))
+    if use_cache:
+        _file_paths_cache.set(cache_key, result)
+    return result
 
 
 async def read_repo_file(repo_name: str, relpath: str) -> str:

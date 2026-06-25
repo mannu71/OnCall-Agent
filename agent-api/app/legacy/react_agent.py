@@ -36,6 +36,7 @@ def build_agent(
     filesystem: bool = False,
     subagents: Optional[List[Dict[str, Any]]] = None,
     sandbox: bool = False,
+    verify: bool = False,
 ) -> Any:
     """Build a LangGraph ReAct agent graph (legacy harness).
 
@@ -53,6 +54,7 @@ def build_agent(
         planning=planning,
         filesystem=filesystem,
         sandbox=sandbox,
+        verify=verify,
         subagents=subagents,
     )
     return _finish_build_agent(

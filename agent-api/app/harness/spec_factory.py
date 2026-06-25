@@ -120,6 +120,11 @@ def resolve_profile_fields(agent_config: Dict[str, Any]) -> Dict[str, Any]:
         "subagents": _coerce_subagents(_pick("subagents")),
         "auto_learn": _as_bool(_pick("autoLearn", "auto_learn")),
         "sandbox": _as_bool(_pick("sandbox")),
+        # Edit→verify→fix loop: operator-configured command run against the real
+        # repo dir after edits (e.g. "pytest -q"). Empty = no run_verify tool.
+        "verify_command": (_pick("verifyCommand", "verify_command") or None),
+        "verify_image": (_pick("verifyImage", "verify_image") or None),
+        "verify_timeout": _pick("verifyTimeout", "verify_timeout"),
         # Explicit per-node override; the authoritative signal is graph
         # connectivity (``has_memory``), resolved in build_agent_spec().
         "memory": _as_bool(_pick("memory")),
@@ -185,5 +190,8 @@ def build_agent_spec(
         auto_learn=auto_learn,
         sandbox=profile["sandbox"],
         memory=memory,
+        verify_command=profile["verify_command"],
+        verify_image=profile["verify_image"],
+        verify_timeout=(int(profile["verify_timeout"]) if profile["verify_timeout"] else None),
         harness=profile["harness"],
     )

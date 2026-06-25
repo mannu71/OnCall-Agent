@@ -213,6 +213,13 @@ async def crawler_list_files(
     glob: Optional[str] = None,
     limit: int = 400,
 ) -> Dict[str, Any]:
+    """List repository file paths filtered by a glob pattern.
+
+    IMPORTANT: Always pass a glob filter (e.g. glob='*.cs', glob='src/Services/**').
+    Omitting glob walks the entire repo — slow (10-15 s) and returns too many files
+    to reason over. Use crawler_grep to find files by content, or crawler_repo_map
+    for a fast symbol-level orientation of the repo.
+    """
     from app.services.crawler_flows import crawler_list_files as _ls
 
     return await _ls(repo=repo, repos=repos, glob=glob, limit=limit)

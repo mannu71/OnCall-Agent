@@ -7,6 +7,16 @@ echo Rebuilding Docker Image (Data Safe)
 echo ========================================
 echo.
 
+REM Build the codegraph engine image first — agent-api's Dockerfile bakes its
+REM binary in via `COPY --from=codegraph:latest`, so it must exist beforehand.
+echo [0/5] Building codegraph engine image...
+docker build -t codegraph:latest ./codegraph
+if %ERRORLEVEL% NEQ 0 (
+    echo Error: Failed to build codegraph engine image!
+    exit /b 1
+)
+echo.
+
 REM Change to agent-api directory
 cd agent-api
 

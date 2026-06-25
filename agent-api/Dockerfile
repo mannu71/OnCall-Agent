@@ -52,10 +52,14 @@ ENV AWS_DEFAULT_REGION=eu-west-1 \
     UVICORN_WORKERS=1 \
     UVICORN_LOOP=auto \
     UVICORN_HTTP=auto \
-    PATH="/opt/venv/bin:$PATH"
+    PATH="/opt/venv/bin:$PATH" \
+    CODEGRAPH_DB=/app/data/codegraph.db
 
+# ripgrep powers the crawler's code-grep tool; git backs codegraph's
+# detect_changes / symbol_history; libtree-sitter0 is the runtime for codegraph's
+# AST backend (the grammar bundle is copied in below).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ripgrep \
+        ripgrep git libtree-sitter0 \
     && rm -rf /var/lib/apt/lists/*
 
 # App code (shared by both runtime targets).
@@ -91,3 +95,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm config set strict-ssl false --global
 
 COPY --from=builder-full /opt/venv /opt/venv
+
+# codegraph — the native code-intelligence MCP server, registered as a stdio MCP
+# server (command=/usr/local/bin/codegraph). Baked in from its own pre-built
+# image. BUILD ORDER: `docker build -t codegraph:latest ./codegraph` MUST run
+# before this image (rebuild-docker.sh does this). The COPY is in runtime-full
+# only (the target that also carries Node for stdio MCP servers); runtime-slim
+# stays minimal and does not include it.
+COPY --from=codegraph:latest /usr/local/bin/codegraph /usr/local/bin/codegraph
+# Grammar bundle for codegraph's tree-sitter AST backend (150+ languages).
+COPY --from=codegraph:latest /opt/codegraph/languages.so /opt/codegraph/languages.so
+ENV CODEGRAPH_TS_SO=/opt/codegraph/languages.so
