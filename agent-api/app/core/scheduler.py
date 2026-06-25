@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Dict, Optional, Set, List
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 import pytz
 
 from app.models.workflow import (
@@ -79,8 +80,36 @@ class WorkflowScheduler:
             loop.create_task(self.reload_workflows())
         except RuntimeError:
             asyncio.run(self.reload_workflows())
-            
+
+        # Periodic self-improvement curator: promotes verified skills, pins
+        # frequently-recalled memories, and (when enabled) consolidates memory.
+        # Leader-locked like cron fires so a multi-replica deployment runs it
+        # once. Interval is operator-tunable; cheap promotions run every cycle.
+        try:
+            _hours = max(1, int(getattr(settings, "curator_interval_hours", 6)))
+            self.scheduler.add_job(
+                self._run_curator_wrapper,
+                IntervalTrigger(hours=_hours),
+                id="self_improvement_curator",
+                replace_existing=True,
+            )
+            logger.info("Scheduled self-improvement curator every %dh", _hours)
+        except Exception as exc:  # noqa: BLE001 — curator is best-effort
+            logger.warning("scheduler: curator scheduling skipped (%s)", exc)
+
         logger.info("Workflow scheduler started")
+
+    async def _run_curator_wrapper(self):
+        """Leader-gated periodic run of the self-improvement curator."""
+        if not await self._ensure_leader():
+            logger.debug("scheduler: not leader — skipping curator run")
+            return
+        try:
+            from app.core.memory.curator import run_curator
+            result = await run_curator()
+            logger.info("scheduler: curator run complete — %s", result)
+        except Exception as exc:  # noqa: BLE001 — never let the curator sink the loop
+            logger.warning("scheduler: curator run failed (%s)", exc)
 
     def stop(self):
         """Stop the scheduler."""

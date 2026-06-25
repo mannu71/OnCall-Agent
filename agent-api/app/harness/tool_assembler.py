@@ -164,15 +164,21 @@ async def assemble_base_tools(
                 extra={"execution_id": execution_id},
             )
 
-    if tools and user_query:
+    # Progressive tool disclosure: when an MCP server exposes a large open-ended
+    # tool set, defer it behind search_tools/call_tool so the AGENT discovers and
+    # invokes tools on demand — instead of keyword-pruning the catalog (which
+    # silently dropped tools the agent needed). Core families + operator-pinned
+    # tools stay directly bound; small toolsets pass through unchanged. This
+    # supersedes the old tool_router.filter_tools prune.
+    if tools:
         try:
-            from app.harness.tool_router import filter_tools
+            from app.harness.tool_disclosure import apply_tool_disclosure
 
-            tools = filter_tools(tools, user_query)
-        except Exception as _tr_err:
+            tools = apply_tool_disclosure(tools, logger_instance=logger_instance)
+        except Exception as _td_err:
             logger_instance.warning(
-                "ReactStrategy: ToolRouter skipped (non-fatal): %s",
-                redact(str(_tr_err)),
+                "ReactStrategy: tool disclosure skipped (non-fatal): %s",
+                redact(str(_td_err)),
                 extra={"execution_id": execution_id},
             )
 
@@ -231,22 +237,31 @@ def add_extension_tools(
     except Exception:  # noqa: BLE001
         _flags = {"planning": False, "filesystem": False, "subagents": []}
 
-    if _flags.get("planning"):
+    # On the deepagents harness, planning (write_todos via TodoListMiddleware) and
+    # the filesystem are deepagents built-ins, so we skip our overlapping fs_*/
+    # write_todos tools (avoids duplicate tools + a write_todos name clash). The
+    # legacy harness still gets them here.
+    try:
+        from app.harness.spec_factory import resolve_harness
+        _deepagents = resolve_harness(agent_config) == "deepagents"
+    except Exception:  # noqa: BLE001
+        _deepagents = False
+
+    if _flags.get("planning") and not _deepagents:
         try:
             from app.workflow.strategies.react.planning_tools import build_planning_tools
             tools.extend(build_planning_tools(execution_id))
         except Exception as _pe:  # noqa: BLE001
             logger_instance.warning("ReactStrategy: planning tools skipped (%s)", _pe)
 
-    # Scratch filesystem is ALWAYS available — it's a harmless, session-scoped,
-    # in-memory store (bounded; dropped at run end) that lets the agent offload
-    # large tool outputs instead of bloating context. No toggle: every agent gets it.
-    try:
-        from app.core.vfs import build_vfs_tools, bind_session
-        bind_session(execution_id)
-        tools.extend(build_vfs_tools(execution_id))
-    except Exception as _fe:  # noqa: BLE001
-        logger_instance.warning("ReactStrategy: vfs tools skipped (%s)", _fe)
+    # Scratch filesystem (legacy harness only — deepagents provides its own).
+    if not _deepagents:
+        try:
+            from app.core.vfs import build_vfs_tools, bind_session
+            bind_session(execution_id)
+            tools.extend(build_vfs_tools(execution_id))
+        except Exception as _fe:  # noqa: BLE001
+            logger_instance.warning("ReactStrategy: vfs tools skipped (%s)", _fe)
 
     if _flags.get("subagents"):
         try:

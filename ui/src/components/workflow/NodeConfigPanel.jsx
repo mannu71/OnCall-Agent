@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import PropTypes from 'prop-types';
 import { localTimeToCron, cronToLocalTime } from '../../utils/cronUtils';
 import { agentApiClient } from '../../services/agentApiClient';
+import HarnessToggle from '../chat/HarnessToggle.jsx';
 
 // Compact human-readable byte size for log-group hints (e.g. 1.4 MB).
 const formatStoredBytes = (bytes) => {
@@ -239,6 +240,19 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
               <small style={{ color: '#666', fontSize: '11px' }}>
                 Pick a profile to configure what type of agent this is (role, output
                 shape, policies). Fields you set below override the profile.
+              </small>
+            </div>
+            <div className="config-field">
+              <label htmlFor="agent-harness">Harness</label>
+              <HarnessToggle
+                value={config.harness || ''}
+                onChange={(v) => handleConfigChange('harness', v)}
+                allowDefault
+              />
+              <small style={{ color: '#666', fontSize: '11px' }}>
+                Which runtime builds this agent. Deepagent adds built-in planning,
+                filesystem, and mid-loop compaction; Legacy is the proven in-house
+                ReAct loop. Default defers to the server setting.
               </small>
             </div>
             <div className="config-field">
@@ -1073,6 +1087,9 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
           </>
         );
 
+      case 'mcp_server':
+        return <MCPServerConfig config={config} handleConfigChange={handleConfigChange} />;
+
       case 'codeAnalyzer':
         return (
           <CodeAnalyzerConfig config={config} handleConfigChange={handleConfigChange} />
@@ -1110,6 +1127,111 @@ const NodeConfigPanel = ({ node, workflowName, onUpdate, onClose }) => {
       </div>
     </div>
   );
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MCP Server node config sub-component
+// ─────────────────────────────────────────────────────────────────────────────
+
+function MCPServerConfig({ config, handleConfigChange }) {
+  const [mcpServers, setMcpServers] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    agentApiClient.getMCPServers()
+      .then((data) => {
+        if (cancelled) return;
+        setMcpServers(data && typeof data === 'object' ? data : {});
+        setLoading(false);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setLoadError(err?.message || 'Failed to load MCP servers');
+        setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  const selectedServers = (config.servers || '')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+
+  const toggleServer = (name) => {
+    const current = new Set(selectedServers);
+    if (current.has(name)) current.delete(name);
+    else current.add(name);
+    handleConfigChange('servers', [...current].join(','));
+  };
+
+  const serverNames = Object.keys(mcpServers);
+
+  return (
+    <>
+      <div className="config-field">
+        <label>MCP Servers</label>
+        {loading && <div style={{ fontSize: 12, color: '#666' }}>Loading servers…</div>}
+        {loadError && <div style={{ fontSize: 12, color: '#c62828' }}>{loadError}</div>}
+        {!loading && !loadError && serverNames.length === 0 && (
+          <div style={{ fontSize: 12, color: '#666' }}>
+            No MCP servers configured. Add them in Settings → MCP.
+          </div>
+        )}
+        {serverNames.map((name) => {
+          const srv = mcpServers[name] || {};
+          const disabled = srv.enabled === false;
+          return (
+            <label
+              key={name}
+              className="checkbox-label"
+              style={{ display: 'block', marginTop: 6, opacity: disabled ? 0.5 : 1 }}
+              title={disabled ? 'This server is disabled in Settings' : undefined}
+            >
+              <input
+                type="checkbox"
+                checked={selectedServers.includes(name)}
+                disabled={disabled}
+                onChange={() => !disabled && toggleServer(name)}
+              />{' '}
+              <span style={{ fontWeight: 500 }}>{name}</span>
+              {disabled && (
+                <span style={{ color: '#999', fontSize: 11, marginLeft: 6 }}>(disabled)</span>
+              )}
+            </label>
+          );
+        })}
+        {!loading && serverNames.length > 0 && selectedServers.length === 0 && (
+          <small style={{ color: '#c62828', fontSize: 11, display: 'block', marginTop: 6 }}>
+            Select at least one server.
+          </small>
+        )}
+        <small style={{ color: '#666', fontSize: 11, display: 'block', marginTop: 8 }}>
+          The agent automatically discovers and picks the tools it needs from the
+          selected server(s) — no manual tool selection required.
+        </small>
+      </div>
+      <div className="config-field">
+        <label htmlFor="mcp-tool-filter">Tool filter (optional, advanced)</label>
+        <input
+          id="mcp-tool-filter"
+          type="text"
+          value={config.tools || ''}
+          onChange={(e) => handleConfigChange('tools', e.target.value)}
+          placeholder="e.g. wit_*, search_code (blank = all)"
+          style={{ fontFamily: 'monospace' }}
+        />
+        <small style={{ color: '#666', fontSize: 11 }}>
+          Comma-separated fnmatch patterns to hard-restrict which tools the agent
+          may use. Leave blank to let the agent choose from all of them.
+        </small>
+      </div>
+    </>
+  );
+}
+
+MCPServerConfig.propTypes = {
+  config: PropTypes.object.isRequired,
+  handleConfigChange: PropTypes.func.isRequired,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

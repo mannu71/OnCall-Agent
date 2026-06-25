@@ -43,8 +43,15 @@ class AgentSpec:
     filesystem: bool = False
     subagents: List[Dict[str, Any]] = field(default_factory=list)
     # Per-workflow capability toggles (default off). ``auto_learn`` gates the
-    # post-run learning loop; ``sandbox`` wires the isolated run_command tool.
+    # post-run learning loop; ``sandbox`` wires the isolated run_command tool;
+    # ``memory`` gates semantic recall + post-run capture and is driven by a
+    # Memory node connected to the agent (see ``has_memory`` in spec_factory).
     auto_learn: bool = False
     sandbox: bool = False
+    memory: bool = False
+    # Effective harness backend for THIS agent: 'legacy' | 'deepagents'. Resolved
+    # from node config (else the global ``settings.harness``) so a single workflow
+    # can pin a harness. None defers to the global default at build time.
+    harness: Optional[str] = None
     # Carried for completeness / future use by the loop engine.
     metadata: Dict[str, Any] = field(default_factory=dict)

@@ -129,12 +129,42 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Tool registry load skipped: {e}")
 
+    # Shared LangGraph persistence (durable checkpointer + store) for the
+    # deepagents harness path. Best-effort; falls back to in-memory if unavailable.
+    try:
+        from app.harness.runtime import init_persistence
+
+        await init_persistence()
+    except Exception as e:
+        logger.warning(f"LangGraph persistence init skipped: {e}")
+
+    # Surface the isolated-sandbox posture once at startup so a mis-set backend
+    # (e.g. SANDBOX_BACKEND=container with no Docker) is visible before any run.
+    try:
+        from app.core import sandbox as _sandbox
+        if _sandbox.is_enabled():
+            logger.info(
+                "Isolated sandbox ENABLED (backend=%s) — workflows with the "
+                "sandbox toggle get an isolated run_command shell",
+                settings.sandbox_backend,
+            )
+        else:
+            logger.info("Isolated sandbox disabled (SANDBOX_BACKEND unset/disabled)")
+    except Exception as e:  # noqa: BLE001 — never fail startup on a log
+        logger.warning(f"Sandbox availability check skipped: {e}")
+
     yield
 
     # Shutdown
     logger.info("Shutting down Agent API...")
     workflow_scheduler.stop()
     await heartbeat_monitor.stop()
+    try:
+        from app.harness.runtime import close_persistence
+
+        await close_persistence()
+    except Exception:
+        pass
 
 
 # Create FastAPI application

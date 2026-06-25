@@ -745,9 +745,26 @@ async def execute_agent_stream(
                         if _nm:
                             current_tool_name = _nm
                 content = getattr(chunk, "content", None) if chunk else None
-                if content and isinstance(content, str):
+                # ChatBedrockConverse streams content as a LIST of blocks
+                # (e.g. [{"type":"text","text":"…"}]) rather than a str, so extract
+                # the text from both shapes — otherwise tokens are silently dropped
+                # (this is why the deepagents path showed 0 streamed tokens).
+                _text = ""
+                if isinstance(content, str):
+                    _text = content
+                elif isinstance(content, list):
+                    _parts = []
+                    for _b in content:
+                        if isinstance(_b, str):
+                            _parts.append(_b)
+                        elif isinstance(_b, dict) and _b.get("type") in (None, "text"):
+                            _t = _b.get("text")
+                            if isinstance(_t, str):
+                                _parts.append(_t)
+                    _text = "".join(_parts)
+                if _text:
                     try:
-                        await stream_callback.on_llm_token(content)
+                        await stream_callback.on_llm_token(_text)
                     except Exception:
                         pass
 

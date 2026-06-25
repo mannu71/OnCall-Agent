@@ -739,6 +739,7 @@ async def execute_workflow(
     input: Optional[str] = None,
     output_mode: Optional[str] = None,
     permission_mode: Optional[str] = None,
+    harness: Optional[str] = None,
     session_id: Optional[str] = None,
     inputs: Optional[Dict[str, Any]] = Body(None),
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
@@ -765,6 +766,11 @@ async def execute_workflow(
     if permission_mode:
         # Tool gatekeeping: default | auto_allow | plan.
         inputs = {**(inputs or {}), "permission_mode": permission_mode}
+    if harness:
+        # Per-turn agent runtime override: legacy | deepagents (accepts the
+        # 'deepagent' UI spelling too). Stamped into the agent node config in the
+        # strategy so all harness readers agree.
+        inputs = {**(inputs or {}), "harness": harness}
 
     workflow = await workflow_repo.get_by_name(workflow_name)
     if not workflow:

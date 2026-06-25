@@ -13,7 +13,6 @@ import {
   Loader2,
   Bot,
   User,
-  Play,
   RefreshCw,
   XCircle,
   Construction,
@@ -35,7 +34,8 @@ import {
   Copy,
   Check,
   RotateCcw,
-  ListTree
+  ListTree,
+  Square
 } from 'lucide-react';
 import { isAgentWorkflowValid } from '../utils/workflowValidation.js';
 import agentApiClient from '../services/agentApiClient.js';
@@ -46,8 +46,21 @@ import AgentThread from '../components/chat/AgentThread.jsx';
 import CollapsibleSection from '../components/chat/CollapsibleSection.jsx';
 import SendButton from '../components/chat/SendButton.jsx';
 import DensityToggle, { DENSITIES } from '../components/chat/DensityToggle.jsx';
+import HarnessToggle from '../components/chat/HarnessToggle.jsx';
 import TraceTimeline from '../components/chat/TraceTimeline.jsx';
 import { formatClock } from '../lib/formatTime.js';
+
+// localStorage key for the active chat session, so a refresh / revisit re-opens
+// the same conversation (and its context) instead of starting a new session.
+const SESSION_STORAGE_KEY = 'currentSessionId';
+
+function persistSessionId(id) {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    if (id) localStorage.setItem(SESSION_STORAGE_KEY, id);
+    else localStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch { /* storage unavailable — best-effort */ }
+}
 
 // Client-side mirror of the backend trace_ids detector (cosmetic badge only —
 // the backend remains the source of truth for the correlation fast-path).
@@ -72,6 +85,13 @@ function isSmallTalk(text) {
 function agentHasCloudWatch(agent) {
   const nodes = agent?.nodes || [];
   return nodes.some(n => n?.type === 'cloudwatch_tool' || n?.type === 'cloudwatchAnalyzer');
+}
+
+/** Human-readable model label for header/composer chips (handles arrays + comma lists). */
+function formatModelLabel(raw) {
+  if (raw == null || raw === '' || raw === '—') return '—';
+  if (Array.isArray(raw)) return raw.filter(Boolean).join(', ');
+  return String(raw).replace(/,\s*/g, ', ').trim();
 }
 
 // Use Vite's environment check for development mode
@@ -119,7 +139,7 @@ function FormattedText({ text, isUser }) {
           return (
             <strong 
               key={index} 
-              className={isUser ? "text-white font-bold" : "text-primary font-bold"}
+              className={isUser ? "text-primary-foreground font-bold" : "text-primary font-bold"}
             >
               {part.slice(2, -2)}
             </strong>
@@ -161,6 +181,9 @@ function Chat() {
   const [searchQuery, setSearchQuery] = useState('');
   const [showToolsList, setShowToolsList] = useState(false);
   const [timeRange, setTimeRange] = useState('24h');
+  // Per-turn agent runtime override ('legacy' | 'deepagents'). Defaults to the
+  // current server default so chatting is unchanged until the user flips it.
+  const [harness, setHarness] = useState('deepagents');
   const [agentSheetOpen, setAgentSheetOpen] = useState(false);
 
   // Persistent chat sessions (migration 022). `sessionId` is created lazily on
@@ -244,9 +267,10 @@ function Chat() {
     // Find LLM model (legacy `llm` OR new `language_model`). The LangflowEditor
     // node stores the chosen model under `params.llm` (e.g. "Claude Sonnet 4.6").
     const llmNode = selectedAgent.nodes?.find(n => n.type === 'llm' || n.type === 'language_model');
-    const modelName = llmNode?.params?.llm || llmNode?.params?.model || llmNode?.params?.modelId
+    const rawModel = llmNode?.params?.llm || llmNode?.params?.model || llmNode?.params?.modelId
       || llmNode?.data?.model || llmNode?.data?.modelId || llmNode?.data?.label
-      || llmNode?.name || "—";
+      || llmNode?.name || '—';
+    const modelName = formatModelLabel(rawModel);
 
     // Find tool nodes connected to the agent node (any non-LLM/schedule capability).
     const NON_TOOL = new Set(['agent', 'llm', 'language_model', 'schedule', 'scheduler', 'trigger', 'memory']);
@@ -271,10 +295,20 @@ function Chat() {
 
   const { modelName, toolsCount, toolsList } = getAgentDetails();
 
-  // Load agent-type workflows + past chat sessions
+  // Load agent-type workflows + past chat sessions, then restore the last-active
+  // session so a page refresh / revisit re-opens the same conversation (and its
+  // context) instead of silently starting a new one.
   useEffect(() => {
-    loadAgents();
-    loadSessions();
+    (async () => {
+      await Promise.all([loadAgents(), loadSessions()]);
+      try {
+        const stored = typeof localStorage !== 'undefined'
+          ? localStorage.getItem(SESSION_STORAGE_KEY) : null;
+        if (stored) await resumeSession(stored);
+      } catch (error) {
+        console.warn('Could not restore previous chat session:', error);
+      }
+    })();
   }, []);
 
   // Auto-scroll to bottom when new messages arrive
@@ -320,6 +354,7 @@ function Chat() {
         workflowName: agent?.name || null,
       });
       setSessionId(created.id);
+      persistSessionId(created.id);
       return created.id;
     } catch (error) {
       console.error('Error creating session:', error);
@@ -329,6 +364,7 @@ function Chat() {
 
   const startNewChat = () => {
     setSessionId(null);
+    persistSessionId(null);
     setMessages([welcomeMessage()]);
     setTraceSteps([]);
     setTokens({ input: 0, output: 0, total: 0 });
@@ -351,6 +387,7 @@ function Chat() {
         selectedSkills: m.metadata?.selected_skills || [],
       }));
       setSessionId(id);
+      persistSessionId(id);
       setMessages(hydrated.length ? hydrated : [welcomeMessage()]);
       setTraceSteps([]);
       setTokens({ input: 0, output: 0, total: 0 });
@@ -362,6 +399,12 @@ function Chat() {
       setSessionSheetOpen(false);
     } catch (error) {
       console.error('Error resuming session:', error);
+      // A stored id that no longer exists (deleted server-side) would otherwise
+      // wedge every revisit — clear it and fall back to a fresh chat.
+      if (error?.response?.status === 404 || error?.status === 404) {
+        persistSessionId(null);
+        setSessionId(null);
+      }
     }
   };
 
@@ -408,70 +451,6 @@ function Chat() {
   const handleSelectAgent = (agent) => {
     setSelectedAgent(agent);
     addMessage(MESSAGE_TYPES.SYSTEM, `Selected agent: **${agent.name}**. Ask it anything to get started.`);
-  };
-
-  // Trigger agent direct workflow run
-  const triggerAgent = async (agent) => {
-    if (!agent) return;
-
-    addMessage(MESSAGE_TYPES.USER, `Triggering workflow run for agent: **${agent.name}**`);
-    
-    // Clear and start trace steps
-    setTraceSteps([
-      { l: "think", t: "5ms", text: `Triggering workflow layout for "${agent.name}"...` }
-    ]);
-
-    const thinkingId = addMessage(MESSAGE_TYPES.AGENT, `Running "${agent.name}"...`, { isLoading: true });
-    setIsLoading(true);
-
-    try {
-      if (window.electronAPI?.triggerWorkflow) {
-        const result = await window.electronAPI.triggerWorkflow(agent.name);
-
-        if (result?.success) {
-          updateMessage(thinkingId, {
-            content: `Agent **${agent.name}** triggered successfully!`,
-            isLoading: false
-          });
-          setTraceSteps(prev => [
-            ...prev,
-            { l: "answer", t: "—", text: `Completed workflow trigger successfully.` }
-          ]);
-        } else {
-          updateMessage(thinkingId, {
-            content: `Failed to trigger agent: ${result?.error || 'Unknown error'}`,
-            isLoading: false,
-            isError: true
-          });
-          setTraceSteps(prev => [
-            ...prev,
-            { l: "answer", t: "—", text: `Workflow trigger aborted: ${result?.error || 'Error'}` }
-          ]);
-        }
-      } else {
-        updateMessage(thinkingId, {
-          content: 'Agent execution is only available in the desktop app.',
-          isLoading: false,
-          isError: true
-        });
-        setTraceSteps(prev => [
-          ...prev,
-          { l: "answer", t: "—", text: "Execution failed: running outside Electron sandbox." }
-        ]);
-      }
-    } catch (error) {
-      updateMessage(thinkingId, {
-        content: `Error: ${error.message}`,
-        isLoading: false,
-        isError: true
-      });
-      setTraceSteps(prev => [
-        ...prev,
-        { l: "answer", t: "—", text: `Error: ${error.message}` }
-      ]);
-    } finally {
-      setIsLoading(false);
-    }
   };
 
   const handleSendMessage = async () => {
@@ -663,6 +642,7 @@ function Chat() {
       const result = await agentApiClient.runAgentStream(agent.name, question, {
         history,
         sessionId: sid,
+        harness,
         onToken,
         onToolCall: (name, args) => { onStepCall(name, args); pushTrace('tool', `Calling ${name}…`); pushStatus(`Calling ${name}…`); },
         onToolResult: (name, res) => { onStepResult(name, res); pushTrace('tool', `${name} returned`); },
@@ -808,12 +788,12 @@ function Chat() {
             )}
           </div>
 
-          {/* Chat Bubble Card — native-macOS look (system-blue user, card assistant) */}
+          {/* Chat Bubble Card — primary user bubble, card assistant */}
           <div
             style={{ padding: 'var(--msg-pad)' }}
             className={`w-full transition-all duration-300 leading-relaxed font-sans text-[13.5px] select-text ${
               isUser
-                ? 'bg-[#0a84ff] text-white rounded-xl rounded-tr-sm shadow-[0_1px_2px_rgb(10_132_255/0.35)]'
+                ? 'bg-primary text-primary-foreground rounded-xl rounded-tr-sm shadow-sm shadow-primary/35'
                 : 'bg-white text-slate-900 border border-black/[0.07] rounded-xl rounded-tl-sm shadow-[0_1px_2px_rgb(0_0_0/0.06)] dark:bg-[#1c1c1e] dark:text-slate-100 dark:border-white/10 dark:shadow-none'
             }`}
           >
@@ -1057,6 +1037,30 @@ function Chat() {
     handleSendMessage();
   };
 
+  const [isStopping, setIsStopping] = useState(false);
+  const handleStop = async () => {
+    if (isStopping || !isLoading) return;
+    setIsStopping(true);
+    try {
+      if (selectedAgent?.name) {
+        await agentApiClient.cancelWorkflow(selectedAgent.name);
+      }
+    } catch (_) {
+      // Server-side cancel failed or execution already finished — still clean up UI
+    } finally {
+      // Mark the in-flight message as stopped and release the composer
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.isLoading
+            ? { ...m, isLoading: false, isError: true, content: 'Stopped by user.' }
+            : m
+        )
+      );
+      setIsLoading(false);
+      setIsStopping(false);
+    }
+  };
+
   return (
     <div className={`${sysDark ? 'dark ' : ''}flex h-screen bg-[#f5f5f7] dark:bg-[#161618] text-slate-800 dark:text-slate-100 select-none overflow-hidden w-full max-w-full`}>
 
@@ -1112,9 +1116,9 @@ function Chat() {
                   <div
                     onClick={() => !isLoading && handleSelectAgent(agent)}
                     className={cn(
-                      "w-full flex items-center justify-between px-3 py-3 rounded-xl transition-all duration-300 cursor-pointer border",
+                      "w-full flex items-center px-3 py-3 rounded-xl transition-all duration-300 cursor-pointer border",
                       isSelected
-                        ? 'bg-[#0a84ff]/10 text-slate-800 dark:text-slate-100 border-[#0a84ff]/30'
+                        ? 'bg-primary/10 text-slate-800 dark:text-slate-100 border-primary/30'
                         : 'text-slate-600 dark:text-slate-300 border-transparent hover:bg-black/[0.03] dark:hover:bg-white/[0.05]',
                       isLoading && 'opacity-65 cursor-not-allowed'
                     )}
@@ -1123,7 +1127,7 @@ function Chat() {
                       <div className={cn(
                         "size-8 rounded-lg flex items-center justify-center flex-shrink-0 transition-colors",
                         isSelected
-                          ? 'bg-[#0a84ff] text-white shadow-sm shadow-[#0a84ff]/30'
+                          ? 'bg-primary text-primary-foreground shadow-sm shadow-primary/30'
                           : 'bg-slate-100 dark:bg-white/[0.06] text-slate-500 dark:text-slate-400'
                       )}>
                         <Bot className="size-4" />
@@ -1144,23 +1148,6 @@ function Chat() {
                         </div>
                       </div>
                     </div>
-
-                    {/* Dynamic Action Trigger button */}
-                    <div className="flex items-center">
-                      <Button
-                        size="icon"
-                        variant="ghost"
-                        className={cn(
-                          "size-7 rounded-md opacity-0 group-hover:opacity-100 transition-opacity hover:bg-slate-100 hover:text-slate-800",
-                          isSelected && 'opacity-100'
-                        )}
-                        onClick={(e) => { e.stopPropagation(); triggerAgent(agent); }}
-                        disabled={isLoading}
-                        title="Run Agent Workflow"
-                      >
-                        <Play className="text-primary fill-primary/10" data-icon="inline-start" />
-                      </Button>
-                    </div>
                   </div>
                   
                   {/* Sidebar indicator bar */}
@@ -1178,8 +1165,8 @@ function Chat() {
       <div className="flex-grow flex flex-col h-full bg-[#f5f5f7] dark:bg-[#161618] min-w-0 relative">
 
         {/* Top Header Bar */}
-        <header className="h-20 px-4 md:px-8 border-b border-black/[0.06] dark:border-white/10 bg-white/70 dark:bg-[#1c1c1e]/70 backdrop-blur-xl flex items-center justify-between flex-shrink-0 z-10">
-          <div className="flex items-center gap-3 min-w-0">
+        <header className="min-h-16 sm:h-20 px-3 sm:px-4 md:px-8 py-2.5 sm:py-0 border-b border-black/[0.06] dark:border-white/10 bg-white/70 dark:bg-[#1c1c1e]/70 backdrop-blur-xl flex items-center gap-2 sm:gap-4 flex-shrink-0 z-10 overflow-hidden">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1 overflow-hidden">
             {/* Mobile agent picker (sidebar is hidden < md) */}
             <Sheet open={agentSheetOpen} onOpenChange={setAgentSheetOpen}>
               <SheetTrigger asChild>
@@ -1216,19 +1203,24 @@ function Chat() {
             <IconChip tint="red">
               <Brain className="size-5" />
             </IconChip>
-            <div className="min-w-0">
-              <h1 className="font-bold text-sm text-slate-800 dark:text-slate-100 tracking-wide truncate">
-                {selectedAgent ? selectedAgent.name : "Select an agent"}
+            <div className="min-w-0 flex-1 overflow-hidden">
+              <h1 className="font-bold text-sm text-slate-800 dark:text-slate-100 tracking-wide truncate leading-tight">
+                {selectedAgent ? selectedAgent.name : 'Select an agent'}
               </h1>
-              <p className="text-[11px] text-slate-400 font-medium flex items-center gap-1.5 mt-0.5 font-sans">
-                <span className="bg-slate-50 border border-slate-100 px-1 py-0.2 rounded font-mono text-[10px] text-slate-500 font-semibold">{modelName}</span>
-                <span className="text-slate-200">·</span>
-                <span>{toolsCount} tools attached</span>
-              </p>
+              <div className="text-[11px] text-slate-400 font-medium flex items-center gap-1.5 mt-0.5 font-sans min-w-0">
+                <span
+                  className="min-w-0 truncate max-w-[min(100%,12rem)] sm:max-w-[min(100%,18rem)] bg-slate-50 dark:bg-white/[0.06] border border-slate-100 dark:border-white/10 px-1.5 py-0.5 rounded font-mono text-[10px] text-slate-500 dark:text-slate-400 font-semibold leading-none"
+                  title={modelName}
+                >
+                  {modelName}
+                </span>
+                <span className="text-slate-200 dark:text-slate-600 shrink-0">·</span>
+                <span className="shrink-0 whitespace-nowrap">{toolsCount} tool{toolsCount === 1 ? '' : 's'}</span>
+              </div>
             </div>
           </div>
-          
-          <div className="flex items-center gap-2">
+
+          <div className="flex items-center gap-1 sm:gap-2 shrink-0">
             <DensityToggle value={density} onChange={changeDensity} />
 
             <Button
@@ -1236,9 +1228,10 @@ function Chat() {
               size="sm"
               onClick={startNewChat}
               title="Start a new chat"
-              className="h-8 rounded-lg text-xs font-semibold gap-1.5"
+              className="h-8 rounded-lg text-xs font-semibold gap-1.5 px-2 sm:px-3"
             >
-              <Plus className="size-3.5" /> New chat
+              <Plus className="size-3.5 shrink-0" />
+              <span className="hidden sm:inline">New chat</span>
             </Button>
 
             {/* Trace drawer toggle */}
@@ -1247,7 +1240,7 @@ function Chat() {
               size="icon"
               onClick={() => setTraceDrawerOpen(true)}
               title="Run trace"
-              className={cn('size-8 rounded-lg relative', isLoading && 'text-primary border-primary/40')}
+              className={cn('size-8 shrink-0 rounded-lg relative', isLoading && 'text-primary border-primary/40')}
             >
               <Activity className="size-4" />
               {isLoading && (
@@ -1258,7 +1251,7 @@ function Chat() {
             {/* Conversation history (persisted sessions) */}
             <Sheet open={sessionSheetOpen} onOpenChange={(o) => { setSessionSheetOpen(o); if (o) loadSessions(); }}>
               <SheetTrigger asChild>
-                <Button variant="outline" size="icon" className="size-8 rounded-lg" title="Chat history">
+                <Button variant="outline" size="icon" className="size-8 shrink-0 rounded-lg" title="Chat history">
                   <History className="size-4" />
                 </Button>
               </SheetTrigger>
@@ -1277,7 +1270,7 @@ function Chat() {
                       onClick={() => resumeSession(s.id)}
                       className={cn(
                         'group w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-left cursor-pointer transition-colors',
-                        s.id === sessionId ? 'bg-[#0a84ff]/10' : 'hover:bg-black/[0.03] dark:hover:bg-white/[0.05]'
+                        s.id === sessionId ? 'bg-primary/10' : 'hover:bg-black/[0.03] dark:hover:bg-white/[0.05]'
                       )}
                     >
                       <MessageSquare className="size-4 text-slate-400 shrink-0" />
@@ -1310,7 +1303,7 @@ function Chat() {
 
             <Badge
               variant="success"
-              className="px-2.5 py-0.5 rounded-full flex items-center gap-1.5 text-[11px] font-semibold transition-all duration-300"
+              className="hidden sm:flex px-2.5 py-0.5 rounded-full items-center gap-1.5 text-[11px] font-semibold transition-all duration-300 shrink-0"
             >
               <span className="relative flex size-1.5">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
@@ -1412,7 +1405,7 @@ function Chat() {
 
         {/* Input tray panel */}
         <div className="p-4 md:p-8 pt-0 md:pt-0 bg-transparent flex-shrink-0 z-10">
-          <div className="bg-white/80 dark:bg-[#1c1c1e]/80 backdrop-blur-xl border border-black/[0.08] dark:border-white/10 rounded-2xl p-3 flex flex-col gap-3 shadow-[0_4px_24px_rgb(0_0_0/0.06)] transition-colors focus-within:border-[#0a84ff]/60 focus-within:ring-2 focus-within:ring-[#0a84ff]/20">
+          <div className="bg-white/80 dark:bg-[#1c1c1e]/80 backdrop-blur-xl border border-black/[0.08] dark:border-white/10 rounded-2xl p-3 flex flex-col gap-3 shadow-[0_4px_24px_rgb(0_0_0/0.06)] transition-colors focus-within:border-primary/60 focus-within:ring-2 focus-within:ring-primary/20">
             
             {/* Multi-line chat Textarea */}
             <Textarea 
@@ -1478,11 +1471,22 @@ function Chat() {
                   </>
                 )}
 
-                <span className="font-mono text-[10px] text-slate-400 font-semibold bg-slate-50 border border-slate-100 rounded-md px-2 py-0.5 flex items-center select-none ml-1">
-                  {modelName}
-                </span>
+                {/* Runtime pick for this turn: Legacy (ReAct) vs Deepagent. */}
+                <HarnessToggle value={harness} onChange={setHarness} />
               </div>
               
+              {isLoading && (
+                <button
+                  type="button"
+                  onClick={handleStop}
+                  disabled={isStopping}
+                  title="Stop agent"
+                  className="flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold bg-red-50 text-red-600 border border-red-200 hover:bg-red-100 hover:border-red-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Square className="size-3 fill-current" />
+                  {isStopping ? 'Stopping…' : 'Stop'}
+                </button>
+              )}
               <SendButton
                 onClick={handleSendClick}
                 disabled={!inputValue.trim() || isLoading}

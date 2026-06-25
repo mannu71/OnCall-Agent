@@ -24,6 +24,15 @@ export const REJECT = {
 };
 
 /**
+ * Names of the MCP servers an MCP node has selected (comma-joined params.servers).
+ */
+export function mcpServerNamesOf(node) {
+  const raw = node?.params?.servers ?? '';
+  if (Array.isArray(raw)) return raw.filter(Boolean).map(String);
+  return String(raw).split(',').map(s => s.trim()).filter(Boolean);
+}
+
+/**
  * Names of the models a Language Model node offers. Supports the multi-select
  * comma-joined `params.llm` ("A,B") and the structured `params.models` list.
  */
@@ -45,27 +54,48 @@ export function modelNamesOf(node) {
  * output port into one `lm::<name>` port per model so each can be wired to a
  * different consumer. A single (or zero) model keeps the static `lm` port for
  * backward compatibility with existing workflows/edges.
+ *
+ * Similarly, an `mcp_server` node with 2+ selected servers expands the single
+ * `tool` output into one `mcp::<name>` port per server.
  */
 export function slotsForNode(nodeTypes, node) {
   const def = nodeTypes[node?.type];
   if (!def) return [];
   const base = def.slots || [];
-  if (node?.type !== 'language_model') return base;
 
-  const names = modelNamesOf(node);
-  if (names.length <= 1) return base;
-
-  const out = [];
-  for (const s of base) {
-    if (s.kind === 'port-out' && s.id === 'lm') {
-      for (const name of names) {
-        out.push({ kind: 'port-out', id: `lm::${name}`, label: name, portType: 'model' });
+  if (node?.type === 'language_model') {
+    const names = modelNamesOf(node);
+    if (names.length <= 1) return base;
+    const out = [];
+    for (const s of base) {
+      if (s.kind === 'port-out' && s.id === 'lm') {
+        for (const name of names) {
+          out.push({ kind: 'port-out', id: `lm::${name}`, label: name, portType: 'model' });
+        }
+      } else {
+        out.push(s);
       }
-    } else {
-      out.push(s);
     }
+    return out;
   }
-  return out;
+
+  if (node?.type === 'mcp_server') {
+    const names = mcpServerNamesOf(node);
+    if (names.length <= 1) return base;
+    const out = [];
+    for (const s of base) {
+      if (s.kind === 'port-out' && s.id === 'tool') {
+        for (const name of names) {
+          out.push({ kind: 'port-out', id: `mcp::${name}`, label: name, portType: 'tool' });
+        }
+      } else {
+        out.push(s);
+      }
+    }
+    return out;
+  }
+
+  return base;
 }
 
 /**
@@ -90,19 +120,95 @@ export function reconcileModelEdges(edges, nodeId, oldNode, newNode) {
     const isModelSlot = ss === 'lm' || ss.startsWith('lm::');
     if (!isModelSlot) return [e];
 
-    // Which model did this edge point at?
     const model = ss.startsWith('lm::') ? ss.slice(4) : oldNames[0];
 
     if (!newIsMulti) {
-      // 0 or 1 model → the port collapses to the static `lm`.
       return [{ ...e, sourceSlot: 'lm', sourceHandle: undefined }];
     }
     if (model && newSet.has(model)) {
       return [{ ...e, sourceSlot: `lm::${model}`, sourceHandle: undefined }];
     }
-    // The model this edge referenced was deselected → drop the orphaned edge.
     return [];
   });
+}
+
+/**
+ * Re-point/prune edges out of an MCP node after its server selection changes.
+ * Mirrors reconcileModelEdges: single server → static `tool` port;
+ * 2+ servers → one `mcp::<name>` port each.
+ */
+export function reconcileMcpEdges(edges, nodeId, oldNode, newNode) {
+  const oldNames = mcpServerNamesOf(oldNode);
+  const newNames = mcpServerNamesOf(newNode);
+  const newSet = new Set(newNames);
+  const newIsMulti = newNames.length >= 2;
+
+  return edges.flatMap(e => {
+    if (e.source !== nodeId) return [e];
+    const ss = e.sourceSlot || e.sourceHandle || '';
+    const isMcpSlot = ss === 'tool' || ss.startsWith('mcp::');
+    if (!isMcpSlot) return [e];
+
+    const server = ss.startsWith('mcp::') ? ss.slice(5) : oldNames[0];
+
+    if (!newIsMulti) {
+      return [{ ...e, sourceSlot: 'tool', sourceHandle: undefined }];
+    }
+    if (server && newSet.has(server)) {
+      return [{ ...e, sourceSlot: `mcp::${server}`, sourceHandle: undefined }];
+    }
+    return [];
+  });
+}
+
+/**
+ * True when the given agent node has a Memory node wired to its `memory`
+ * input port. Mirrors the backend `has_memory_node` graph check.
+ */
+export function agentHasMemoryNode(agentNode, nodes, edges) {
+  if (!agentNode) return false;
+  const memoryTypes = new Set(['vector_memory', 'memory']);
+  const memoryNodeIds = new Set(
+    (nodes || []).filter(n => memoryTypes.has(n?.type)).map(n => n.id)
+  );
+  if (!memoryNodeIds.size) return false;
+  // Undirected: a Memory node connected to this agent in either direction.
+  return (edges || []).some(e =>
+    (e.source === agentNode.id && memoryNodeIds.has(e.target)) ||
+    (e.target === agentNode.id && memoryNodeIds.has(e.source))
+  );
+}
+
+const AGENT_AUTO_LEARN_KEYS = ['autoLearn', 'auto_learn'];
+
+function agentAutoLearnOn(node) {
+  const p = node?.params || {};
+  const cfg = node || {};
+  for (const k of AGENT_AUTO_LEARN_KEYS) {
+    const v = p[k] ?? cfg[k];
+    if (v !== undefined && v !== null) {
+      return String(v).trim().toLowerCase() === 'true' || v === true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Non-blocking workflow lint. Returns an array of { nodeId, message } warnings.
+ * Currently: auto-learn requires a Memory node (auto-learn captures/recalls via
+ * memory; without a Memory node the backend enables it implicitly and warns).
+ */
+export function workflowWarnings(nodes, edges) {
+  const warnings = [];
+  for (const n of nodes || []) {
+    if (n?.type === 'agent' && agentAutoLearnOn(n) && !agentHasMemoryNode(n, nodes, edges)) {
+      warnings.push({
+        nodeId: n.id,
+        message: 'Auto-learn requires a Memory node — connect one to this agent so learned findings persist and are recalled.',
+      });
+    }
+  }
+  return warnings;
 }
 
 function findSlot(nodeTypes, node, slotId) {

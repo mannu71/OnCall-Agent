@@ -387,6 +387,15 @@ class Settings(BaseSettings):
     )
     skills_dir: str = Field(default="data/skills", validation_alias="SKILLS_DIR")
 
+    # ── Harness backend (official LangChain stack migration) ─────────────────
+    # 'legacy' = the in-house ReAct harness; 'deepagents' = the official deep
+    # agent stack (deepagents + LangGraph saver/store + LangMem). Default legacy
+    # until the deepagents path passes the accuracy eval.
+    harness: str = Field(default="deepagents", validation_alias="HARNESS")
+    # Memory backend: 'legacy' = semantic_memory (FTS+vector RRF); 'langmem' =
+    # LangGraph PostgresStore + LangMem. Default legacy until eval-gated.
+    memory_backend: str = Field(default="legacy", validation_alias="MEMORY_BACKEND")
+
     # ── Self-improvement (hill-climbing) loop ────────────────────────────────
     # OFF by default. When enabled, an on-demand analyzer samples recent execution
     # traces and proposes prompt/tool/skill refinements as DRAFTS for operator
@@ -413,6 +422,30 @@ class Settings(BaseSettings):
     pinned_promote_recall_threshold: int = Field(
         default=3, validation_alias="PINNED_PROMOTE_RECALL_THRESHOLD"
     )
+    # How often the scheduler runs the self-improvement curator (hours). The
+    # cheap promotions run every cycle; LLM consolidation stays gated by
+    # ``memory_audit_enabled``.
+    curator_interval_hours: int = Field(
+        default=6, validation_alias="CURATOR_INTERVAL_HOURS"
+    )
+
+    # ── Context references (@file / @folder / @url / @git in the query) ──────
+    # When enabled, an inbound query is scanned for @-references and their
+    # content is expanded inline. File access is restricted to
+    # ``context_reference_root`` (defaults to the process CWD). No-op when the
+    # message has no references.
+    context_references_enabled: bool = Field(
+        default=True, validation_alias="CONTEXT_REFERENCES_ENABLED"
+    )
+    context_reference_root: str = Field(
+        default="", validation_alias="CONTEXT_REFERENCE_ROOT"
+    )
+
+    # ── Configurable agent persona / context document ───────────────────────
+    # Optional operator-set persona (tone/role/standards) and a context doc,
+    # prepended to the system prompt. Empty by default → prompt unchanged.
+    agent_persona: str = Field(default="", validation_alias="AGENT_PERSONA")
+    agent_context_doc: str = Field(default="", validation_alias="AGENT_CONTEXT_DOC")
 
     # ── Tool execution sandbox ───────────────────────────────────────────────
     # Isolate shell/code-execution tools. Backends:

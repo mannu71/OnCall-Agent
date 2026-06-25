@@ -6,9 +6,12 @@ lives in one place and can be reused by other strategies / the scheduler / evals
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from app.harness.spec import AgentSpec
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_policies(
@@ -32,6 +35,27 @@ def resolve_policies(
         if candidate:
             return candidate if isinstance(candidate, list) else None
     return None
+
+
+def resolve_harness(agent_config: Dict[str, Any]) -> str:
+    """Resolve the effective agent harness for this node: ``legacy`` | ``deepagents``.
+
+    Per-node config wins (agent node ``harness`` or ``params.harness``); when unset
+    or invalid it falls back to the server-wide ``settings.harness``. This lets a
+    single workflow pin a harness without flipping the global default — and is the
+    one source of truth shared by the agent builder, the prompt composer, and the
+    tool assembler so all three agree on which harness a run uses.
+    """
+    cfg = agent_config if isinstance(agent_config, dict) else {}
+    params = cfg.get("params") if isinstance(cfg.get("params"), dict) else {}
+    val = cfg.get("harness") or params.get("harness")
+    if isinstance(val, str) and val.strip().lower() in ("legacy", "deepagents"):
+        return val.strip().lower()
+    try:
+        from app.config import settings
+        return getattr(settings, "harness", "legacy")
+    except Exception:  # noqa: BLE001 — never break a run on a config read
+        return "legacy"
 
 
 def resolve_permission_mode(context: Dict[str, Any], agent_config: Dict[str, Any]) -> str:
@@ -96,6 +120,10 @@ def resolve_profile_fields(agent_config: Dict[str, Any]) -> Dict[str, Any]:
         "subagents": _coerce_subagents(_pick("subagents")),
         "auto_learn": _as_bool(_pick("autoLearn", "auto_learn")),
         "sandbox": _as_bool(_pick("sandbox")),
+        # Explicit per-node override; the authoritative signal is graph
+        # connectivity (``has_memory``), resolved in build_agent_spec().
+        "memory": _as_bool(_pick("memory")),
+        "harness": resolve_harness(cfg),
     }
 
 
@@ -121,9 +149,26 @@ def build_agent_spec(
     has_cloudwatch: bool,
     has_code_analyzer: bool,
     session_id: Optional[str] = None,
+    has_memory: bool = False,
+    logger_instance: Optional[Any] = None,
 ) -> AgentSpec:
-    """Assemble the declarative :class:`AgentSpec` for this execution."""
+    """Assemble the declarative :class:`AgentSpec` for this execution.
+
+    ``has_memory`` is the graph signal (a Memory node connected to the agent);
+    it is OR-ed with the explicit per-node ``memory`` toggle. Auto-learn
+    *requires* memory, so when ``auto_learn`` is set without memory we enable it
+    implicitly and warn — the loop must never silently fail to capture.
+    """
     profile = resolve_profile_fields(agent_config)
+    memory = bool(has_memory or profile["memory"])
+    auto_learn = profile["auto_learn"]
+    if auto_learn and not memory:
+        memory = True
+        (logger_instance or logger).warning(
+            "AgentSpec: auto-learn enabled without a Memory node — enabling "
+            "memory capture for this run. Add a Memory node to the agent to "
+            "make this explicit."
+        )
     return AgentSpec(
         agent_config=agent_config,
         has_cloudwatch=has_cloudwatch,
@@ -137,6 +182,8 @@ def build_agent_spec(
         planning=profile["planning"],
         filesystem=profile["filesystem"],
         subagents=profile["subagents"],
-        auto_learn=profile["auto_learn"],
+        auto_learn=auto_learn,
         sandbox=profile["sandbox"],
+        memory=memory,
+        harness=profile["harness"],
     )

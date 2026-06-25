@@ -81,7 +81,11 @@ def test_spec_and_facade() -> None:
                             has_cloudwatch=True, has_code_analyzer=False, session_id="x")
     check("spec_factory builds spec", spec.permission_mode == "auto_allow" and spec.has_cloudwatch and spec.session_id == "x")
 
-    import app.workflow.strategies.react.agent_builder as ab
+    # The legacy ReAct builder moved to app.legacy.react_agent; build_agent_from_spec
+    # routes there only under harness=legacy (default is now deepagents). Force the
+    # legacy flag and patch the moved builder to verify the AgentSpec→kwargs mapping.
+    import app.legacy.react_agent as ab
+    from app.config import settings as _s
     captured: dict = {}
 
     def fake_build_agent(llm, tools, agent_config, **kw):
@@ -89,7 +93,9 @@ def test_spec_and_facade() -> None:
         return "AGENT"
 
     orig = ab.build_agent
+    orig_harness = _s.harness
     ab.build_agent = fake_build_agent
+    _s.harness = "legacy"
     try:
         s = AgentSpec(agent_config={"x": 1}, has_cloudwatch=True, has_code_analyzer=False,
                       permission_mode="auto_allow", session_id="exec-9")
@@ -101,6 +107,7 @@ def test_spec_and_facade() -> None:
         check("build_agent_from_spec maps AgentSpec→kwargs", ok, str(captured))
     finally:
         ab.build_agent = orig
+        _s.harness = orig_harness
 
 
 # ── supervisor_loop ──────────────────────────────────────────────────────────
@@ -181,14 +188,30 @@ def test_context_builder() -> None:
 # ── tool_assembler.add_extension_tools ───────────────────────────────────────
 def test_extension_tools() -> None:
     from app.harness.tool_assembler import add_extension_tools
+    from app.config import settings as _s
     log = logging.getLogger("t")
-    # No code_analyzer_config → no delegate/edit tools, but the scratch filesystem
-    # (fs_*) is ALWAYS added (it's unconditional now), so base is preserved + fs_*.
-    out = add_extension_tools(tools=["base"], llm="LLM", agent_config={}, code_analyzer_config=None,
-                              execution_id="e", logger_instance=log)
+    # Scratch filesystem (fs_*) is the LEGACY harness's offload mechanism; on the
+    # deepagents harness it's skipped (deepagents provides its own filesystem). So
+    # force legacy here to assert base is preserved + fs_* added.
+    _oh = _s.harness
+    _s.harness = "legacy"
+    try:
+        out = add_extension_tools(tools=["base"], llm="LLM", agent_config={}, code_analyzer_config=None,
+                                  execution_id="e", logger_instance=log)
+    finally:
+        _s.harness = _oh
     _names0 = [getattr(t, "name", t) for t in out]
-    check("add_extension_tools keeps base + always adds vfs",
+    check("add_extension_tools(legacy) keeps base + adds vfs",
           "base" in _names0 and "fs_write" in _names0 and "fs_grep" in _names0, str(_names0))
+    # On deepagents, fs_* is NOT added (deepagents built-in filesystem).
+    _s.harness = "deepagents"
+    try:
+        out_da = add_extension_tools(tools=["base"], llm="LLM", agent_config={}, code_analyzer_config=None,
+                                     execution_id="e", logger_instance=log)
+    finally:
+        _s.harness = _oh
+    _da_names = [getattr(t, "name", t) for t in out_da]
+    check("add_extension_tools(deepagents) skips vfs", "fs_write" not in _da_names, str(_da_names))
     # with code config → appends delegate (+ edit, best-effort)
     out2 = add_extension_tools(tools=[], llm="LLM", agent_config={"instructions": "x"},
                                code_analyzer_config={"repos": []}, execution_id="e", logger_instance=log)
@@ -992,6 +1015,72 @@ def test_agent_spec() -> None:
         check("spec rejects unsupported version", True)
 
 
+def test_memory_capability_and_autolearn() -> None:
+    """Node-driven memory capability + auto-learn safety defaults. DB-free."""
+    from app.harness.spec_factory import build_agent_spec
+    from app.workflow.strategies.react.workflow_config import has_memory_node
+    from app.core.auto_learn import AutoLearnConfig
+
+    base_cfg = {"instructions": "x"}
+    ctx: dict = {}
+
+    # No memory node, no auto-learn → memory off.
+    s1 = build_agent_spec(agent_config=base_cfg, context=ctx,
+                          has_cloudwatch=False, has_code_analyzer=False)
+    check("memory off when no node and no auto-learn", s1.memory is False)
+
+    # Memory node connected → memory on.
+    s2 = build_agent_spec(agent_config=base_cfg, context=ctx,
+                          has_cloudwatch=False, has_code_analyzer=False,
+                          has_memory=True)
+    check("memory on when node connected", s2.memory is True)
+
+    # Auto-learn implies memory even without a node.
+    s3 = build_agent_spec(agent_config={**base_cfg, "autoLearn": "true"}, context=ctx,
+                          has_cloudwatch=False, has_code_analyzer=False,
+                          has_memory=False)
+    check("auto-learn implies memory", s3.auto_learn is True and s3.memory is True)
+
+    # Graph connectivity helper detects a wired vector_memory node.
+    wf = {
+        "nodes": [{"id": "agent", "type": "agent"},
+                  {"id": "m1", "type": "vector_memory"}],
+        "edges": [{"source": "m1", "target": "agent"}],
+    }
+    check("has_memory_node detects connected node", has_memory_node(wf) is True)
+    wf_unwired = {
+        "nodes": [{"id": "agent", "type": "agent"},
+                  {"id": "m1", "type": "vector_memory"}],
+        "edges": [],
+    }
+    check("has_memory_node false when unwired", has_memory_node(wf_unwired) is False)
+
+    # Safety: runtime code compilation is OFF by default.
+    check("auto-learn compile_dynamic_nodes off by default",
+          AutoLearnConfig().compile_dynamic_nodes is False)
+
+
+def test_persona_and_supervisor_toggle() -> None:
+    """Persona is additive (empty → unchanged); supervisor toggle coerces. DB-free."""
+    from app.workflow.strategies.react.agent_builder import compose_system_prompt
+    from app.harness.spec_factory import _as_bool
+
+    base = dict(tools=[], agent_config={"instructions": "do the thing"},
+                has_cloudwatch=False, has_code_analyzer=False)
+    plain = compose_system_prompt(**base)
+    with_persona = compose_system_prompt(
+        **{**base, "agent_config": {"instructions": "do the thing",
+                                    "persona": "You are terse and precise."}})
+    check("persona empty leaves prompt unchanged",
+          compose_system_prompt(**base) == plain)
+    check("persona prepended when set",
+          with_persona.startswith("You are terse and precise.") and len(with_persona) > len(plain))
+
+    # Autonomy toggle coercion: 'false' string must read as autonomous (False).
+    check("supervisor 'false' string coerces to False", _as_bool("false") is False)
+    check("supervisor 'true' string coerces to True", _as_bool("true") is True)
+
+
 # ── chat sessions ─────────────────────────────────────────────────────────────
 def test_session_answer_extraction() -> None:
     """Server-side final-answer/metadata extraction for chat persistence. DB-free."""
@@ -1261,6 +1350,8 @@ async def _main() -> int:
     test_privacy_pseudonymization()
     test_pinned_facts_budget()
     test_agent_spec()
+    test_memory_capability_and_autolearn()
+    test_persona_and_supervisor_toggle()
     await test_supervisor_loop()
     test_context_builder()
     test_extension_tools()

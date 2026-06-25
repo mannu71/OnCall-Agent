@@ -146,6 +146,44 @@ class MCPClientManager:
         self.tool_objects: Dict[str, Dict[str, Any]] = {}  # server_id -> {tool_name -> MCP Tool obj}
         self._exit_stacks: Dict[str, AsyncExitStack] = {}  # server_id -> exit stack
         self.last_errors: Dict[str, str] = {}  # server_id -> last connection failure reason
+        # server_id -> list of fnmatch patterns restricting which discovered tools
+        # are exposed to the agent. Empty/missing = expose all. Lets a node pick a
+        # handful of tools (e.g. wit_*) from a server that advertises dozens, so
+        # the agent's tool list — and every request's token count — stays small.
+        self.tool_filters: Dict[str, List[str]] = {}
+
+    def set_tool_filter(self, server_id: str, patterns: List[str]) -> None:
+        """Restrict which tools from *server_id* are exposed to the agent.
+
+        ``patterns`` are fnmatch-style globs (e.g. ``wit_*``, ``search_code``).
+        An empty list clears the filter (all tools exposed).
+        """
+        clean = [p.strip() for p in patterns if p and p.strip()]
+        if clean:
+            self.tool_filters[server_id] = clean
+        else:
+            self.tool_filters.pop(server_id, None)
+
+    def filtered_tool_names(self, server_id: str) -> List[str]:
+        """Return the tool names for *server_id* after applying its tool filter.
+
+        With no filter set, returns every discovered tool name unchanged.
+        """
+        import fnmatch
+
+        all_names = self.tools.get(server_id, [])
+        patterns = self.tool_filters.get(server_id)
+        if not patterns:
+            return all_names
+        kept = [n for n in all_names if any(fnmatch.fnmatch(n, p) for p in patterns)]
+        if not kept:
+            logger.warning(
+                "MCP server %s: tool filter %s matched no tools (of %d) — exposing "
+                "all to avoid leaving the agent with none",
+                server_id, patterns, len(all_names),
+            )
+            return all_names
+        return kept
     
     # Timeout (seconds) for the entire connect + initialize + list_tools sequence.
     # npx must download the package on first run, so allow generous time.

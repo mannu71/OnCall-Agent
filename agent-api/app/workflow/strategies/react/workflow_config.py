@@ -63,6 +63,17 @@ async def resolve_llm_config_for_workflow(workflow: Dict[str, Any]) -> Dict[str,
             )
     return await resolve_llm_config(workflow)
 
+# Node ``type`` values that represent a Memory node wired to the agent's
+# ``memory`` input port. Kept here next to the connectivity helper so callers
+# share one definition.
+MEMORY_NODE_TYPES = ("vector_memory", "memory")
+
+
+def has_memory_node(workflow: Dict[str, Any]) -> bool:
+    """True when a Memory node is connected to the agent (drives ``spec.memory``)."""
+    return bool(get_connected_node_ids(workflow, MEMORY_NODE_TYPES))
+
+
 def get_connected_node_ids(
     workflow: Dict[str, Any],
     target_type: "str | tuple[str, ...]",

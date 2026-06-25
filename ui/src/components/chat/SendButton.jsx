@@ -20,7 +20,7 @@ export default function SendButton({ onClick, disabled, phase = 'idle', launchin
       aria-label="Send"
       className={cn(
         'h-8 px-4 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors',
-        'bg-[#0a84ff] hover:bg-[#0a84ff]/90 text-white shadow-sm shadow-[#0a84ff]/20',
+        'bg-primary hover:bg-primary/90 text-primary-foreground shadow-sm shadow-primary/20',
         'disabled:opacity-50 disabled:cursor-not-allowed',
       )}
     >

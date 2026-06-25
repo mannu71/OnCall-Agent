@@ -30,7 +30,14 @@ _SMALL_TALK_RE = re.compile(
     r"bye|goodbye|see\s*ya|"
     r"who\s*are\s*you|what\s*are\s*you|"
     r"what\s*can\s*you\s*do|what\s*do\s*you\s*do|help|"
-    r"how\s*are\s*you|how(?:'s|\s+is)\s+it\s+going"
+    r"how\s*are\s*you|how(?:'s|\s+is)\s+it\s+going|"
+    # Meta / capability questions — answerable from the agent's own tool list,
+    # they need no credentialed pre-work (must NOT trip the CloudWatch STS check).
+    r"what(?:'s|\s+is|\s+are)?\s*(?:the\s+|your\s+)?(?:tools?|capabilities|commands?)"
+    r"(?:\s+(?:available|do\s*you\s*have|are\s*there|can\s*you\s*use))?|"
+    r"(?:list|show)\s*(?:me\s*)?(?:your\s*|the\s*)?(?:tools?|capabilities|commands?)"
+    r"(?:\s+available)?|"
+    r"what\s*can\s*you\s*(?:access|use)"
     r")"
     r"[\s!.,?]*$",
     re.IGNORECASE,

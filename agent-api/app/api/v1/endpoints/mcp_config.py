@@ -19,7 +19,6 @@ _DESC_ICON = "Icon for the server"
 _DESC_DISABLED = "Whether server is disabled"
 
 
-# Pydantic models for request/response
 class MCPServerConfig(BaseModel):
     """MCP Server configuration model."""
     command: str = Field(..., description=_DESC_COMMAND)

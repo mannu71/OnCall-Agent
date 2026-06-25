@@ -33,9 +33,15 @@ def filter_tools(tools: List[Any], query: str) -> List[Any]:
     keep_prefixes = tuple(p.strip() for p in keep_prefixes_env.split(",") if p.strip())
     top_k = int(os.environ.get("TOOL_ROUTER_TOP_K", _DEFAULT_TOP_K))
 
+    # An MCP tool is "rankable" (eligible for pruning) only when it is NOT a
+    # core-family tool AND NOT explicitly pinned by an operator tool filter on
+    # its node. A node-level filter is a deliberate allowlist — the user already
+    # chose those tools, so the relevance ranker must never drop them.
     mcp_tools = [
         t for t in tools
-        if hasattr(t, "name") and not any(t.name.startswith(p) for p in keep_prefixes)
+        if hasattr(t, "name")
+        and not any(t.name.startswith(p) for p in keep_prefixes)
+        and not getattr(t, "router_pinned", False)
     ]
     special_tools = [t for t in tools if t not in mcp_tools]
     if not mcp_tools:

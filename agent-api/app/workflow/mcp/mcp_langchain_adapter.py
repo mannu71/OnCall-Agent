@@ -10,6 +10,7 @@ back through the MCPClientManager.execute_tool() coroutine.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from typing import Any, Dict, List, Optional, Type
@@ -20,6 +21,24 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field, create_model
 
 logger = logging.getLogger(__name__)
+
+_BEDROCK_TOOL_NAME_LIMIT = 64
+
+
+def _safe_tool_name(server_id: str, tool_name: str) -> str:
+    """Return a Bedrock-safe composite tool name (≤64 chars).
+
+    Bedrock's ConverseStream rejects tool names longer than 64 characters.
+    When the composite ``{server_id}__{tool_name}`` exceeds the limit we
+    truncate to 57 chars and append ``_`` + the first 6 hex digits of the
+    SHA-256 of the full name so the shortened name stays unique.
+    """
+    full = f"{server_id}__{tool_name}"
+    if len(full) <= _BEDROCK_TOOL_NAME_LIMIT:
+        return full
+    suffix = hashlib.sha256(full.encode()).hexdigest()[:6]
+    return full[: _BEDROCK_TOOL_NAME_LIMIT - 7] + "_" + suffix
+
 
 # Ceiling for a single MCP tool's text output. Unbounded outputs are a token
 # sink: the full result is replayed in the message history on every subsequent
@@ -105,6 +124,10 @@ class MCPToolWrapper(BaseTool):
     mcp_manager: Any  # MCPClientManager — typed as Any to avoid circular imports
     args_schema: Optional[Type[BaseModel]] = None
     tool_timeout: Optional[float] = None  # seconds; None = use manager default
+    # True when this tool came from a node with an explicit tool filter set — an
+    # operator's deliberate allowlist. The relevance router must NOT prune these
+    # (the user already chose them); see app.harness.tool_router.filter_tools.
+    router_pinned: bool = False
 
     class Config:
         arbitrary_types_allowed = True
@@ -128,15 +151,34 @@ class MCPToolWrapper(BaseTool):
             extra={"tool": self.tool_name, "server": self.server_id, "kwargs": list(kwargs.keys())},
         )
 
+        # Strip None values before sending — MCP servers with strict JSON-schema
+        # validation reject explicit null for optional params that they'd accept
+        # as absent. The ADO MCP server is a known case (project, fields, etc.).
+        clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         result = await self.mcp_manager.execute_tool(
             server_id=self.server_id,
             tool_name=self.tool_name,
-            arguments=kwargs,
+            arguments=clean_kwargs,
             tool_timeout=self.tool_timeout,
         )
 
         if result.get("isError"):
-            error_msg = result.get("error", "Unknown MCP tool error")
+            # MCP servers put error details in `content`, not `error` (which is
+            # only set on transport-level failures). Extract the text so the agent
+            # can see the real message and self-correct (e.g. wrong project name).
+            raw = result.get("content") or result.get("error") or "Unknown MCP tool error"
+            if isinstance(raw, list):
+                parts = []
+                for item in raw:
+                    if hasattr(item, "text"):
+                        parts.append(item.text)
+                    elif isinstance(item, dict):
+                        parts.append(item.get("text", json.dumps(item)))
+                    else:
+                        parts.append(str(item))
+                error_msg = "\n".join(parts) or "Unknown MCP tool error"
+            else:
+                error_msg = str(raw)
             logger.warning("MCPToolWrapper: tool returned error: %s", error_msg)
             return f"[Tool Error] {error_msg}"
 
@@ -181,13 +223,28 @@ def build_langchain_tools(
 
     # Resolve which servers and tools to expose
     if server_tool_map is None:
-        # Use all connected servers and their discovered tools
-        server_tool_map = mcp_manager.get_available_tools()
+        # Use all connected servers, but honor any per-server tool filter set on
+        # the manager (e.g. an MCP node that exposes only wit_* from an ADO server
+        # advertising 90 tools). Filtering here keeps the agent's tool list — and
+        # every request's token count — small, which avoids guardrail throttling.
+        get_filtered = getattr(mcp_manager, "filtered_tool_names", None)
+        if callable(get_filtered):
+            server_tool_map = {
+                sid: get_filtered(sid) for sid in mcp_manager.get_available_tools()
+            }
+        else:
+            server_tool_map = mcp_manager.get_available_tools()
+
+    # Servers carrying an explicit per-node tool filter: their tools are an
+    # operator allowlist and must survive the relevance router downstream.
+    _filtered_servers = set(getattr(mcp_manager, "tool_filters", {}) or {})
 
     for server_id, tool_names in server_tool_map.items():
         if not mcp_manager.is_connected(server_id):
             logger.warning("build_langchain_tools: server '%s' not connected, skipping", server_id)
             continue
+
+        _server_pinned = server_id in _filtered_servers
 
         # Try to retrieve the raw tool metadata (name, description, inputSchema)
         # The MCPClientManager stores the session — we can inspect the tools list
@@ -211,14 +268,22 @@ def build_langchain_tools(
             input_schema = mcp_tool_obj.get("inputSchema") if mcp_tool_obj else None
             args_schema = _build_input_schema(input_schema)
 
+            composite_name = _safe_tool_name(server_id, tool_name)
+            if composite_name != f"{server_id}__{tool_name}":
+                logger.warning(
+                    "build_langchain_tools: tool name truncated to fit Bedrock 64-char limit "
+                    "'%s' → '%s'",
+                    f"{server_id}__{tool_name}", composite_name,
+                )
             tool = MCPToolWrapper(
-                name=f"{server_id}__{tool_name}",
+                name=composite_name,
                 description=description,
                 server_id=server_id,
                 tool_name=tool_name,
                 mcp_manager=mcp_manager,
                 args_schema=args_schema,
                 tool_timeout=tool_timeout,
+                router_pinned=_server_pinned,
             )
             langchain_tools.append(tool)
 

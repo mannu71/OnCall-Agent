@@ -282,6 +282,45 @@ async def list_tool_approvals(execution_id: str) -> Dict[str, Any]:
     return {"execution_id": execution_id, "approvals": records}
 
 
+@router.get("/{execution_id}/history")
+async def execution_checkpoint_history(execution_id: str) -> Dict[str, Any]:
+    """Time-travel: list the LangGraph checkpoints for this execution's thread.
+
+    Backed by the durable ``AsyncPostgresSaver`` (thread_id == execution_id), so
+    operators can inspect each step of a run and (later) resume/fork from a given
+    checkpoint. Returns newest-first checkpoint metadata + message counts.
+    """
+    from app.harness.runtime import get_saver
+
+    saver = get_saver()
+    if saver is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Durable checkpointer unavailable (Postgres persistence not initialised).",
+        )
+    config = {"configurable": {"thread_id": str(execution_id)}}
+    history: List[Dict[str, Any]] = []
+    try:
+        async for ct in saver.alist(config):
+            cp = getattr(ct, "checkpoint", {}) or {}
+            meta = getattr(ct, "metadata", {}) or {}
+            cfg = getattr(ct, "config", {}) or {}
+            msgs = ((cp.get("channel_values") or {}).get("messages")) or []
+            history.append({
+                "checkpoint_id": (cfg.get("configurable") or {}).get("checkpoint_id"),
+                "ts": cp.get("ts"),
+                "step": meta.get("step"),
+                "source": meta.get("source"),
+                "message_count": len(msgs) if isinstance(msgs, list) else None,
+            })
+    except Exception as exc:  # noqa: BLE001 — history is read-only/diagnostic
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read checkpoint history: {exc}",
+        )
+    return {"execution_id": execution_id, "checkpoints": history, "count": len(history)}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # /steer — mid-run engineer note injection
 # ─────────────────────────────────────────────────────────────────────────────

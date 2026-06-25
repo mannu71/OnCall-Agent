@@ -38,7 +38,25 @@ def build_agent_from_spec(
     Single entry point that unpacks the spec into the underlying
     ``agent_builder.build_agent`` call, so the four-or-so call sites stay in sync.
     """
-    from app.workflow.strategies.react.agent_builder import build_agent as _build_agent
+    # Official-stack path: when the deepagents harness is selected, build the
+    # agent with deepagents instead of the in-house ReAct wrapper. Same Bedrock
+    # model + tools. The choice is per-node (``spec.harness``, set from the agent
+    # node's Harness dropdown) and falls back to the global ``settings.harness``.
+    try:
+        from app.harness.spec_factory import resolve_harness
+        _effective = spec.harness or resolve_harness(spec.agent_config)
+        if _effective == "deepagents":
+            from app.harness.deep_agent import build_deep_agent
+            return build_deep_agent(
+                spec, llm, tools, checkpointer=checkpointer, execution_port=execution_port,
+            )
+    except Exception as _da_exc:  # noqa: BLE001 — never break legacy on flag check
+        import logging
+        logging.getLogger(__name__).warning(
+            "deepagents harness build failed (%s) — using legacy", _da_exc
+        )
+
+    from app.legacy.react_agent import build_agent as _build_agent
 
     return _build_agent(
         llm,

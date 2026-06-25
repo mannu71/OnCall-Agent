@@ -103,5 +103,5 @@ class MCPConfigRepository(BaseAsyncRepository):
             "enabled": server.enabled,
             "description": server.description,
             "created_at": server.created_at.isoformat() if server.created_at else None,
-            "updated_at": server.updated_at.isoformat() if server.updated_at else None
+            "updated_at": server.updated_at.isoformat() if server.updated_at else None,
         }

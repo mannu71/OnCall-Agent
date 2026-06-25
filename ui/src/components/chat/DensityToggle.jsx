@@ -24,7 +24,7 @@ export default function DensityToggle({ value, onChange }) {
             className={cn(
               'size-6 rounded-md flex items-center justify-center transition-colors',
               active
-                ? 'bg-[#0a84ff] text-white shadow-sm'
+                ? 'bg-primary text-primary-foreground shadow-sm'
                 : 'text-slate-400 hover:text-slate-600 hover:bg-black/[0.04] dark:hover:bg-white/[0.06]',
             )}
           >

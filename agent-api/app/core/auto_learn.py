@@ -75,8 +75,11 @@ class AutoLearnConfig:
     # Whether to attempt skill distillation.
     distill_skills: bool = os.getenv("AUTO_LEARN_DISTILL_SKILLS", "true").lower() != "false"
 
-    # Whether to attempt dynamic node code generation.
-    compile_dynamic_nodes: bool = os.getenv("AUTO_LEARN_COMPILE_NODES", "true").lower() != "false"
+    # Whether to attempt dynamic node code generation. OFF by default: this
+    # compiles and registers LLM-generated Python at runtime, which is an
+    # unacceptable default for a compliance system. Opt in explicitly via the
+    # AUTO_LEARN_COMPILE_NODES env var.
+    compile_dynamic_nodes: bool = os.getenv("AUTO_LEARN_COMPILE_NODES", "false").lower() == "true"
 
     # Confidence delta added per occurrence.
     confidence_delta: float = 0.10

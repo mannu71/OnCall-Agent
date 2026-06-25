@@ -223,7 +223,7 @@ def wrap_tools_with_permissions(
         # win queue.get(), leaving the rest hung ("stuck after approval"). So we
         # register a per-request_id Future and the approve endpoint resolves the
         # matching one. See app/api/v1/endpoints/executions.py::approve_hitl_request.
-        async def _gated(*_a, __orig=original, __name=name, **kwargs) -> Any:
+        async def _gated(*_a, __orig=original, __tool=tool, __name=name, **kwargs) -> Any:
             runtime = execution_port.get_runtime(execution_id) if (execution_port and execution_id) else None
             if not isinstance(runtime, dict) or not runtime:
                 logger.warning("tool_permissions: ASK %s has no approval channel; blocking", __name)
@@ -292,7 +292,14 @@ def wrap_tools_with_permissions(
             await _record_approval_decision(
                 execution_id, request_id, "approved", reason=_reason,
             )
-            return await __orig(*_a, **kwargs)
+            # Tools that expose a plain `.coroutine` (StructuredTool) are invoked
+            # directly. Tools that only implement `_arun` (MCPToolWrapper, several
+            # builtin BaseTools like fs_write) have no `.coroutine`, so `__orig`
+            # is None — fall back to the tool's own async invoke instead of
+            # crashing with "'NoneType' object is not callable".
+            if __orig is not None:
+                return await __orig(*_a, **kwargs)
+            return await __tool.ainvoke(kwargs)
 
         wrapped.append(_clone_with_coroutine(tool, _gated))
 

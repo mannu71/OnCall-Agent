@@ -175,6 +175,9 @@ export const agentApiClient = {
         if (o.userQuery) params.query = o.userQuery;
         if (o.outputMode) params.output_mode = o.outputMode;
         if (o.permissionMode) params.permission_mode = o.permissionMode;
+        // Per-turn runtime override: 'legacy' | 'deepagents'. Overrides the
+        // agent node's harness setting (and the server default) for this run.
+        if (o.harness) params.harness = o.harness;
         // When a persisted chat session is active, the backend records the user
         // and assistant turns against it so the conversation survives a refresh.
         if (o.sessionId) params.session_id = o.sessionId;
@@ -264,6 +267,7 @@ export const agentApiClient = {
         try {
             const data = await this.executeWorkflow(workflowName, {
                 background: false, userQuery, history: h.history, sessionId: h.sessionId,
+                harness: h.harness,
             });
             if (data && data.status === 'already_running') {
                 throw new Error(`Agent "${workflowName}" is already running. Wait for it to finish.`);
@@ -339,6 +343,11 @@ export const agentApiClient = {
 
     async listActiveWorkflows() {
         const response = await client.get('/api/v1/executions/active');
+        return response.data;
+    },
+
+    async cancelWorkflow(workflowName) {
+        const response = await client.delete(`/api/v1/executions/active/${encodeURIComponent(workflowName)}`);
         return response.data;
     },
 

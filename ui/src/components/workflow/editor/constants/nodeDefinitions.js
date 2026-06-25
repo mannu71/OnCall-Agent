@@ -45,25 +45,6 @@ export const NODE_TYPES = {
       { kind: 'port-out', id: 'trigger', label: 'Trigger', portType: 'trigger' },
     ],
   },
-  http_in: {
-    category: 'Inputs', label: 'HTTP Request', icon: 'globe',
-    desc: 'Fetch a URL, return JSON',
-    slots: [
-      { kind: 'port-in',  id: 'trigger', label: 'Trigger',  portType: 'trigger' },
-      { kind: 'select',   id: 'method',  label: 'Method' },
-      { kind: 'field',    id: 'url',     label: 'URL', mono: true },
-      { kind: 'port-out', id: 'body',    label: 'Response', portType: 'data' },
-    ],
-  },
-  webhook: {
-    category: 'Inputs', label: 'Webhook', icon: 'webhook',
-    desc: 'Trigger via HTTP webhook',
-    slots: [
-      { kind: 'field',    id: 'path', label: 'Path', mono: true },
-      { kind: 'port-out', id: 'body', label: 'Body', portType: 'message' },
-    ],
-  },
-
   // ── Models ───────────────────────────────────────────────────
   // Legacy types kept for existing saved workflows — hidden from palette
   anthropic_model: {
@@ -144,9 +125,20 @@ export const NODE_TYPES = {
   database: {
     category: 'Tools', label: 'Database', icon: 'db',
     desc: 'Database MCP server from Settings',
+    paletteHidden: true,  // superseded by mcp_server node
     slots: [
-      { kind: 'db-select', id: 'server', label: 'Server' },  // dynamic — see NodeProperties
+      { kind: 'db-select', id: 'server', label: 'Server' },
       { kind: 'port-out',  id: 'tool',   label: 'Tool', portType: 'tool' },
+    ],
+  },
+  mcp_server: {
+    category: 'Tools', label: 'MCP', icon: 'server',
+    desc: 'Connect MCP servers from Settings · wire each independently',
+    slots: [
+      { kind: 'mcp-select', id: 'servers', label: 'MCP Servers' },
+      { kind: 'field',      id: 'tools',   label: 'Tool filter',
+        placeholder: 'e.g. wit_*, search_code (blank = all)' },
+      { kind: 'port-out',   id: 'tool',    label: 'Tool', portType: 'tool' },
     ],
   },
   code_search_tool: {
@@ -197,6 +189,7 @@ export const NODE_TYPES = {
       { kind: 'field',    id: 'maxIter',  label: 'Max iterations', suffix: 'steps' },
       { kind: 'toggle',   id: 'autoLearn',   label: 'Auto-learn' },
       { kind: 'toggle',   id: 'sandbox',     label: 'Sandbox shell' },
+      { kind: 'toggle',   id: 'supervisor_enabled', label: 'Supervisor (human review)' },
       { kind: 'port-out', id: 'response', label: 'Response', portType: 'message' },
     ],
   },
@@ -214,33 +207,6 @@ export const NODE_TYPES = {
   },
 
   // ── Outputs ──────────────────────────────────────────────────
-  pagerduty: {
-    category: 'Outputs', label: 'PagerDuty', icon: 'bell',
-    desc: 'Create an incident',
-    slots: [
-      { kind: 'port-in', id: 'msg',      label: 'Message',  portType: 'message' },
-      { kind: 'select',  id: 'severity', label: 'Severity' },
-      { kind: 'field',   id: 'service',  label: 'Service',  mono: true },
-    ],
-  },
-  slack: {
-    category: 'Outputs', label: 'Slack', icon: 'msg',
-    desc: 'Post to a channel',
-    slots: [
-      { kind: 'port-in', id: 'msg',     label: 'Message', portType: 'message' },
-      { kind: 'field',   id: 'channel', label: 'Channel', mono: true },
-      { kind: 'field',   id: 'mention', label: 'Mention', mono: true },
-    ],
-  },
-  email_out: {
-    category: 'Outputs', label: 'Email', icon: 'mail',
-    desc: 'Send an email',
-    slots: [
-      { kind: 'port-in', id: 'msg',     label: 'Message', portType: 'message' },
-      { kind: 'field',   id: 'to',      label: 'To',      mono: true },
-      { kind: 'field',   id: 'subject', label: 'Subject' },
-    ],
-  },
   wiki: {
     category: 'Outputs', label: 'Wiki', icon: 'wiki',
     desc: 'Publish agent output to a Wiki page',
@@ -262,15 +228,10 @@ export const NODE_TYPES = {
 // ── Default params applied when a node is dropped from the palette ───────────
 export const NODE_DEFAULTS = {
   schedule:    { frequency: 'Every 15 min', time: '09:00', days: 'Mon,Tue,Wed,Thu,Fri', tz: 'UTC' },
-  http_in:     { method: 'GET', url: '' },
-  webhook:     { path: '/hooks/incoming' },
   vector_memory: { collection: '', topK: '5' },
   cloudwatch_tool: { region: 'us-east-1', profile: '', groups: '', analysis: 'error-patterns', analysis_depth: 'auto', tool_mode: 'auto', range: '15m', threshold: '10', alerts: 'false' },
-  agent:       { system: '', maxIter: '10', autoLearn: 'false', sandbox: 'false' },
+  agent:       { system: '', maxIter: '10', harness: '', autoLearn: 'false', sandbox: 'false', supervisor_enabled: 'true' },
   if:          { condition: '' },
-  pagerduty:   { severity: 'P2', service: '' },
-  slack:       { channel: '', mention: '' },
-  email_out:   { to: '', subject: '' },
   wiki:        { format: 'Summary', platform: 'Azure DevOps Wiki', wikiUrl: '', pagePath: '', project: '', pat: '', tokenVar: 'ADO_WIKI_PAT' },
   orchestrator: { sqlFile: '' },
   router:      { routes: {}, routes_description: {} },

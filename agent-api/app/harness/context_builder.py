@@ -38,6 +38,7 @@ async def build_recall_query(
     logger_instance: Any,
     execution_id: Optional[str],
     code_analyzer_config: Optional[Dict[str, Any]] = None,
+    memory_enabled: bool = False,
 ) -> Tuple[str, int, list]:
     """Return ``(augmented_query, recall_hits, selected_skills)`` with blocks prepended.
 
@@ -70,9 +71,12 @@ async def build_recall_query(
             extra={"execution_id": execution_id},
         )
 
-    # ── (b) Learned semantic memory (Phase 2, opt-in) ────────────────────────
+    # ── (b) Learned semantic memory ──────────────────────────────────────────
+    # Driven by a Memory node connected to the agent (``memory_enabled``). The
+    # global ``semantic_memory_enabled`` remains a master enable-all override for
+    # non-graph callers; default off so memory is purely node-driven per workflow.
     try:
-        if settings.semantic_memory_enabled:
+        if memory_enabled or settings.semantic_memory_enabled:
             from app.services.semantic_memory import semantic_memory, format_recall_block
             _mem = await semantic_memory.recall(user_query, repo=repos or None)
             _mem_block = format_recall_block(_mem)

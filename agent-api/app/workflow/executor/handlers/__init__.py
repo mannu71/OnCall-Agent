@@ -22,7 +22,8 @@ def register(node_type: str):
 from . import scheduler  # noqa: E402,F401
 from . import orchestrator  # noqa: E402,F401
 from . import tool  # noqa: E402,F401
-from . import database  # noqa: E402,F401  — new LangflowEditor 'database' node type
+from . import database    # noqa: E402,F401  — new LangflowEditor 'database' node type
+from . import mcp_server  # noqa: E402,F401  — generic MCP node (any server type)
 from . import agent  # noqa: E402,F401
 from . import batch_agent  # noqa: E402,F401
 from . import cloudwatch  # noqa: E402,F401

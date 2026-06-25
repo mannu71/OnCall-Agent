@@ -22,7 +22,6 @@ from app.harness.tool_assembler import add_extension_tools, assemble_base_tools
 from app.workflow.execution_port import ExecutionPort
 from app.workflow.llm_config import LLM_NODE_TYPES
 from app.workflow.strategies.base import BaseStrategy
-from app.workflow.strategies.react.agent_builder import build_agent
 from app.workflow.strategies.react.agent_runner import execute_agent
 from app.workflow.strategies.react.hitl import emit_hitl_pause, make_checkpointer
 from app.workflow.strategies.react.learning import auto_learn, exec_fallback
@@ -41,6 +40,7 @@ from app.workflow.strategies.react.workflow_config import (
     extract_tools_config,
     find_agent_node_id,
     find_code_analyzer_node_id,
+    has_memory_node,
     resolve_default_tools_config,
     resolve_llm_config_for_workflow,
 )
@@ -118,6 +118,25 @@ class ReactStrategy(BaseStrategy):
                 )
             except Exception as _prof_err:  # noqa: BLE001
                 logger.warning("ReactStrategy: profile merge skipped (%s)", _prof_err)
+
+            # Per-turn harness override (Chat composer's Legacy/Deepagent pill →
+            # request inputs.harness). Stamp it into the agent config so EVERY
+            # harness reader agrees — the agent builder, the prompt composer, and
+            # the tool assembler all derive the effective harness from this dict.
+            # Accepts the 'deepagent' UI spelling; node config is the default and
+            # an explicit per-turn choice wins for this run.
+            _harness_req = str(
+                (context.get("inputs") or {}).get("harness")
+                or context.get("harness")
+                or ""
+            ).strip().lower()
+            if _harness_req:
+                _norm = "deepagents" if _harness_req.startswith("deepagent") else (
+                    "legacy" if _harness_req == "legacy" else ""
+                )
+                if _norm:
+                    agent_config = {**agent_config, "harness": _norm}
+
             llm_config = await resolve_llm_config_for_workflow(workflow)
 
             # Node-level gateway: resolve the models wired to the dedicated model
@@ -176,6 +195,77 @@ class ReactStrategy(BaseStrategy):
             cloudwatch_config = extract_cloudwatch_config(workflow)
             code_analyzer_config = extract_code_analyzer_config(workflow)
 
+            # ── Conversational fast-path ──────────────────────────────────────
+            # A purely conversational turn (greeting / thanks / "what can you do?"
+            # / "what tools are available?") needs no logs, code search, or DB. The
+            # full agent build would still hand the model the entire investigation
+            # system prompt + every bound tool schema (~28K input tokens for a
+            # one-word "Hi"). Short-circuit with a single cheap, tool-less model
+            # call against a tiny capability-aware prompt. Any failure falls through
+            # to the full path so a real query is never dropped.
+            from app.core.intent import is_conversational
+            if is_conversational(user_query):
+                try:
+                    from app.harness.conversational import conversational_reply
+                    privacy.bind_session(execution_id)
+                    _conv = await conversational_reply(
+                        llm=build_llm(llm_config),
+                        user_query=user_query,
+                        llm_config=llm_config,
+                        has_cloudwatch=bool(cloudwatch_config),
+                        has_code_analyzer=bool(code_analyzer_config),
+                        has_db=bool(context.get("db_server_map")),
+                        stream_callback=stream_callback,
+                        execution_id=execution_id,
+                        logger_instance=logger_instance,
+                    )
+                    if mcp_manager:
+                        try:
+                            await mcp_manager.disconnect_all()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    privacy.drop_vault(execution_id)
+                    return _conv
+                except Exception as _conv_err:  # noqa: BLE001 — use the full path
+                    logger_instance.warning(
+                        "ReactStrategy: conversational fast-path failed (%s) — "
+                        "using full path", redact(str(_conv_err)),
+                        extra={"execution_id": execution_id},
+                    )
+                    try:
+                        privacy.drop_vault(execution_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            # Expand @file / @folder / @url / @git references in the query into
+            # inline context (best-effort, no-op when none present). File access
+            # is restricted to the configured root for safety.
+            if getattr(settings, "context_references_enabled", True) and "@" in (user_query or ""):
+                try:
+                    import os as _os
+                    from app.core.context_references import preprocess_context_references_async
+                    _ref_root = getattr(settings, "context_reference_root", "") or _os.getcwd()
+                    _ref_res = await preprocess_context_references_async(
+                        user_query,
+                        cwd=_ref_root,
+                        context_length=200_000,
+                        allowed_root=_ref_root,
+                    )
+                    if _ref_res.expanded:
+                        user_query = _ref_res.message
+                        logger_instance.info(
+                            "ReactStrategy: expanded %d context reference(s) (%d tokens)",
+                            len(_ref_res.references), _ref_res.injected_tokens,
+                            extra={"execution_id": execution_id},
+                        )
+                    for _w in _ref_res.warnings:
+                        logger_instance.warning("ReactStrategy: context-ref: %s", _w)
+                except Exception as _ref_err:  # noqa: BLE001 — never block on references
+                    logger_instance.warning(
+                        "ReactStrategy: context-reference expansion skipped (%s)",
+                        redact(str(_ref_err)), extra={"execution_id": execution_id},
+                    )
+
             # Prepend a knowledge-base recall block (similar past issues /
             # patterns / skills) so the agent starts with institutional memory.
             augmented_query, recall_hits, selected_skills = await build_recall_query(
@@ -184,6 +274,7 @@ class ReactStrategy(BaseStrategy):
                 logger_instance=logger_instance,
                 execution_id=execution_id,
                 code_analyzer_config=code_analyzer_config,
+                memory_enabled=has_memory_node(workflow),
             )
 
             # Assemble the base action space (MCP + CloudWatch + crawler + DB
@@ -259,6 +350,8 @@ class ReactStrategy(BaseStrategy):
                 has_cloudwatch=bool(cloudwatch_config),
                 has_code_analyzer=bool(code_analyzer_config),
                 session_id=execution_id,
+                has_memory=has_memory_node(workflow),
+                logger_instance=logger_instance,
             )
 
             # Expand any named-policy-set references (DB-backed) into inline
@@ -280,7 +373,17 @@ class ReactStrategy(BaseStrategy):
 
             agent = _rebuild_agent()
 
-            supervisor_enabled = agent_config.get("supervisor_enabled", True)
+            # Per-workflow autonomy: turning the supervisor OFF on the agent node
+            # runs the agent fully autonomously (no scoring / HITL pause). Coerce
+            # via _as_bool because the UI writes the string 'true'/'false', and a
+            # bare ``'false'`` would otherwise be truthy. Check both the node data
+            # and its ``params`` mirror (same as the autoLearn/sandbox toggles).
+            from app.harness.spec_factory import _as_bool
+            _sup_params = agent_config.get("params") if isinstance(agent_config.get("params"), dict) else {}
+            _sup_raw = agent_config.get("supervisor_enabled")
+            if _sup_raw is None:
+                _sup_raw = _sup_params.get("supervisor_enabled")
+            supervisor_enabled = _as_bool(_sup_raw) if _sup_raw is not None else True
             supervisor = (
                 InvestigationSupervisor(SupervisorConfig.from_settings())
                 if supervisor_enabled
@@ -386,6 +489,8 @@ class ReactStrategy(BaseStrategy):
                     await auto_learn(
                         user_query, result, execution_id, execution_start, recall_hits,
                         logger_instance, code_analyzer_config=code_analyzer_config,
+                        workflow_name=workflow.get("name") or workflow.get("id") or "",
+                        memory_enabled=spec.memory,
                     )
                 except Exception as _learn_call_err:
                     logger_instance.warning(

@@ -15,7 +15,7 @@ import { getLLMs } from '../../services/llmService.js';
 import { getMCPServers } from '../../services/mcpService.js';
 import { getAppSettings } from '../../services/apiClient.js';
 import { useWorkflowStatus } from '../../context/WorkflowStatusContext.jsx';
-import { validateConnection, getValidDropTargets, slotsForNode, modelNamesOf, reconcileModelEdges } from './portValidation.js';
+import { validateConnection, getValidDropTargets, slotsForNode, modelNamesOf, reconcileModelEdges, mcpServerNamesOf, reconcileMcpEdges, workflowWarnings } from './portValidation.js';
 import agentApiClient from '../../services/agentApiClient.js';
 import { CAT_TINT, PORT_TYPE, NODE_TYPES, NODE_DEFAULTS } from './editor/constants/nodeDefinitions.js';
 
@@ -84,8 +84,6 @@ function _dataToParams(type, data) {
       };
     case 'schedule':
       return { cron: data.cron || '*/15 * * * *', tz: data.tz || 'UTC' };
-    case 'http_in':
-      return { method: data.method || 'GET', url: data.url || '' };
     case 'vector_memory':
       return { collection: data.collection || '', topK: String(data.topK || '5') };
     case 'cloudwatch_tool': {
@@ -105,12 +103,6 @@ function _dataToParams(type, data) {
     }
     case 'postgres_tool':
       return { connection: data.connection || data.connectionString || '' };
-    case 'pagerduty':
-      return { severity: data.severity || 'P2', service: data.service || '' };
-    case 'slack':
-      return { channel: data.channel || '', mention: data.mention || '' };
-    case 'email_out':
-      return { to: data.to || '', subject: data.subject || '' };
     case 'wiki':
       return {
         format:   data.format   || 'Summary',
@@ -163,8 +155,6 @@ const SAMPLE_WORKFLOW = {
   nodes: [
     { id: 'n_trigger', type: 'schedule',        x:   20, y:  40, name: 'Every 15 min',     status: 'success',
       params: { cron: '*/15 * * * *', tz: 'UTC' } },
-    { id: 'n_fetch',   type: 'http_in',         x:   20, y: 300, name: 'Fetch endpoints',  status: 'success',
-      params: { method: 'GET', url: '/api/v1/endpoints' } },
     { id: 'n_model',   type: 'anthropic_model', x:  300, y:  40, name: 'Claude Haiku 4.5', status: 'idle',
       params: { model: 'claude-haiku-4-5', temp: '0.2',
                 system: 'You triage SLO breaches. Return JSON with breaches[] and severity.' } },
@@ -174,22 +164,15 @@ const SAMPLE_WORKFLOW = {
       params: { groups: '4', range: '15m' } },
     { id: 'n_agent',   type: 'agent',           x:  580, y: 100, name: 'Health Agent',     status: 'running',
       params: { system: 'Triage SLO breaches from 24 endpoints. Cite log evidence.', maxIter: '12' } },
-    { id: 'n_if',      type: 'if',              x:  890, y: 100, name: 'Has breach?',      status: 'idle',
-      params: { condition: '$json.breaches.length > 0' } },
-    { id: 'n_pd',      type: 'pagerduty',       x: 1170, y:   0, name: 'Page on-call',     status: 'idle',
-      params: { severity: 'P2', service: 'core-api' } },
-    { id: 'n_slack',   type: 'slack',           x: 1170, y: 280, name: '#oncall recap',    status: 'idle',
-      params: { channel: '#oncall', mention: '@here' } },
+    { id: 'n_wiki',    type: 'wiki',            x:  890, y: 100, name: 'Post summary',     status: 'idle',
+      params: { format: 'Summary', platform: 'Azure DevOps Wiki', wikiUrl: '', pagePath: '', project: '', pat: '', tokenVar: 'ADO_WIKI_PAT' } },
   ],
   edges: [
-    { id: 'e1', source: 'n_trigger', sourceSlot: 'trigger',  target: 'n_fetch',  targetSlot: 'trigger'  },
-    { id: 'e2', source: 'n_fetch',   sourceSlot: 'body',     target: 'n_agent',  targetSlot: 'input'    },
-    { id: 'e3', source: 'n_model',   sourceSlot: 'lm',       target: 'n_agent',  targetSlot: 'lm'       },
-    { id: 'e4', source: 'n_mem',     sourceSlot: 'mem',      target: 'n_agent',  targetSlot: 'memory'   },
-    { id: 'e5', source: 'n_tool_cw', sourceSlot: 'tool',     target: 'n_agent',  targetSlot: 'tools'    },
-    { id: 'e6', source: 'n_agent',   sourceSlot: 'response', target: 'n_if',     targetSlot: 'input'    },
-    { id: 'e7', source: 'n_if',      sourceSlot: 'true',     target: 'n_pd',     targetSlot: 'msg'      },
-    { id: 'e8', source: 'n_if',      sourceSlot: 'false',    target: 'n_slack',  targetSlot: 'msg'      },
+    { id: 'e1', source: 'n_trigger', sourceSlot: 'trigger',  target: 'n_agent',  targetSlot: 'trigger'  },
+    { id: 'e2', source: 'n_model',   sourceSlot: 'lm',       target: 'n_agent',  targetSlot: 'lm'       },
+    { id: 'e3', source: 'n_mem',     sourceSlot: 'mem',      target: 'n_agent',  targetSlot: 'memory'   },
+    { id: 'e4', source: 'n_tool_cw', sourceSlot: 'tool',     target: 'n_agent',  targetSlot: 'tools'    },
+    { id: 'e5', source: 'n_agent',   sourceSlot: 'response', target: 'n_wiki',   targetSlot: 'msg'      },
   ],
 };
 
@@ -218,7 +201,7 @@ function rowHeight(slot) {
   if (slot.kind === 'tz-info')                                 return FIELD_H;
   if (slot.kind === 'textarea')                                return TEXTAREA_H;
   if (slot.kind === 'select' || slot.kind === 'llm-select' ||
-      slot.kind === 'db-select' || slot.kind === 'repo-select') return SELECT_H;
+      slot.kind === 'db-select' || slot.kind === 'mcp-select' || slot.kind === 'repo-select') return SELECT_H;
   if (slot.kind === 'weekday-select')                          return WEEKDAY_H;
   if (slot.kind === 'file-select')                             return FIELD_H;
   if (slot.kind === 'toggle')                                  return TOGGLE_H;
@@ -363,7 +346,7 @@ function SlotRow({ slot, value, gtz }) {
     const tp = PORT_TYPE[slot.portType] || PORT_TYPE.message;
     // Language Model outputs: the row label IS the model name, so the generic
     // "Language Model" chip would be redundant — show a slim colored dot instead.
-    const isModelPort = slot.id === 'lm' || slot.id.startsWith('lm::');
+    const isModelPort = slot.id === 'lm' || slot.id.startsWith('lm::') || slot.id.startsWith('mcp::');
     return (
       <div style={{ height: ROW_H, padding: '0 18px 0 12px', display: 'flex',
                     alignItems: 'center', gap: 8, justifyContent: 'flex-end',
@@ -530,7 +513,7 @@ function SlotRow({ slot, value, gtz }) {
       </div>
     );
   }
-  if (slot.kind === 'llm-select' || slot.kind === 'db-select') {
+  if (slot.kind === 'llm-select' || slot.kind === 'db-select' || slot.kind === 'mcp-select') {
     // Canvas card: show selected value(s) as plain text — actual picker is in properties panel
     const parts = value ? String(value).split(',').filter(Boolean) : [];
     const noun = slot.kind === 'llm-select' ? 'models' : 'servers';
@@ -591,6 +574,21 @@ function NodeFooter({ slots }) {
                        textTransform: 'uppercase', fontWeight: 600 }}>Outputs</span>
         <span style={{ fontSize: 10.5, color: '#64748b', fontWeight: 600 }}>
           {outs.length} models · wire each
+        </span>
+      </div>
+    );
+  }
+  // MCP node: same collapse pattern — one tool port per server.
+  const allMcpOuts = outs.every(o => o.id.startsWith('mcp::'));
+  if (allMcpOuts && outs.length > 1) {
+    return (
+      <div style={{ height: FOOTER_H, padding: '0 12px', display: 'flex', alignItems: 'center',
+                    gap: 6, justifyContent: 'flex-end', background: '#fafbfc',
+                    borderTop: '1px solid #f1f5f9', borderBottomLeftRadius: 11, borderBottomRightRadius: 11 }}>
+        <span style={{ fontSize: 10, color: '#94a3b8', letterSpacing: '0.06em',
+                       textTransform: 'uppercase', fontWeight: 600 }}>Outputs</span>
+        <span style={{ fontSize: 10.5, color: '#64748b', fontWeight: 600 }}>
+          {outs.length} servers · wire each
         </span>
       </div>
     );
@@ -2006,9 +2004,9 @@ function MultiRepoSelect({ value, onChange }) {
   const isCode      = slotKind === 'textarea';
   const isWeekday   = slotKind === 'weekday-select';
   const isFilePick  = slotKind === 'file-select';
-  // 'llm-select' is multi: selecting N models on a Language Model node yields N
-  // output ports (one per model) that can each be wired to a different consumer.
-  const isMultiDb   = slotKind === 'db-select' || slotKind === 'llm-select';
+  // 'llm-select'/'mcp-select' are multi: selecting N items yields N output ports
+  // that can each be wired to a different consumer.
+  const isMultiDb   = slotKind === 'db-select' || slotKind === 'llm-select' || slotKind === 'mcp-select';
   const isRepoSel   = slotKind === 'repo-select';
   const isSelect    = slotKind === 'select';
   const isToggle    = slotKind === 'toggle';
@@ -2329,11 +2327,10 @@ function PortRowR({ slot }) {
   );
 }
 
-function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, workflowName, edges, nodes }) {
+function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpServers, workflowName, edges, nodes }) {
   const def = NODE_TYPES[node.type];
   if (!def) return null;
   const tint = CAT_TINT[def.category] || CAT_TINT.Tools;
-  const [cfail, setCfail] = useState(false);
   const [editingName, setEditingName] = useState(false);
   const [nameVal, setNameVal] = useState(node.name);
   const [lastExecStatus, setLastExecStatus] = useState(null);
@@ -2460,7 +2457,7 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, workflo
         <SHdr>{def.desc}</SHdr>
 
         {(() => {
-          const EDITABLE_KINDS = new Set(['field', 'select', 'textarea', 'llm-select', 'db-select', 'repo-select', 'weekday-select', 'file-select', 'toggle', 'chips', 'routes-editor']);
+          const EDITABLE_KINDS = new Set(['field', 'select', 'textarea', 'llm-select', 'db-select', 'mcp-select', 'repo-select', 'weekday-select', 'file-select', 'toggle', 'chips', 'routes-editor']);
           const currentParams = node.params || {};
           const editableSlots = (def.slots || []).filter(s => {
             if (!EDITABLE_KINDS.has(s.kind)) return false;
@@ -2475,6 +2472,7 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, workflo
           // Build option lists for dynamic selects
           const llmOptions = Object.keys(llms || {});
           const dbOptions  = Object.keys(dbServers || {});
+          const mcpOptions = Object.keys(allMcpServers || {});
 
           return (
             <>
@@ -2482,9 +2480,10 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, workflo
               <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 12 }}>
                 {editableSlots.map(slot => {
                   const selectOptions =
-                    slot.kind === 'llm-select' ? llmOptions :
-                    slot.kind === 'db-select'  ? dbOptions  :
-                    slot.kind === 'select'     ? (slot.options || []) :
+                    slot.kind === 'llm-select'  ? llmOptions :
+                    slot.kind === 'db-select'   ? dbOptions  :
+                    slot.kind === 'mcp-select'  ? mcpOptions :
+                    slot.kind === 'select'      ? (slot.options || []) :
                     null;
                   return (
                     <ParamRow key={slot.id} k={slot.id} label={slot.label}
@@ -2515,14 +2514,6 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, workflo
                       display: 'flex', flexDirection: 'column', gap: 6 }}>
           {slotsForNode(NODE_TYPES, node).filter(s => s.kind === 'port-in' || s.kind === 'port-out')
             .map(s => <PortRowR key={s.id} slot={s} />)}
-        </div>
-
-        <SHdr style={{ marginTop: 20 }}>Advanced</SHdr>
-        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '4px 0' }}>
-            <span style={{ fontSize: 12, color: '#0f172a', fontWeight: 500 }}>Continue on fail</span>
-            <ToggleSwitch on={cfail} onChange={setCfail} />
-          </div>
         </div>
       </div>
     </div>
@@ -2660,7 +2651,7 @@ function ExecutionList({ workflowName, onCount }) {
   );
 }
 
-function RPanel({ tab, setTab, node, onUpdateNode, onDelete, llms, dbServers, workflowName, edges, nodes }) {
+function RPanel({ tab, setTab, node, onUpdateNode, onDelete, llms, dbServers, allMcpServers, workflowName, edges, nodes }) {
   const [execCount, setExecCount] = useState(null);
 
   return (
@@ -2674,7 +2665,7 @@ function RPanel({ tab, setTab, node, onUpdateNode, onDelete, llms, dbServers, wo
               label="Executions" icon="history" badge={execCount ?? undefined} />
       </div>
       {tab === 'node' && (node
-        ? <NodeProperties node={node} onUpdateNode={onUpdateNode} onDelete={onDelete} llms={llms} dbServers={dbServers} workflowName={workflowName} edges={edges} nodes={nodes} />
+        ? <NodeProperties node={node} onUpdateNode={onUpdateNode} onDelete={onDelete} llms={llms} dbServers={dbServers} allMcpServers={allMcpServers} workflowName={workflowName} edges={edges} nodes={nodes} />
         : <EmptyProps />)}
       {tab === 'executions' && (
         <ExecutionList workflowName={workflowName} onCount={setExecCount} />
@@ -2836,21 +2827,37 @@ const LangflowEditor = forwardRef(function LangflowEditor(
   const [active, setActive]                 = useState(initialEnabled ?? true);
 
   // Load LLMs and MCP servers from settings
-  const [llms, setLlms]           = useState({});
-  const [dbServers, setDbServers] = useState({});
+  const [llms, setLlms]               = useState({});
+  const [dbServers, setDbServers]     = useState({});
+  const [allMcpServers, setAllMcpServers] = useState({});
   const [gtz, setGtz]             = useState(GLOBAL_TZ);
+  const loadMcpServers = useCallback(() => {
+    getMCPServers().then(all => {
+      if (!all || !Object.keys(all).length) return; // don't overwrite good data with empty
+      setAllMcpServers(all);
+      setDbServers(all); // legacy database node shows all servers
+    }).catch(() => {});
+  }, []);
+
   useEffect(() => {
     getLLMs().then(data => setLlms(data || {})).catch(() => {});
-    // Show all MCP servers — user picks which one is their database
-    getMCPServers().then(all => setDbServers(all || {})).catch(() => {});
+    loadMcpServers();
     // Global timezone (Settings) — shown read-only on Schedule nodes.
     getAppSettings().then(s => {
       const tz = s?.global_timezone;
       if (tz) { _setGlobalTzCache(tz); setGtz(tz); }
     }).catch(() => {});
-  }, []);
+  }, [loadMcpServers]);
 
   const selectedNode = useMemo(() => nodes.find(n => n.id === selectedId), [nodes, selectedId]);
+  const lintWarnings = useMemo(() => workflowWarnings(nodes, edges), [nodes, edges]);
+
+  // Re-fetch MCP servers when an mcp_server node is selected and data is stale.
+  useEffect(() => {
+    if (selectedNode?.type === 'mcp_server' && !Object.keys(allMcpServers).length) {
+      loadMcpServers();
+    }
+  }, [selectedNode, allMcpServers, loadMcpServers]);
 
   // Update a node's fields (name, params, etc.)
   // Deep-merges `params` so two successive param updates don't overwrite each other.
@@ -2869,6 +2876,10 @@ const LangflowEditor = forwardRef(function LangflowEditor(
         ('llm' in patch.params || 'models' in patch.params)) {
       const newNode = { ...oldNode, ...patch, params: { ...(oldNode.params || {}), ...patch.params } };
       setEdges(es => reconcileModelEdges(es, id, oldNode, newNode));
+    }
+    if (oldNode?.type === 'mcp_server' && patch.params && 'servers' in patch.params) {
+      const newNode = { ...oldNode, ...patch, params: { ...(oldNode.params || {}), ...patch.params } };
+      setEdges(es => reconcileMcpEdges(es, id, oldNode, newNode));
     }
   }, [nodes]);
 
@@ -2942,6 +2953,21 @@ const LangflowEditor = forwardRef(function LangflowEditor(
         </div>
       </div>
 
+      {/* Non-blocking workflow lint (e.g. auto-learn needs a Memory node) */}
+      {lintWarnings.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4,
+                      padding: '8px 16px', background: '#fffbeb',
+                      borderBottom: '1px solid #fde68a' }}>
+          {lintWarnings.map((w, i) => (
+            <button key={i} onClick={() => setSelectedId(w.nodeId)}
+              style={{ textAlign: 'left', background: 'none', border: 'none', cursor: 'pointer',
+                       fontSize: 12, color: '#92400e', padding: 0 }}>
+              ⚠️ {w.message}
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* 3-pane */}
       <div style={{ flex: 1, minHeight: 0, display: 'grid',
                     gridTemplateColumns: `${paletteCollapsed ? '52px' : '244px'} 1fr ${selectedNode ? '320px' : '0px'}`,
@@ -2968,7 +2994,7 @@ const LangflowEditor = forwardRef(function LangflowEditor(
         </div>
         {selectedNode && (
           <RPanel tab={rightTab} setTab={setRightTab} node={selectedNode} onUpdateNode={handleUpdateNode}
-                  onDelete={handleDeleteNode} llms={llms} dbServers={dbServers} workflowName={workflowName} edges={edges} nodes={nodes} />
+                  onDelete={handleDeleteNode} llms={llms} dbServers={dbServers} allMcpServers={allMcpServers} workflowName={workflowName} edges={edges} nodes={nodes} />
         )}
       </div>
     </div>

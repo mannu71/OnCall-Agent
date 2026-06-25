@@ -57,7 +57,7 @@ class Workflow(BaseModel):
     id: Optional[Union[str, int]] = Field(None, description="Unique workflow ID")
     name: str = Field(..., description="Unique workflow name")
     description: str = Field("", description="Workflow description")
-    type: Optional[Literal["workflow"]] = Field("workflow", description="Workflow type")
+    type: Optional[Literal["workflow", "agent"]] = Field("workflow", description="Workflow type")
     schedule: Optional[str] = Field(None, description="Cron expression for scheduling")
     enabled: bool = Field(True, description="Whether the workflow is enabled")
     indexing_status: Optional[str] = Field(None, description="Set to 'indexing' while repos are being indexed; null when idle.")
@@ -150,14 +150,14 @@ class WorkflowCreate(BaseModel):
     id: Optional[str] = None
     name: str
     description: str = ""
-    type: Literal["workflow"] = "workflow"
+    type: Literal["workflow", "agent"] = "workflow"
     schedule: Optional[str] = None
     enabled: bool = True
-    
+
     # Workflow structure
     nodes: Optional[List[Dict[str, Any]]] = None
     edges: Optional[List[Dict[str, Any]]] = None
-    
+
     # Legacy fields
     tasks: Optional[List[Any]] = None
     max_retries: int = 0
@@ -174,7 +174,7 @@ class WorkflowUpdate(BaseModel):
     id: Optional[Union[str, int]] = None
     name: Optional[str] = None
     description: Optional[str] = None
-    type: Optional[Literal["workflow"]] = None
+    type: Optional[Literal["workflow", "agent"]] = None
     schedule: Optional[str] = None
     enabled: Optional[bool] = None
     indexing_status: Optional[str] = None
@@ -194,14 +194,15 @@ class WorkflowResponse(BaseModel):
     id: Optional[Union[str, int]] = None
     name: str
     description: str = ""
-    type: Optional[Literal["workflow"]] = "workflow"
+    type: Optional[Literal["workflow", "agent"]] = "workflow"
     schedule: Optional[str] = None
     enabled: bool = True
-    
+
     # Workflow structure
     nodes: Optional[List[Dict[str, Any]]] = None
     edges: Optional[List[Dict[str, Any]]] = None
-    
+
+
     # Legacy fields
     tasks: Optional[List[Dict[str, Any]]] = None
     max_retries: Optional[int] = None

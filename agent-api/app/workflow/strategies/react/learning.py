@@ -18,6 +18,8 @@ async def auto_learn(
     recall_hits: int,
     logger_instance: Any,
     code_analyzer_config: Optional[Dict[str, Any]] = None,
+    workflow_name: str = "",
+    memory_enabled: bool = False,
 ) -> None:
     """Persist what this execution found to the knowledge base.
 
@@ -57,9 +59,29 @@ async def auto_learn(
     # ── Phase 2: closed learning loop (AutoLearnService) ─────────────
     try:
         from app.core.auto_learn import AutoLearnService, AutoLearnConfig
+        from app.core.database import AsyncSessionLocal
 
         _config = AutoLearnConfig()
-        _svc = AutoLearnService(config=_config)
+
+        # Resolve a DB-configured auxiliary model for distillation. No model is
+        # hardcoded — ``resolve_llm_config_for_role`` falls back to the default
+        # DB LLM config when no 'auxiliary' role is assigned (same pattern as the
+        # subagent path). Without this the service can still upsert the KB and
+        # write trajectories; only LLM-backed skill/node distillation is skipped.
+        _aux_llm = None
+        try:
+            from app.workflow.llm_config import resolve_llm_config_for_role
+            from app.workflow.strategies.react.llm_factory import build_llm
+
+            _aux_cfg = await resolve_llm_config_for_role("auxiliary")
+            _aux_llm = build_llm(_aux_cfg)
+        except Exception as _aux_err:
+            logger_instance.warning(
+                "ReactStrategy: auto-learn aux LLM unavailable (%s); "
+                "skill distillation will be skipped",
+                redact(str(_aux_err)),
+                extra={"execution_id": execution_id},
+            )
 
         # Derive a rough confidence score: high when a resolution keyword
         # was found, moderate otherwise.  The AutoLearnService gate uses
@@ -71,6 +93,7 @@ async def auto_learn(
             "execution_id": execution_id,
             "user_query": user_query,
             "final_answer": final_answer,
+            "workflow_name": result.get("workflow_name") or workflow_name or "",
             "tool_calls": result.get("tool_calls", []),
             "confidence_score": _confidence,
             "recall_hits": recall_hits,
@@ -78,10 +101,15 @@ async def auto_learn(
             "execution_end": execution_end.isoformat(),
         }
 
-        _learn_result = await _svc.learn(
-            execution_id=str(execution_id or "unknown"),
-            state=_learn_state,
-        )
+        # A real DB session is required for the KB upsert + pattern bump to run;
+        # the service commits/rolls back internally, so a scoped session is
+        # correct. Without it the entire loop was a silent no-op.
+        async with AsyncSessionLocal() as _db:
+            _svc = AutoLearnService(db=_db, llm=_aux_llm, config=_config)
+            _learn_result = await _svc.learn(
+                execution_id=str(execution_id or "unknown"),
+                state=_learn_state,
+            )
 
         logger_instance.info(
             "ReactStrategy: AutoLearnService completed — "
@@ -107,7 +135,9 @@ async def auto_learn(
     # flag + a confidence floor so we don't bloat memory with uncertain runs.
     try:
         from app.config import settings
-        if settings.semantic_memory_enabled and final_answer.strip():
+        # Capture is driven by a Memory node on the agent (``memory_enabled``);
+        # the global flag stays a master override for non-graph callers.
+        if (memory_enabled or settings.semantic_memory_enabled) and final_answer.strip():
             _conf = estimate_confidence(final_answer, result.get("tool_calls", []))
             if _conf >= settings.memory_capture_min_confidence:
                 from app.services.semantic_memory import semantic_memory
