@@ -11,14 +11,16 @@ See also: [Agent harness](agent-harness.md) for the agent runtime in detail.
 
 ![System architecture overview](diagrams/system-overview.svg)
 
-The platform ships as three deployment units, wired together by
-[`agent-api/docker-compose.yml`](../agent-api/docker-compose.yml):
+The platform ships as three separate Docker containers, wired together by
+[`docker-compose.yml`](../docker-compose.yml) (full stack) or the per-service
+compose files in [`agent-api/`](../agent-api/docker-compose.yml) and
+[`ui/`](../ui/docker-compose.yml):
 
-| Unit | Tech | Role |
-|------|------|------|
-| `ui` | React + Vite (also packaged via Electron) | Operator console — workflows, chat, dashboards, scheduler |
-| `agent-api` | FastAPI in Docker | Backend — API, workflow engine, agent harness, crawler, core runtime |
-| `postgres` | `pgvector/pgvector:pg16` | Relational state, vector embeddings, and coordination |
+| Unit | Container | Tech | Role |
+|------|-----------|------|------|
+| `ui` | `kyc-agent-ui` | React + nginx | Operator console — workflows, chat, dashboards, scheduler |
+| `agent-api` | `kyc-agent-api` | FastAPI | Backend — API, workflow engine, agent harness, crawler |
+| `postgres` | `kyc-agent-db` | `pgvector/pgvector:pg16` | Relational state, vector embeddings, coordination |
 
 The UI talks to the backend over REST and Server-Sent Events (SSE streams live
 execution progress). Backend code is **baked into the Docker image** — there is no hot

@@ -6,14 +6,30 @@ import axios from 'axios';
  * Provides methods to communicate directly with the agent-api service.
  */
 
-const AGENT_API_URL = import.meta.env.VITE_AGENT_API_URL || 'http://localhost:8000';
+function getAgentApiHost() {
+    const env = import.meta.env.VITE_AGENT_API_URL || import.meta.env.VITE_API_URL;
+    if (env) {
+        return env.replace(/\/+$/, '');
+    }
+    return import.meta.env.DEV ? 'http://localhost:8000' : '';
+}
+
+const AGENT_API_URL = getAgentApiHost();
 
 const client = axios.create({
     baseURL: AGENT_API_URL,
     headers: {
         'Content-Type': 'application/json',
     },
+    timeout: 30_000,
 });
+
+/** @param {{ signal?: AbortSignal }} [opts] */
+function requestConfig(opts = {}) {
+    const config = {};
+    if (opts.signal) config.signal = opts.signal;
+    return config;
+}
 
 // Add response interceptor for global error logging
 client.interceptors.response.use(
@@ -119,8 +135,8 @@ export const agentApiClient = {
     /**
      * List all workflows
      */
-    async listWorkflows() {
-        const response = await client.get('/api/v1/workflows');
+    async listWorkflows(opts = {}) {
+        const response = await client.get('/api/v1/workflows', requestConfig(opts));
         return response.data;
     },
 
@@ -285,9 +301,10 @@ export const agentApiClient = {
     // ==================== Chat Sessions ====================
 
     /** List chat sessions (metadata only), most-recently-active first. */
-    async listSessions({ includeArchived = false, limit = 100 } = {}) {
+    async listSessions({ includeArchived = false, limit = 100, signal } = {}) {
         const response = await client.get('/api/v1/sessions', {
             params: { include_archived: includeArchived, limit },
+            ...requestConfig({ signal }),
         });
         return response.data;
     },
@@ -324,9 +341,10 @@ export const agentApiClient = {
     /**
      * Get execution history for a workflow
      */
-    async getWorkflowExecutions(workflowName, limit = 50) {
+    async getWorkflowExecutions(workflowName, limit = 50, opts = {}) {
         const response = await client.get(`/api/v1/workflows/${encodeURIComponent(workflowName)}/executions`, {
             params: { limit },
+            ...requestConfig(opts),
         });
         return response.data;
     },
@@ -334,15 +352,16 @@ export const agentApiClient = {
     /**
      * Get all execution history
      */
-    async listAllExecutions(limit = 100) {
+    async listAllExecutions(limit = 100, opts = {}) {
         const response = await client.get('/api/v1/executions', {
             params: { limit },
+            ...requestConfig(opts),
         });
         return response.data;
     },
 
-    async listActiveWorkflows() {
-        const response = await client.get('/api/v1/executions/active');
+    async listActiveWorkflows(opts = {}) {
+        const response = await client.get('/api/v1/executions/active', requestConfig(opts));
         return response.data;
     },
 
@@ -362,24 +381,24 @@ export const agentApiClient = {
     /**
      * Check agent-api health
      */
-    async getHealth() {
-        const response = await client.get('/api/v1/health');
+    async getHealth(opts = {}) {
+        const response = await client.get('/api/v1/health', requestConfig(opts));
         return response.data;
     },
 
     /**
      * Detailed system status (scheduler, jobs, executions)
      */
-    async getStatus() {
-        const response = await client.get('/api/v1/status');
+    async getStatus(opts = {}) {
+        const response = await client.get('/api/v1/status', requestConfig(opts));
         return response.data;
     },
 
     /**
      * Application settings (timeouts, embedding config, etc.)
      */
-    async getSettings() {
-        const response = await client.get('/api/v1/settings');
+    async getSettings(opts = {}) {
+        const response = await client.get('/api/v1/settings', requestConfig(opts));
         return response.data;
     },
 
@@ -429,8 +448,8 @@ export const agentApiClient = {
     /**
      * Get all MCP servers
      */
-    async getMCPServers() {
-        const response = await client.get('/api/v1/mcp-config/servers');
+    async getMCPServers(opts = {}) {
+        const response = await client.get('/api/v1/mcp-config/servers', requestConfig(opts));
         return response.data;
     },
 
@@ -468,8 +487,8 @@ export const agentApiClient = {
     /**
      * Get MCP input values
      */
-    async getMCPInputValues() {
-        const response = await client.get('/api/v1/mcp-config/input-values');
+    async getMCPInputValues(opts = {}) {
+        const response = await client.get('/api/v1/mcp-config/input-values', requestConfig(opts));
         return response.data;
     },
 
@@ -502,8 +521,8 @@ export const agentApiClient = {
     /**
      * List all uploaded certificates
      */
-    async listCertificates() {
-        const response = await client.get('/api/v1/certificates');
+    async listCertificates(opts = {}) {
+        const response = await client.get('/api/v1/certificates', requestConfig(opts));
         return response.data;
     },
 

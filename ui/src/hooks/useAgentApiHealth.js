@@ -1,66 +1,111 @@
-import { useCallback, useEffect, useState } from 'react';
-import agentApiClient from '../services/agentApiClient';
+import { useCallback } from 'react';
+
+import { useHealthQuery } from './queries/useHealthQuery';
+
+
 
 /**
+
  * Agent API `/api/v1/health` state — same semantics as Settings "Check API".
+
  *
+
  * @param {object} [options]
- * @param {number | null | undefined} [options.pollIntervalMs] - If > 0, re-fetch on this interval (silent: no spinner).
+
+ * @param {number | null | undefined} [options.pollIntervalMs] - Ignored when using TanStack (always 30s).
+
  * @param {boolean} [options.initialShowSpinner] - If true, first fetch toggles loading (Settings-style).
+
  */
+
 export function useAgentApiHealth(options = {}) {
-  const pollIntervalMs = options.pollIntervalMs ?? null;
+
   const initialShowSpinner = options.initialShowSpinner ?? false;
 
-  const [apiHealth, setApiHealth] = useState(null);
-  const [loading, setLoading] = useState(false);
+  const { data: health, isLoading, isFetching, refetch } = useHealthQuery();
 
-  const checkHealth = useCallback(async ({ showSpinner = false } = {}) => {
-    if (showSpinner) setLoading(true);
-    const startedAt = performance.now();
-    try {
-      const health = await agentApiClient.getHealth();
-      const latencyMs = Math.round(performance.now() - startedAt);
-      const isHealthy = health?.status === 'healthy';
 
-      setApiHealth({
-        ...health,
+
+  const startedAtRef = { current: null };
+
+
+
+  const apiHealth = health
+
+    ? (() => {
+
+        const isHealthy = health?.status === 'healthy';
+
+        return {
+
+          ...health,
+
+          status: isHealthy ? 'healthy' : 'error',
+
+          message: isHealthy ? undefined : health?.status || 'API reported unhealthy',
+
+        };
+
+      })()
+
+    : null;
+
+
+
+  const loading = initialShowSpinner ? isLoading : false;
+
+
+
+  const recheckWithSpinner = useCallback(async () => {
+
+    startedAtRef.current = performance.now();
+
+    const result = await refetch();
+
+    const latencyMs = Math.round(performance.now() - startedAtRef.current);
+
+    if (result.data) {
+
+      const isHealthy = result.data?.status === 'healthy';
+
+      return {
+
+        ...result.data,
+
         status: isHealthy ? 'healthy' : 'error',
+
         latencyMs,
-        message: isHealthy ? undefined : health?.status || 'API reported unhealthy',
-      });
-    } catch (error) {
-      setApiHealth({
-        status: 'error',
-        latencyMs: Math.round(performance.now() - startedAt),
-        message: error.message || 'Failed to connect to API',
-      });
-    } finally {
-      if (showSpinner) setLoading(false);
-    }
-  }, []);
 
-  useEffect(() => {
-    checkHealth({ showSpinner: initialShowSpinner });
+        message: isHealthy ? undefined : result.data?.status || 'API reported unhealthy',
 
-    if (pollIntervalMs == null || pollIntervalMs <= 0) {
-      return undefined;
+      };
+
     }
 
-    const id = setInterval(() => {
-      if (!document.hidden) checkHealth({ showSpinner: false });
-    }, pollIntervalMs);
+    return {
 
-    return () => clearInterval(id);
-  }, [checkHealth, initialShowSpinner, pollIntervalMs]);
+      status: 'error',
 
-  const recheckWithSpinner = useCallback(() => {
-    return checkHealth({ showSpinner: true });
-  }, [checkHealth]);
+      latencyMs,
+
+      message: result.error?.message || 'Failed to connect to API',
+
+    };
+
+  }, [refetch]);
+
+
 
   return {
-    apiHealth,
+
+    apiHealth: apiHealth && !isFetching ? { ...apiHealth, latencyMs: apiHealth.latencyMs } : apiHealth,
+
     loading,
+
     recheckWithSpinner,
+
   };
+
 }
+
+

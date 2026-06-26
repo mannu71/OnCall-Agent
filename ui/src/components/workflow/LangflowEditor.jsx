@@ -15,6 +15,7 @@ import { getLLMs } from '../../services/llmService.js';
 import { getMCPServers } from '../../services/mcpService.js';
 import { getAppSettings } from '../../services/apiClient.js';
 import { useWorkflowStatus } from '../../context/WorkflowStatusContext.jsx';
+import { useWorkflowExecutionsQuery } from '../../hooks/queries/useExecutionsQuery.js';
 import { validateConnection, getValidDropTargets, slotsForNode, modelNamesOf, reconcileModelEdges, mcpServerNamesOf, reconcileMcpEdges, workflowWarnings } from './portValidation.js';
 import agentApiClient from '../../services/agentApiClient.js';
 import { CAT_TINT, PORT_TYPE, NODE_TYPES, NODE_DEFAULTS } from './editor/constants/nodeDefinitions.js';
@@ -633,7 +634,7 @@ const WfNode = memo(function WfNode({ node, selected, dragging, drawingSourceSlo
   const [menuOpen, setMenuOpen] = useState(false);
 
   return (
-    <div onPointerDown={onPointerDown}
+    <div onPointerDown={e => onPointerDown?.(node.id, e)}
       onClick={e => { e.stopPropagation(); onClick?.(node.id); setMenuOpen(false); }}
       style={{ position: 'absolute', left: node.x, top: node.y, width: w, height: h,
                background: '#fff', border: `${borderWidth}px solid ${borderColor}`,
@@ -820,7 +821,7 @@ function CanvasBtn({ onClick, icon, title }) {
   );
 }
 
-function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selectedEdgeId, onSelect, onSelectEdge, onDelete, workflowName, gtz }) {
+function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selectedEdgeId, onSelect, onSelectEdge, onDelete, workflowName, gtz, latestExecution }) {
   const ref = useRef(null);
   const [view, setView]     = useState({ x: 24, y: 24, zoom: 0.62 });
   const [panning, setPanning] = useState(false);
@@ -845,25 +846,15 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
   }, []);
 
   // ── Per-node status from latest execution ─────────────────────
-  const [nodeStatusMap, setNodeStatusMap] = useState({});
-  useEffect(() => {
-    if (!workflowName) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const { agentApiClient } = await import('../../services/agentApiClient.js');
-        const data = await agentApiClient.getWorkflowExecutions(workflowName, 1);
-        if (!cancelled && data?.[0]?.results) {
-          const map = {};
-          for (const [nid, r] of Object.entries(data[0].results)) {
-            map[nid] = r?.status ?? null;
-          }
-          setNodeStatusMap(map);
-        }
-      } catch { /* silently ignore */ }
-    })();
-    return () => { cancelled = true; };
-  }, [workflowName, isLive]);
+  const nodeStatusMap = useMemo(() => {
+    const map = {};
+    if (latestExecution?.results) {
+      for (const [nid, r] of Object.entries(latestExecution.results)) {
+        map[nid] = r?.status ?? null;
+      }
+    }
+    return map;
+  }, [latestExecution]);
 
   // Track whether the last pointerdown turned into a drag — suppresses the
   // subsequent click event on the node so the panel doesn't open after a drag.
@@ -1004,7 +995,9 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
   };
 
   // ── Node drag via window listeners ────────────────────────────
-  const startDrag = (n, e) => {
+  const startDrag = useCallback((nodeId, e) => {
+    const n = nodesRef.current.find(m => m.id === nodeId);
+    if (!n) return;
     e.stopPropagation();
     nodeDraggedRef.current = false;
     const sx = e.clientX, sy = e.clientY;
@@ -1030,7 +1023,17 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
     };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
-  };
+  }, [setNodes]);
+
+  const handleNodeClick = useCallback((id) => {
+    if (nodeDraggedRef.current) return;
+    onSelect?.(id);
+    onSelectEdge?.(null);
+  }, [onSelect, onSelectEdge]);
+
+  const handleNodePointerDown = useCallback((nodeId, e) => {
+    startDrag(nodeId, e);
+  }, [startDrag]);
 
   // ── Palette drag-and-drop ─────────────────────────────────────
   const onDragOver = e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; };
@@ -1159,8 +1162,8 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
             selected={selectedId === n.id}
             dragging={false}
             drawingSourceSlot={drawEdge?.sourceNodeId === n.id ? drawEdge.sourceSlotId : null}
-            onClick={id => { if (nodeDraggedRef.current) return; onSelect?.(id); onSelectEdge?.(null); }}
-            onPointerDown={e => startDrag(n, e)}
+            onClick={handleNodeClick}
+            onPointerDown={handleNodePointerDown}
             onDelete={onDelete}
             onPortPointerDown={startPortDrag}
             liveStatus={isLive ? 'running' : (nodeStatusMap[n.id] ?? (connectedNodeIds.has(n.id) ? 'success' : null))}
@@ -1541,35 +1544,49 @@ function ChipEditor({ value, onChange, action, actionContext }) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, padding: chips.length ? '6px 8px' : '0' }}>
+      <div style={{
+        display: 'flex', flexDirection: 'column', gap: 4,
+        padding: chips.length ? '4px 0' : '0',
+        maxHeight: 160, overflowY: 'auto',
+      }}>
         {chips.map(chip => (
-          <span key={chip}
+          <div key={chip}
             style={{
-              display: 'inline-flex', alignItems: 'center', gap: 4,
-              padding: '3px 8px', background: '#eff6ff', color: '#1e40af',
+              display: 'flex', alignItems: 'center', gap: 6,
+              width: '100%', boxSizing: 'border-box', minWidth: 0,
+              padding: '5px 8px', background: '#eff6ff', color: '#1e40af',
               border: '1px solid #bfdbfe', borderRadius: 6, fontSize: 11,
-              fontFamily: "'JetBrains Mono', monospace", maxWidth: '100%',
-              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+              fontFamily: "'JetBrains Mono', monospace",
             }}>
-            {chip}
+            <span
+              title={chip}
+              style={{
+                flex: 1, minWidth: 0,
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }}
+            >
+              {chip}
+            </span>
             <button
               type="button"
               onClick={() => handleRemove(chip)}
+              aria-label={`Remove ${chip}`}
               style={{
-                background: 'none', border: 'none', color: '#93c5fd',
-                cursor: 'pointer', padding: 0, fontSize: 13, display: 'flex',
-                alignItems: 'center', justifyContent: 'center'
+                background: 'none', border: 'none', color: '#64748b',
+                cursor: 'pointer', padding: 0, fontSize: 14, display: 'flex',
+                alignItems: 'center', justifyContent: 'center',
+                flexShrink: 0, width: 16, height: 16, lineHeight: 1,
               }}
               onMouseEnter={e => { e.currentTarget.style.color = '#ef4444'; }}
-              onMouseLeave={e => { e.currentTarget.style.color = '#93c5fd'; }}
+              onMouseLeave={e => { e.currentTarget.style.color = '#64748b'; }}
             >
               ×
             </button>
-          </span>
+          </div>
         ))}
       </div>
 
-      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         <input
           type="text"
           value={inputValue}
@@ -1580,11 +1597,12 @@ function ChipEditor({ value, onChange, action, actionContext }) {
               handleAdd(inputValue);
             }
           }}
-          placeholder="Add log group... (press Enter)"
+          placeholder="Add log group…"
           style={{
-            flex: 1, border: '1px solid #e2e8f0', borderRadius: 6,
+            width: '100%', boxSizing: 'border-box',
+            border: '1px solid #e2e8f0', borderRadius: 6,
             padding: '6px 10px', fontSize: 12, outline: 'none',
-            background: '#fafbfc', fontFamily: "'JetBrains Mono', monospace"
+            background: '#fafbfc', fontFamily: "'JetBrains Mono', monospace",
           }}
         />
         {action === 'discoverCloudWatchLogGroups' && (
@@ -1592,14 +1610,15 @@ function ChipEditor({ value, onChange, action, actionContext }) {
             type="button"
             onClick={() => setShowDiscover(!showDiscover)}
             style={{
+              alignSelf: 'flex-start',
               padding: '6px 10px', background: '#f1f5f9', border: '1px solid #cbd5e1',
               borderRadius: 6, fontSize: 11, color: '#475569', cursor: 'pointer',
-              fontWeight: 600, transition: 'all 120ms'
+              fontWeight: 600, transition: 'all 120ms', whiteSpace: 'nowrap',
             }}
             onMouseEnter={e => { e.currentTarget.style.background = '#e2e8f0'; }}
             onMouseLeave={e => { e.currentTarget.style.background = '#f1f5f9'; }}
           >
-            {showDiscover ? 'Hide Discovery' : '🔍 Discover'}
+            {showDiscover ? 'Hide discovery' : '🔍 Discover from AWS'}
           </button>
         )}
       </div>
@@ -1609,16 +1628,17 @@ function ChipEditor({ value, onChange, action, actionContext }) {
           background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8,
           padding: 8, display: 'flex', flexDirection: 'column', gap: 6
         }}>
-          <div style={{ display: 'flex', gap: 4 }}>
+          <div style={{ display: 'flex', gap: 4, alignItems: 'stretch' }}>
             <input
               type="text"
               value={discoverPrefix}
               onChange={e => setDiscoverPrefix(e.target.value)}
-              placeholder={`Filter by name in ${region} (blank = all)`}
+              placeholder={`Filter in ${region} (blank = all)`}
               style={{
-                flex: 1, border: '1px solid #cbd5e1', borderRadius: 6,
+                flex: 1, minWidth: 0, boxSizing: 'border-box',
+                border: '1px solid #cbd5e1', borderRadius: 6,
                 padding: '4px 8px', fontSize: 11, outline: 'none',
-                background: '#fff'
+                background: '#fff',
               }}
               onKeyDown={e => { if (e.key === 'Enter' && !discovering) handleDiscover(); }}
             />
@@ -1630,7 +1650,7 @@ function ChipEditor({ value, onChange, action, actionContext }) {
                 padding: '4px 12px', background: discovering ? '#93c5fd' : '#3b82f6',
                 border: 'none', borderRadius: 6, fontSize: 11, color: '#fff',
                 cursor: discovering ? 'wait' : 'pointer', fontWeight: 600,
-                whiteSpace: 'nowrap'
+                whiteSpace: 'nowrap', flexShrink: 0,
               }}
             >
               {discovering ? 'Scanning…' : 'Scan'}
@@ -2327,7 +2347,7 @@ function PortRowR({ slot }) {
   );
 }
 
-function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpServers, workflowName, edges, nodes }) {
+function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpServers, workflowName, edges, nodes, latestExecution }) {
   const def = NODE_TYPES[node.type];
   if (!def) return null;
   const tint = CAT_TINT[def.category] || CAT_TINT.Tools;
@@ -2339,23 +2359,12 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpS
   const { isWorkflowRunning } = useWorkflowStatus();
   const isRunning = workflowName ? isWorkflowRunning(workflowName) : false;
 
-  // Fetch the most recent execution and look up THIS node's result by node.id
   useEffect(() => {
-    if (!workflowName) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const { agentApiClient } = await import('../../services/agentApiClient.js');
-        const data = await agentApiClient.getWorkflowExecutions(workflowName, 1);
-        if (!cancelled && data?.[0]) {
-          // results is a dict keyed by node id: { [nodeId]: { status, ... } }
-          const nodeResult = data[0].results?.[node.id];
-          setLastExecStatus(nodeResult?.status ?? null);
-        }
-      } catch { /* ignore */ }
-    })();
-    return () => { cancelled = true; };
-  }, [workflowName, node.id, isRunning]); // re-fetch when run finishes or selected node changes
+    if (latestExecution?.results) {
+      const nodeResult = latestExecution.results[node.id];
+      setLastExecStatus(nodeResult?.status ?? null);
+    }
+  }, [latestExecution, node.id]);
 
   // A node is "connected" when it has at least one edge in the graph
   const isConnected = (edges || []).some(e => e.source === node.id || e.target === node.id);
@@ -2558,33 +2567,10 @@ function RunDot({ status }) {
   );
 }
 
-function ExecutionList({ workflowName, onCount }) {
-  const [executions, setExecutions] = useState([]);
-  const [loading, setLoading]       = useState(true);
-  const [error, setError]           = useState(null);
-  const { isWorkflowRunning }       = useWorkflowStatus();
-
-  const load = useCallback(async () => {
-    if (!workflowName) return;
-    try {
-      const { agentApiClient } = await import('../../services/agentApiClient.js');
-      const data = await agentApiClient.getWorkflowExecutions(workflowName, 20);
-      setExecutions(data || []);
-      onCount?.((data || []).length);
-      setError(null);
-    } catch (e) {
-      setError('Failed to load executions');
-    } finally {
-      setLoading(false);
-    }
-  }, [workflowName, onCount]);
-
-  // Initial load + refresh whenever the workflow finishes running
-  const isRunning = workflowName ? isWorkflowRunning(workflowName) : false;
-  useEffect(() => { load(); }, [load]);
+function ExecutionList({ workflowName, onCount, executions = [], loading = false, error = null }) {
   useEffect(() => {
-    if (!isRunning) load(); // refresh when execution completes
-  }, [isRunning, load]);
+    onCount?.(executions.length);
+  }, [executions.length, onCount]);
 
   if (loading) {
     return (
@@ -2651,7 +2637,7 @@ function ExecutionList({ workflowName, onCount }) {
   );
 }
 
-function RPanel({ tab, setTab, node, onUpdateNode, onDelete, llms, dbServers, allMcpServers, workflowName, edges, nodes }) {
+function RPanel({ tab, setTab, node, onUpdateNode, onDelete, llms, dbServers, allMcpServers, workflowName, edges, nodes, latestExecution, executions, execLoading, execError }) {
   const [execCount, setExecCount] = useState(null);
 
   return (
@@ -2665,10 +2651,10 @@ function RPanel({ tab, setTab, node, onUpdateNode, onDelete, llms, dbServers, al
               label="Executions" icon="history" badge={execCount ?? undefined} />
       </div>
       {tab === 'node' && (node
-        ? <NodeProperties node={node} onUpdateNode={onUpdateNode} onDelete={onDelete} llms={llms} dbServers={dbServers} allMcpServers={allMcpServers} workflowName={workflowName} edges={edges} nodes={nodes} />
+        ? <NodeProperties node={node} onUpdateNode={onUpdateNode} onDelete={onDelete} llms={llms} dbServers={dbServers} allMcpServers={allMcpServers} workflowName={workflowName} edges={edges} nodes={nodes} latestExecution={latestExecution} />
         : <EmptyProps />)}
       {tab === 'executions' && (
-        <ExecutionList workflowName={workflowName} onCount={setExecCount} />
+        <ExecutionList workflowName={workflowName} onCount={setExecCount} executions={executions} loading={execLoading} error={execError} />
       )}
     </aside>
   );
@@ -2826,6 +2812,11 @@ const LangflowEditor = forwardRef(function LangflowEditor(
   const [rightTab, setRightTab]             = useState('node');
   const [active, setActive]                 = useState(initialEnabled ?? true);
 
+  const { data: workflowExecutions = [], isLoading: execLoading, isError: execIsError } =
+    useWorkflowExecutionsQuery(workflowName, 20, { enabled: !!workflowName });
+  const latestExecution = workflowExecutions[0] ?? null;
+  const execError = execIsError ? 'Failed to load executions' : null;
+
   // Load LLMs and MCP servers from settings
   const [llms, setLlms]               = useState({});
   const [dbServers, setDbServers]     = useState({});
@@ -2862,26 +2853,25 @@ const LangflowEditor = forwardRef(function LangflowEditor(
   // Update a node's fields (name, params, etc.)
   // Deep-merges `params` so two successive param updates don't overwrite each other.
   const handleUpdateNode = useCallback((id, patch) => {
-    const oldNode = nodes.find(n => n.id === id);
-    setNodes(ns => ns.map(n => {
-      if (n.id !== id) return n;
-      const merged = { ...n, ...patch };
-      if (patch.params) merged.params = { ...(n.params || {}), ...patch.params };
-      return merged;
-    }));
-    // When a Language Model node's model selection changes, its output port ids
-    // change (lm ↔ lm::<name>) — re-point or prune edges so existing wires don't
-    // dangle/misalign.
-    if (oldNode?.type === 'language_model' && patch.params &&
-        ('llm' in patch.params || 'models' in patch.params)) {
-      const newNode = { ...oldNode, ...patch, params: { ...(oldNode.params || {}), ...patch.params } };
-      setEdges(es => reconcileModelEdges(es, id, oldNode, newNode));
-    }
-    if (oldNode?.type === 'mcp_server' && patch.params && 'servers' in patch.params) {
-      const newNode = { ...oldNode, ...patch, params: { ...(oldNode.params || {}), ...patch.params } };
-      setEdges(es => reconcileMcpEdges(es, id, oldNode, newNode));
-    }
-  }, [nodes]);
+    setNodes(ns => {
+      const oldNode = ns.find(n => n.id === id);
+      const next = ns.map(n => {
+        if (n.id !== id) return n;
+        const merged = { ...n, ...patch };
+        if (patch.params) merged.params = { ...(n.params || {}), ...patch.params };
+        return merged;
+      });
+      const newNode = next.find(n => n.id === id);
+      if (oldNode?.type === 'language_model' && patch.params &&
+          ('llm' in patch.params || 'models' in patch.params)) {
+        setEdges(es => reconcileModelEdges(es, id, oldNode, newNode));
+      }
+      if (oldNode?.type === 'mcp_server' && patch.params && 'servers' in patch.params) {
+        setEdges(es => reconcileMcpEdges(es, id, oldNode, newNode));
+      }
+      return next;
+    });
+  }, [setEdges]);
 
   // Delete a node and its connected edges
   const handleDeleteNode = useCallback((id) => {
@@ -2990,11 +2980,13 @@ const LangflowEditor = forwardRef(function LangflowEditor(
             onDelete={handleDeleteNode}
             workflowName={workflowName}
             gtz={gtz}
+            latestExecution={latestExecution}
           />
         </div>
         {selectedNode && (
           <RPanel tab={rightTab} setTab={setRightTab} node={selectedNode} onUpdateNode={handleUpdateNode}
-                  onDelete={handleDeleteNode} llms={llms} dbServers={dbServers} allMcpServers={allMcpServers} workflowName={workflowName} edges={edges} nodes={nodes} />
+                  onDelete={handleDeleteNode} llms={llms} dbServers={dbServers} allMcpServers={allMcpServers} workflowName={workflowName} edges={edges} nodes={nodes}
+                  latestExecution={latestExecution} executions={workflowExecutions} execLoading={execLoading} execError={execError} />
         )}
       </div>
     </div>

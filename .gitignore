@@ -57,6 +57,9 @@ worker/output/
 agent/data/
 agent-api/data/
 
+# Code graph
+codegraph/
+
 # Temporary files
 tmp/
 temp/

@@ -122,9 +122,19 @@ export const loadLLMConfig = async () => {
 /**
  * Get all configured LLMs
  */
-export const getLLMs = async () => {
-  const config = await loadLLMConfig();
-  return config.llms || {};
+export const getLLMs = async (opts = {}) => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/llm-config`, { signal: opts.signal });
+    if (response.ok) {
+      const config = await response.json();
+      return config.llms || {};
+    }
+    return {};
+  } catch (error) {
+    if (error.name === 'AbortError') throw error;
+    console.error('Error loading LLM config:', error);
+    return {};
+  }
 };
 
 /**

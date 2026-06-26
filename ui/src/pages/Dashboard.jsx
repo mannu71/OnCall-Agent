@@ -20,9 +20,8 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import { mdComponents, cleanLlmText } from '../components/markdown/MarkdownMessage.jsx';
+import { LazyMarkdown } from '../components/markdown/LazyMarkdown.jsx';
+import { cleanLlmText } from '../components/markdown/markdownUtils.js';
 
 const DAY_MS = 86400000;
 
@@ -1243,7 +1242,7 @@ export default function Dashboard() {
                           <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Analysis</p>
                         </div>
                         <div className="px-4 py-4">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>{llmOutput}</ReactMarkdown>
+                          <LazyMarkdown content={llmOutput} />
                         </div>
                       </div>
                     )}
@@ -1461,7 +1460,7 @@ export default function Dashboard() {
                         </div>
                         <div className="px-4 py-4">
                           {finalAnswer ? (
-                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>{finalAnswer}</ReactMarkdown>
+                            <LazyMarkdown content={finalAnswer} />
                           ) : (
                             <p className="text-sm text-slate-400 italic">(no answer)</p>
                           )}

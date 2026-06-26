@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -39,16 +40,14 @@ import {
 } from 'lucide-react';
 import { isAgentWorkflowValid } from '../utils/workflowValidation.js';
 import agentApiClient from '../services/agentApiClient.js';
-import MarkdownMessage from '../components/markdown/MarkdownMessage.jsx';
-import PlanChecklist from '../components/markdown/PlanChecklist.jsx';
-import PrivacyInsightsPanel from '../components/privacy/PrivacyInsightsPanel.jsx';
-import AgentThread from '../components/chat/AgentThread.jsx';
-import CollapsibleSection from '../components/chat/CollapsibleSection.jsx';
+import ChatMessage, { MESSAGE_TYPES } from '../components/chat/ChatMessage.jsx';
 import SendButton from '../components/chat/SendButton.jsx';
 import DensityToggle, { DENSITIES } from '../components/chat/DensityToggle.jsx';
 import HarnessToggle from '../components/chat/HarnessToggle.jsx';
 import TraceTimeline from '../components/chat/TraceTimeline.jsx';
 import { formatClock } from '../lib/formatTime.js';
+import { useChatSessionsQuery } from '../hooks/queries/useChatSessionsQuery.js';
+import { queryKeys } from '../lib/queryKeys.js';
 
 // localStorage key for the active chat session, so a refresh / revisit re-opens
 // the same conversation (and its context) instead of starting a new session.
@@ -97,12 +96,7 @@ function formatModelLabel(raw) {
 // Use Vite's environment check for development mode
 const DEV_MODE = import.meta.env.DEV;
 
-// Message types
-const MESSAGE_TYPES = {
-  USER: 'user',
-  AGENT: 'agent',
-  SYSTEM: 'system'
-};
+// Message types imported from ChatMessage.jsx
 
 // Fresh-conversation seed — a single welcome note, then real turns only.
 const welcomeMessage = () => ({
@@ -127,49 +121,9 @@ function IconChip({ tint = "red", children }) {
   );
 }
 
-// Custom parser to format agent answers with custom deep red for asterisks
-function FormattedText({ text, isUser }) {
-  if (!text) return null;
-  // Split by bold (**text**), inline code (`code`), or italics (_text_)
-  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`|_[^_]+_)/);
-  return (
-    <>
-      {parts.map((part, index) => {
-        if (part.startsWith("**") && part.endsWith("**")) {
-          return (
-            <strong 
-              key={index} 
-              className={isUser ? "text-primary-foreground font-bold" : "text-primary font-bold"}
-            >
-              {part.slice(2, -2)}
-            </strong>
-          );
-        }
-        if (part.startsWith("`") && part.endsWith("`")) {
-          return (
-            <code 
-              key={index} 
-              className={`font-mono text-xs px-1.5 py-0.5 rounded border transition-colors ${
-                isUser 
-                  ? "bg-slate-800 text-slate-200 border-slate-700" 
-                  : "bg-slate-50 text-slate-800 border-slate-200"
-              }`}
-            >
-              {part.slice(1, -1)}
-            </code>
-          );
-        }
-        if (part.startsWith("_") && part.endsWith("_")) {
-          return <em key={index} className="italic font-medium">{part.slice(1, -1)}</em>;
-        }
-        return part;
-      })}
-    </>
-  );
-}
-
 function Chat() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
@@ -189,6 +143,15 @@ function Chat() {
   // Persistent chat sessions (migration 022). `sessionId` is created lazily on
   // the first message of a fresh chat; resuming hydrates messages from the API.
   const [sessions, setSessions] = useState([]);
+  const { data: sessionsData } = useChatSessionsQuery();
+
+  useEffect(() => {
+    if (sessionsData) setSessions(sessionsData);
+  }, [sessionsData]);
+
+  const invalidateSessions = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: queryKeys.sessions({}) });
+  }, [queryClient]);
   const [sessionId, setSessionId] = useState(null);
   const [sessionSheetOpen, setSessionSheetOpen] = useState(false);
   const [traceDrawerOpen, setTraceDrawerOpen] = useState(false);
@@ -209,13 +172,13 @@ function Chat() {
 
   // Per-message copy feedback (id of the message just copied → ✓ for a moment).
   const [copiedId, setCopiedId] = useState(null);
-  const copyMessage = async (msg) => {
+  const copyMessage = useCallback(async (msg) => {
     try {
       await navigator.clipboard.writeText(msg.content || msg.text || '');
       setCopiedId(msg.id);
       setTimeout(() => setCopiedId((c) => (c === msg.id ? null : c)), 1500);
     } catch { /* clipboard may be blocked; ignore */ }
-  };
+  }, []);
 
   // System-adaptive theme (native-macOS look). Dark mode is class-based
   // (.dark) app-wide, so we scope it to the Chat root only — following the OS
@@ -258,21 +221,17 @@ function Chat() {
   const [pendingApprovals, setPendingApprovals] = useState([]); // [{ tool, args, requestId, executionId }]
   const pendingApproval = pendingApprovals[0] || null;
 
-  // Dynamic values based on selected agent workflow node structure
-  const getAgentDetails = () => {
+  const agentDetails = useMemo(() => {
     if (!selectedAgent) {
-      return { modelName: "—", toolsCount: 0, toolsList: [] };
+      return { modelName: '—', toolsCount: 0, toolsList: [] };
     }
 
-    // Find LLM model (legacy `llm` OR new `language_model`). The LangflowEditor
-    // node stores the chosen model under `params.llm` (e.g. "Claude Sonnet 4.6").
     const llmNode = selectedAgent.nodes?.find(n => n.type === 'llm' || n.type === 'language_model');
     const rawModel = llmNode?.params?.llm || llmNode?.params?.model || llmNode?.params?.modelId
       || llmNode?.data?.model || llmNode?.data?.modelId || llmNode?.data?.label
       || llmNode?.name || '—';
     const modelName = formatModelLabel(rawModel);
 
-    // Find tool nodes connected to the agent node (any non-LLM/schedule capability).
     const NON_TOOL = new Set(['agent', 'llm', 'language_model', 'schedule', 'scheduler', 'trigger', 'memory']);
     const agentNode = selectedAgent.nodes?.find(n => n.type === 'agent');
     let toolsList = [];
@@ -286,29 +245,27 @@ function Chat() {
         .map(node => node.data?.label || node.data?.name || node.params?.label || node.type);
     }
 
-    return {
-      modelName,
-      toolsCount: toolsList.length,
-      toolsList,
-    };
-  };
+    return { modelName, toolsCount: toolsList.length, toolsList };
+  }, [selectedAgent]);
 
-  const { modelName, toolsCount, toolsList } = getAgentDetails();
+  const { modelName, toolsCount, toolsList } = agentDetails;
 
   // Load agent-type workflows + past chat sessions, then restore the last-active
   // session so a page refresh / revisit re-opens the same conversation (and its
   // context) instead of silently starting a new one.
   useEffect(() => {
     (async () => {
-      await Promise.all([loadAgents(), loadSessions()]);
+      const loadedAgents = await loadAgents();
+      invalidateSessions();
       try {
         const stored = typeof localStorage !== 'undefined'
           ? localStorage.getItem(SESSION_STORAGE_KEY) : null;
-        if (stored) await resumeSession(stored);
+        if (stored) await resumeSession(stored, loadedAgents);
       } catch (error) {
         console.warn('Could not restore previous chat session:', error);
       }
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Auto-scroll to bottom when new messages arrive
@@ -323,29 +280,19 @@ function Chat() {
   const loadAgents = async () => {
     try {
       const workflows = await agentApiClient.listWorkflows();
-      // Filter to only show valid agent workflows
       const agentWorkflows = workflows.filter(wf => isAgentWorkflowValid(wf));
       setAgents(agentWorkflows);
+      return agentWorkflows;
     } catch (error) {
       console.error('Error loading agents:', error);
       setAgents([]);
       if (error.code === 'ERR_NETWORK' || error.message.includes('Network Error')) {
         console.warn('Cannot connect to Agent API. Please start the API server at http://localhost:8000');
       }
+      return [];
     }
   };
 
-  // ── Chat sessions ──────────────────────────────────────────────────────────
-  const loadSessions = async () => {
-    try {
-      setSessions(await agentApiClient.listSessions());
-    } catch (error) {
-      console.error('Error loading sessions:', error);
-    }
-  };
-
-  // Ensure a persisted session exists for the current chat; create lazily on the
-  // first turn so empty chats never clutter the history. Returns the session id.
   const ensureSession = async (agent, firstMessage) => {
     if (sessionId) return sessionId;
     try {
@@ -358,7 +305,7 @@ function Chat() {
       return created.id;
     } catch (error) {
       console.error('Error creating session:', error);
-      return null;  // persistence is best-effort — the turn still runs
+      return null;
     }
   };
 
@@ -372,8 +319,7 @@ function Chat() {
     setSessionSheetOpen(false);
   };
 
-  // Resume a past conversation: hydrate its messages into the UI shape.
-  const resumeSession = async (id) => {
+  const resumeSession = async (id, agentsList = agents) => {
     try {
       const data = await agentApiClient.getSession(id);
       const hydrated = (data.messages || []).map((m) => ({
@@ -391,16 +337,13 @@ function Chat() {
       setMessages(hydrated.length ? hydrated : [welcomeMessage()]);
       setTraceSteps([]);
       setTokens({ input: 0, output: 0, total: 0 });
-      // Re-select the agent this chat targeted, if still available.
       if (data.workflow_name) {
-        const match = agents.find((a) => a.name === data.workflow_name);
+        const match = agentsList.find((a) => a.name === data.workflow_name);
         if (match) setSelectedAgent(match);
       }
       setSessionSheetOpen(false);
     } catch (error) {
       console.error('Error resuming session:', error);
-      // A stored id that no longer exists (deleted server-side) would otherwise
-      // wedge every revisit — clear it and fall back to a fresh chat.
       if (error?.response?.status === 404 || error?.status === 404) {
         persistSessionId(null);
         setSessionId(null);
@@ -413,7 +356,7 @@ function Chat() {
     try {
       await agentApiClient.deleteSession(id);
       if (id === sessionId) startNewChat();
-      await loadSessions();
+      invalidateSessions();
     } catch (error) {
       console.error('Error deleting session:', error);
     }
@@ -423,7 +366,7 @@ function Chat() {
     e?.stopPropagation();
     try {
       await agentApiClient.updateSession(sess.id, { isImportant: !sess.is_important });
-      await loadSessions();
+      invalidateSessions();
     } catch (error) {
       console.error('Error pinning session:', error);
     }
@@ -504,61 +447,8 @@ function Chat() {
     // Dynamic metrics simulation
     const startTime = Date.now();
 
-    // Subscribe to progress events
-    let unsubscribe = null;
-    if (window.electronAPI?.onAgentProgress) {
-      unsubscribe = window.electronAPI.onAgentProgress((progress) => {
-        // Update message history
-        setMessages(prev => prev.map(msg => {
-          if (msg.id === thinkingId) {
-            const statusHistory = [...(msg.statusHistory || [])];
-            if (progress.message) {
-              statusHistory.push({
-                type: progress.type,
-                message: progress.message,
-                time: new Date().toLocaleTimeString()
-              });
-              if (statusHistory.length > 8) statusHistory.shift();
-            }
-            return {
-              ...msg,
-              content: progress.message || msg.content,
-              currentStatus: progress,
-              statusHistory
-            };
-          }
-          return msg;
-        }));
-
-        // Append to right pane stepper timeline
-        if (progress.message) {
-          setTraceSteps(prev => {
-            const lastStep = prev[prev.length - 1];
-            const type = progress.type === 'tool' ? 'tool' : progress.type === 'thinking' ? 'think' : 'answer';
-            
-            // Skip duplicates
-            if (lastStep && lastStep.text === progress.message) {
-              return prev;
-            }
-
-            const stepDuration = progress.duration ? `${(progress.duration / 1000).toFixed(1)}s` : `${Math.floor(Math.random() * 800) + 100}ms`;
-
-            return [
-              ...prev,
-              {
-                l: type,
-                t: stepDuration,
-                text: progress.message
-              }
-            ];
-          });
-        }
-      });
-    }
-
     try {
-      // Run via the FastAPI HTTP/SSE bridge — works in the browser AND Electron
-      // (both reach the agent-api). Live tool/token events stream into the trace
+      // Run via the FastAPI HTTP/SSE bridge. Live tool/token events stream into the trace
       // panel; the final answer renders as rich Markdown.
       const pushTrace = (l, text) =>
         setTraceSteps(prev => {
@@ -714,9 +604,7 @@ function Chat() {
       ]);
     } finally {
       setIsLoading(false);
-      if (unsubscribe) unsubscribe();
-      // Refresh the session list so the new chat's title/count appear in history.
-      loadSessions();
+      invalidateSessions();
     }
   };
 
@@ -728,17 +616,16 @@ function Chat() {
   };
 
   // Hover-action: re-ask the last user turn (regenerate the assistant answer).
-  const regenerateLast = () => {
+  const regenerateLast = useCallback(() => {
     if (isLoading || !selectedAgent) return;
     const lastUser = [...messages].reverse().find((m) => m.type === MESSAGE_TYPES.USER);
     if (lastUser?.content) askAgent(selectedAgent, lastUser.content);
-  };
+  }, [isLoading, selectedAgent, messages]);
 
-  // Hover-action: load a message's text back into the composer to edit & resend.
-  const editMessage = (msg) => {
+  const editMessage = useCallback((msg) => {
     setInputValue(msg.content || msg.text || '');
     setTimeout(() => inputRef.current?.focus(), 0);
-  };
+  }, []);
 
   // Approve or deny the HEAD gated tool call, then reveal the next pending one.
   // Each is resolved by its own requestId so concurrent gates unblock correctly.
@@ -754,271 +641,6 @@ function Chat() {
     }
   };
 
-  // Render message item
-  const renderMessage = (message) => {
-    const isUser = message.type === MESSAGE_TYPES.USER;
-    const isSystem = message.type === MESSAGE_TYPES.SYSTEM;
-    const textContent = message.content || message.text || "";
-
-    if (isSystem) {
-      return (
-        <div key={message.id} className="flex justify-center my-4 animate-in fade-in duration-300">
-          <div className="bg-slate-100/80 dark:bg-white/[0.06] backdrop-blur-sm border border-slate-200/50 dark:border-white/10 rounded-full px-4 py-1.5 max-w-xl text-center shadow-sm flex items-center gap-2">
-            <Info className="size-3.5 text-slate-500 dark:text-slate-400" />
-            <span className="text-slate-600 dark:text-slate-300 font-sans text-xs leading-none">
-              <FormattedText text={textContent} isUser={false} />
-            </span>
-          </div>
-        </div>
-      );
-    }
-
-    return (
-      <div
-        key={message.id}
-        className={`group/msg flex w-full ${isUser ? 'justify-end' : 'justify-start'} chat-msg-enter`}
-        style={{ marginBottom: 'var(--msg-gap)' }}
-      >
-        <div className={`flex flex-col items-${isUser ? 'end' : 'start'} max-w-[85%]`}>
-          {/* Sender Header */}
-          <div className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 pl-1 pr-1 flex items-center gap-2">
-            <span>{isUser ? 'You' : 'Agent'} · {formatClock(message.timestamp)}</span>
-            {isUser && message.hasTraceId && (
-              <span className="normal-case tracking-normal text-[9px] font-semibold text-sky-700 bg-sky-50 border border-sky-100 rounded px-1 leading-4">🔎 correlation lookup</span>
-            )}
-          </div>
-
-          {/* Chat Bubble Card — primary user bubble, card assistant */}
-          <div
-            style={{ padding: 'var(--msg-pad)' }}
-            className={`w-full transition-all duration-300 leading-relaxed font-sans text-[13.5px] select-text ${
-              isUser
-                ? 'bg-primary text-primary-foreground rounded-xl rounded-tr-sm shadow-sm shadow-primary/35'
-                : 'bg-white text-slate-900 border border-black/[0.07] rounded-xl rounded-tl-sm shadow-[0_1px_2px_rgb(0_0_0/0.06)] dark:bg-[#1c1c1e] dark:text-slate-100 dark:border-white/10 dark:shadow-none'
-            }`}
-          >
-            {/* Inline agent-thread timeline — the agent's tool calls as a
-                vertical timeline with a live synapse pulse while running. */}
-            {!isUser && message.steps && message.steps.length > 0 && (
-              <AgentThread steps={message.steps} live={message.isLoading} />
-            )}
-
-            {/* Plan card — pinned task list (multi-step runs) */}
-            {!isUser && message.isMarkdown && textContent && (
-              <PlanChecklist content={textContent} />
-            )}
-
-            {textContent && (
-              <div className="break-words">
-                {(!isUser && message.isMarkdown)
-                  ? <MarkdownMessage content={textContent} />
-                  : <div className="whitespace-pre-wrap"><FormattedText text={textContent} isUser={isUser} /></div>}
-                {message.streaming && (
-                  <span className="inline-block w-[2px] h-[1em] ml-0.5 -mb-0.5 bg-primary/70 animate-pulse rounded-sm align-middle" />
-                )}
-              </div>
-            )}
-
-            {/* Privacy filter + auto-selected skills — transparency surfaces */}
-            {!isUser && ((message.privacyRedactions?.length > 0) || (message.selectedSkills?.length > 0)) && (
-              <div className="mt-3 flex flex-wrap items-center gap-2">
-                {message.privacyRedactions?.length > 0 && (
-                  <PrivacyInsightsPanel redactions={message.privacyRedactions} />
-                )}
-                {(message.selectedSkills || []).map((name) => (
-                  <span
-                    key={name}
-                    title="Skill auto-selected for this query"
-                    className="inline-flex items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2 py-0.5 text-xs font-medium text-violet-700 dark:border-violet-500/30 dark:bg-violet-500/10 dark:text-violet-300"
-                  >
-                    <Wrench className="h-3 w-3" />
-                    {name}
-                  </span>
-                ))}
-              </div>
-            )}
-
-            {/* Deep-agent plan checklist (planning capability) */}
-            {Array.isArray(message.todos) && message.todos.length > 0 && (
-              <div className="mt-3.5 rounded-xl border border-emerald-200/70 bg-emerald-50/40 dark:border-emerald-500/25 dark:bg-emerald-500/[0.07] p-3 text-[12px]">
-                <div className="flex items-center gap-1.5 mb-2 font-semibold text-emerald-700 dark:text-emerald-300 uppercase tracking-wide text-[10px]">
-                  <Terminal className="size-3.5" /> Plan
-                </div>
-                <ul className="space-y-1">
-                  {message.todos.map((t, i) => (
-                    <li key={i} className="flex items-start gap-2">
-                      <span>{t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : t.status === 'blocked' ? '⛔' : '⬜'}</span>
-                      <span className={t.status === 'completed' ? 'line-through opacity-70' : ''}>{t.text}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            {/* Structured InvestigationReport card (Data Query Mode) */}
-            {message.structured && (
-              <div className="mt-3.5 rounded-xl border border-indigo-200/70 bg-indigo-50/40 dark:border-indigo-500/25 dark:bg-indigo-500/[0.07] p-3 text-[12px]">
-                <div className="flex items-center gap-1.5 mb-2 font-semibold text-indigo-700 dark:text-indigo-300 uppercase tracking-wide text-[10px]">
-                  <Terminal className="size-3.5" /> Structured report
-                  {message.structured.severity && (
-                    <span className="ml-1 px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 dark:bg-indigo-500/20 dark:text-indigo-200 normal-case tracking-normal">{message.structured.severity}</span>
-                  )}
-                  {typeof message.structured.confidence === 'number' && (
-                    <span className="ml-auto text-indigo-400 dark:text-indigo-400/80 normal-case tracking-normal">conf {Math.round(message.structured.confidence * 100)}%</span>
-                  )}
-                </div>
-                {message.structured.root_cause && (
-                  <div className="mb-2"><span className="font-semibold text-slate-600 dark:text-slate-300">Root cause:</span> <span className="text-slate-700 dark:text-slate-200">{message.structured.root_cause}</span></div>
-                )}
-                {Array.isArray(message.structured.evidence) && message.structured.evidence.length > 0 && (
-                  <div className="mb-2">
-                    <div className="font-semibold text-slate-600 dark:text-slate-300 mb-1">Evidence</div>
-                    <ul className="space-y-0.5">
-                      {message.structured.evidence.map((ev, i) => (
-                        <li key={i} className="font-mono text-[11px] text-slate-600 dark:text-slate-400">
-                          {ev.file}{ev.line ? `:${ev.line}` : ''}{ev.symbol ? ` — ${ev.symbol}` : ''}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {Array.isArray(message.structured.next_steps) && message.structured.next_steps.length > 0 && (
-                  <div>
-                    <div className="font-semibold text-slate-600 dark:text-slate-300 mb-1">Next steps</div>
-                    <ul className="list-disc list-inside text-slate-600 dark:text-slate-300 space-y-0.5">
-                      {message.structured.next_steps.map((s, i) => <li key={i}>{s}</li>)}
-                    </ul>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Custom Tool usage info */}
-            {message.tools && message.tools.length > 0 && (
-              <div className="mt-3.5 flex gap-2 flex-wrap">
-                {message.tools.map(t => (
-                  <span 
-                    key={t.name} 
-                    className="inline-flex items-center gap-1.5 font-mono text-[10.5px] font-medium text-slate-600 bg-slate-50 border border-slate-200/60 px-2 py-0.5 rounded-lg hover:bg-slate-100/80 hover:text-slate-800 transition-colors shadow-sm cursor-help select-all"
-                    title={`Tool run: ${t.name}`}
-                  >
-                    <Terminal className="size-3.5 text-slate-400" />
-                    {t.name}
-                    <span className="text-slate-300">·</span>
-                    <span className="text-slate-400 font-normal">{t.t || t.duration || "0s"}</span>
-                  </span>
-                ))}
-              </div>
-            )}
-
-            {/* Citations / Sources — collapsible, numbered */}
-            {message.citations && message.citations.length > 0 && (
-              <CollapsibleSection icon={ListTree} title="Sources" accent="blue" count={message.citations.length}>
-                <div className="flex flex-col gap-1">
-                  {message.citations.map((c, idx) => (
-                    <div key={c} className="flex items-center gap-2 text-[11px]">
-                      <span className="shrink-0 size-4 rounded-full bg-slate-100 dark:bg-white/10 text-slate-500 dark:text-slate-300 text-[9px] font-semibold flex items-center justify-center">{idx + 1}</span>
-                      <span className="font-mono text-[10.5px] text-slate-500 dark:text-slate-400 break-all select-all">{c}</span>
-                    </div>
-                  ))}
-                </div>
-              </CollapsibleSection>
-            )}
-
-            {/* Live progress — collapsible reasoning/activity log while running */}
-            {message.isLoading && (
-              <div className="mt-3 animate-in fade-in duration-300">
-                {message.statusHistory && message.statusHistory.length > 0 && (
-                  <CollapsibleSection
-                    icon={Brain}
-                    title="Reasoning"
-                    accent="primary"
-                    defaultOpen
-                    count={message.statusHistory.length}
-                  >
-                    <div className="max-h-36 overflow-y-auto space-y-1.5 pr-1">
-                      {message.statusHistory.map((status, idx) => (
-                        <div
-                          key={idx}
-                          className={`text-xs pl-2.5 border-l-2 py-0.5 font-sans leading-relaxed ${
-                            status.type === 'tool'
-                              ? 'border-blue-500 text-blue-600 dark:text-blue-400 bg-blue-50/20 dark:bg-blue-500/[0.06]'
-                              : status.type === 'thinking'
-                              ? 'border-primary text-primary bg-red-50/20 dark:bg-primary/[0.08]'
-                              : status.type === 'error'
-                              ? 'border-red-500 text-red-600 bg-red-50/20 dark:bg-red-500/[0.06]'
-                              : 'border-slate-400 text-slate-600 dark:text-slate-300'
-                          }`}
-                        >
-                          <span className="opacity-60 mr-1.5 font-mono text-[10px]">{status.time}</span>
-                          {status.message}
-                        </div>
-                      ))}
-                    </div>
-                  </CollapsibleSection>
-                )}
-                {/* Generic spinner only before the answer streams in — once
-                    tokens flow, the caret + streamed text carry the activity. */}
-                {!message.streaming && !(message.steps && message.steps.length > 0) && (
-                  <div className="mt-2 flex items-center gap-2 bg-slate-50 dark:bg-white/[0.04] border border-slate-100 dark:border-white/10 rounded-lg p-2.5">
-                    <Loader2 className="size-4 animate-spin text-primary" />
-                    <span className="text-xs text-slate-500 dark:text-slate-400 font-medium">
-                      {message.currentStatus?.message || 'Executing agent workflows'}
-                      <span className="chat-thinking-dots" />
-                    </span>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {message.isError && (
-              <Badge variant="destructive" className="mt-3.5 px-2.5 py-0.5 rounded-full flex items-center gap-1.5 w-fit font-sans text-xs">
-                <XCircle className="w-3.5 h-3.5" />
-                Workflow Terminated
-              </Badge>
-            )}
-          </div>
-
-          {/* Hover-reveal message actions */}
-          {!message.isLoading && (message.content || message.text) && (
-            <div className={cn(
-              'mt-1 flex items-center gap-0.5 opacity-0 group-hover/msg:opacity-100 transition-opacity',
-              isUser ? 'pr-1' : 'pl-1'
-            )}>
-              <button
-                type="button"
-                onClick={() => copyMessage(message)}
-                title="Copy"
-                className="size-6 rounded-md flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors"
-              >
-                {copiedId === message.id ? <Check className="size-3.5 text-emerald-500" /> : <Copy className="size-3.5" />}
-              </button>
-              {isUser ? (
-                <button
-                  type="button"
-                  onClick={() => editMessage(message)}
-                  title="Edit & resend"
-                  className="size-6 rounded-md flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors"
-                >
-                  <CornerDownLeft className="size-3.5" />
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={regenerateLast}
-                  disabled={isLoading}
-                  title="Regenerate"
-                  className="size-6 rounded-md flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors disabled:opacity-40"
-                >
-                  <RotateCcw className="size-3.5" />
-                </button>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  };
 
 
 
@@ -1249,7 +871,7 @@ function Chat() {
             </Button>
 
             {/* Conversation history (persisted sessions) */}
-            <Sheet open={sessionSheetOpen} onOpenChange={(o) => { setSessionSheetOpen(o); if (o) loadSessions(); }}>
+            <Sheet open={sessionSheetOpen} onOpenChange={(o) => { setSessionSheetOpen(o); if (o) invalidateSessions(); }}>
               <SheetTrigger asChild>
                 <Button variant="outline" size="icon" className="size-8 shrink-0 rounded-lg" title="Chat history">
                   <History className="size-4" />
@@ -1317,7 +939,17 @@ function Chat() {
         {/* Scrollable Conversation Stream — centered single-column rail */}
         <div className="flex-grow overflow-auto px-4 md:px-8 py-6 select-text">
           <div className={cn('mx-auto w-full max-w-[var(--chat-max)] flex flex-col', `chat-density-${density}`)}>
-            {messages.map(renderMessage)}
+            {messages.map((message) => (
+              <ChatMessage
+                key={message.id}
+                message={message}
+                copiedId={copiedId}
+                isLoading={isLoading}
+                onCopy={copyMessage}
+                onEdit={editMessage}
+                onRegenerate={regenerateLast}
+              />
+            ))}
             <div ref={messagesEndRef} />
           </div>
         </div>

@@ -59,7 +59,7 @@ ENV AWS_DEFAULT_REGION=eu-west-1 \
 # detect_changes / symbol_history; libtree-sitter0 is the runtime for codegraph's
 # AST backend (the grammar bundle is copied in below).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ripgrep git libtree-sitter0 \
+        ripgrep git libtree-sitter0.22 libcurl4 \
     && rm -rf /var/lib/apt/lists/*
 
 # App code (shared by both runtime targets).

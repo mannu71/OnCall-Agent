@@ -1,0 +1,15 @@
+export const queryKeys = {
+  workflows: ['workflows'],
+  activeWorkflows: ['workflows', 'active'],
+  settings: ['settings'],
+  status: ['status'],
+  health: ['health'],
+  mcp: ['mcp'],
+  mcpInputValues: ['mcp', 'inputValues'],
+  llm: ['llm'],
+  certificates: ['certificates'],
+  modelKeys: ['modelKeys'],
+  executions: (limit = 100) => ['executions', { limit }],
+  sessions: (opts = {}) => ['sessions', opts],
+  workflowExecutions: (name, limit = 50) => ['workflowExecutions', name, { limit }],
+};

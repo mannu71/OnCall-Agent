@@ -1,10 +1,11 @@
 /**
  * API Client for communicating with the FastAPI backend.
  * This service provides a unified interface for the UI to interact with the backend,
- * whether running in Electron (packaged) or as a standalone web app.
+ * whether running in Docker (nginx same-origin proxy) or local Vite dev.
  */
 
 const DEFAULT_API_HOST = 'http://localhost:8000';
+const RELATIVE_API_BASE = '/api/v1';
 const API_PREFIX = '/api/v1';
 
 /**
@@ -17,9 +18,19 @@ const API_PREFIX = '/api/v1';
  * agent-api host. The bare host (e.g. ``http://localhost:8000``) is normalised
  * here: strip trailing slashes and ensure the ``/api/v1`` suffix, whether the env
  * var includes it or not. Without this, calls like ``/settings/general`` 404.
+ *
+ * When env vars are unset in production builds, defaults to relative ``/api/v1``
+ * so nginx can proxy API traffic on the same origin as the SPA.
  */
 export function getApiBaseUrl() {
-    const env = import.meta.env.VITE_API_URL || import.meta.env.VITE_AGENT_API_URL || DEFAULT_API_HOST;
+    const env = import.meta.env.VITE_API_URL || import.meta.env.VITE_AGENT_API_URL;
+    if (!env) {
+        if (import.meta.env.DEV) {
+            const raw = DEFAULT_API_HOST.replace(/\/+$/, '');
+            return raw.endsWith(API_PREFIX) ? raw : `${raw}${API_PREFIX}`;
+        }
+        return RELATIVE_API_BASE;
+    }
     const raw = env.replace(/\/+$/, '');
     return raw.endsWith(API_PREFIX) ? raw : `${raw}${API_PREFIX}`;
 }

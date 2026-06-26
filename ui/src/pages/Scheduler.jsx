@@ -1,7 +1,7 @@
 import React, { useState, useCallback, memo } from 'react';
 import { Button } from '@/components/ui/button';
 import { Plus } from 'lucide-react';
-import { SchedulerProvider, useScheduler } from '../context/SchedulerContext';
+import { useScheduler } from '../context/SchedulerContext';
 import ScheduleList from '../components/scheduler/ScheduleList';
 import AddScheduleDialog from '../components/scheduler/AddScheduleDialog';
 
@@ -42,10 +42,4 @@ const SchedulerContent = memo(() => {
   );
 });
 
-export default function Scheduler() {
-  return (
-    <SchedulerProvider>
-      <SchedulerContent />
-    </SchedulerProvider>
-  );
-}
+export default SchedulerContent;

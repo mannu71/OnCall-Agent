@@ -2,33 +2,24 @@ import {
     addDiscoveredModels,
     discoverModels,
 } from '../../services/llmService';
-import { testLLMConnection as testLLMConnectionAPI } from '../../services/apiClient';
+import {
+    testLLMConnection as testLLMConnectionAPI,
+    testMCPServer as testMCPServerAPI,
+} from '../../services/apiClient';
 
 export async function discoverBedrockModels() {
-    if (globalThis.electronAPI?.discoverModels) {
-        return globalThis.electronAPI.discoverModels('AWS Bedrock');
-    }
     return discoverModels('AWS Bedrock');
 }
 
 export async function importDiscoveredModels(models, region) {
-    if (globalThis.electronAPI?.addDiscoveredModels) {
-        return globalThis.electronAPI.addDiscoveredModels(models, region);
-    }
     return addDiscoveredModels(models, region);
 }
 
 export async function testMcpServer(serverName, serverConfig) {
-    if (!globalThis.electronAPI?.testMCPServer) {
-        return { desktopOnly: true };
-    }
-    return globalThis.electronAPI.testMCPServer(serverName, serverConfig);
+    return testMCPServerAPI(serverName, serverConfig);
 }
 
 export async function testLlmConnection(llmName) {
-    if (globalThis.electronAPI?.testLLM) {
-        return globalThis.electronAPI.testLLM(llmName, {});
-    }
     return testLLMConnectionAPI(llmName, {});
 }
 

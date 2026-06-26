@@ -1,15 +1,15 @@
 # AGENTS.md — ui (Frontend)
 # Claude Code reads this at the start of every session.
 # Keep this file updated as the codebase evolves.
-# Last updated: manually maintain this date — YYYY-MM-DD
+# Last updated: 2026-06-25
 
 ---
 
 ## What this repo is
 
-AI Investigation Platform frontend. React + ReactFlow visual workflow
-builder. Engineers compose investigation pipelines by dragging nodes,
-watch agents run in real time via SSE, approve/deny tool requests,
+AI Investigation Platform frontend. React + Vite SPA with a Langflow-style
+visual workflow builder. Engineers compose investigation pipelines by dragging
+nodes, watch agents run in real time via SSE, approve/deny tool requests,
 and review synthesised root cause and suggestions.
 
 ---
@@ -18,16 +18,17 @@ and review synthesised root cause and suggestions.
 
 | Layer | Technology | Notes |
 |---|---|---|
-| Framework | React 18 + JSX | Not TypeScript — pure JSX throughout |
-| Build tool | Vite | vite.config.js |
-| Styling | Tailwind CSS | tailwind.config.js |
+| Framework | React 19 + JSX | Not TypeScript — pure JSX throughout |
+| Build tool | Vite 7 | vite.config.js |
+| Styling | Tailwind CSS 4 | tailwind.config.js |
 | UI primitives | shadcn/ui | components.json — do not modify manually |
-| Workflow canvas | ReactFlow 11 | src/components/workflow/WorkflowEditor.jsx |
-| State | React Context | context/ directory — no Redux/Zustand |
+| Workflow canvas | LangflowEditor | src/components/workflow/LangflowEditor.jsx |
+| Server state | TanStack Query | src/lib/queryClient.js, src/hooks/queries/ |
+| State | React Context + Query | context/ for scheduler/workflow status |
 | Routing | React Router | App.jsx |
-| API calls | Custom clients | src/services/ |
+| API calls | Custom clients | src/services/ — wrapped by TanStack Query hooks |
 | Real-time | SSE (not WebSocket) | src/hooks/useWorkflowStream.js |
-| Desktop shell | Electron | electron/ directory |
+| Production deploy | Docker + nginx | ui/Dockerfile, ui/nginx.conf |
 
 ---
 
@@ -44,7 +45,15 @@ src/
     Releases.jsx              ← Azure DevOps release management
     Scheduler.jsx             ← Scheduled investigation runs
     Settings.jsx              ← Platform settings
-    workflow.jsx              ← Visual workflow builder page (ReactFlow)
+    workflow.jsx              ← Visual workflow builder page (LangflowEditor)
+
+  lib/
+    queryClient.js            ← TanStack Query defaults
+    queryKeys.js              ← Centralized query key factory
+
+  hooks/queries/              ← useQuery hooks (workflows, settings, health, …)
+
+  _deprecated/                ← Unused modules (see README); not in bundle
 
   components/
     logwatch/
@@ -52,7 +61,6 @@ src/
 
     monitoring/
       ExecutionLog.jsx        ← Raw execution log display
-      ExecutionMonitor.jsx    ← Live execution monitoring panel
       StatusBadge.jsx         ← Execution status indicator component
 
     releases/
@@ -80,16 +88,14 @@ src/
       ← To add new components: npx shadcn-ui add [component]
       ← Never hand-edit files in this directory
 
-    workflow/                 ← ReactFlow canvas and node system — CORE
-      WorkflowEditor.jsx      ← MAIN: ReactFlow canvas, node management,
-                                 edge wiring, save/run workflow
-      NodeConfigPanel.jsx     ← Right panel: selected node configuration
+    workflow/                 ← Langflow-style canvas — CORE
+      LangflowEditor.jsx      ← MAIN: custom canvas, node management, save/run
       NodeSidebar.jsx         ← Left panel: draggable node palette
+      HITLPanel.jsx           ← Tool approval gate UI
       AgentAdvancedConfig.jsx ← Advanced per-agent configuration
-      TrajectoryReplay.jsx    ← Replay past investigation trajectories
       nodes/
-        OrchestratorNode.jsx  ← Multi-agent orchestrator node type
-        OutputNode.jsx        ← Output/result node type
+        OrchestratorNode.jsx  ← Legacy node components (orchestrator/output)
+        OutputNode.jsx
 
   context/
     SchedulerContext.jsx      ← Scheduler state shared across components
@@ -108,10 +114,6 @@ src/
 
   lib/ utils/                 ← Shared utilities and helpers
 
-electron/                     ← Electron desktop shell
-  ← Do not modify without understanding Electron IPC
-  ← Desktop build is separate from web build
-
 public/                       ← Static assets
 ```
 
@@ -129,39 +131,38 @@ public/                       ← Static assets
 3. **NEVER use WebSocket** — the backend streams via SSE.
    The SSE hook is `useWorkflowStream.js` — use it.
 
-4. **NEVER modify `WorkflowEditor.jsx`** without reading the entire
+4. **NEVER modify `LangflowEditor.jsx`** without reading the entire
    file first and showing the full diff. It is the most critical
-   frontend file. ReactFlow state management is complex here.
+   frontend file.
 
-5. **NEVER add new npm packages** without asking first and updating
+5. **Prefer TanStack Query hooks** in `src/hooks/queries/` for GET/polling;
+   keep SSE streaming in `useWorkflowStream.js`.
+
+6. **NEVER add new npm packages** without asking first and updating
    `package.json` with a pinned version.
 
-6. **ALWAYS show diff before applying** any change to existing files.
+7. **ALWAYS show diff before applying** any change to existing files.
 
-7. **ALWAYS check that the API contract matches** — when changing
+8. **ALWAYS check that the API contract matches** — when changing
    a service call, verify the backend endpoint schema in
    `agent-api/app/api/v1/schemas/` matches.
 
-8. **The backend API base URL** comes from environment variables —
+9. **The backend API base URL** comes from environment variables —
    never hardcode `localhost:8000` in component files.
 
 ---
 
 ## What is working — do not refactor without explicit instruction
 
-- `WorkflowEditor.jsx` — ReactFlow canvas, node drag/drop, edge wiring
-- `NodeConfigPanel.jsx` — node configuration panel
+- `LangflowEditor.jsx` — custom workflow canvas, node drag/drop, edge wiring
 - `NodeSidebar.jsx` — draggable node palette
-- `OrchestratorNode.jsx` — multi-agent node type
-- `OutputNode.jsx` — output node type
+- TanStack Query hooks — server state caching, dedup, route-scoped polling
 - `useWorkflowStream.js` — SSE live event streaming
 - `WorkflowStatusContext.jsx` — live status shared state
-- `ExecutionMonitor.jsx` — live execution monitoring
 - All `releases/` components — Azure DevOps release workflow
 - All `scheduler/` components — scheduled runs
 - All `services/` — API clients
 - `AppSidebar.jsx` — navigation
-- Electron shell — desktop app wrapper
 
 ---
 
@@ -178,7 +179,7 @@ public/                       ← Static assets
 ### High
 - [ ] Agent node status badges — real-time status colour updates
       on ReactFlow nodes during execution not fully wired
-      Needs: SSE events → node style updates in WorkflowEditor.jsx
+      Needs: SSE events → node style updates in LangflowEditor.jsx
 
 - [ ] Cost tracking display — per-agent USD cost not shown live
       Needs: cost events from SSE → display in ExecutionMonitor.jsx
@@ -230,16 +231,10 @@ When building new components that need live updates, always use
 
 ---
 
-## ReactFlow specifics
+## LangflowEditor specifics
 
-- ReactFlow canvas lives in `WorkflowEditor.jsx`
-- Node types registered in WorkflowEditor — `OrchestratorNode`, `OutputNode`
-- To add a new node type:
-  1. Create `src/components/workflow/nodes/NewNode.jsx`
-  2. Register in WorkflowEditor `nodeTypes` object
-  3. Add to NodeSidebar draggable palette
-  4. Add config schema to NodeConfigPanel
-
+- Workflow canvas lives in `LangflowEditor.jsx`
+- Node types defined in `editor/constants/nodeDefinitions.js`
 - Workflow JSON saved to backend via `agentApiClient.js`
 - Format: ReactFlow's native `{ nodes: [...], edges: [...] }`
   which `workflow/workflow_translator.py` (backend) translates to agent graph
@@ -286,10 +281,15 @@ VITE_WS_URL=ws://localhost:8000      # Not used — SSE not WebSocket
 
 ```bash
 npm install
-npm run dev           # Vite dev server on port 5173
+npm run dev           # Vite dev server on port 5173 (proxies /api to backend)
 
-# Desktop (Electron)
-npm run electron:dev  # Starts Electron + Vite together
+# Full stack via Docker (from repo root)
+docker build -t codegraph:latest ./codegraph
+docker compose up --build
+# Open http://localhost:8080
+
+# Backend only: cd agent-api && docker compose up --build
+# UI only (backend must be running): cd ui && docker compose up --build
 ```
 
 ---

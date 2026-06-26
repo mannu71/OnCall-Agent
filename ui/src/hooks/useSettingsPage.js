@@ -1,25 +1,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import {
     addLLM,
     bulkDeleteLLMs,
     deleteLLM,
-    getLLMs,
     updateLLM,
 } from '../services/llmService';
 import {
     addMCPServer,
     deleteMCPServer,
-    getMCPServers,
     getMCPInputValues,
-    invalidateCache,
     updateMCPServer,
     updateMCPInputValue,
 } from '../services/mcpService';
-import { deleteModelKey, getModelKeys, upsertModelKey } from '../services/modelKeyService';
-import { getAppSettings, updateGeneralSettings } from '../services/apiClient';
+import { deleteModelKey, upsertModelKey } from '../services/modelKeyService';
+import { updateGeneralSettings } from '../services/apiClient';
 import agentApiClient from '../services/agentApiClient';
 import { useAgentApiHealth } from './useAgentApiHealth';
 import { usePersistedState, useSettingsToast } from './usePersistedState';
+import { useMcpConfigQuery } from './queries/useConfigQueries';
+import { useLlmConfigQuery, useCertificatesQuery } from './queries/useConfigQueries';
+import { useModelKeysQuery } from './queries/useModelKeysQuery';
+import { useSettingsQuery, useStatusQuery } from './queries/useSettingsQuery';
+import { queryKeys } from '../lib/queryKeys';
 import {
     discoverBedrockModels,
     importDiscoveredModels,
@@ -59,22 +62,29 @@ export function useSettingsPage() {
     const [timezone, setTimezone] = usePersistedState(LS_TIMEZONE, DEFAULT_TIMEZONE);
     const [confirmDestructive, setConfirmDestructive] = usePersistedState(LS_CONFIRM_DESTRUCTIVE, true);
     const [agentTimeout, setAgentTimeout] = useState('180');
-    const [systemStatus, setSystemStatus] = useState(null);
 
-    // Load the persisted global timezone from the backend on mount. The backend
-    // is the source of truth for scheduling; localStorage is just a fast cache.
+    const queryClient = useQueryClient();
+    const { data: settingsData } = useSettingsQuery();
+    const { data: statusData } = useStatusQuery();
+    const { data: mcpData } = useMcpConfigQuery();
+    const { data: llmData } = useLlmConfigQuery();
+    const { data: certData } = useCertificatesQuery();
+    const { data: keysData } = useModelKeysQuery();
+
+    const systemStatus = statusData ?? null;
+
+    // Sync timezone from settings query (single source — no duplicate getAppSettings)
     useEffect(() => {
-        let cancelled = false;
-        getAppSettings()
-            .then((data) => {
-                if (!cancelled && data?.global_timezone) {
-                    setTimezone(data.global_timezone);
-                }
-            })
-            .catch(() => { /* offline: keep cached localStorage value */ });
-        return () => { cancelled = true; };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
+        if (settingsData?.global_timezone) {
+            setTimezone(settingsData.global_timezone);
+        }
+    }, [settingsData?.global_timezone, setTimezone]);
+
+    useEffect(() => {
+        if (settingsData?.agent_timeout_seconds != null) {
+            setAgentTimeout(String(settingsData.agent_timeout_seconds));
+        }
+    }, [settingsData?.agent_timeout_seconds]);
 
     // Persist timezone changes to the backend (and keep the localStorage cache).
     const handleTimezoneChange = useCallback((tz) => {
@@ -96,6 +106,22 @@ export function useSettingsPage() {
     const [certificates, setCertificates] = useState([]);
     const [certUploadLoading, setCertUploadLoading] = useState(false);
     const [modelKeys, setModelKeys] = useState([]);
+
+    useEffect(() => {
+        if (mcpData) setServers(mcpData);
+    }, [mcpData]);
+
+    useEffect(() => {
+        if (llmData) setLlms(llmData);
+    }, [llmData]);
+
+    useEffect(() => {
+        if (certData) setCertificates(certData);
+    }, [certData]);
+
+    useEffect(() => {
+        if (keysData) setModelKeys(keysData);
+    }, [keysData]);
 
     const [dialog, setDialog] = useState(null);
     const [editingServer, setEditingServer] = useState(null);
@@ -165,93 +191,26 @@ export function useSettingsPage() {
         }
     }, [modelKeys]);
 
-    useEffect(() => {
-        let cancelled = false;
-
-        (async () => {
-            invalidateCache();
-            const results = await Promise.allSettled([
-                getMCPServers(),
-                getLLMs(),
-                agentApiClient.listCertificates(),
-                getModelKeys(),
-                agentApiClient.getSettings(),
-                agentApiClient.getStatus(),
-            ]);
-
-            if (cancelled) return;
-
-            const [mcpR, llmR, certR, keysR, settingsR, statusR] = results;
-
-            if (mcpR.status === 'fulfilled') setServers(mcpR.value);
-            if (llmR.status === 'fulfilled') setLlms(llmR.value);
-            if (certR.status === 'fulfilled') setCertificates(certR.value);
-            if (keysR.status === 'fulfilled') setModelKeys(keysR.value);
-            else setModelKeys([]);
-
-            if (settingsR.status === 'fulfilled' && settingsR.value?.agent_timeout_seconds != null) {
-                setAgentTimeout(String(settingsR.value.agent_timeout_seconds));
-            }
-
-            if (statusR.status === 'fulfilled') setSystemStatus(statusR.value);
-        })();
-
-        return () => { cancelled = true; };
-    }, []);
-
-    useEffect(() => {
-        if (apiHealth == null) return undefined;
-
-        let cancelled = false;
-        agentApiClient.getStatus()
-            .then((data) => {
-                if (!cancelled) setSystemStatus(data);
-            })
-            .catch(() => {
-                if (!cancelled) setSystemStatus(null);
-            });
-
-        return () => { cancelled = true; };
-    }, [apiHealth]);
-
     const reloadServers = useCallback(async () => {
-        invalidateCache();
-        setServers(await getMCPServers());
-    }, []);
+        await queryClient.invalidateQueries({ queryKey: queryKeys.mcp });
+    }, [queryClient]);
 
     const reloadLlms = useCallback(async () => {
-        setLlms(await getLLMs());
-    }, []);
+        await queryClient.invalidateQueries({ queryKey: queryKeys.llm });
+    }, [queryClient]);
 
     const reloadModelKeys = useCallback(async () => {
-        try {
-            setModelKeys(await getModelKeys());
-        } catch {
-            setModelKeys([]);
-        }
-    }, []);
+        await queryClient.invalidateQueries({ queryKey: queryKeys.modelKeys });
+    }, [queryClient]);
 
     const reloadCertificates = useCallback(async () => {
-        try {
-            setCertificates(await agentApiClient.listCertificates());
-        } catch {
-            setCertificates([]);
-        }
-    }, []);
+        await queryClient.invalidateQueries({ queryKey: queryKeys.certificates });
+    }, [queryClient]);
 
     const testServerConnection = useCallback(async (serverName, serverConfig) => {
         setConnectionTesting(setConnectionStatus, serverName);
         try {
             const result = await testMcpServer(serverName, serverConfig);
-            if (result.desktopOnly) {
-                showToast('Connection test is only available in the desktop app');
-                setConnectionStatus((prev) => {
-                    const next = { ...prev };
-                    delete next[serverName];
-                    return next;
-                });
-                return;
-            }
             setConnectionResult(setConnectionStatus, serverName, result, 'Connection failed');
         } catch (error) {
             setConnectionError(setConnectionStatus, serverName, error);
@@ -273,19 +232,9 @@ export function useSettingsPage() {
         } catch (error) {
             setConnectionError(setLLMConnectionStatus, llmName, error);
         }
-    }, []);
+    }, [showToast]);
 
-    // Automatically test LLM connections once when they are loaded on mount
-    const autoTestedRef = useRef(false);
-    useEffect(() => {
-        const names = Object.keys(llms);
-        if (names.length > 0 && !autoTestedRef.current) {
-            autoTestedRef.current = true;
-            names.forEach((name) => {
-                testLLMConnectionHandler(name);
-            });
-        }
-    }, [llms, testLLMConnectionHandler]);
+    // LLM connection tests are manual only (testAllConnections / per-model test buttons)
 
     const openMcpDialog = useCallback(async (serverName = null) => {
         const currentInputValues = await getMCPInputValues();

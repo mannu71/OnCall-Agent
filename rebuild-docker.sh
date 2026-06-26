@@ -1,56 +1,54 @@
 #!/bin/bash
-# Rebuild Docker image with new implementation (preserves data)
-# This script rebuilds the agent-api container while keeping all data intact
+# Rebuild Docker images with new implementation (preserves data)
+# Rebuilds backend and UI containers separately via the root compose file
 
-set -e  # Exit on error
+set -e
 
 echo "========================================"
-echo "Rebuilding Docker Image (Data Safe)"
+echo "Rebuilding Docker Images (Data Safe)"
 echo "========================================"
 echo ""
 
-# Build the codegraph engine image first — agent-api's Dockerfile bakes its
-# binary in via `COPY --from=codegraph:latest`, so it must exist beforehand.
-echo "[0/5] Building codegraph engine image..."
+echo "[0/6] Building codegraph engine image..."
 docker build -t codegraph:latest ./codegraph
 echo ""
 
-# Change to agent-api directory
-cd agent-api
-
-echo "[1/5] Stopping agent-api container (keeping database running)..."
-docker-compose stop agent-api || echo "Warning: Failed to stop agent-api container. It may not be running."
+echo "[1/6] Stopping backend and UI containers (keeping database running)..."
+docker compose stop agent-api ui || echo "Warning: Failed to stop containers. They may not be running."
 echo ""
 
-echo "[2/5] Removing old agent-api container..."
-docker-compose rm -f agent-api || echo "Warning: Failed to remove agent-api container. It may not exist."
+echo "[2/6] Removing old backend and UI containers..."
+docker compose rm -f agent-api ui || echo "Warning: Failed to remove containers. They may not exist."
 echo ""
 
-echo "[3/5] Building new Docker image with updated code..."
-docker-compose build agent-api
+echo "[3/6] Building new Docker images..."
+docker compose build agent-api ui
 echo ""
 
-echo "[4/5] Starting agent-api container with new image..."
-docker-compose up -d agent-api
+echo "[4/6] Starting backend container..."
+docker compose up -d agent-api
 echo ""
 
-echo "[5/5] Checking container status..."
+echo "[5/6] Starting UI container..."
+docker compose up -d ui
+echo ""
+
+echo "[6/6] Checking container status..."
 sleep 3
-docker-compose ps
+docker compose ps
 echo ""
 
 echo "========================================"
 echo "Rebuild Complete!"
 echo "========================================"
 echo ""
-echo "Data Status:"
-echo "  - Database: PRESERVED (postgres_data volume)"
-echo "  - Workflows: PRESERVED (./data directory)"
-echo "  - Storage: PRESERVED (./data/storage)"
-echo "  - Logs: PRESERVED (./data/logs)"
+echo "Containers:"
+echo "  - kyc-agent-db   (postgres)"
+echo "  - kyc-agent-api  (backend, :8000)"
+echo "  - kyc-agent-ui   (frontend, :8080)"
 echo ""
-echo "View logs: docker-compose logs -f agent-api"
-echo "Stop all: docker-compose down"
+echo "Open the app: http://localhost:8080"
+echo "View backend logs: docker compose logs -f agent-api"
+echo "View UI logs: docker compose logs -f ui"
+echo "Stop all: docker compose down"
 echo ""
-
-cd ..

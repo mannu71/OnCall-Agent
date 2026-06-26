@@ -1,21 +1,23 @@
 # OnCall Agent
 
-A desktop application for building and running AI-powered on-call investigation workflows. The UI is an Electron + React app; the backend is a Python FastAPI service that orchestrates agents, MCP tool servers, scheduled runs, and real-time execution streaming.
+A web application for building and running AI-powered on-call investigation workflows. The UI is a React app served via nginx in Docker (or Vite during local dev); the backend is a Python FastAPI service that orchestrates agents, MCP tool servers, scheduled runs, and real-time execution streaming.
 
 ## Project structure
 
 ```
 kyc-protect-oncall-agent/
+├── docker-compose.yml      # Full stack: postgres + backend + UI
 ├── agent-api/              # Python FastAPI backend (workflows, agents, MCP, scheduler)
 │   ├── app/                # Application code
 │   ├── migrations/         # PostgreSQL schema migrations (run manually)
-│   ├── docker-compose.yml  # PostgreSQL + agent-api containers
+│   ├── docker-compose.yml  # Backend only: postgres + agent-api
 │   ├── run-migration.bat   # Apply migrations (Windows)
 │   ├── run-migration.sh    # Apply migrations (Linux/macOS)
 │   └── requirements.txt    # Python dependencies
-├── ui/                     # Electron + React frontend
-│   ├── electron/           # Electron main process (starts backend when packaged)
+├── ui/                     # React frontend (Docker nginx or Vite dev)
 │   ├── src/                # React app (workflow builder, scheduler, settings)
+│   ├── Dockerfile          # UI container
+│   ├── docker-compose.yml  # UI only (joins backend network)
 │   └── package.json
 ├── setup.ps1               # Automated first-time setup (Windows PowerShell)
 ├── setup.sh                # Automated first-time setup (Linux / macOS)
@@ -29,7 +31,7 @@ Install these before setting up the project:
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| **Node.js** | 18+ | UI, Electron, and MCP servers (`npx`) |
+| **Node.js** | 18+ | UI dev server and MCP servers (`npx`) |
 | **npm** | 9+ | Frontend package management |
 | **Python** | 3.12+ | Backend API |
 | **Docker Desktop** | Latest | PostgreSQL (pgvector) and optional containerized backend |
@@ -82,6 +84,16 @@ chmod +x setup.sh
 
 When setup finishes, start the app:
 
+**Full Docker stack:**
+
+```bash
+docker build -t codegraph:latest ./codegraph
+docker compose up --build
+# Open http://localhost:8080
+```
+
+**Local development:**
+
 ```bash
 # Terminal 1 — backend
 cd agent-api
@@ -92,6 +104,7 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 # Terminal 2 — UI
 cd ui
 npm run dev
+# Open http://localhost:5173
 ```
 
 ---
@@ -198,7 +211,7 @@ aws configure --profile your-aws-profile
 # or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the environment
 ```
 
-If you use **Docker Compose for the full stack**, set `REPOS_HOST_PATH` in `agent-api/.env` (the setup script does this automatically). Docker Compose reads that value for the code analyzer volume mount.
+If you use **Docker Compose for the full stack from the repo root**, set `REPOS_HOST_PATH` in a `.env` file at the repo root (or export it in your shell). When using `agent-api/docker-compose.yml` alone, set it in `agent-api/.env` instead.
 
 ### Step 5 — Install backend dependencies
 
@@ -265,19 +278,26 @@ Verify the API is running:
 
 ### Step 8 — Start the UI
 
-In a **separate terminal**:
+**Full Docker stack (recommended for deployment):**
+
+```bash
+# From repo root — builds codegraph, then all three containers
+docker build -t codegraph:latest ./codegraph
+docker compose up --build
+```
+
+Open **http://localhost:8080** in your browser. The UI container (`kyc-agent-ui`) proxies `/api` to the backend container (`kyc-agent-api`) over the shared Docker network.
+
+**Local UI development (hot reload):**
+
+In a **separate terminal** (with backend running from Step 7 or Docker):
 
 ```bash
 cd ui
 npm run dev
 ```
 
-This starts:
-
-- Vite dev server on **http://localhost:5173**
-- Electron with hot reload
-
-In development mode, Electron expects the backend to already be running (Step 7). It does **not** auto-start the API.
+This starts the Vite dev server on **http://localhost:5173**. Vite proxies `/api` to `http://localhost:8000`.
 
 Optional frontend env file `ui/.env`:
 
@@ -286,11 +306,9 @@ VITE_AGENT_API_URL=http://localhost:8000
 VITE_API_URL=http://localhost:8000
 ```
 
-Vite also proxies `/api` to `http://localhost:8000` during development.
-
 ### Step 9 — Verify the installation
 
-1. Open the Electron window (or http://localhost:5173 in a browser).
+1. Open http://localhost:8080 (Docker) or http://localhost:5173 (Vite dev).
 2. Confirm **Settings** loads and the backend health check succeeds.
 3. Open http://localhost:8000/docs and confirm the API responds.
 
@@ -341,53 +359,60 @@ Add API keys or confirm AWS Bedrock access for the models your workflows use.
 
 ---
 
-## Run with Docker only (no local Python)
+## Run with Docker (full stack)
 
-If you prefer not to run Python locally:
+Build the codegraph engine first (required by the agent-api image), then start all services from the **repo root**:
 
 ```bash
-cd agent-api
+docker build -t codegraph:latest ./codegraph
 
-# 1. Start database
-docker-compose up -d postgres
+# 1. Start database (if not already running)
+docker compose up -d postgres
 
 # 2. Apply migrations (see Step 3)
 
-# 3. Start API + database
-docker-compose up --build
+# 3. Start postgres + backend + UI (separate containers)
+docker compose up --build
 ```
 
-Then start only the UI locally:
+Open the app at **http://localhost:8080**.
+
+### Run stacks independently
+
+Backend only (postgres + API):
+
+```bash
+cd agent-api
+docker compose up --build
+```
+
+UI only (requires backend running first to create the `oncall-agent` network):
 
 ```bash
 cd ui
+docker compose up --build
+```
+
+For local UI development with a Docker backend only:
+
+```bash
+cd agent-api
+docker compose up -d postgres agent-api
+
+cd ../ui
 npm install
 npm run dev
 ```
 
-Useful Docker commands:
+Useful Docker commands (from repo root):
 
 | Command | Description |
 |---------|-------------|
-| `docker-compose logs -f agent-api` | Follow API logs |
-| `docker-compose down` | Stop all containers |
-| `../rebuild-docker.bat` | Rebuild API image without losing DB data (Windows) |
+| `docker compose logs -f agent-api` | Follow backend logs |
+| `docker compose logs -f ui` | Follow UI/nginx logs |
+| `docker compose down` | Stop all containers |
+| `../rebuild-docker.bat` | Rebuild backend + UI without losing DB data (Windows) |
 | `../rebuild-docker.sh` | Same on Linux/macOS |
-
----
-
-## Build the desktop app (EXE)
-
-```bash
-cd ui
-npm run package
-```
-
-Output:
-
-- Portable Windows app: `ui/dist-electron/win-unpacked/OnCall Agent.exe`
-
-When packaged, Electron starts the FastAPI backend automatically from the bundled `agent-api` folder. You still need PostgreSQL running and migrations applied.
 
 ---
 
@@ -397,10 +422,10 @@ When packaged, Electron starts the FastAPI backend automatically from the bundle
 
 | Command | Description |
 |---------|-------------|
-| `npm run dev` | Vite + Electron with hot reload |
-| `npm run dev:vite` | Vite only (browser) |
-| `npm run build` | Build React frontend |
-| `npm run package` | Build and package Electron app |
+| `npm run dev` | Vite dev server on port 5173 (browser) |
+| `npm run dev:vite` | Same as `npm run dev` |
+| `npm run build` | Build React frontend for production |
+| `npm run preview` | Preview production build locally |
 | `npm run lint` | Run ESLint |
 
 ### Backend (`agent-api/`)
@@ -424,7 +449,7 @@ When packaged, Electron starts the FastAPI backend automatically from the bundle
 | MCP server connection fails | Node.js installed? `npx` works? Connection string and SSL certs correct? |
 | Bedrock / AWS errors | `AWS_PROFILE` or credentials configured? `PROVIDER_TRANSPORT=bedrock` set? |
 | Code analyzer cannot see repos | `REPOS_BASE_PATH` (local) or docker-compose volume mount points at your repos |
-| Electron shows blank page | Vite dev server running on port 5173 before Electron opens |
+| UI shows API errors in Docker | Check `docker compose logs ui agent-api`; confirm http://localhost:8080/api/v1/health |
 
 ---
 

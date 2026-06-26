@@ -1,4 +1,4 @@
-name: oncall-agent-backend
+name: oncall-agent
 
 services:
   postgres:
@@ -23,18 +23,15 @@ services:
 
   agent-api:
     build:
-      context: .
+      context: ./agent-api
       dockerfile: Dockerfile
     container_name: kyc-agent-api
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/app/data
+      - ./agent-api/data:/app/data
       - ~/.aws:/root/.aws:ro
-      # Host path for the code analyzer (set REPOS_HOST_PATH in .env). Mounted
-      # READ-WRITE so the gated edit_file tool can apply approved fixes; every
-      # edit still requires operator approval via the permission gate.
-      - ${REPOS_HOST_PATH:-./data/indexed_repos}:/app/data/indexed_repos
+      - ${REPOS_HOST_PATH:-./agent-api/data/indexed_repos}:/app/data/indexed_repos
     environment:
       - API_HOST=0.0.0.0
       - API_PORT=8000
@@ -51,6 +48,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - oncall-agent
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    container_name: kyc-agent-ui
+    ports:
+      - "3000:80"
+    depends_on:
+      - agent-api
     restart: unless-stopped
     networks:
       - oncall-agent

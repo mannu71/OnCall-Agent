@@ -1,8 +1,11 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
+import React, { createContext, useContext, useCallback, useMemo } from 'react';
 import PropTypes from 'prop-types';
+import { useQueryClient } from '@tanstack/react-query';
 import { agentApiClient } from '../services/agentApiClient';
 import { cronToLocalTime } from '../utils/cronUtils';
 import { getSchedulerNode, applyScheduleToWorkflow } from '../utils/workflowUtils';
+import { useWorkflowsQuery } from '../hooks/queries/useWorkflowsQuery';
+import { queryKeys } from '../lib/queryKeys';
 
 const SchedulerContext = createContext();
 
@@ -18,34 +21,13 @@ const formatTime = (timeString) => {
   if (!timeString) return '-';
   try {
     const [hours, minutes] = timeString.split(':');
-    const date = new Date(2024, 0, 15); // Fixed date to avoid DST issue
+    const date = new Date(2024, 0, 15);
     date.setHours(Number.parseInt(hours, 10), Number.parseInt(minutes, 10), 0, 0);
     return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   } catch {
     return timeString;
   }
 };
-
-function schedulesMetadataEqual(a, b) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    const x = a[i];
-    const y = b[i];
-    if (
-      x.name !== y.name ||
-      x.enabled !== y.enabled ||
-      x.schedule !== y.schedule ||
-      x.updatedAt !== y.updatedAt ||
-      x.startTime !== y.startTime ||
-      x.recurrence !== y.recurrence ||
-      x.indexingStatus !== y.indexingStatus ||
-      x.type !== y.type
-    ) {
-      return false;
-    }
-  }
-  return true;
-}
 
 const fromApi = (wf) => {
   let startTime;
@@ -80,90 +62,54 @@ const fromApi = (wf) => {
 };
 
 export const SchedulerProvider = ({ children }) => {
-  const [schedules, setSchedules] = useState([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState(null);
+  const queryClient = useQueryClient();
+  const { data: apiWorkflows, isLoading, error: queryError, refetch } = useWorkflowsQuery();
 
-  const loadSchedules = useCallback(async (silent = false) => {
-    try {
-      if (!silent) setIsLoading(true);
-      setError(null);
-      const apiWorkflows = await agentApiClient.listWorkflows();
-      const normalized = Array.isArray(apiWorkflows) ? apiWorkflows.map(fromApi) : [];
-      setSchedules(prev => {
-        if (silent && schedulesMetadataEqual(prev, normalized)) return prev;
-        return normalized;
-      });
-    } catch (err) {
-      console.error('Failed to load schedules:', err);
-      if (!silent) setError('Failed to connect to agent-api');
-    } finally {
-      if (!silent) setIsLoading(false);
-    }
-  }, []);
+  const schedules = useMemo(() => {
+    const list = Array.isArray(apiWorkflows) ? apiWorkflows : [];
+    return list.map(fromApi);
+  }, [apiWorkflows]);
 
-  useEffect(() => {
-    // Initial Load
-    loadSchedules(false);
+  const error = queryError ? 'Failed to connect to agent-api' : null;
 
-    // Background polling every 30 seconds (increased from 15s to reduce load)
-    const interval = setInterval(() => {
-      if (!document.hidden) loadSchedules(true);
-    }, 30000);
+  const invalidateWorkflows = useCallback(async () => {
+    await queryClient.invalidateQueries({ queryKey: queryKeys.workflows });
+  }, [queryClient]);
 
-    const handleVisibilityChange = () => {
-      if (!document.hidden) loadSchedules(true);
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => {
-      clearInterval(interval);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-    };
-  }, [loadSchedules]);
+  const loadSchedules = useCallback(async () => {
+    await refetch();
+  }, [refetch]);
 
   const addSchedule = useCallback(async (schedule) => {
     try {
-      setIsLoading(true);
       const existingWorkflow = await agentApiClient.getWorkflow(schedule.workflow);
       const payload = applyScheduleToWorkflow(existingWorkflow, schedule);
       await agentApiClient.updateWorkflow(schedule.workflow, payload);
-      await loadSchedules(true);
+      await invalidateWorkflows();
     } catch (err) {
-      setError('Failed to create schedule');
       throw err;
-    } finally {
-      setIsLoading(false);
     }
-  }, [loadSchedules]);
+  }, [invalidateWorkflows]);
 
   const updateSchedule = useCallback(async (name, updatedSchedule) => {
     try {
-      setIsLoading(true);
       const existingWorkflow = await agentApiClient.getWorkflow(name);
       const payload = applyScheduleToWorkflow(existingWorkflow, updatedSchedule);
       await agentApiClient.updateWorkflow(name, payload);
-      await loadSchedules(true);
+      await invalidateWorkflows();
     } catch (err) {
-      setError('Failed to update schedule');
       throw err;
-    } finally {
-      setIsLoading(false);
     }
-  }, [loadSchedules]);
+  }, [invalidateWorkflows]);
 
   const deleteSchedule = useCallback(async (name) => {
     try {
-      setIsLoading(true);
       await agentApiClient.deleteWorkflow(name);
-      await loadSchedules(true);
+      await invalidateWorkflows();
     } catch (err) {
-      setError('Failed to delete schedule');
       throw err;
-    } finally {
-      setIsLoading(false);
     }
-  }, [loadSchedules]);
+  }, [invalidateWorkflows]);
 
   const triggerWorkflow = useCallback(async (name) => {
     return await agentApiClient.executeWorkflow(name, true);
