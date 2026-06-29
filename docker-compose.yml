@@ -48,9 +48,23 @@ services:
       - CODEGRAPH_CACHE_DIR=/root/.cache/codegraph
       - CODEGRAPH_SEARCH_TIMEOUT=30
       - PROVIDER_TRANSPORT=bedrock
+      - COMPRESSION_ENABLED=true
+      - COMPRESSION_ENDPOINT=http://headroom:8787
+      - COMPRESSION_MIN_CHARS=500
+      - COMPRESSION_TIMEOUT_MS=2000
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - oncall-agent
+
+  headroom:
+    image: ghcr.io/chopratejas/headroom:latest
+    container_name: kyc-agent-headroom
+    command: ["--port", "8787"]
+    ports:
+      - "127.0.0.1:8787:8787"
     restart: unless-stopped
     networks:
       - oncall-agent

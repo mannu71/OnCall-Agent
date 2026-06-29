@@ -1165,9 +1165,28 @@ export default function Dashboard() {
               const outputTok = selectedRun?.output_tokens || _agentTok?.output_tokens || 0;
               const totalTok  = selectedRun?.total_tokens  || _agentTok?.total_tokens  || (inputTok + outputTok) || 0;
               if (!totalTok) return null;
+
+              // Bedrock sums cache-read tokens INTO input_tokens. Back them out so
+              // the panel shows what was actually reprocessed at full price vs.
+              // served cheaply from the prompt cache. cache reads bill ≈10% of
+              // fresh input, so "effective" input ≈ non-cached + 10% of cached.
+              const cacheReadTok = selectedRun?.cache_read_tokens || _agentTok?.cache_read_tokens || 0;
+              const nonCachedTok = Math.max(0, inputTok - cacheReadTok);
+              const cacheHitPct = inputTok > 0 ? Math.round((cacheReadTok / inputTok) * 100) : 0;
+              const effInputTok = Math.round(nonCachedTok + cacheReadTok * 0.1);
+              const savedTok = Math.max(0, inputTok - effInputTok);
+              const savedPct = inputTok > 0 ? Math.round((savedTok / inputTok) * 100) : 0;
+
               return (
                 <div className="bg-white rounded-lg border border-slate-200 p-6">
-                  <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-4">⚡ Token Usage</p>
+                  <div className="flex items-center justify-between mb-4">
+                    <p className="text-sm font-semibold text-slate-500 uppercase tracking-wider">⚡ Token Usage</p>
+                    {cacheReadTok > 0 && (
+                      <span className="text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-full px-2.5 py-0.5">
+                        {cacheHitPct}% cache hit · ~{savedPct}% cost saved
+                      </span>
+                    )}
+                  </div>
                   <div className="grid grid-cols-3 gap-4 text-center">
                     <div className="bg-blue-50 rounded-lg p-4">
                       <p className="text-xs font-medium text-slate-500 mb-1">Input</p>
@@ -1182,6 +1201,28 @@ export default function Dashboard() {
                       <p className="text-2xl font-bold text-slate-900">{totalTok.toLocaleString()}</p>
                     </div>
                   </div>
+                  {cacheReadTok > 0 && (
+                    <div className="mt-4 pt-4 border-t border-slate-100">
+                      <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-3">Input Breakdown</p>
+                      <div className="grid grid-cols-3 gap-4 text-center">
+                        <div>
+                          <p className="text-xs font-medium text-slate-500 mb-1">Non-cached</p>
+                          <p className="text-lg font-bold text-amber-600">{nonCachedTok.toLocaleString()}</p>
+                          <p className="text-[10px] text-slate-400">full price</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-slate-500 mb-1">Cache-read</p>
+                          <p className="text-lg font-bold text-emerald-600">{cacheReadTok.toLocaleString()}</p>
+                          <p className="text-[10px] text-slate-400">~10% price</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-slate-500 mb-1">Effective</p>
+                          <p className="text-lg font-bold text-slate-900">{effInputTok.toLocaleString()}</p>
+                          <p className="text-[10px] text-slate-400">billed-equiv input</p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })()}

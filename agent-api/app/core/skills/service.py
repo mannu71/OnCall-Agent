@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _DISTILL_SYSTEM = """\
-You are converting a completed investigation into a reusable, executable skill.
+You are converting a completed agent run into a reusable, executable skill.
 
 Return ONLY a JSON object — no markdown, no explanation.
 
@@ -95,14 +95,14 @@ Rules:
 - If a step requires human judgement and no tool, set tool to null.
 - Keep steps concrete and specific — not "check the logs" but "call cloudwatch_get_logs with log_group={log_group}".
 - Maximum 10 steps.
-- confidence is 0.0–1.0: how reliably this generalises to future incidents. A
-  one-off or shaky procedure scores low (<0.6); a clean, repeatable fix scores high.
+- confidence is 0.0–1.0: how reliably this generalises to future runs. A
+  one-off or shaky procedure scores low (<0.6); a clean, repeatable procedure scores high.
 """
 
 _DISTILL_USER = """\
-Investigation summary:
+Run summary:
 Query: {user_query}
-Root cause: {root_cause}
+Outcome: {outcome}
 Tool calls made ({tool_count}):
 {tool_summary}
 Resolution: {resolution}
@@ -326,10 +326,11 @@ class SkillService:
         """Invoke the LLM and parse the returned JSON."""
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        user_query  = state.get("user_query") or state.get("trigger") or ""
-        root_cause  = state.get("root_cause") or ""
+        user_query   = state.get("user_query") or state.get("trigger") or ""
         final_answer = state.get("final_answer") or ""
-        resolution  = root_cause or final_answer
+        root_cause   = state.get("root_cause") or ""
+        outcome      = final_answer or root_cause
+        resolution   = outcome
 
         tool_summary_lines = []
         for tc in tool_calls[:15]:
@@ -340,7 +341,7 @@ class SkillService:
 
         user_msg = _DISTILL_USER.format(
             user_query   = user_query[:400],
-            root_cause   = root_cause[:400],
+            outcome      = outcome[:400],
             tool_count   = len(tool_calls),
             tool_summary = "\n".join(tool_summary_lines) or "  (none recorded)",
             resolution   = resolution[:400],

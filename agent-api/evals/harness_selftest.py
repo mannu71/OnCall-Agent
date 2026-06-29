@@ -134,7 +134,7 @@ async def test_supervisor_loop() -> None:
     runs = {"n": 0}
     async def ra(a, q):
         runs["n"] += 1; return {"final_answer": "done", "input_tokens": 10, "output_tokens": 5, "tool_calls": []}
-    res, ti, to = await run_supervised(agent="a0", run_agent=ra, rebuild_agent=lambda: "a",
+    res, ti, to, tc = await run_supervised(agent="a0", run_agent=ra, rebuild_agent=lambda: "a",
         supervisor=FakeSup([V(SupervisorAction.PASS)]), base_query="Q", execution_id="e",
         logger_instance=log, wall_clock_budget=900)
     check("supervisor_loop PASS = 1 run", runs["n"] == 1 and ti == 10 and to == 5)
@@ -143,13 +143,13 @@ async def test_supervisor_loop() -> None:
     runs = {"n": 0}; rebuilds = {"n": 0}
     async def ra2(a, q):
         runs["n"] += 1; return {"final_answer": "x", "input_tokens": 7, "output_tokens": 3, "tool_calls": []}
-    res, ti, to = await run_supervised(agent="a0", run_agent=ra2, rebuild_agent=lambda: (rebuilds.__setitem__("n", rebuilds["n"] + 1) or "a2"),
+    res, ti, to, tc = await run_supervised(agent="a0", run_agent=ra2, rebuild_agent=lambda: (rebuilds.__setitem__("n", rebuilds["n"] + 1) or "a2"),
         supervisor=FakeSup([V(SupervisorAction.RETRY), V(SupervisorAction.PASS)]), base_query="Q",
         execution_id="e", logger_instance=log, wall_clock_budget=900)
     check("supervisor_loop RETRY→PASS rebuilds once", runs["n"] == 2 and rebuilds["n"] == 1 and ti == 14 and to == 6)
 
     # ESCALATE sets flag
-    res, _, _ = await run_supervised(agent="a0",
+    res, _, _, _ = await run_supervised(agent="a0",
         run_agent=lambda a, q: _coro({"final_answer": "weak", "input_tokens": 1, "output_tokens": 1, "tool_calls": []}),
         rebuild_agent=lambda: "a", supervisor=FakeSup([V(SupervisorAction.ESCALATE)]), base_query="Q",
         execution_id="e", logger_instance=log, wall_clock_budget=900)
@@ -1058,6 +1058,28 @@ def test_memory_capability_and_autolearn() -> None:
     # Safety: runtime code compilation is OFF by default.
     check("auto-learn compile_dynamic_nodes off by default",
           AutoLearnConfig().compile_dynamic_nodes is False)
+
+    # Generic-task state: only final_answer set, no root_cause / matched_pattern_ids.
+    # IncidentKBSink and LogPatternSink must both return applies=False.
+    from app.core.auto_learn import IncidentKBSink, LogPatternSink
+    generic_state = {"final_answer": "All checks passed.", "tool_calls": [], "confidence_score": 0.9}
+    check("IncidentKBSink does not apply for generic state (no root_cause)",
+          IncidentKBSink().applies(generic_state) is False)
+    check("LogPatternSink does not apply for generic state (no matched_pattern_ids)",
+          LogPatternSink().applies(generic_state) is False)
+
+    # Incident state: sinks must apply.
+    incident_state = {
+        "root_cause": "High error rate in payment-service due to DB timeout.",
+        "matched_pattern_ids": [1, 2],
+        "final_answer": "Rolled back migration.",
+        "tool_calls": [],
+        "confidence_score": 0.9,
+    }
+    check("IncidentKBSink applies for incident state (has root_cause)",
+          IncidentKBSink().applies(incident_state) is True)
+    check("LogPatternSink applies for incident state (has matched_pattern_ids)",
+          LogPatternSink().applies(incident_state) is True)
 
 
 def test_persona_and_supervisor_toggle() -> None:

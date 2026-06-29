@@ -112,7 +112,7 @@ class ToolCallGuardrailConfig:
 
     # Same tool (any args) failure thresholds
     same_tool_failure_warn_after: int = 3
-    same_tool_failure_halt_after: int = 8
+    same_tool_failure_halt_after: int = 2
 
     # Idempotent tool returning identical result thresholds
     no_progress_warn_after: int = 2
@@ -234,6 +234,12 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
         except (_json.JSONDecodeError, TypeError):
             pass
         return False, ""
+
+    # Terminal infra errors raised by the tool layer (timeout/disconnect after retries).
+    if "timed out after retries" in result or (
+        result.startswith("Tool '") and "failed:" in result
+    ):
+        return True, " [terminal]"
 
     lower = result[:500].lower()
     if any(kw in lower for kw in ('"error"', '"failed"')):

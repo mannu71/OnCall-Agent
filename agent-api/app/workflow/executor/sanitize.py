@@ -9,6 +9,7 @@ def build_node_result(value: Dict[str, Any]) -> Dict[str, Any]:
     node_result = {}
     for field in ('status', 'output', 'trigger_time', 'model',
                   'input_tokens', 'output_tokens', 'total_tokens',
+                  'cache_read_tokens',
                   'final_answer', 'structured_output', 'output_mode',
                   'tool_calls', 'provider', 'message_count', 'user_query',
                   'messages', 'ungrounded_ids', 'privacy_redactions',

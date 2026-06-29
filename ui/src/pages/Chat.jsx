@@ -280,7 +280,9 @@ function Chat() {
   const loadAgents = async () => {
     try {
       const workflows = await agentApiClient.listWorkflows();
-      const agentWorkflows = workflows.filter(wf => isAgentWorkflowValid(wf));
+      const agentWorkflows = workflows.filter(wf =>
+        wf.type === 'agent' && wf.enabled && isAgentWorkflowValid(wf)
+      );
       setAgents(agentWorkflows);
       return agentWorkflows;
     } catch (error) {
@@ -987,7 +989,7 @@ function Chat() {
         {/* Tool-approval gate (Permission Gatekeeping) */}
         {pendingApproval && (
           <div className="px-4 md:px-8 pb-2 flex-shrink-0">
-            <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 shadow-sm">
+            <div className="mx-auto w-full max-w-[var(--chat-max)] rounded-xl border border-amber-300 bg-amber-50 p-3 shadow-sm">
               <div className="flex items-center gap-2 text-amber-800 text-sm font-semibold mb-1">
                 <Terminal className="size-4" /> Approval required
                 {pendingApprovals.length > 1 && (
@@ -1035,9 +1037,9 @@ function Chat() {
           </div>
         )}
 
-        {/* Input tray panel */}
+        {/* Input tray panel — same max width as the message rail */}
         <div className="p-4 md:p-8 pt-0 md:pt-0 bg-transparent flex-shrink-0 z-10">
-          <div className="bg-white/80 dark:bg-[#1c1c1e]/80 backdrop-blur-xl border border-black/[0.08] dark:border-white/10 rounded-2xl p-3 flex flex-col gap-3 shadow-[0_4px_24px_rgb(0_0_0/0.06)] transition-colors focus-within:border-primary/60 focus-within:ring-2 focus-within:ring-primary/20">
+          <div className="mx-auto w-full max-w-[var(--chat-max)] bg-white/80 dark:bg-[#1c1c1e]/80 backdrop-blur-xl border border-black/[0.08] dark:border-white/10 rounded-2xl p-3 flex flex-col gap-3 shadow-[0_4px_24px_rgb(0_0_0/0.06)] transition-colors focus-within:border-primary/60 focus-within:ring-2 focus-within:ring-primary/20">
             
             {/* Multi-line chat Textarea */}
             <Textarea 
@@ -1051,15 +1053,15 @@ function Chat() {
               className="w-full min-h-[44px] max-h-48 border-none outline-none resize-none bg-transparent text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus-visible:ring-0 focus-visible:ring-offset-0 p-1"
             />
             
-            {/* Input Footer row */}
-            <div className="flex items-center justify-between gap-2 border-t border-slate-50 pt-2.5 flex-wrap">
-              <div className="flex gap-2 flex-wrap">
+            {/* Input Footer row — tools wrap; actions stay grouped on the right */}
+            <div className="flex flex-col gap-2 border-t border-slate-50 dark:border-white/[0.06] pt-2.5 sm:flex-row sm:items-center">
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 sm:gap-2">
                 <Button 
                   variant="ghost" 
                   size="sm" 
                   onClick={() => setShowToolsList(!showToolsList)}
                   className={cn(
-                    "h-8 rounded-lg text-xs font-semibold text-muted-foreground",
+                    "h-8 shrink-0 rounded-lg text-xs font-semibold text-muted-foreground",
                     showToolsList && "bg-red-50 text-primary hover:bg-red-50"
                   )}
                 >
@@ -1077,17 +1079,18 @@ function Chat() {
                         setInputValue('Trace correlation id <paste id here> ');
                         setTimeout(() => inputRef.current?.focus(), 0);
                       }}
-                      className="h-8 rounded-lg text-xs font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-700"
+                      className="h-8 shrink-0 rounded-lg text-xs font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-700"
                       title="Insert a correlation/trace ID lookup template"
                     >
-                      🔎 Trace ID
+                      <Search className="size-3.5 shrink-0" data-icon="inline-start" />
+                      <span className="max-[420px]:hidden">Trace ID</span>
                     </Button>
 
                     {/* Time range scoping for CloudWatch lookups */}
                     <Select value={timeRange} onValueChange={setTimeRange}>
                       <SelectTrigger
                         size="sm"
-                        className="h-8 w-[74px] rounded-lg text-xs font-semibold text-slate-600"
+                        className="h-8 w-[74px] shrink-0 rounded-lg text-xs font-semibold text-slate-600"
                         title="Time range for CloudWatch lookups"
                       >
                         <SelectValue />
@@ -1106,25 +1109,27 @@ function Chat() {
                 {/* Runtime pick for this turn: Legacy (ReAct) vs Deepagent. */}
                 <HarnessToggle value={harness} onChange={setHarness} />
               </div>
-              
-              {isLoading && (
-                <button
-                  type="button"
-                  onClick={handleStop}
-                  disabled={isStopping}
-                  title="Stop agent"
-                  className="flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold bg-red-50 text-red-600 border border-red-200 hover:bg-red-100 hover:border-red-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <Square className="size-3 fill-current" />
-                  {isStopping ? 'Stopping…' : 'Stop'}
-                </button>
-              )}
-              <SendButton
-                onClick={handleSendClick}
-                disabled={!inputValue.trim() || isLoading}
-                phase={sendPhase}
-                launching={sendLaunching}
-              />
+
+              <div className="flex shrink-0 items-center justify-end gap-2 sm:ml-2">
+                {isLoading && (
+                  <button
+                    type="button"
+                    onClick={handleStop}
+                    disabled={isStopping}
+                    title="Stop agent"
+                    className="flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold bg-red-50 text-red-600 border border-red-200 hover:bg-red-100 hover:border-red-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <Square className="size-3 fill-current" />
+                    {isStopping ? 'Stopping…' : 'Stop'}
+                  </button>
+                )}
+                <SendButton
+                  onClick={handleSendClick}
+                  disabled={!inputValue.trim() || isLoading}
+                  phase={sendPhase}
+                  launching={sendLaunching}
+                />
+              </div>
             </div>
 
           </div>

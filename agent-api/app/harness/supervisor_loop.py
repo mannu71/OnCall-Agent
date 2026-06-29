@@ -42,7 +42,7 @@ async def run_supervised(
 ) -> Tuple[Dict[str, Any], int, int]:
     """Run the agent under supervisor review with hard termination bounds.
 
-    Returns ``(result, accum_input_tokens, accum_output_tokens)``.
+    Returns ``(result, accum_input_tokens, accum_output_tokens, accum_cache_read_tokens)``.
     """
     # Lazy imports to avoid the import cycle documented at module top.
     from app.workflow.strategies.react.helpers import estimate_confidence
@@ -53,10 +53,12 @@ async def run_supervised(
     result: Dict[str, Any] = {}
     accum_input_tokens = 0
     accum_output_tokens = 0
-    token_budget = supervisor._cfg.token_budget if supervisor else 0
+    accum_cache_read_tokens = 0
+    _cfg = getattr(supervisor, "_cfg", None) if supervisor else None
+    token_budget = getattr(_cfg, "token_budget", 0) or 0
 
     # Defensive hard bounds (see module docstring).
-    max_iterations = (supervisor._cfg.max_retries + 1) if supervisor else 1
+    max_iterations = (getattr(_cfg, "max_retries", 0) + 1) if supervisor else 1
     loop_deadline = time.monotonic() + float(wall_clock_budget)
     iteration = 0
 
@@ -79,9 +81,20 @@ async def run_supervised(
             result["supervisor_retry_exhausted"] = True
             break
 
+        if token_budget and (accum_input_tokens + accum_output_tokens) >= token_budget:
+            logger_instance.warning(
+                "supervisor_loop: pre-call token budget already exhausted (%d >= %d) — stopping",
+                accum_input_tokens + accum_output_tokens,
+                token_budget,
+                extra={"execution_id": execution_id},
+            )
+            result["supervisor_token_budget_exhausted"] = True
+            break
+
         result = await run_agent(agent, current_query)
         accum_input_tokens += result.get("input_tokens", 0) or 0
         accum_output_tokens += result.get("output_tokens", 0) or 0
+        accum_cache_read_tokens += result.get("cache_read_tokens", 0) or 0
 
         final_answer = result.get("final_answer") or ""
         confidence = estimate_confidence(final_answer, result.get("tool_calls", []))
@@ -138,4 +151,4 @@ async def run_supervised(
             break
         break
 
-    return result, accum_input_tokens, accum_output_tokens
+    return result, accum_input_tokens, accum_output_tokens, accum_cache_read_tokens

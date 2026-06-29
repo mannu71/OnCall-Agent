@@ -48,7 +48,12 @@ _ALWAYS_KEEP_NAMES = {
     "write_todos", "update_todo", "run_command",
     "fs_write", "fs_read", "fs_ls", "fs_grep",
 }
-# char/4 token heuristic; cutoff above which disclosure activates in "auto".
+# char/4 token heuristic for schema size estimation. This is intentionally
+# approximate — the gate activates on a soft cliff (20K tokens), not a hard
+# limit. Bedrock tokenises closer to 3.5 chars/token for dense JSON, so the
+# real token cost can be ~15% higher than this estimate. Acceptable: when the
+# threshold is wrong it errs on the side of *not* deferring (binding more
+# tools directly), which is the safer direction for accuracy.
 _CHARS_PER_TOKEN = 4.0
 _DEFAULT_CUTOFF_TOKENS = 20_000
 # Count-based trigger: a server like Azure DevOps (~90 tools) is only ~5K tokens

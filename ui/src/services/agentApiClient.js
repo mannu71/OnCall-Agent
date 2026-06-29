@@ -712,6 +712,21 @@ export const agentApiClient = {
         return response.data;
     },
 
+    async getSkill(name) {
+        const response = await client.get(`/api/v1/skills/${encodeURIComponent(name)}`);
+        return response.data; // { success, skill: {...} }
+    },
+
+    async updateSkill(name, body) {
+        const response = await client.put(`/api/v1/skills/${encodeURIComponent(name)}`, body);
+        return response.data;
+    },
+
+    async deleteFsSkill(name) {
+        const response = await client.delete(`/api/v1/skills/fs/${encodeURIComponent(name)}`);
+        return response.data;
+    },
+
     /**
      * Force a full rebuild of a repository index (bypasses the skip-if-unchanged
      * SHA check). Returns the refreshed repo overview.

@@ -120,9 +120,19 @@ def _find_scheduler_node(nodes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]
 
 
 def _clear_schedule_fields(workflow_dict: Dict[str, Any]) -> None:
-    """Clear schedule-related fields from workflow."""
-    workflow_dict.update({'schedule': None, 'enabled': False})
-    logger.info("[SYNC] No scheduler node found, clearing schedule")
+    """Clear schedule-related fields from workflow.
+
+    For agentic processes (type='agent') we only clear the schedule expression —
+    the enabled state is user-owned (Active toggle) and must not be forced off.
+    Standard workflows without a scheduler node are disabled since they have no
+    trigger mechanism.
+    """
+    if workflow_dict.get("type") == "agent":
+        workflow_dict["schedule"] = None
+        logger.info("[SYNC] Agentic process — clearing schedule only (preserving enabled)")
+    else:
+        workflow_dict.update({'schedule': None, 'enabled': False})
+        logger.info("[SYNC] No scheduler node found, clearing schedule")
 
 
 #: Schedule-node weekday label → cron day-of-week number (Sun=0 … Sat=6).
@@ -819,6 +829,14 @@ async def execute_workflow(
             message=f"Workflow '{workflow_name}' not found",
             details={"workflow_name": workflow_name}
         )
+
+    # Block execution of inactive workflows (standard and agentic alike)
+    if not workflow.get("enabled", True):
+        return {
+            "status": "inactive",
+            "workflow_name": workflow_name,
+            "message": f"Workflow '{workflow_name}' is not active. Enable it before running."
+        }
 
     # Check if already running (prevents duplicate executions)
     if await is_workflow_running(workflow_name):

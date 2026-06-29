@@ -310,6 +310,31 @@ class SkillManager:
         
         return self._skills.get(name)
     
+    def delete_skill(self, name: str) -> bool:
+        """Delete a filesystem skill by removing its directory.
+
+        Returns True if the skill was found and deleted, False otherwise.
+        Never raises — logs errors instead.
+        """
+        if not self._loaded:
+            self.scan_skills()
+
+        skill = self._skills.get(name)
+        if skill is None:
+            return False
+
+        try:
+            import shutil
+            skill_dir = skill.skill_dir
+            if skill_dir.exists():
+                shutil.rmtree(skill_dir)
+            del self._skills[name]
+            logger.info("SkillManager: deleted filesystem skill '%s' from %s", name, skill_dir)
+            return True
+        except Exception as exc:
+            logger.warning("SkillManager: failed to delete skill '%s': %s", name, exc)
+            return False
+
     def get_preloaded_skills_content(
         self,
         config_overrides: Optional[Dict[str, Any]] = None,

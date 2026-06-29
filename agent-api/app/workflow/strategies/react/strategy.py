@@ -456,7 +456,7 @@ class ReactStrategy(BaseStrategy):
 
             # Bounded supervisor loop (run → score → retry/HITL/escalate) lives in
             # the harness now; it enforces iteration / wall-clock / token bounds.
-            result, _accum_input_tokens, _accum_output_tokens = await run_supervised(
+            result, _accum_input_tokens, _accum_output_tokens, _accum_cache_read_tokens = await run_supervised(
                 agent=agent,
                 run_agent=_run_agent,
                 rebuild_agent=_rebuild_agent,
@@ -641,6 +641,7 @@ class ReactStrategy(BaseStrategy):
                 "input_tokens": _accum_input_tokens,
                 "output_tokens": _accum_output_tokens,
                 "total_tokens": _accum_input_tokens + _accum_output_tokens,
+                "cache_read_tokens": _accum_cache_read_tokens,
             }
 
         except Exception as error:

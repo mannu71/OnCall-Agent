@@ -168,7 +168,23 @@ async def execute_agent(
                 _prior_messages.append(AIMessage(content=_text))
             elif _role in ("user", "human"):
                 _prior_messages.append(HumanMessage(content=_text))
-        except Exception:  # noqa: BLE001
+            elif _role == "system":
+                logger_instance.debug(
+                    "ReactStrategy: skipping system message from conversation history"
+                )
+            elif _role == "tool":
+                logger_instance.debug(
+                    "ReactStrategy: skipping tool message from conversation history"
+                )
+            else:
+                logger_instance.warning(
+                    "ReactStrategy: dropping conversation history message with unrecognised role %r",
+                    _role,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger_instance.debug(
+                "ReactStrategy: skipping malformed conversation history entry: %s", exc
+            )
             continue
     input_state = {"messages": _prior_messages + [HumanMessage(content=user_query)]}
 
@@ -305,6 +321,31 @@ async def execute_agent(
                 )
                 if msgs:
                     from langchain_core.messages import HumanMessage
+
+                    # The recovery state is, by definition, the LARGEST the
+                    # context ever gets (the agent looped to the recursion
+                    # limit). Synthesizing over the full bloated history is a
+                    # 200K+ token call that is slow and can time out. Compact it
+                    # first — deterministic, LLM-free pruning of stale tool
+                    # results — so the final synthesis is small, fast, and
+                    # reliable. This is the automatic long-context recovery.
+                    _before = len(msgs)
+                    try:
+                        msgs = compact_input_state({"messages": msgs})["messages"]
+                        if len(msgs) != _before:
+                            logger_instance.info(
+                                "ReactStrategy: compacted recovery context %d → %d messages "
+                                "before final synthesis (execution_id=%s)",
+                                _before, len(msgs), execution_id,
+                            )
+                    except Exception as _comp_exc:  # noqa: BLE001 — best-effort
+                        logger_instance.warning(
+                            "ReactStrategy: recovery compaction skipped (%s); "
+                            "synthesizing over full history (execution_id=%s)",
+                            _comp_exc, execution_id,
+                        )
+                    msgs = _strip_dangling_tool_calls(msgs)
+
                     msgs = msgs + [HumanMessage(content=(
                         "You have gathered enough information and may NOT call any more tools. "
                         "Give your FINAL answer now, citing concrete file:line evidence. If you "
@@ -377,9 +418,19 @@ async def execute_agent(
             parsed["last_stop_reason"], parsed["fallback_output_tokens"], execution_id,
         )
         try:
+            # The truncated turn ends with an assistant message. Bedrock (Converse)
+            # rejects a request whose conversation ends on an assistant message
+            # ("does not support assistant message prefill. The conversation must
+            # end with a user message"), so we must append a user turn to continue.
+            # The nudge both satisfies that constraint and tells the model to finish.
+            from langchain_core.messages import HumanMessage
+            _cont_msgs = list(result_state.get("messages", [])) + [HumanMessage(content=(
+                "Continue and COMPLETE your previous answer. Do not repeat what you "
+                "already wrote; finish it, citing concrete file:line evidence."
+            ))]
             cont_state = await invoke_agent(
                 agent,
-                {"messages": result_state.get("messages", [])},
+                {"messages": _cont_msgs},
                 {**run_config, "recursion_limit": _CONTINUATION_RECURSION_LIMIT},
             )
             cont_parsed = _serialize_agent_result(cont_state)
@@ -486,6 +537,12 @@ async def execute_agent(
         except Exception:  # noqa: BLE001
             pass
 
+    # cache_read_tokens: how many input tokens were served from the Bedrock
+    # prompt cache (≈10% the price of fresh input). The provider sums cache
+    # reads INTO input_tokens, so input_tokens − cache_read = the true
+    # non-cached (full-price) portion. Surfacing it lets the UI show real
+    # savings instead of a number inflated by cache reuse.
+    _cache_read_tokens = getattr(token_cb, "cache_read_tokens", 0) or 0
     result: Dict[str, Any] = {
         "final_answer":   final_answer,
         "messages":       serialized_messages,
@@ -493,6 +550,7 @@ async def execute_agent(
         "input_tokens":   total_input_tokens,
         "output_tokens":  total_output_tokens,
         "total_tokens":   total_input_tokens + total_output_tokens,
+        "cache_read_tokens": _cache_read_tokens,
     }
     if parsed.get("truncated"):
         result["truncated"] = True
@@ -852,6 +910,16 @@ async def execute_agent_stream(
                         _gc_post.action.upper(), tool_name, _gc_post.count, _gc_post.message,
                         extra={"execution_id": execution_id},
                     )
+                    if _gc_post.action == "halt":
+                        try:
+                            await stream_callback.on_error(
+                                f"Tool '{tool_name}' halted the run: {_gc_post.message}"
+                            )
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            f"Tool '{tool_name}' halted the agent run: {_gc_post.message}"
+                        )
 
                 try:
                     await stream_callback.on_tool_result(tool_name, output_str[:2000])

@@ -165,6 +165,12 @@ async def lifespan(app: FastAPI):
         await close_persistence()
     except Exception:
         pass
+    try:
+        from app.core.compaction.compressor import close_client as close_compressor_client
+
+        await close_compressor_client()
+    except Exception:
+        pass
 
 
 # Create FastAPI application

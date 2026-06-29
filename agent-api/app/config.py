@@ -276,6 +276,12 @@ class Settings(BaseSettings):
     # the limit mid-investigation and returned a "Let me search…" preamble.
     # Override via AGENT_RECURSION_LIMIT.
     agent_recursion_limit: int = Field(default=25, validation_alias="AGENT_RECURSION_LIMIT")
+    # Bedrock client read timeout (seconds). Botocore's 60s default is too short
+    # for large-context synthesis calls (200K+ tokens, including the forced
+    # recovery synthesis after a recursion-limit hit), which raised
+    # "Read timeout on endpoint URL …/converse" and failed the run.
+    # Override via BEDROCK_READ_TIMEOUT_SECONDS.
+    bedrock_read_timeout_seconds: int = Field(default=300, validation_alias="BEDROCK_READ_TIMEOUT_SECONDS")
     # Default per-turn output-token cap for agent/workflow LLM calls. 4096 was
     # too small: the model could exhaust its budget mid-reasoning (right before
     # emitting a tool_use), get cut off with stopReason="max_tokens", and have
@@ -352,6 +358,25 @@ class Settings(BaseSettings):
     # (avoids storing low-value/uncertain results). 0 captures everything.
     memory_capture_min_confidence: float = Field(
         default=0.6, validation_alias="MEMORY_CAPTURE_MIN_CONFIDENCE"
+    )
+
+    # ── Tool-output compression ──────────────────────────────────────────────
+    # Replaces lossy char-truncation with type-aware reversible compression for
+    # large MCP tool outputs. Compression runs in a local sidecar (no LLM call).
+    # Opt-in (default off); on timeout/error falls back to existing truncation.
+    compression_enabled: bool = Field(
+        default=False, validation_alias="COMPRESSION_ENABLED"
+    )
+    compression_endpoint: str = Field(
+        default="http://headroom:8787", validation_alias="COMPRESSION_ENDPOINT"
+    )
+    # Only compress outputs larger than this; smaller ones go straight to truncation.
+    compression_min_chars: int = Field(
+        default=2000, validation_alias="COMPRESSION_MIN_CHARS"
+    )
+    # Hard timeout for a single compress call (ms). On expiry, fall back to truncation.
+    compression_timeout_ms: int = Field(
+        default=250, validation_alias="COMPRESSION_TIMEOUT_MS"
     )
 
     # ── Per-turn durable-fact extraction + audit loop ────────────────────────
@@ -636,6 +661,7 @@ class Settings(BaseSettings):
             "cloudwatch_auto_escalate": False,
             "cloudwatch_auto_drilldown": False,
             "startup_indexing_recovery_enabled": False,
+            "compression_enabled": False,
         }
         for name, value in lite_defaults.items():
             if name not in self.model_fields_set:

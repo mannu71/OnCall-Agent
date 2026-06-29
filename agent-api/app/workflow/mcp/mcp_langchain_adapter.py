@@ -16,6 +16,7 @@ import logging
 from typing import Any, Dict, List, Optional, Type
 
 from app.config import settings
+from app.core.compaction.compressor import compress_text
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field, create_model
@@ -60,6 +61,42 @@ def _truncate_output(text: str, max_chars: int = MCP_TOOL_OUTPUT_MAX_CHARS) -> s
     return text[:max_chars] + suffix
 
 
+async def _compress_or_truncate(text: str) -> str:
+    """Compress large tool output when enabled; fall back to lossy truncation.
+
+    Compression is type-aware and reversible (no data loss); truncation is the
+    existing lossy char-cap kept as the safety net when compression is disabled
+    or the sidecar is unreachable.
+    """
+    chars = len(text)
+    if settings.compression_enabled and chars > settings.compression_min_chars:
+        logger.info(
+            "Compression: attempting %d-char tool output (min_chars=%d)",
+            chars,
+            settings.compression_min_chars,
+        )
+        result = await compress_text(
+            text,
+            endpoint=settings.compression_endpoint,
+            timeout_ms=settings.compression_timeout_ms,
+        )
+        if result.compressed:
+            logger.info(
+                "Compression: %d → %d chars (%.0f%% saved, %d → %d tokens)",
+                chars,
+                len(result.text),
+                (1 - len(result.text) / max(chars, 1)) * 100,
+                result.tokens_before,
+                result.tokens_after,
+            )
+            return result.text
+        logger.info(
+            "Compression: sidecar returned unchanged text for %d-char output; falling back to truncate",
+            chars,
+        )
+    return _truncate_output(text)
+
+
 def _build_input_schema(tool_schema: Optional[Dict[str, Any]]) -> Type[BaseModel]:
     """
     Dynamically build a Pydantic model from an MCP inputSchema definition.
@@ -74,15 +111,34 @@ def _build_input_schema(tool_schema: Optional[Dict[str, Any]]) -> Type[BaseModel
     Returns:
         A Pydantic BaseModel class with fields matching the MCP schema.
     """
-    if not tool_schema or not tool_schema.get("properties"):
-        # No schema — accept a single free-form JSON string argument
-        return create_model("MCPToolInput", query=(str, Field(default="", description="Tool arguments as JSON string")))
+    _free_form = create_model(
+        "MCPToolInput",
+        query=(str, Field(default="", description="Tool arguments as JSON string")),
+    )
 
-    properties: Dict[str, Any] = tool_schema.get("properties", {})
-    required: List[str] = tool_schema.get("required", [])
+    if not tool_schema or not tool_schema.get("properties"):
+        return _free_form
+
+    properties = tool_schema.get("properties", {})
+    if not isinstance(properties, dict):
+        logger.warning(
+            "MCP tool schema 'properties' is not a dict (got %s) — "
+            "falling back to free-form input model",
+            type(properties).__name__,
+        )
+        return _free_form
+
+    required_raw = tool_schema.get("required", [])
+    required: List[str] = required_raw if isinstance(required_raw, list) else []
 
     field_definitions: Dict[str, Any] = {}
     for prop_name, prop_schema in properties.items():
+        if not isinstance(prop_schema, dict):
+            logger.warning(
+                "MCP schema property '%s' has a non-dict schema (got %s) — skipping",
+                prop_name, type(prop_schema).__name__,
+            )
+            continue
         prop_type = prop_schema.get("type", "string")
         description = prop_schema.get("description", prop_name)
 
@@ -163,9 +219,6 @@ class MCPToolWrapper(BaseTool):
         )
 
         if result.get("isError"):
-            # MCP servers put error details in `content`, not `error` (which is
-            # only set on transport-level failures). Extract the text so the agent
-            # can see the real message and self-correct (e.g. wrong project name).
             raw = result.get("content") or result.get("error") or "Unknown MCP tool error"
             if isinstance(raw, list):
                 parts = []
@@ -179,7 +232,14 @@ class MCPToolWrapper(BaseTool):
                 error_msg = "\n".join(parts) or "Unknown MCP tool error"
             else:
                 error_msg = str(raw)
-            logger.warning("MCPToolWrapper: tool returned error: %s", error_msg)
+            logger.warning("MCPToolWrapper: tool error (terminal=%s): %s", result.get("terminal"), error_msg)
+            if result.get("terminal"):
+                # Infrastructure failure after retries exhausted (timeout, disconnect).
+                # Raise so the agent run terminates immediately rather than the agent
+                # re-calling the same broken tool.
+                raise RuntimeError(f"Tool '{self.tool_name}' failed: {error_msg}")
+            # MCP application error (wrong args, not found, permission denied) —
+            # return as string so the agent can self-correct with different arguments.
             return f"[Tool Error] {error_msg}"
 
         content = result.get("content", "")
@@ -193,9 +253,9 @@ class MCPToolWrapper(BaseTool):
                     parts.append(item.get("text", json.dumps(item)))
                 else:
                     parts.append(str(item))
-            return _truncate_output("\n".join(parts))
+            return await _compress_or_truncate("\n".join(parts))
 
-        return _truncate_output(str(content)) if content else "Tool executed successfully (no output)"
+        return await _compress_or_truncate(str(content)) if content else "Tool executed successfully (no output)"
 
 
 def build_langchain_tools(
@@ -326,4 +386,9 @@ def _get_tool_metadata(mcp_manager: Any, server_id: str, tool_name: str) -> Opti
             "description": getattr(tool_obj, "description", ""),
             "inputSchema": getattr(tool_obj, "inputSchema", None),
         }
+    logger.debug(
+        "MCP: no cached metadata for tool '%s' on server '%s' — "
+        "falling back to generic description",
+        tool_name, server_id,
+    )
     return None

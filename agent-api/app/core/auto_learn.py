@@ -1,27 +1,28 @@
-"""Closed learning loop — automatically learn from completed investigations.
+"""Closed learning loop — automatically learn from completed agent runs.
 
-When an investigation finishes the agent optionally triggers this module to:
+When an agent execution finishes the module optionally:
   1. **Auto-approve gate** — if confidence ≥ threshold, skip HITL and learn
      immediately; otherwise record the result and wait for engineer approval.
-  2. **KB upsert** — insert or update the ``knowledge_entries`` table so future
-     investigations recall this resolution (pgvector similarity search).
-  3. **Pattern upsert** — bump occurrence_count / confidence in log_patterns
-     so high-frequency signatures surface first in recall.
-  4. **Trajectory write** — append a structured JSONL record to the
+  2. **LearningSink dispatch** — iterates registered sinks; each sink decides
+     via ``applies(state)`` whether it is relevant to the current run.
+     Built-in sinks: IncidentKBSink (knowledge_entries upsert) and
+     LogPatternSink (log_patterns severity bump).  Third-party sinks can be
+     appended to ``DEFAULT_SINKS`` before the service is instantiated.
+  3. **Trajectory write** — append a structured JSONL record to the
      trajectory file for audit and quality tracking.
-  5. **Skill distillation** — when ≥ MIN_TOOL_CALLS tool calls were made,
+  4. **Skill distillation** — when ≥ MIN_TOOL_CALLS tool calls were made,
      delegate to ``SkillService.distill()`` to produce a structured, executable
-     skill saved to the ``skills`` table.
+     skill.
 
 Usage (call from the synthesis / learn node in the LangGraph graph)::
 
     from app.core.auto_learn import AutoLearnService, AutoLearnConfig
 
     svc = AutoLearnService(db_session, llm=aux_llm)
-    result = await svc.learn(execution_id, investigation_state)
+    result = await svc.learn(execution_id, agent_state)
 
-The service is designed to be called **outside** the main investigation
-transaction — a failure here must never fail the investigation itself.
+The service is designed to be called **outside** the main agent transaction —
+a failure here must never fail the agent itself.
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ import json
 import logging
 import os
 import re
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,8 +56,8 @@ class AutoLearnConfig:
         os.getenv("AUTO_LEARN_THRESHOLD", "0.85")
     )
 
-    # Minimum number of tool calls in an investigation before skill distillation
-    # is attempted (prevents generating trivial one-liner skills).
+    # Minimum number of tool calls before skill distillation is attempted
+    # (prevents generating trivial one-liner skills).
     min_tool_calls_for_skill: int = int(
         os.getenv("AUTO_LEARN_MIN_TOOL_CALLS", "5")
     )
@@ -81,7 +83,21 @@ class AutoLearnConfig:
     # AUTO_LEARN_COMPILE_NODES env var.
     compile_dynamic_nodes: bool = os.getenv("AUTO_LEARN_COMPILE_NODES", "false").lower() == "true"
 
-    # Confidence delta added per occurrence.
+    # Keywords in the user query that trigger dynamic node compilation.
+    # Configurable so non-incident workflows can set domain-appropriate triggers.
+    compile_node_keywords: List[str] = field(default_factory=lambda: list(
+        kw.strip()
+        for kw in os.getenv(
+            "AUTO_LEARN_COMPILE_KEYWORDS",
+            "parse,extract,hex,regex,map,resolve",
+        ).split(",")
+        if kw.strip()
+    ))
+
+    # Name to give the compiled dynamic node.
+    compile_node_name: str = os.getenv("AUTO_LEARN_COMPILE_NODE_NAME", "log_parser")
+
+    # Confidence delta added per occurrence (used by LogPatternSink).
     confidence_delta: float = 0.10
 
     # Maximum confidence ceiling.
@@ -90,6 +106,161 @@ class AutoLearnConfig:
 
 # Singleton default config — callers may pass a custom one.
 _DEFAULT_CONFIG = AutoLearnConfig()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LearningSink protocol
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LearningSink(ABC):
+    """Abstract base for pluggable post-run learning writers.
+
+    Each sink is responsible for a single write concern (e.g. KB upsert,
+    pattern bump).  ``AutoLearnService.learn()`` iterates all registered sinks
+    and calls ``persist()`` only when ``applies()`` returns True.
+
+    Failures inside ``persist()`` must be caught internally and return False —
+    they must never propagate to the caller.
+    """
+
+    @abstractmethod
+    def applies(self, state: Dict[str, Any]) -> bool:
+        """Return True when this sink is relevant for the given state."""
+
+    @abstractmethod
+    async def persist(
+        self,
+        execution_id: str,
+        state: Dict[str, Any],
+        db: Any,
+    ) -> bool:
+        """Write the learning artifact.  Return True on success, False on skip/fail."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Built-in sinks  (incident-domain — no-op for generic tasks)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class IncidentKBSink(LearningSink):
+    """Upsert a knowledge_entries row from an incident root-cause analysis.
+
+    Only runs when ``state["root_cause"]`` is present — generic tasks that
+    only set ``final_answer`` are silently skipped.
+    """
+
+    def applies(self, state: Dict[str, Any]) -> bool:
+        return bool((state.get("root_cause") or "").strip())
+
+    async def persist(
+        self,
+        execution_id: str,
+        state: Dict[str, Any],
+        db: Any,
+    ) -> bool:
+        if db is None:
+            logger.debug("IncidentKBSink: no DB session — skipping")
+            return False
+
+        root_cause = (state.get("root_cause") or "").strip()
+        try:
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+            from app.models.db_models import KnowledgeEntryModel
+
+            title = _make_title(root_cause)
+            symptoms = _extract_symptoms(state)
+            solution = _build_solution(state)
+
+            stmt = pg_insert(KnowledgeEntryModel).values(
+                title=title,
+                description=root_cause[:2000],
+                symptoms=symptoms,
+                solution=solution,
+                category=state.get("workflow_name", "general"),
+                source="agent",
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            ).on_conflict_do_update(
+                index_elements=["title"],
+                set_={
+                    "description": root_cause[:2000],
+                    "solution": solution,
+                    "source": "agent",
+                    "updated_at": datetime.now(timezone.utc),
+                },
+            )
+            await db.execute(stmt)
+            await db.commit()
+            logger.info(
+                "IncidentKBSink: knowledge_entry upserted (execution_id=%s, title=%r)",
+                execution_id, title,
+            )
+            return True
+
+        except Exception as exc:
+            logger.warning("IncidentKBSink: KB upsert failed — %s", exc)
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            return False
+
+
+class LogPatternSink(LearningSink):
+    """Increment severity for log_patterns matched during this run.
+
+    Only runs when ``state["matched_pattern_ids"]`` is non-empty.
+    """
+
+    def applies(self, state: Dict[str, Any]) -> bool:
+        return bool(state.get("matched_pattern_ids"))
+
+    async def persist(
+        self,
+        execution_id: str,
+        state: Dict[str, Any],
+        db: Any,
+    ) -> bool:
+        if db is None:
+            return False
+
+        pattern_ids: List[int] = state.get("matched_pattern_ids") or []
+        if not pattern_ids:
+            return False
+
+        try:
+            from sqlalchemy import text
+
+            for pid in pattern_ids:
+                await db.execute(
+                    text(
+                        """
+                        UPDATE log_patterns
+                        SET severity = LEAST(severity + 1, 10),
+                            updated_at = NOW()
+                        WHERE id = :pid
+                        """
+                    ),
+                    {"pid": pid},
+                )
+            await db.commit()
+            logger.info("LogPatternSink: bumped %d log_pattern(s)", len(pattern_ids))
+            return True
+
+        except Exception as exc:
+            logger.warning("LogPatternSink: pattern bump failed — %s", exc)
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            return False
+
+
+# Default sinks registered for every AutoLearnService instance.
+# Append custom sinks here before the service is first instantiated.
+DEFAULT_SINKS: List[LearningSink] = [
+    IncidentKBSink(),
+    LogPatternSink(),
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,7 +288,11 @@ def _trajectory_entry(
         "tool_call_count": len(tool_calls),
         "tool_calls": tool_calls[:50],   # cap to avoid huge JSONL entries
         "synthesis": {
-            "root_cause": state.get("root_cause") or state.get("final_answer") or "",
+            "outcome": (
+                state.get("root_cause")
+                or state.get("final_answer")
+                or ""
+            ),
             "confidence_score": state.get("confidence_score"),
             "suggestions": state.get("suggestions") or [],
         },
@@ -156,13 +331,14 @@ class AutoLearnResult:
 
     execution_id: str
     auto_approved: bool
-    kb_upserted: bool = False
-    pattern_bumped: bool = False
+    kb_upserted: bool = False        # IncidentKBSink compat alias
+    pattern_bumped: bool = False     # LogPatternSink compat alias
     trajectory_saved: bool = False
     skill_distilled: bool = False
     dynamic_node_compiled: bool = False
     skipped_reason: Optional[str] = None   # set when learning was skipped
     error: Optional[str] = None
+    sink_results: Dict[str, bool] = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,6 +354,9 @@ class AutoLearnService:
         llm:    LangChain LLM used for skill distillation.  When ``None``,
                 distillation is skipped.
         config: AutoLearnConfig instance.  Defaults to environment-driven config.
+        sinks:  List of LearningSink instances.  Defaults to DEFAULT_SINKS
+                (IncidentKBSink + LogPatternSink).  Pass an empty list or a
+                custom list for non-incident workflows.
     """
 
     def __init__(
@@ -185,19 +364,17 @@ class AutoLearnService:
         db: Any = None,
         llm: Any = None,
         config: AutoLearnConfig = _DEFAULT_CONFIG,
+        sinks: Optional[List[LearningSink]] = None,
     ) -> None:
         self._db = db
         self._llm = llm
         self._cfg = config
+        self._sinks: List[LearningSink] = sinks if sinks is not None else list(DEFAULT_SINKS)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def should_auto_approve(self, state: Dict[str, Any]) -> bool:
-        """Return True when confidence is high enough to skip HITL.
-
-        Trajectories above a quality threshold are accepted immediately
-        without human review.
-        """
+        """Return True when confidence is high enough to skip HITL."""
         confidence = state.get("confidence_score")
         if confidence is None:
             return False
@@ -213,13 +390,13 @@ class AutoLearnService:
         *,
         force: bool = False,
     ) -> AutoLearnResult:
-        """Run the full closed learning loop for one completed investigation.
+        """Run the full closed learning loop for one completed agent run.
 
         Args:
-            execution_id: Unique execution / investigation ID.
-            state:        Final LangGraph state dict after synthesis.
+            execution_id: Unique execution ID.
+            state:        Final agent state dict after synthesis.
             force:        If True, bypass the auto-approve check (use when
-                          engineer has manually approved via HITL).
+                          an engineer has manually approved via HITL).
 
         Returns:
             AutoLearnResult with flags for each write that succeeded.
@@ -229,7 +406,7 @@ class AutoLearnService:
             auto_approved=False,
         )
 
-        # ── Gate: only learn from approved or auto-approved investigations ────
+        # ── Gate: only learn from approved or auto-approved runs ─────────────
         approved = state.get("engineer_approved") or force
         auto = self.should_auto_approve(state)
 
@@ -251,13 +428,22 @@ class AutoLearnService:
             execution_id, result.auto_approved,
         )
 
-        # ── 1. KB upsert ──────────────────────────────────────────────────────
-        result.kb_upserted = await self._upsert_known_issue(execution_id, state)
+        # ── 1. Sink dispatch ──────────────────────────────────────────────────
+        for sink in self._sinks:
+            sink_name = type(sink).__name__
+            if not sink.applies(state):
+                logger.debug("auto_learn: sink %s skipped (applies=False)", sink_name)
+                result.sink_results[sink_name] = False
+                continue
+            ok = await sink.persist(execution_id, state, self._db)
+            result.sink_results[sink_name] = ok
+            # Back-compat aliases
+            if isinstance(sink, IncidentKBSink):
+                result.kb_upserted = ok
+            elif isinstance(sink, LogPatternSink):
+                result.pattern_bumped = ok
 
-        # ── 2. Pattern bump ───────────────────────────────────────────────────
-        result.pattern_bumped = await self._bump_pattern(state)
-
-        # ── 3. Trajectory write ───────────────────────────────────────────────
+        # ── 2. Trajectory write ───────────────────────────────────────────────
         entry = _trajectory_entry(
             execution_id, state,
             success=True,
@@ -268,7 +454,7 @@ class AutoLearnService:
         result.trajectory_saved = True
         logger.info("auto_learn: trajectory appended → %s", path)
 
-        # ── 4. Skill distillation ─────────────────────────────────────────────
+        # ── 3. Skill distillation ─────────────────────────────────────────────
         tool_calls = state.get("tool_calls") or []
         if (
             self._cfg.distill_skills
@@ -277,14 +463,14 @@ class AutoLearnService:
         ):
             result.skill_distilled = await self._distill_skill(execution_id, state)
 
-        # ── 5. Dynamic Node Compilation ───────────────────────────────────────
+        # ── 4. Dynamic Node Compilation ───────────────────────────────────────
         if (
             self._cfg.compile_dynamic_nodes
             and self._llm is not None
             and len(tool_calls) >= self._cfg.min_tool_calls_for_skill
         ):
             user_query = state.get("user_query") or state.get("trigger") or ""
-            if any(kw in user_query.lower() for kw in ("parse", "extract", "hex", "regex", "map", "resolve")):
+            if any(kw in user_query.lower() for kw in self._cfg.compile_node_keywords):
                 result.dynamic_node_compiled = await self._distill_dynamic_node(execution_id, state)
 
         return result
@@ -308,111 +494,6 @@ class AutoLearnService:
         except Exception as exc:
             logger.warning("auto_learn: failed trajectory write error: %s", exc)
 
-    # ── Private: KB upsert ────────────────────────────────────────────────────
-
-    async def _upsert_known_issue(
-        self,
-        execution_id: str,
-        state: Dict[str, Any],
-    ) -> bool:
-        """Insert or update a KnowledgeEntry row from the investigation result.
-
-        Uses SQLAlchemy ``ON CONFLICT`` upsert on ``(title)`` to avoid
-        duplicates for the same root cause.
-        """
-        if self._db is None:
-            logger.debug("auto_learn: no DB session — skipping KB upsert")
-            return False
-
-        root_cause = state.get("root_cause") or state.get("final_answer") or ""
-        if not root_cause.strip():
-            logger.debug("auto_learn: no root_cause in state — skipping KB upsert")
-            return False
-
-        try:
-            from sqlalchemy.dialects.postgresql import insert as pg_insert
-            from app.models.db_models import KnowledgeEntryModel
-
-            title = _make_title(root_cause)
-            symptoms = _extract_symptoms(state)
-            solution = _build_solution(state)
-
-            stmt = pg_insert(KnowledgeEntryModel).values(
-                title=title,
-                description=root_cause[:2000],
-                symptoms=symptoms,
-                solution=solution,
-                category=state.get("workflow_name", "general"),
-                source="agent",
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            ).on_conflict_do_update(
-                index_elements=["title"],
-                set_={
-                    "description": root_cause[:2000],
-                    "solution": solution,
-                    "source": "agent",
-                    "updated_at": datetime.now(timezone.utc),
-                },
-            )
-            await self._db.execute(stmt)
-            await self._db.commit()
-            logger.info(
-                "auto_learn: knowledge_entry upserted (execution_id=%s, title=%r)",
-                execution_id, title,
-            )
-            return True
-
-        except Exception as exc:
-            logger.warning("auto_learn: KB upsert failed — %s", exc)
-            try:
-                await self._db.rollback()
-            except Exception:
-                pass
-            return False
-
-    # ── Private: pattern bump ─────────────────────────────────────────────────
-
-    async def _bump_pattern(self, state: Dict[str, Any]) -> bool:
-        """Increment severity for any log_pattern that was matched during
-        this investigation (identified via state["matched_pattern_ids"]).
-        """
-        if self._db is None:
-            return False
-
-        pattern_ids: List[int] = state.get("matched_pattern_ids") or []
-        if not pattern_ids:
-            return False
-
-        try:
-            from sqlalchemy import text
-
-            for pid in pattern_ids:
-                await self._db.execute(
-                    text(
-                        """
-                        UPDATE log_patterns
-                        SET severity = LEAST(severity + 1, 10),
-                            updated_at = NOW()
-                        WHERE id = :pid
-                        """
-                    ),
-                    {"pid": pid},
-                )
-            await self._db.commit()
-            logger.info(
-                "auto_learn: bumped %d log_pattern(s)", len(pattern_ids)
-            )
-            return True
-
-        except Exception as exc:
-            logger.warning("auto_learn: pattern bump failed — %s", exc)
-            try:
-                await self._db.rollback()
-            except Exception:
-                pass
-            return False
-
     # ── Private: skill distillation ───────────────────────────────────────────
 
     async def _distill_skill(
@@ -420,12 +501,7 @@ class AutoLearnService:
         execution_id: str,
         state: Dict[str, Any],
     ) -> bool:
-        """Delegate to SkillService to distil the investigation into an executable skill.
-
-        SkillService uses the LLM to produce structured steps (not freeform
-        markdown) and saves them to the ``skills`` table, not knowledge_entries.
-        Uses the auxiliary (cheap) model, not the main investigation model.
-        """
+        """Delegate to SkillService to distil the run into an executable skill."""
         try:
             from app.core.skills import SkillService
             svc = SkillService(llm=self._llm)
@@ -446,7 +522,7 @@ class AutoLearnService:
         execution_id: str,
         state: Dict[str, Any],
     ) -> bool:
-        """Use LLM to distill incident logs into a dynamically compiled python GraphNode class."""
+        """Use LLM to distill a run into a dynamically compiled Python GraphNode class."""
         if self._llm is None:
             return False
 
@@ -454,10 +530,11 @@ class AutoLearnService:
             from app.workflow.dynamic_loader import DynamicNodeCompiler
             from langchain_core.messages import SystemMessage, HumanMessage
 
-            # 1. Ask the LLM to output a standalone Python GraphNode class following our exact structure
+            node_name = self._cfg.compile_node_name
+
             _COMPILER_SYSTEM_PROMPT = """\
-You are an advanced self-programming compiler agent for an on-call response system.
-Your job is to translate a completed incident investigation trajectory into a standalone, safe, and optimized Python class inheriting from GraphNode.
+You are an advanced self-programming compiler agent for an automated response system.
+Your job is to translate a completed task run trajectory into a standalone, safe, and optimized Python class inheriting from GraphNode.
 
 The class MUST:
 1. Be named <SnakeCaseConverted>Node (e.g., if node name is 'log_parser', class is 'LogParserNode').
@@ -473,13 +550,13 @@ The class MUST:
 Output ONLY the exact Python code within ```python ``` blocks. Do not add markdown explanation, notes, or preamble outside the code fences."""
 
             user_query = state.get("user_query") or state.get("trigger") or ""
-            root_cause = state.get("root_cause") or state.get("final_answer") or ""
+            outcome = state.get("final_answer") or state.get("root_cause") or ""
 
             prompt_msg = f"""\
-Generate a custom GraphNode subclass named 'log_parser' to automate the parsing of this incident query.
-Incident Query: {user_query}
-Root cause: {root_cause}
-Logs gathered in tool calls: {json.dumps(state.get("tool_calls", []))}
+Generate a custom GraphNode subclass named '{node_name}' to automate the following task.
+Task query: {user_query}
+Outcome: {outcome}
+Tool calls in run: {json.dumps(state.get("tool_calls", []))}
 """
 
             response = await self._llm.ainvoke([
@@ -492,9 +569,8 @@ Logs gathered in tool calls: {json.dumps(state.get("tool_calls", []))}
             raw = re.sub(r"^```(?:python)?\s*", "", raw.strip(), flags=re.MULTILINE)
             raw = re.sub(r"\s*```$", "", raw.strip(), flags=re.MULTILINE)
 
-            # 2. Compile and Register via DynamicNodeCompiler
             compiler = DynamicNodeCompiler()
-            compiler.compile_and_register(node_name="log_parser", code_content=raw)
+            compiler.compile_and_register(node_name=node_name, code_content=raw)
             return True
 
         except Exception as exc:
@@ -514,7 +590,7 @@ def _make_title(root_cause: str) -> str:
 
 
 def _extract_symptoms(state: Dict[str, Any]) -> List[str]:
-    """Extract symptom strings from state for the known_issue.symptoms column."""
+    """Extract symptom strings from state for the knowledge_entry symptoms column."""
     symptoms: List[str] = []
     query = state.get("user_query") or state.get("trigger") or ""
     if query:

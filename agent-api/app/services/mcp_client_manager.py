@@ -14,12 +14,12 @@ import logging
 import os
 import os.path
 import glob
-import re
 from contextlib import AsyncExitStack
 from typing import Dict, List, Any, Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from app.core.redact import redact as _redact_credentials
 from app.core.retry import with_retry
 from app.core.security import check_ssrf, SSRFError, scan_injection, InjectionError
 
@@ -33,34 +33,22 @@ CERTS_DIR = '/app/data/certs'
 # Strips common credential patterns from tool response text before the LLM
 # sees the output, preventing key material leaking into trajectory logs or
 # the model's context window.
+#
+# Credential patterns are consolidated in app.core.redact (imported above as
+# _redact_credentials) so they are maintained in one place. Pseudonymization
+# of PII is applied as a second pass below via the active session vault.
 # ─────────────────────────────────────────────────────────────────────────────
-_CREDENTIAL_PATTERNS: list[re.Pattern[str]] = [
-    # GitHub personal access tokens  (ghp_*, gho_*, github_pat_*)
-    re.compile(r'\bghp_[A-Za-z0-9]{36,}\b'),
-    re.compile(r'\bgho_[A-Za-z0-9]{36,}\b'),
-    re.compile(r'\bgithub_pat_[A-Za-z0-9_]{36,}\b'),
-    # OpenAI / Anthropic style secret keys  (sk-…)
-    re.compile(r'\bsk-[A-Za-z0-9\-_]{20,}\b'),
-    # AWS access key IDs  (AKIA…)
-    re.compile(r'\bAKIA[A-Z0-9]{16}\b'),
-    # Generic Bearer tokens in Authorization headers
-    re.compile(r'(?i)Bearer\s+[A-Za-z0-9\-._~+/]+=*'),
-    # Generic "token": "…" JSON patterns
-    re.compile(r'(?i)"(?:token|api_?key|secret|password|credential)"\s*:\s*"[^"]{8,}"'),
-]
-_REDACTED = "[REDACTED]"
 
 
 def _sanitize_credential(text: str) -> str:
     """Scrub credentials, then pseudonymize PII, before MCP output reaches the LLM.
 
-    Credentials are redacted one-way; PII (email/phone/SSN/card/IP/account-id) is
-    swapped for reversible placeholders via the active session vault so the final
-    answer can be re-hydrated. Pseudonymization is a no-op when disabled or when
-    no session is bound, leaving legacy behaviour unchanged.
+    Credentials are redacted one-way via core.redact; PII (email/phone/SSN/
+    card/IP/account-id) is swapped for reversible placeholders via the active
+    session vault so the final answer can be re-hydrated. Pseudonymization is a
+    no-op when disabled or when no session is bound.
     """
-    for pattern in _CREDENTIAL_PATTERNS:
-        text = pattern.sub(_REDACTED, text)
+    text = _redact_credentials(text)
     try:
         from app.core.privacy import pseudonymize_active
         text = pseudonymize_active(text)
@@ -151,6 +139,19 @@ class MCPClientManager:
         # handful of tools (e.g. wit_*) from a server that advertises dozens, so
         # the agent's tool list — and every request's token count — stays small.
         self.tool_filters: Dict[str, List[str]] = {}
+        # Per-server call lock. MCP stdio is a single pipe — concurrent call_tool
+        # requests interleave their JSON-RPC frames and responses get mismatched,
+        # so every call to a given server must be serialized. The model can emit
+        # parallel tool calls in one turn; without this they corrupt the session
+        # and all hang to timeout.
+        self._call_locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_call_lock(self, server_id: str) -> "asyncio.Lock":
+        lock = self._call_locks.get(server_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._call_locks[server_id] = lock
+        return lock
 
     def set_tool_filter(self, server_id: str, patterns: List[str]) -> None:
         """Restrict which tools from *server_id* are exposed to the agent.
@@ -382,7 +383,10 @@ class MCPClientManager:
 
             async def _call_tool():
                 # Always read session fresh — if reconnect replaced it we use the new one.
-                session = self.connections[server_id]['session']
+                conn = self.connections.get(server_id)
+                if not conn:
+                    raise RuntimeError(f"MCP server '{server_id}' is not connected")
+                session = conn['session']
                 async with tool_span(tool_name):
                     if timeout_secs:
                         return await asyncio.wait_for(
@@ -428,8 +432,12 @@ class MCPClientManager:
                             return await _call_tool()
                     raise  # re-raise if we couldn't reconnect
 
-            result = await with_retry(_call_with_reconnect, max_retries=2)
-            
+            # Serialize calls to this server — MCP stdio cannot multiplex
+            # concurrent requests on one session (parallel tool calls from the
+            # model would otherwise interleave frames and hang to timeout).
+            async with self._get_call_lock(server_id):
+                result = await with_retry(_call_with_reconnect, max_retries=2)
+
             logger.info("Tool '%s' executed successfully", tool_name)
 
             raw_content = result.content if hasattr(result, 'content') else result
@@ -445,18 +453,20 @@ class MCPClientManager:
             }
             
         except asyncio.TimeoutError:
-            logger.error("Tool '%s' timed out", tool_name)
+            logger.error("Tool '%s' timed out after retries", tool_name)
             return {
                 'success': False,
-                'error': f"Tool '{tool_name}' timed out",
-                'isError': True
+                'error': f"Tool '{tool_name}' timed out after retries",
+                'isError': True,
+                'terminal': True,
             }
         except Exception as e:
             logger.error("Tool '%s' execution failed: %s", tool_name, e)
             return {
                 'success': False,
                 'error': str(e),
-                'isError': True
+                'isError': True,
+                'terminal': True,
             }
     
     @staticmethod

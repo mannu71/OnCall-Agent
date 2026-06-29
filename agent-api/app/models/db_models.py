@@ -65,6 +65,7 @@ class WorkflowModel(Base):
     nodes = Column(JSON, nullable=False)
     edges = Column(JSON, nullable=False)
     viewport = Column(JSON)
+    type = Column(String(20), default='workflow')
     enabled = Column(Boolean, default=True)
     schedule = Column(String(100))  # Cron expression
     indexing_status = Column(String(50), nullable=True)  # None | 'indexing' | 'indexing_failed: [repo]'

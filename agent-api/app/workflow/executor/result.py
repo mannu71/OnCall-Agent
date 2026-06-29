@@ -60,13 +60,18 @@ async def persist_execution(
                     trajectory.extend(node_result["messages"])
 
         # Accumulate token usage from all node results (agent nodes carry
-        # input_tokens / output_tokens set by ReactStrategy._execute_agent)
+        # input_tokens / output_tokens / cache_read_tokens set by
+        # ReactStrategy._execute_agent). cache_read is the slice of input
+        # served from the prompt cache (the provider sums it INTO input_tokens),
+        # so it lets the UI back out the true non-cached cost.
         input_tokens = 0
         output_tokens = 0
+        cache_read_tokens = 0
         for node_result in (node_results.values() if isinstance(node_results, dict) else []):
             if isinstance(node_result, dict):
                 input_tokens += node_result.get("input_tokens", 0) or 0
                 output_tokens += node_result.get("output_tokens", 0) or 0
+                cache_read_tokens += node_result.get("cache_read_tokens", 0) or 0
 
         await execution_repo.save({
             **result,
@@ -77,6 +82,7 @@ async def persist_execution(
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
+            "cache_read_tokens": cache_read_tokens,
         })
     except Exception as e:
         logger.error(f"Failed to save execution to storage: {e}")

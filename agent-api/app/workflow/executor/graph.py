@@ -11,8 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import defaultdict
 from typing import Any, Awaitable, Callable, Dict, List
+
+# Per-node wall-clock budget. A handler that wedges (e.g. an MCP call that
+# never returns) would otherwise block the entire asyncio.gather batch
+# indefinitely. Override via env when long-running agent nodes need more time.
+_NODE_TIMEOUT_SECONDS = float(os.getenv("WORKFLOW_NODE_TIMEOUT_SECONDS", "300"))
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +112,30 @@ async def execute_nodes_bfs(
                 "Executing node: %s (%s) [exec=%s]",
                 node_id, node.get("type"), execution_id,
             )
-            result = await execute_node_fn(execution_id, node, execution_results)
+            try:
+                result = await asyncio.wait_for(
+                    execute_node_fn(execution_id, node, execution_results),
+                    timeout=_NODE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Node '%s' (%s) timed out after %.0fs [exec=%s]",
+                    node_id, node.get("type"), _NODE_TIMEOUT_SECONDS, execution_id,
+                )
+                result = {
+                    "status": "failed",
+                    "error": (
+                        f"Node timed out after {_NODE_TIMEOUT_SECONDS:.0f}s — "
+                        "set WORKFLOW_NODE_TIMEOUT_SECONDS to a higher value for "
+                        "long-running agent or MCP nodes."
+                    ),
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Node '%s' (%s) raised unexpectedly [exec=%s]: %s",
+                    node_id, node.get("type"), execution_id, exc,
+                )
+                result = {"status": "failed", "error": f"Unexpected error: {exc}"}
         return node_id, result, True
 
     # Safety: cap total levels at 2x node count to defend against malformed
@@ -147,14 +176,23 @@ async def execute_nodes_bfs(
                 }
             break
 
-        # Launch every ready node concurrently.
+        # Launch every ready node concurrently.  return_exceptions=True so a
+        # single failing node does not abort the entire level and discard the
+        # partial results of its siblings (_run_one already handles its own
+        # exceptions, so items should never be BaseException in practice).
         results = await asyncio.gather(
             *(_run_one(nid) for nid in ready),
-            return_exceptions=False,
+            return_exceptions=True,
         )
 
         next_frontier: List[str] = list(blocked)
-        for node_id, result, ran in results:
+        for item in results:
+            if isinstance(item, BaseException):
+                # _run_one escaped its own guard — log and continue; we cannot
+                # attribute the exception to a specific node_id here.
+                logger.error("BFS: unattributed node runner exception: %s", item)
+                continue
+            node_id, result, ran = item
             executed.add(node_id)
             if ran:
                 execution_results[node_id] = result

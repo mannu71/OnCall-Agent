@@ -86,6 +86,7 @@ class WorkflowRepository(BaseAsyncRepository):
                 workflow = WorkflowModel(
                     name=workflow_data["name"],
                     description=workflow_data.get("description"),
+                    type=workflow_data.get("type", "workflow"),
                     nodes=workflow_data.get("nodes", []),
                     edges=workflow_data.get("edges", []),
                     viewport=workflow_data.get("viewport"),
@@ -211,6 +212,7 @@ class WorkflowRepository(BaseAsyncRepository):
             "id": workflow.id,
             "name": workflow.name,
             "description": workflow.description,
+            "type": workflow.type or "workflow",
             "nodes": workflow.nodes or [],
             "edges": workflow.edges or [],
             "viewport": workflow.viewport,

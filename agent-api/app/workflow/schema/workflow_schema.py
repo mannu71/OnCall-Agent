@@ -72,9 +72,60 @@ def normalize_workflow_dialect(workflow_dict: Dict[str, Any]) -> Dict[str, Any]:
 # Node type groupings (both dialects).
 _AGENT_TYPES = ("agent",)
 _LLM_TYPES = ("llm", "language_model")
-_TOOL_TYPES = ("tool",)
+_TOOL_TYPES = ("tool", "mcp_server")
 _CLOUDWATCH_TYPES = ("cloudwatchAnalyzer", "cloudwatch_tool")
 _CODE_TYPES = ("codeAnalyzer", "code_search_tool")
+
+
+def _llm_node_has_model(node: Dict[str, Any]) -> bool:
+    """Check if an LLM/language_model node has a model configured.
+
+    Handles both dialects:
+    - Scalar keys: params.model / params.modelId / params.llm / etc.
+    - LangflowEditor multi-select: params.models (list of str or {name})
+    - LangflowEditor comma-joined: params.llm "A,B"
+    """
+    # Check scalar keys first (legacy + anthropic_model / openai_model)
+    scalar = get_node_param(
+        node, "model", "modelId", "model_id", "modelName",
+        "configName", "llmConfigId", "llm",
+    )
+    if scalar:
+        return True
+    # params.models list (LangflowEditor language_model node)
+    params = node.get("params") or {}
+    models = params.get("models")
+    if isinstance(models, list):
+        return any(
+            (isinstance(m, str) and m.strip()) or
+            (isinstance(m, dict) and m.get("name", "").strip())
+            for m in models
+        )
+    return False
+
+
+def _tool_node_has_server(node: Dict[str, Any]) -> bool:
+    """Check if a tool/mcp_server node has an MCP server configured.
+
+    Handles:
+    - legacy tool node: params.serverName / params.server_name / params.name / params.command
+    - LangflowEditor mcp_server node: params.servers (comma-joined or list)
+    """
+    command = get_node_param(node, "command")
+    if command:
+        return True
+    # Scalar server name keys (legacy tool node)
+    server = get_node_param(node, "serverName", "server_name", "name")
+    if server:
+        return True
+    # LangflowEditor mcp_server: params.servers (comma-joined string or list)
+    params = node.get("params") or {}
+    servers = params.get("servers")
+    if isinstance(servers, list):
+        return any(s for s in servers if s)
+    if isinstance(servers, str):
+        return any(s.strip() for s in servers.split(","))
+    return False
 
 
 def validate_workflow(workflow_dict: Dict[str, Any]) -> List[str]:
@@ -103,20 +154,11 @@ def validate_workflow(workflow_dict: Dict[str, Any]) -> List[str]:
                 errors.append(f"Code analyzer node '{label}' has no repositories configured.")
 
         elif ntype in _TOOL_TYPES:
-            server = get_node_param(node, "serverName", "server_name", "name")
-            command = get_node_param(node, "command")
-            if not server and not command:
+            if not _tool_node_has_server(node):
                 errors.append(f"Tool node '{label}' has no MCP server selected.")
 
         elif ntype in _LLM_TYPES:
-            # The unified language_model node references an LLM *config* (by id or
-            # name) rather than a raw model string — accept all of those keys, in
-            # both dialects, matching how the executor resolves the LLM.
-            model = get_node_param(
-                node, "model", "modelId", "model_id", "modelName",
-                "configName", "llmConfigId", "llm",
-            )
-            if not model:
+            if not _llm_node_has_model(node):
                 errors.append(f"LLM node '{label}' has no model selected.")
 
     return errors

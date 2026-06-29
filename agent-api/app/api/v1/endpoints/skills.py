@@ -68,6 +68,46 @@ async def delete_all_skills(
     return {"success": True, "deleted": removed}
 
 
+@router.get("/{name}", response_model=Dict[str, Any])
+async def get_skill(name: str) -> Dict[str, Any]:
+    """Return the full detail for a single skill by name."""
+    skill = await skill_service.get_skill(name)
+    if skill is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"skill '{name}' not found")
+    return {"success": True, "skill": skill}
+
+
+@router.put("/{name}", response_model=Dict[str, Any])
+async def update_skill(name: str, body: SkillBody) -> Dict[str, Any]:
+    """Update (upsert) an existing skill by name."""
+    existing = await skill_service.get_skill(name)
+    if existing is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"skill '{name}' not found")
+    triggers = body.trigger_patterns or []
+    skill = await skill_service.create_manual(
+        name=name,
+        title=body.title,
+        description=body.description,
+        trigger_patterns=triggers,
+        steps=body.steps,
+        workflow_name=body.workflow_name,
+    )
+    return {"success": True, "skill": skill}
+
+
+@router.delete("/fs/{name}", response_model=Dict[str, Any])
+async def delete_fs_skill(name: str) -> Dict[str, Any]:
+    """Delete a filesystem (markdown) skill by removing its directory."""
+    manager = get_default_skill_manager()
+    deleted = manager.delete_skill(name)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"filesystem skill '{name}' not found")
+    return {"success": True, "deleted": name}
+
+
 @router.delete("/{name}", response_model=Dict[str, Any])
 async def delete_skill(name: str) -> Dict[str, Any]:
     deleted = await skill_service.delete(name)

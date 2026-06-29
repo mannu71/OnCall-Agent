@@ -191,6 +191,10 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
             'input_tokens':  result.get('input_tokens',  0) or 0,
             'output_tokens': result.get('output_tokens', 0) or 0,
             'total_tokens':  result.get('total_tokens',  0) or 0,
+            # cache_read is the slice of input_tokens served from the prompt
+            # cache (~10% price). Carry it through so the UI can show real
+            # savings instead of a number inflated by cache reuse.
+            'cache_read_tokens': result.get('cache_read_tokens', 0) or 0,
         }
 
     except Exception as e:

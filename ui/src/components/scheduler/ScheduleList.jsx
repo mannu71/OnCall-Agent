@@ -34,6 +34,7 @@ const ScheduleList = memo(() => {
   const filteredSchedules = useMemo(() => {
     const searchLower = searchTerm.toLowerCase();
     return schedules.filter(s => {
+      if (s.type === 'agent') return false;
       const name = (s.name || '').toLowerCase();
       const title = (s.title || '').toLowerCase();
       return name.includes(searchLower) || title.includes(searchLower);

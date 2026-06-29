@@ -136,8 +136,6 @@ export const NODE_TYPES = {
     desc: 'Connect MCP servers from Settings · wire each independently',
     slots: [
       { kind: 'mcp-select', id: 'servers', label: 'MCP Servers' },
-      { kind: 'field',      id: 'tools',   label: 'Tool filter',
-        placeholder: 'e.g. wit_*, search_code (blank = all)' },
       { kind: 'port-out',   id: 'tool',    label: 'Tool', portType: 'tool' },
     ],
   },

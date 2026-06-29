@@ -138,11 +138,21 @@ def build_llm(llm_config: Dict[str, Any]) -> Any:
             )
         else:
             boto_session = boto3.Session(region_name=region, profile_name=aws_profile)
+        # read_timeout default is botocore's 60s, which is too short for a
+        # large-context synthesis call (200K+ tokens) — those legitimately take
+        # >60s and would raise "Read timeout on endpoint URL …/converse",
+        # killing the run. Lift it to a configurable ceiling (default 300s, the
+        # same bound as the agent's non-streaming asyncio.wait_for).
+        _read_timeout = getattr(settings, "bedrock_read_timeout_seconds", 300)
         boto_client = boto_session.client(
             "bedrock-runtime",
             region_name=region,
             verify=False,
-            config=BotocoreConfig(retries={"max_attempts": 3}),
+            config=BotocoreConfig(
+                retries={"max_attempts": 3},
+                read_timeout=_read_timeout,
+                connect_timeout=10,
+            ),
         )
         return ChatBedrockConverse(
             model=model,
