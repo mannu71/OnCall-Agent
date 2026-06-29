@@ -8,9 +8,14 @@ only for the lifetime of an in-process run.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from app.infrastructure.persistence import ExecutionRepository
+
+# Executions older than this that are still marked "running" are considered
+# crashed/orphaned and are auto-expired so they don't permanently block re-runs.
+_STALE_THRESHOLD = timedelta(hours=2)
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +66,31 @@ class ExecutionStateService:
         return execution_id
 
     async def find_running_id(self, workflow_name: str) -> Optional[str]:
-        """Return execution id if *workflow_name* has a running DB record."""
+        """Return execution id if *workflow_name* has a running DB record.
+
+        Stale records (started more than _STALE_THRESHOLD ago with no heartbeat)
+        are auto-cancelled so a crashed workflow never permanently blocks re-runs.
+        """
         record = await self.repo.find_running_by_workflow(workflow_name)
         if record:
-            return str(record["execution_id"])
+            exec_id = str(record["execution_id"])
+            started_raw = record.get("started_at")
+            if started_raw:
+                try:
+                    started = datetime.fromisoformat(started_raw)
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) - started > _STALE_THRESHOLD:
+                        logger.warning(
+                            "Auto-expiring stale execution %s for '%s' (started %s)",
+                            exec_id, workflow_name, started_raw,
+                        )
+                        await self.repo.mark_cancelled(exec_id, reason="auto-expired: stale")
+                        self.runtime_cache.pop(exec_id, None)
+                        return None
+                except (ValueError, TypeError):
+                    pass
+            return exec_id
 
         for exec_id, data in self.runtime_cache.items():
             if (

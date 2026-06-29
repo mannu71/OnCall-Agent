@@ -394,6 +394,24 @@ class MCPClientManager:
             async def _call_with_reconnect():
                 try:
                     return await _call_tool()
+                except asyncio.TimeoutError:
+                    # asyncio.wait_for cancels the in-flight coroutine when it times out,
+                    # leaving the MCP session's internal state machine waiting for a
+                    # response we've abandoned. The next call_tool would get a mismatched
+                    # response frame. Reconnect to get a fresh session before re-raising
+                    # so with_retry's next attempt starts from a clean state.
+                    logger.warning(
+                        "MCP server '%s' tool '%s' timed out — reconnecting to reset session state",
+                        server_id, tool_name,
+                    )
+                    config = (self.connections.get(server_id) or {}).get('config')
+                    if config:
+                        try:
+                            await self.disconnect_server(server_id)
+                            await self.connect_server(server_id, config)
+                        except Exception:
+                            pass
+                    raise
                 except (BrokenPipeError, ConnectionResetError, EOFError, OSError) as exc:
                     # The MCP server process died (common for npx servers after a long
                     # idle or mid-run OOM). Try to reconnect once before giving up.

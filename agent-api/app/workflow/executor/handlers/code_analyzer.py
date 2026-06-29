@@ -177,29 +177,39 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
 
     if backend == "codegraph":
         # codegraph projects are PRE-INDEXED on workflow save (background, fast
-        # mode). The project name is the repo basename. Steer the agent to query
-        # the existing graph directly — re-indexing a large repo at runtime is
-        # slow (a 9 GB repo's FULL index exceeds 30 s and can blow the tool
-        # timeout). Only index on demand, and only in fast mode, if a query
-        # reports the project is missing (e.g. the store was reset).
-        result['codegraph_repo_paths'] = {
-            name: os.path.join(repos_base_path, name)
+        # mode). The project name is derived from the absolute path by stripping
+        # the leading slash and replacing remaining slashes with dashes — e.g.
+        # /app/data/indexed_repos/compliance-api → app-data-indexed_repos-compliance-api.
+        # Steer the agent to query the existing graph directly.
+        def _cg_project_name(short_name: str) -> str:
+            abs_path = os.path.join(repos_base_path, short_name)
+            return abs_path.lstrip('/').replace('/', '-')
+
+        codegraph_project_names = {
+            name: _cg_project_name(name)
             for name in all_indexed
         }
-        _names = ", ".join(all_indexed)
+        result['codegraph_repo_paths'] = {
+            cg_name: os.path.join(repos_base_path, short_name)
+            for short_name, cg_name in codegraph_project_names.items()
+        }
+        _names = ", ".join(codegraph_project_names.values())
         result['output'] = (
-            f'Repos pre-indexed in codegraph (project names: {_names}). '
+            f'Repos pre-indexed in codegraph (exact project names: {_names}). '
+            f'ALWAYS pass the exact project name above — codegraph will reject '
+            f'short names like "compliance-api" (use the full name, e.g. '
+            f'"app-data-indexed_repos-compliance-api"). '
             f'Query the GRAPH tools first — they are sub-second and ~500 tokens '
             f'each: prefer search_graph / find_symbol / query_graph / '
             f'search_semantic / trace_path / get_code_snippet, always with '
-            f'project="<repo name>". '
+            f'project="<exact project name>". '
             f'AVOID search_code for discovery — it greps source files and is far '
             f'slower and more token-heavy (~80K). Use search_code ONLY as a '
             f'last-resort literal-text fallback, and always scope it with '
             f'path_filter (e.g. path_filter="src/") or file_pattern. '
             f'Do NOT re-index; only if a tool reports the project is missing, '
             f'call index_repository once with '
-            f'repo_path="{repos_base_path}/<name>" and mode="fast".'
+            f'repo_path="{repos_base_path}/<short-name>" and mode="fast".'
         )
 
     return result

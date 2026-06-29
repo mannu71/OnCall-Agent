@@ -46,6 +46,7 @@ services:
       - DATABASE_URL=postgresql://kycuser:kycpassword@postgres:5432/kycagent
       - REPOS_BASE_PATH=/app/data/indexed_repos
       - CODEGRAPH_CACHE_DIR=/root/.cache/codegraph
+      - CODEGRAPH_SEARCH_TIMEOUT=30
       - PROVIDER_TRANSPORT=bedrock
     depends_on:
       postgres:
