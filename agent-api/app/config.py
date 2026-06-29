@@ -138,6 +138,36 @@ class Settings(BaseSettings):
         default="/tmp/indexed_repos",
         validation_alias="REPOS_BASE_PATH",
     )
+    # codegraph — the native C code-intelligence engine baked into the image. Used
+    # as an alternative Code-Crawler-node backend, driven in-process over stdio
+    # (codegraph serve) via an inline MCP config — NOT registered as a platform
+    # MCP server. Path is configurable for non-container / test hosts.
+    codegraph_bin: str = Field(
+        default="/usr/local/bin/codegraph",
+        validation_alias="CODEGRAPH_BIN",
+    )
+    # v0.10.0+ of the codegraph engine stores one SQLite DB per project under a
+    # cache directory (default ~/.cache/codegraph). Admin reads scan this dir.
+    # Override via CODEGRAPH_CACHE_DIR.
+    codegraph_cache_dir: str = Field(
+        default=os.path.expanduser("~/.cache/codegraph"),
+        validation_alias="CODEGRAPH_CACHE_DIR",
+    )
+    # Legacy single-DB path (used by v0.1.x); kept for reference only — no
+    # longer read by admin code. Override via CODEGRAPH_STORE_DB.
+    codegraph_db_path: str = Field(
+        default="/tmp/codegraph.db",
+        validation_alias="CODEGRAPH_STORE_DB",
+    )
+    # Per-call timeout (seconds) for codegraph's `search_code` tool only. It shells
+    # out to grep over source files (the one non-graph, potentially slow tool); the
+    # fast graph tools inherit the default MCP tool timeout. Capping it stops a
+    # single broad grep from exhausting an agent run's time/iteration budget — the
+    # agent gets a recoverable tool error and falls back to the graph tools.
+    codegraph_search_timeout_seconds: float = Field(
+        default=12.0,
+        validation_alias="CODEGRAPH_SEARCH_TIMEOUT",
+    )
     code_analyzer_list_cache_ttl_seconds: float = 60.0
     code_analyzer_search_concurrency: int = 3
     background_index_concurrency: int = 2

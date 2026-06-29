@@ -115,12 +115,13 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
     for key, value in context.items():
         if isinstance(value, dict) and value.get('code_analysis_type'):
             code_results[key] = {
-                'code_analysis_type': value.get('code_analysis_type'),
-                'repos_indexed':      value.get('repos_indexed'),
-                'repos_config':       value.get('repos_config'),
-                'pre_summary':        value.get('pre_summary'),
-                'project_brief':      value.get('project_brief'),
-                'output':             value.get('output'),
+                'code_analysis_type':   value.get('code_analysis_type'),
+                'repos_indexed':        value.get('repos_indexed'),
+                'repos_config':         value.get('repos_config'),
+                'pre_summary':          value.get('pre_summary'),
+                'project_brief':        value.get('project_brief'),
+                'output':               value.get('output'),
+                'codegraph_repo_paths': value.get('codegraph_repo_paths'),
             }
     if code_results:
         strategy_context['code_analyzer_context'] = code_results

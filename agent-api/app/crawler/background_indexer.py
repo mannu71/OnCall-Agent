@@ -112,6 +112,144 @@ async def index_workflow_repos(
         )
 
 
+async def index_workflow_repos_codegraph(
+    workflow_name: str,
+    repos: List[str],
+) -> None:
+    """Index repos into the codegraph engine, then re-enable the workflow.
+
+    Mirrors :func:`index_workflow_repos` but targets the native codegraph engine
+    instead of the crawler. codegraph is driven in-process over stdio (no
+    ``mcp_servers`` row): we spawn ``codegraph serve`` once via a short-lived
+    ``MCPClientManager`` and call its ``index_repository`` tool per repo
+    (incremental — codegraph dedupes unchanged files), then disconnect.
+
+    Repo paths resolve under ``REPOS_BASE_PATH`` (the same base the crawler uses).
+    """
+    import json
+    import os
+
+    from app.config import settings
+    from app.infrastructure.persistence.workflow_repository import WorkflowRepository
+    from app.services.background_jobs import background_job_store
+    from app.services.mcp_client_manager import MCPClientManager
+    from app.workflow.tools.codegraph_tools import (
+        CODEGRAPH_SERVER_ID,
+        codegraph_inline_config,
+    )
+
+    workflow_repo = WorkflowRepository()
+    errors: List[str] = []
+
+    job_id = await background_job_store.create(
+        "repo_index_codegraph", workflow_name,
+        total=len(repos), payload={"repos": repos, "backend": "codegraph"},
+    )
+    await background_job_store.mark_running(job_id)
+
+    manager = MCPClientManager()
+    connected = False
+    try:
+        connected = await manager.connect_server(
+            CODEGRAPH_SERVER_ID, codegraph_inline_config()
+        )
+        if not connected:
+            err = getattr(manager, "last_errors", {}).get(CODEGRAPH_SERVER_ID, "")
+            logger.warning(
+                "background_indexer[codegraph]: failed to start engine (bin=%s): %s",
+                settings.codegraph_bin, err,
+            )
+            errors = list(repos)
+        else:
+            _done = 0
+            for repo_name in repos:
+                repo_path = os.path.join(settings.repos_base_path, repo_name)
+                logger.info(
+                    "background_indexer[codegraph]: indexing repo=%s path=%s",
+                    repo_name, repo_path,
+                )
+                try:
+                    result = await manager.execute_tool(
+                        server_id=CODEGRAPH_SERVER_ID,
+                        tool_name="index_repository",
+                        # mode=fast skips build artifacts / test fixtures
+                        # (bin/, build/, tests fixtures, generated) and the
+                        # expensive similarity/semantic-edge passes — the
+                        # difference between sub-second and many-minutes on large
+                        # repos (e.g. a 9 GB checkout whose tests/ alone is ~5 GB).
+                        arguments={"repo_path": repo_path, "mode": "fast"},
+                        tool_timeout=0,  # indexing can be long; no per-call cap
+                    )
+                    if result.get("isError"):
+                        logger.warning(
+                            "background_indexer[codegraph]: repo=%s error: %s",
+                            repo_name, _content_text(result),
+                        )
+                        errors.append(repo_name)
+                    else:
+                        logger.info(
+                            "background_indexer[codegraph]: repo=%s indexed OK", repo_name
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "background_indexer[codegraph]: repo=%s unhandled exception",
+                        repo_name,
+                    )
+                    errors.append(repo_name)
+                finally:
+                    _done += 1
+                    await background_job_store.update_progress(
+                        job_id, progress=_done, detail=f"indexed {repo_name}",
+                    )
+    finally:
+        if connected:
+            try:
+                await manager.disconnect_all()
+            except Exception:  # noqa: BLE001
+                logger.debug("background_indexer[codegraph]: disconnect failed", exc_info=True)
+
+    final_status: str | None = f"indexing_failed: {errors}" if errors else None
+    if errors:
+        await background_job_store.mark_failed(job_id, error=f"repos failed: {errors}")
+    else:
+        await background_job_store.mark_completed(job_id, detail="all repos indexed")
+
+    try:
+        workflow = await workflow_repo.get_by_name(workflow_name)
+        if workflow is not None:
+            workflow["enabled"] = True
+            workflow["indexing_status"] = final_status
+            await workflow_repo.save(workflow)
+            logger.info(
+                "background_indexer[codegraph]: workflow=%s re-enabled (indexing_status=%s)",
+                workflow_name, final_status,
+            )
+        else:
+            logger.warning(
+                "background_indexer[codegraph]: workflow=%s not found after indexing",
+                workflow_name,
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "background_indexer[codegraph]: failed to re-enable workflow=%s",
+            workflow_name,
+        )
+
+
+def _content_text(result: dict) -> str:
+    """Best-effort flatten of an MCP tool result's content to a short string."""
+    content = result.get("content")
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if hasattr(item, "text"):
+                parts.append(item.text)
+            elif isinstance(item, dict):
+                parts.append(item.get("text", ""))
+            else:
+                parts.append(str(item))
+        return " ".join(p for p in parts if p)[:500]
+    return str(content or result.get("error") or "")[:500]
 
 
 async def recover_interrupted_indexing() -> None:

@@ -58,7 +58,7 @@ agent/data/
 agent-api/data/
 
 # Code graph
-codegraph/
+# codegraph/
 
 # Temporary files
 tmp/

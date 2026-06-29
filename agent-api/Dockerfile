@@ -7,8 +7,48 @@
 #                            ~40-50% smaller. For deployments that don't launch
 #                            npx MCP servers or use the code crawler.
 #
-#   docker build -t agent-api:full .                      # default = runtime-full
-#   docker build --target runtime-slim -t agent-api:slim .
+# Build context must be the repo root (docker-compose.yml sets context: .).
+# That lets these cg-* stages COPY from codegraph/ without a pre-build step.
+#
+#   docker compose up --build -d                          # one command, everything
+#   docker build --target runtime-slim -t agent-api:slim -f agent-api/Dockerfile .
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── codegraph pre-build (inlined so `docker compose up --build` works standalone) ─
+FROM node:20 AS cg-uibuilder
+WORKDIR /ui
+COPY codegraph/graph-ui/ ./
+RUN npm config set strict-ssl false \
+    && (npm ci || npm install) \
+    && ./node_modules/.bin/vite build
+
+FROM debian:bookworm-slim AS cg-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ cmake make libc6-dev zlib1g-dev python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --break-system-packages --no-cache-dir \
+        --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+        tree-sitter-languages \
+    && cp "$(python3 -c 'import tree_sitter_languages,os;print(os.path.dirname(tree_sitter_languages.__file__))')/languages.so" \
+          /languages.so
+WORKDIR /build
+COPY codegraph/CMakeLists.txt .
+COPY codegraph/src/ ./src/
+COPY codegraph/lib/ ./lib/
+COPY codegraph/scripts/ ./scripts/
+COPY --from=cg-uibuilder /ui/dist ./graph-ui/dist
+RUN python3 scripts/gen_embedded_assets.py graph-ui/dist src/webui/embedded_assets.c
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --target codegraph_engine --parallel \
+    && strip build/codegraph
+
+FROM debian:bookworm-slim AS cg-runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libstdc++6 zlib1g git \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=cg-builder /build/build/codegraph /usr/local/bin/codegraph
+COPY --from=cg-builder /languages.so /opt/codegraph/languages.so
+RUN /usr/local/bin/codegraph --version
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1a — builder-core: core venv (build toolchain stays in builder only) ──
@@ -23,7 +63,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-COPY requirements-core.txt .
+COPY agent-api/requirements-core.txt .
 RUN pip install \
     --timeout 180 --retries 10 \
     --trusted-host pypi.org \
@@ -33,7 +73,7 @@ RUN pip install \
 # ── Stage 1b — builder-full: add the crawler + openai extras on top of core ─────
 FROM builder-core AS builder-full
 
-COPY requirements-crawler.txt .
+COPY agent-api/requirements-crawler.txt .
 RUN pip install \
     --timeout 180 --retries 10 \
     --trusted-host pypi.org \
@@ -63,7 +103,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # App code (shared by both runtime targets).
-COPY app/ ./app/
+COPY agent-api/app/ ./app/
 RUN mkdir -p /app/data/certs
 
 EXPOSE 8000
@@ -97,12 +137,10 @@ RUN npm config set strict-ssl false --global
 COPY --from=builder-full /opt/venv /opt/venv
 
 # codegraph — the native code-intelligence MCP server, registered as a stdio MCP
-# server (command=/usr/local/bin/codegraph). Baked in from its own pre-built
-# image. BUILD ORDER: `docker build -t codegraph:latest ./codegraph` MUST run
-# before this image (rebuild-docker.sh does this). The COPY is in runtime-full
-# only (the target that also carries Node for stdio MCP servers); runtime-slim
-# stays minimal and does not include it.
-COPY --from=codegraph:latest /usr/local/bin/codegraph /usr/local/bin/codegraph
+# server (command=/usr/local/bin/codegraph). Built inline via the cg-* stages
+# above. The COPY is in runtime-full only (the target that also carries Node for
+# stdio MCP servers); runtime-slim stays minimal and does not include it.
+COPY --from=cg-runtime /usr/local/bin/codegraph /usr/local/bin/codegraph
 # Grammar bundle for codegraph's tree-sitter AST backend (150+ languages).
-COPY --from=codegraph:latest /opt/codegraph/languages.so /opt/codegraph/languages.so
+COPY --from=cg-runtime /opt/codegraph/languages.so /opt/codegraph/languages.so
 ENV CODEGRAPH_TS_SO=/opt/codegraph/languages.so

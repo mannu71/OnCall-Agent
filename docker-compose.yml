@@ -23,8 +23,8 @@ services:
 
   agent-api:
     build:
-      context: ./agent-api
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: agent-api/Dockerfile
     container_name: kyc-agent-api
     ports:
       - "8000:8000"
@@ -32,6 +32,7 @@ services:
       - ./agent-api/data:/app/data
       - ~/.aws:/root/.aws:ro
       - ${REPOS_HOST_PATH:-./agent-api/data/indexed_repos}:/app/data/indexed_repos
+      - ./agent-api/data/codegraph-cache:/root/.cache/codegraph
     environment:
       - API_HOST=0.0.0.0
       - API_PORT=8000
@@ -44,6 +45,7 @@ services:
       - AWS_SSL_VERIFY=false
       - DATABASE_URL=postgresql://kycuser:kycpassword@postgres:5432/kycagent
       - REPOS_BASE_PATH=/app/data/indexed_repos
+      - CODEGRAPH_CACHE_DIR=/root/.cache/codegraph
       - PROVIDER_TRANSPORT=bedrock
     depends_on:
       postgres:

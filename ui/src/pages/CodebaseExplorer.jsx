@@ -313,6 +313,10 @@ function ProjectIntelligencePanel({ repo }) {
 }
 
 export default function CodebaseExplorer() {
+  // Which code-intel backend's store to manage: the Python Code Crawler (default)
+  // or the native codegraph engine. They have separate stores/endpoints; the
+  // toggle swaps every data call below via the `api` adapter.
+  const [backend, setBackend] = useState('crawler'); // 'crawler' | 'codegraph'
   const [repos, setRepos] = useState([]);
   const [selectedRepo, setSelectedRepo] = useState('');
   const [files, setFiles] = useState([]);
@@ -334,11 +338,39 @@ export default function CodebaseExplorer() {
   const [diffSymbolsText, setDiffSymbolsText] = useState('');
   const [diffImpactResult, setDiffImpactResult] = useState(null);
 
+  // Backend adapter — maps the Explorer's data operations to the selected
+  // backend's client methods. codegraph has no callers/callees-expand, diff
+  // impact, or project-intelligence endpoints, so those features are gated off
+  // for it (supportsExpand / supportsIntel).
+  const api = useMemo(() => (
+    backend === 'codegraph'
+      ? {
+          listRepos: () => agentApiClient.listCodegraphRepos(),
+          getFiles: (repo) => agentApiClient.getCodegraphRepoFiles(repo),
+          getFileNodes: (repo, f) => agentApiClient.getCodegraphFileNodes(repo, f),
+          getNode: (repo, q) => agentApiClient.getCodegraphNode(repo, q),
+          reindex: (repo) => agentApiClient.reindexCodegraphRepo(repo),
+          deleteIndex: (repo) => agentApiClient.deleteCodegraphIndex(repo),
+          supportsExpand: false,
+          supportsIntel: false,
+        }
+      : {
+          listRepos: () => agentApiClient.listCrawlerRepos(),
+          getFiles: (repo) => agentApiClient.getRepoFiles(repo, null, false, 500),
+          getFileNodes: (repo, f) => agentApiClient.getFileNodes(repo, f),
+          getNode: (repo, q) => agentApiClient.getKGNode(repo, q),
+          reindex: (repo) => agentApiClient.reindexRepo(repo),
+          deleteIndex: (repo) => agentApiClient.deleteIndex(repo),
+          supportsExpand: true,
+          supportsIntel: true,
+        }
+  ), [backend]);
+
   // 1. Fetch available indexed repositories. Returns the repo list so callers
   //    (initial load, post-reindex, post-delete) can react to the new state.
   const loadRepos = useCallback(async ({ preferRepo } = {}) => {
     try {
-      const res = await agentApiClient.listCrawlerRepos();
+      const res = await api.listRepos();
       const list = res?.repos || [];
       setRepos(list);
       if (list.length > 0) {
@@ -352,7 +384,7 @@ export default function CodebaseExplorer() {
       console.error('Failed to load repositories', err);
       return [];
     }
-  }, []);
+  }, [api]);
 
   useEffect(() => {
     loadRepos();
@@ -364,10 +396,10 @@ export default function CodebaseExplorer() {
     setIsMutating(true);
     setActionError('');
     try {
-      await agentApiClient.reindexRepo(selectedRepo);
+      await api.reindex(selectedRepo);
       await loadRepos({ preferRepo: selectedRepo });
       // Refresh the file list for the rebuilt index.
-      const res = await agentApiClient.getRepoFiles(selectedRepo, null, false, 500);
+      const res = await api.getFiles(selectedRepo);
       if (res?.files) {
         setFiles(res.files);
         setFilteredFiles(res.files);
@@ -378,7 +410,7 @@ export default function CodebaseExplorer() {
     } finally {
       setIsMutating(false);
     }
-  }, [selectedRepo, isMutating, loadRepos]);
+  }, [selectedRepo, isMutating, loadRepos, api]);
 
   // Delete the entire index for the selected repo after explicit confirmation.
   const handleDeleteIndex = useCallback(async () => {
@@ -391,7 +423,7 @@ export default function CodebaseExplorer() {
     setIsMutating(true);
     setActionError('');
     try {
-      await agentApiClient.deleteIndex(selectedRepo);
+      await api.deleteIndex(selectedRepo);
       const remaining = await loadRepos();
       if (remaining.length === 0) {
         setFiles([]);
@@ -408,7 +440,7 @@ export default function CodebaseExplorer() {
     } finally {
       setIsMutating(false);
     }
-  }, [selectedRepo, isMutating, loadRepos, setNodes, setEdges]);
+  }, [selectedRepo, isMutating, loadRepos, setNodes, setEdges, api]);
 
   // 2. Fetch files for selected repository
   useEffect(() => {
@@ -416,7 +448,7 @@ export default function CodebaseExplorer() {
     async function loadFiles() {
       setIsLoading(true);
       try {
-        const res = await agentApiClient.getRepoFiles(selectedRepo, null, false, 500);
+        const res = await api.getFiles(selectedRepo);
         if (res?.files) {
           setFiles(res.files);
           setFilteredFiles(res.files);
@@ -433,7 +465,7 @@ export default function CodebaseExplorer() {
     setNodes([]);
     setEdges([]);
     setDiffImpactResult(null);
-  }, [selectedRepo]);
+  }, [selectedRepo, api]);
 
   // 3. Filter files by search query
   useEffect(() => {
@@ -479,7 +511,7 @@ export default function CodebaseExplorer() {
     setIsLoading(true);
     try {
       // Fetch all nodes and edges inside this file using our new API
-      const res = await agentApiClient.getFileNodes(selectedRepo, fileObj.file);
+      const res = await api.getFileNodes(selectedRepo, fileObj.file);
       
       const newNodes = [];
       const newEdges = [];
@@ -579,14 +611,14 @@ export default function CodebaseExplorer() {
     } finally {
       setIsLoading(false);
     }
-  }, [selectedRepo, setNodes, setEdges]);
+  }, [selectedRepo, setNodes, setEdges, api]);
 
   // 5. Click on visual node to fetch node metadata (Deterministic call details)
   const onNodeClick = useCallback(async (event, flowNode) => {
     if (flowNode.id.startsWith('file:')) return;
     setIsLoading(true);
     try {
-      const res = await agentApiClient.getKGNode(selectedRepo, flowNode.id);
+      const res = await api.getNode(selectedRepo, flowNode.id);
       if (res && !res.error) {
         setSelectedNode(res);
       }
@@ -595,11 +627,14 @@ export default function CodebaseExplorer() {
     } finally {
       setIsLoading(false);
     }
-  }, [selectedRepo]);
+  }, [selectedRepo, api]);
 
   // 6. Trace path forward/backward dynamically when double clicked (Interactive call trees)
   const onNodeDoubleCliick = useCallback(async (event, flowNode) => {
     if (flowNode.id.startsWith('file:')) return;
+    // codegraph has no callers/callees-expand REST endpoint; the in-file graph
+    // from handleFileClick is the available view.
+    if (!api.supportsExpand) return;
     setIsLoading(true);
     try {
       const callersRes = await agentApiClient.getKGCallers(selectedRepo, flowNode.id, 2);
@@ -668,7 +703,7 @@ export default function CodebaseExplorer() {
     } finally {
       setIsLoading(false);
     }
-  }, [selectedRepo, setNodes, setEdges]);
+  }, [selectedRepo, setNodes, setEdges, api]);
 
   // 7. Compute deterministic Diff Impact Analysis
   const handleRunDiffImpact = async () => {
@@ -742,7 +777,33 @@ export default function CodebaseExplorer() {
             {isLoading && <Activity className="w-4 h-4 text-primary animate-spin" />}
           </div>
 
+          {/* Backend selector — Code Crawler vs codegraph (separate stores) */}
+          <div className="mb-2 flex items-center gap-1 p-1 rounded-md bg-muted border border-border">
+            {[
+              { id: 'crawler', label: 'Code Crawler' },
+              { id: 'codegraph', label: 'codegraph' },
+            ].map(b => (
+              <button
+                key={b.id}
+                onClick={() => { if (b.id !== backend) { setBackend(b.id); setActiveTab('structure'); } }}
+                disabled={isMutating}
+                className={`flex-1 px-2 py-1 rounded text-[11px] font-semibold transition-colors disabled:opacity-50 ${
+                  backend === b.id
+                    ? 'bg-background text-primary shadow-sm border border-border'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {b.label}
+              </button>
+            ))}
+          </div>
+
           {/* Repo selector */}
+          {repos.length === 0 ? (
+            <p className="text-[11px] text-muted-foreground italic px-1 py-1.5">
+              No {backend === 'codegraph' ? 'codegraph' : 'Code Crawler'}-indexed repos yet.
+            </p>
+          ) : (
           <select
             value={selectedRepo}
             onChange={(e) => setSelectedRepo(e.target.value)}
@@ -754,6 +815,7 @@ export default function CodebaseExplorer() {
               </option>
             ))}
           </select>
+          )}
 
           {/* Index lifecycle actions */}
           <div className="mt-2 flex items-center gap-2">
@@ -801,14 +863,16 @@ export default function CodebaseExplorer() {
           >
             Business Domains
           </button>
-          <button
-            onClick={() => setActiveTab('impact')}
-            className={`flex-1 py-3 text-center border-b-2 font-medium transition-all ${
-              activeTab === 'impact' ? 'border-primary text-foreground font-semibold' : 'border-transparent text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            Diff Impact
-          </button>
+          {api.supportsExpand && (
+            <button
+              onClick={() => setActiveTab('impact')}
+              className={`flex-1 py-3 text-center border-b-2 font-medium transition-all ${
+                activeTab === 'impact' ? 'border-primary text-foreground font-semibold' : 'border-transparent text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              Diff Impact
+            </button>
+          )}
         </div>
 
         {/* Tab Contents */}
@@ -1018,8 +1082,9 @@ export default function CodebaseExplorer() {
           </div>
         )}
 
-        {/* Read-only project intelligence (brief / standards / modules) */}
-        {selectedRepo && <ProjectIntelligencePanel repo={selectedRepo} />}
+        {/* Read-only project intelligence (brief / standards / modules) —
+            crawler-only; codegraph has no project-intelligence endpoints. */}
+        {selectedRepo && api.supportsIntel && <ProjectIntelligencePanel repo={selectedRepo} />}
 
         {/* Guided Code Tour segment for Diff Impact */}
         {activeTab === 'impact' && diffImpactResult && (

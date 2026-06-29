@@ -205,7 +205,13 @@ export const agentApiClient = {
         const response = await client.post(
             `/api/v1/workflows/${encodeURIComponent(workflowName)}/execute`,
             body,
-            { params },
+            // Agent execution is a synchronous, long-running ReAct loop (code
+            // search, CloudWatch, multi-tool reasoning) that routinely runs for
+            // minutes. The default 30s client timeout would abort a perfectly
+            // healthy run mid-flight ("timeout of 30000ms exceeded" →
+            // "Workflow Terminated"), so disable the per-request timeout here and
+            // let the server own the run's lifetime.
+            { params, timeout: 0 },
         );
         return response.data;
     },
@@ -725,6 +731,57 @@ export const agentApiClient = {
     async deleteIndex(repo) {
         const response = await client.delete(
             `/api/v1/crawler/index/${encodeURIComponent(repo)}`
+        );
+        return response.data;
+    },
+
+    // ==================== codegraph backend (alt code-intel store) ============
+    // The Codebase Explorer can manage repos indexed by the codegraph engine,
+    // whose graph lives in a separate store reachable only via these endpoints
+    // (it speaks MCP, not REST, to the agent). Shapes mirror the crawler methods
+    // above so the Explorer renders both backends with one code path.
+
+    async listCodegraphRepos() {
+        const response = await client.get('/api/v1/codegraph/repos');
+        return response.data; // { repos: [{ repo_name, files_indexed, ... }] }
+    },
+
+    async getCodegraphRepoFiles(repo) {
+        const response = await client.get(
+            `/api/v1/codegraph/repos/${encodeURIComponent(repo)}/files`
+        );
+        return response.data; // { files: [...] }
+    },
+
+    async getCodegraphFileNodes(repo, filePath) {
+        const response = await client.get(
+            `/api/v1/codegraph/repos/${encodeURIComponent(repo)}/file-nodes`,
+            { params: { file: filePath } }
+        );
+        return response.data; // { nodes: [...], edges: [...] }
+    },
+
+    async getCodegraphNode(repo, qualifiedName) {
+        const response = await client.get(
+            `/api/v1/codegraph/repos/${encodeURIComponent(repo)}/node`,
+            { params: { qualified_name: qualifiedName } }
+        );
+        return response.data;
+    },
+
+    /** Reindex a codegraph repo (fast mode). Long-running — disable the timeout. */
+    async reindexCodegraphRepo(repo) {
+        const response = await client.post(
+            `/api/v1/codegraph/index/${encodeURIComponent(repo)}`,
+            null,
+            { timeout: 0 }
+        );
+        return response.data;
+    },
+
+    async deleteCodegraphIndex(repo) {
+        const response = await client.delete(
+            `/api/v1/codegraph/index/${encodeURIComponent(repo)}`
         );
         return response.data;
     },

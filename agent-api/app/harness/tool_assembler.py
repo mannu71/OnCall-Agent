@@ -127,24 +127,42 @@ async def assemble_base_tools(
         return tools, expired_creds_msg
 
     if code_analyzer_config:
+        backend = (code_analyzer_config.get("backend") or "code_crawler")
         try:
-            from app.workflow.tools.code_analyzer_tools import build_crawler_tools
+            if backend == "codegraph":
+                # Native C engine, driven in-process over stdio (no MCP-server
+                # registration). Tools come out as codegraph__<tool> and pass
+                # through tool disclosure below like any other MCP tool set.
+                from app.workflow.tools.codegraph_tools import build_codegraph_tools
 
-            tools.extend(
-                build_crawler_tools(
-                    repos=code_analyzer_config.get("repos"),
-                    default_model_id=crawler_model_id,
+                tools.extend(
+                    await build_codegraph_tools(
+                        mcp_manager, repos=code_analyzer_config.get("repos")
+                    )
                 )
-            )
-            if crawler_model_id:
                 logger_instance.info(
-                    "ReactStrategy: crawler tools using wired model=%s",
-                    crawler_model_id,
+                    "ReactStrategy: code-analyzer backend=codegraph",
                     extra={"execution_id": execution_id},
                 )
+            else:
+                from app.workflow.tools.code_analyzer_tools import build_crawler_tools
+
+                tools.extend(
+                    build_crawler_tools(
+                        repos=code_analyzer_config.get("repos"),
+                        default_model_id=crawler_model_id,
+                    )
+                )
+                if crawler_model_id:
+                    logger_instance.info(
+                        "ReactStrategy: crawler tools using wired model=%s",
+                        crawler_model_id,
+                        extra={"execution_id": execution_id},
+                    )
         except Exception as _cr_err:
             logger_instance.warning(
-                "ReactStrategy: failed to build Crawler tools (non-fatal): %s",
+                "ReactStrategy: failed to build code-analyzer tools (backend=%s, non-fatal): %s",
+                backend,
                 redact(str(_cr_err)),
                 extra={"execution_id": execution_id},
             )

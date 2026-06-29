@@ -88,8 +88,18 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
                 }
 
     repo_names = [repo.get("name", "") for repo in repos if repo.get("name")]
-    unindexed = await crawler_service.filter_unindexed_repos(repo_names)
-    all_indexed = [name for name in repo_names if name not in unindexed]
+
+    from app.workflow.code_analyzer_config import read_code_analyzer_backend
+    backend = read_code_analyzer_backend(node)
+
+    if backend == "codegraph":
+        # codegraph manages its own index state; the agent calls index_repository
+        # on first use. Skip the crawler repo_abstractions check entirely.
+        all_indexed = repo_names
+        unindexed = []
+    else:
+        unindexed = await crawler_service.filter_unindexed_repos(repo_names)
+        all_indexed = [name for name in repo_names if name not in unindexed]
 
     if unindexed:
         return {
@@ -155,7 +165,7 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
             if ctx is not None:
                 project_briefs[repo_name] = ctx
 
-    return {
+    result: Dict[str, Any] = {
         'status': 'success',
         'output': f'Repos ready: {", ".join(all_indexed)}',
         'code_analysis_type': 'pre_summary',
@@ -164,3 +174,32 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
         'pre_summary': pre_summary_results or None,
         'project_brief': project_briefs or None,
     }
+
+    if backend == "codegraph":
+        # codegraph projects are PRE-INDEXED on workflow save (background, fast
+        # mode). The project name is the repo basename. Steer the agent to query
+        # the existing graph directly — re-indexing a large repo at runtime is
+        # slow (a 9 GB repo's FULL index exceeds 30 s and can blow the tool
+        # timeout). Only index on demand, and only in fast mode, if a query
+        # reports the project is missing (e.g. the store was reset).
+        result['codegraph_repo_paths'] = {
+            name: os.path.join(repos_base_path, name)
+            for name in all_indexed
+        }
+        _names = ", ".join(all_indexed)
+        result['output'] = (
+            f'Repos pre-indexed in codegraph (project names: {_names}). '
+            f'Query the GRAPH tools first — they are sub-second and ~500 tokens '
+            f'each: prefer search_graph / find_symbol / query_graph / '
+            f'search_semantic / trace_path / get_code_snippet, always with '
+            f'project="<repo name>". '
+            f'AVOID search_code for discovery — it greps source files and is far '
+            f'slower and more token-heavy (~80K). Use search_code ONLY as a '
+            f'last-resort literal-text fallback, and always scope it with '
+            f'path_filter (e.g. path_filter="src/") or file_pattern. '
+            f'Do NOT re-index; only if a tool reports the project is missing, '
+            f'call index_repository once with '
+            f'repo_path="{repos_base_path}/<name>" and mode="fast".'
+        )
+
+    return result

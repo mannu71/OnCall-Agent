@@ -142,9 +142,13 @@ export const NODE_TYPES = {
     ],
   },
   code_search_tool: {
-    category: 'Tools', label: 'Code Crawler', icon: 'search',
-    desc: 'Grep across repositories',
+    category: 'Tools', label: 'Code Search', icon: 'search',
+    desc: 'Search repositories via Code Crawler or codegraph',
     slots: [
+      { kind: 'segment', id: 'backend', label: 'Backend', options: [
+        { label: 'Code Crawler', value: 'code_crawler' },
+        { label: 'codegraph',    value: 'codegraph' },
+      ] },
       { kind: 'repo-select', id: 'repos', label: 'Repositories' },
       { kind: 'port-in',     id: 'lm',    label: 'Crawler model', portType: 'model', optional: true },
       { kind: 'port-out',    id: 'tool',  label: 'Tool', portType: 'tool' },
@@ -235,4 +239,5 @@ export const NODE_DEFAULTS = {
   wiki:        { format: 'Summary', platform: 'Azure DevOps Wiki', wikiUrl: '', pagePath: '', project: '', pat: '', tokenVar: 'ADO_WIKI_PAT' },
   orchestrator: { sqlFile: '' },
   router:      { routes: {}, routes_description: {} },
+  code_search_tool: { repos: '', backend: 'code_crawler' },
 };

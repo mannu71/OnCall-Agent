@@ -11,10 +11,19 @@
 #   docker build -t codegraph:latest ./codegraph
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── UI stage — build the graph-ui React/Three.js bundle ─────────────────────
+FROM node:20 AS uibuilder
+WORKDIR /ui
+COPY graph-ui/ ./
+RUN npm config set strict-ssl false \
+    && (npm ci || npm install) \
+    && ./node_modules/.bin/vite build
+
 FROM debian:bookworm-slim AS builder
+# All third-party libraries are bundled under lib/ and src/parser/lib/, so the
+# only system build deps are a C/C++ toolchain + zlib.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc cmake make libc6-dev libsqlite3-dev libtree-sitter-dev \
-        python3 python3-pip \
+        gcc g++ cmake make libc6-dev zlib1g-dev python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # Fetch the bundled tree-sitter grammars (single dlopen-able languages.so with
@@ -28,18 +37,28 @@ RUN pip3 install --break-system-packages --no-cache-dir \
 WORKDIR /build
 COPY CMakeLists.txt .
 COPY src/ ./src/
+COPY lib/ ./lib/
+COPY scripts/ ./scripts/
+# Embed the built UI bundle (generates src/webui/embedded_assets.c; CMake then
+# drops the empty embedded_stub.c automatically).
+COPY --from=uibuilder /ui/dist ./graph-ui/dist
+RUN python3 scripts/gen_embedded_assets.py graph-ui/dist src/webui/embedded_assets.c
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build --parallel \
+    && cmake --build build --target codegraph_engine --parallel \
     && strip build/codegraph
 
-# ── Runtime — binary + SQLite + tree-sitter runtime + grammar bundle ────────
+# ── Runtime — binary + C++ runtime + zlib + grammar bundle ──────────────────
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libsqlite3-0 git libtree-sitter0 \
+        libstdc++6 zlib1g git \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/build/codegraph /usr/local/bin/codegraph
 COPY --from=builder /languages.so /opt/codegraph/languages.so
+# CG_TS_SO is the grammar-bundle path the dlopen bridge resolves at runtime.
+ENV CG_TS_SO=/opt/codegraph/languages.so
 ENV CODEGRAPH_TS_SO=/opt/codegraph/languages.so
+# 3D graph visualization UI (codegraph serve --ui=true --port=9749).
+EXPOSE 9749
 # Smoke test at build time: the binary must report its version.
 RUN /usr/local/bin/codegraph --version
 ENTRYPOINT ["/usr/local/bin/codegraph"]

@@ -197,6 +197,7 @@ const FOOTER_H      = 28;
 const WEEKDAY_H = 58;
 const TOGGLE_H  = 38;
 const CHIPS_H   = 62;
+const SEGMENT_H = 56;
 function rowHeight(slot) {
   if (slot.kind === 'field')                                   return FIELD_H;
   if (slot.kind === 'tz-info')                                 return FIELD_H;
@@ -206,6 +207,7 @@ function rowHeight(slot) {
   if (slot.kind === 'weekday-select')                          return WEEKDAY_H;
   if (slot.kind === 'file-select')                             return FIELD_H;
   if (slot.kind === 'toggle')                                  return TOGGLE_H;
+  if (slot.kind === 'segment')                                 return SEGMENT_H;
   if (slot.kind === 'chips')                                   return CHIPS_H;
   return ROW_H;
 }
@@ -480,6 +482,29 @@ function SlotRow({ slot, value, gtz }) {
           <span style={{ position: 'absolute', top: 1, left: on ? 13 : 1, width: 12, height: 12,
                          borderRadius: 999, background: '#fff', transition: 'left 120ms' }} />
         </span>
+      </div>
+    );
+  }
+  if (slot.kind === 'segment') {
+    const opts = slot.options || [];
+    const active = value != null && value !== '' ? value : (opts[0] && opts[0].value);
+    return (
+      <div style={{ padding: '6px 12px 4px', height: SEGMENT_H, boxSizing: 'border-box' }}>
+        <div style={{ fontSize: 10.5, color: '#64748b', fontWeight: 600,
+                      letterSpacing: '0.02em', textTransform: 'uppercase', marginBottom: 5 }}>{slot.label}</div>
+        <div style={{ display: 'flex', gap: 2, padding: 2, borderRadius: 7,
+                      background: '#f1f5f9', border: '1px solid #e2e8f0' }}>
+          {opts.map(o => {
+            const on = o.value === active;
+            return (
+              <span key={o.value} style={{ flex: 1, textAlign: 'center', fontSize: 11, fontWeight: 600,
+                                           padding: '4px 0', borderRadius: 5, whiteSpace: 'nowrap',
+                                           background: on ? '#fff' : 'transparent',
+                                           color: on ? '#2563eb' : '#94a3b8',
+                                           boxShadow: on ? '0 1px 2px rgba(15,23,42,0.08)' : 'none' }}>{o.label}</span>
+            );
+          })}
+        </div>
       </div>
     );
   }
@@ -1354,6 +1379,31 @@ function ToggleSwitch({ on, onChange }) {
   );
 }
 
+// Two-state segmented slider (e.g. code-search backend). options: [{label,value}].
+function SegmentSwitch({ value, options, onChange }) {
+  const opts = options || [];
+  const active = value != null && value !== '' ? value : (opts[0] && opts[0].value);
+  return (
+    <div style={{ display: 'flex', gap: 3, padding: 3, borderRadius: 8,
+                  background: '#f1f5f9', border: '1px solid #e2e8f0' }}>
+      {opts.map(o => {
+        const on = o.value === active;
+        return (
+          <button key={o.value} onClick={() => onChange?.(o.value)}
+            style={{ flex: 1, padding: '6px 0', borderRadius: 6, border: 'none', cursor: 'pointer',
+                     fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap',
+                     background: on ? '#fff' : 'transparent',
+                     color: on ? '#2563eb' : '#64748b',
+                     boxShadow: on ? '0 1px 2px rgba(15,23,42,0.10)' : 'none',
+                     transition: 'background 120ms, color 120ms' }}>
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function RTab({ id, active, onClick, label, icon, badge }) {
   return (
     <button onClick={() => onClick(id)}
@@ -2030,6 +2080,7 @@ function MultiRepoSelect({ value, onChange }) {
   const isRepoSel   = slotKind === 'repo-select';
   const isSelect    = slotKind === 'select';
   const isToggle    = slotKind === 'toggle';
+  const isSegment   = slotKind === 'segment';
   const isChips     = slotKind === 'chips';
   const isMono      = isCode || k === 'cron' || k === 'url';
   const displayLabel = label || humanize(k);
@@ -2045,12 +2096,12 @@ function MultiRepoSelect({ value, onChange }) {
                        letterSpacing: '0.04em', textTransform: 'uppercase' }}>{displayLabel}</span>
       </div>
       <div style={{ padding: isCode ? '9px 11px'
-                          : (isWeekday || isFilePick || isToggle || isChips) ? '0'
+                          : (isWeekday || isFilePick || isToggle || isChips || isSegment) ? '0'
                           : '7px 11px',
                     background: isCode ? '#0f172a'
-                                : (isWeekday || isFilePick || isToggle || isChips) ? 'transparent'
+                                : (isWeekday || isFilePick || isToggle || isChips || isSegment) ? 'transparent'
                                 : '#fafbfc',
-                    border: (isWeekday || isFilePick || isToggle || isChips) ? 'none'
+                    border: (isWeekday || isFilePick || isToggle || isChips || isSegment) ? 'none'
                             : `1px solid ${isCode ? '#1e293b' : '#e2e8f0'}`,
                     borderRadius: 7 }}>
         {slotKind === 'routes-editor'
@@ -2281,6 +2332,9 @@ function MultiRepoSelect({ value, onChange }) {
           : isToggle
           ? <ToggleSwitch on={v === true || v === 'true'}
               onChange={next => onChange?.(k, String(!!next))} />
+          : isSegment
+          ? <SegmentSwitch value={String(v ?? '')} options={selectOptions || []}
+              onChange={val => onChange?.(k, val)} />
           : isChips
           ? <ChipEditor value={String(v ?? '')}
               onChange={val => onChange?.(k, val)}
@@ -2466,7 +2520,7 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpS
         <SHdr>{def.desc}</SHdr>
 
         {(() => {
-          const EDITABLE_KINDS = new Set(['field', 'select', 'textarea', 'llm-select', 'db-select', 'mcp-select', 'repo-select', 'weekday-select', 'file-select', 'toggle', 'chips', 'routes-editor']);
+          const EDITABLE_KINDS = new Set(['field', 'select', 'segment', 'textarea', 'llm-select', 'db-select', 'mcp-select', 'repo-select', 'weekday-select', 'file-select', 'toggle', 'chips', 'routes-editor']);
           const currentParams = node.params || {};
           const editableSlots = (def.slots || []).filter(s => {
             if (!EDITABLE_KINDS.has(s.kind)) return false;
@@ -2493,6 +2547,7 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpS
                     slot.kind === 'db-select'   ? dbOptions  :
                     slot.kind === 'mcp-select'  ? mcpOptions :
                     slot.kind === 'select'      ? (slot.options || []) :
+                    slot.kind === 'segment'     ? (slot.options || []) :
                     null;
                   return (
                     <ParamRow key={slot.id} k={slot.id} label={slot.label}

@@ -525,15 +525,18 @@ async def update_workflow(
             workflow_dict[field] = existing_workflow[field]
     
     # ── Detect codeAnalyzer repos that need indexing ─────────────────────
+    # Split by backend: crawler repos index into repo_abstractions; codegraph
+    # repos index into the native engine. A node carries exactly one backend.
     repos_to_index = await _extract_unindexed_repos(workflow_dict)
-    if repos_to_index:
+    codegraph_repos = _extract_codegraph_repos(workflow_dict)
+    if repos_to_index or codegraph_repos:
         # Disable the workflow while background indexing runs so it cannot
         # be executed with un-indexed repos.
         workflow_dict["enabled"] = False
         workflow_dict["indexing_status"] = "indexing"
         logger.info(
-            "[UPDATE] workflow='%s' has %d unindexed repo(s) %s — disabling and firing background indexer",
-            workflow_name, len(repos_to_index), repos_to_index,
+            "[UPDATE] workflow='%s' indexing: crawler=%s codegraph=%s — disabling and firing indexer(s)",
+            workflow_name, repos_to_index, codegraph_repos,
         )
 
     # Pass original workflow_name for rename detection
@@ -552,29 +555,67 @@ async def update_workflow(
         visual_executor.background_tasks.add(task)
         task.add_done_callback(visual_executor.background_tasks.discard)
 
+    if codegraph_repos:
+        # codegraph indexes via its own in-process engine. (If a workflow mixes
+        # both backends, each re-enables on completion — benign for the rare
+        # mixed case; nodes normally share one backend.)
+        from app.crawler.background_indexer import index_workflow_repos_codegraph
+        cg_task = asyncio.create_task(
+            index_workflow_repos_codegraph(saved_workflow["name"], codegraph_repos)
+        )
+        visual_executor.background_tasks.add(cg_task)
+        cg_task.add_done_callback(visual_executor.background_tasks.discard)
+
     return WorkflowResponse(**saved_workflow)
 
 
 async def _extract_unindexed_repos(workflow_dict: dict) -> list:
-    """Return repo names from code-analyzer nodes not yet in repo_abstractions.
+    """Return crawler-backend repo names not yet in repo_abstractions.
 
-    Accepts both node dialects (``codeAnalyzer`` with ``data.repos`` list and
+    Only considers code-analyzer nodes whose backend is ``code_crawler`` —
+    codegraph-backend repos index via :func:`_extract_codegraph_repos`. Accepts
+    both node dialects (``codeAnalyzer`` with ``data.repos`` list and
     ``code_search_tool`` with ``params.repos`` string) via the shared parser.
     """
     from app.services.crawler_service import crawler_service
     from app.workflow.code_analyzer_config import (
         CODE_ANALYZER_NODE_TYPES,
+        read_code_analyzer_backend,
         read_code_analyzer_repos,
     )
 
     repo_names: list = []
     for node in workflow_dict.get("nodes") or []:
-        if node.get("type") in CODE_ANALYZER_NODE_TYPES:
+        if node.get("type") in CODE_ANALYZER_NODE_TYPES and \
+                read_code_analyzer_backend(node) == "code_crawler":
             for r in read_code_analyzer_repos(node):
                 if r["name"]:
                     repo_names.append(r["name"])
 
     return await crawler_service.filter_unindexed_repos(repo_names)
+
+
+def _extract_codegraph_repos(workflow_dict: dict) -> list:
+    """Return deduped repo names from codegraph-backend code-analyzer nodes.
+
+    codegraph tracks its own index, so we don't filter against repo_abstractions;
+    ``index_repository`` is incremental and dedupes unchanged files on its side.
+    """
+    from app.workflow.code_analyzer_config import (
+        CODE_ANALYZER_NODE_TYPES,
+        read_code_analyzer_backend,
+        read_code_analyzer_repos,
+    )
+
+    repo_names: list = []
+    for node in workflow_dict.get("nodes") or []:
+        if node.get("type") in CODE_ANALYZER_NODE_TYPES and \
+                read_code_analyzer_backend(node) == "codegraph":
+            for r in read_code_analyzer_repos(node):
+                if r["name"]:
+                    repo_names.append(r["name"])
+
+    return list(dict.fromkeys(repo_names))
 
 
 async def _resolve_workflow_model_id(workflow_dict: dict) -> "Optional[str]":

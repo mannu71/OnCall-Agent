@@ -53,6 +53,33 @@ The agent-api spawns stdio MCP servers from DB config (`MCPServerModel`:
 }
 ```
 
+## Neural semantic search (optional, M2)
+
+By default `search_semantic` uses the deterministic TF-IDF + co-occurrence backend
+(no model). To enable neural embeddings, run a small code-embedding model behind an
+OpenAI-compatible `/v1/embeddings` endpoint and point codegraph at it — it then fuses
+the neural and deterministic rankings with Reciprocal Rank Fusion.
+
+Recommended models for a CPU-only host (e.g. 12-core, 32 GB RAM, no GPU):
+- **nomic-ai/CodeRankEmbed** (137M, 768-d) — lightest/fastest; convert to GGUF once
+  with llama.cpp's `convert_hf_to_gguf.py`. Query prefix:
+  `Represent this query for searching relevant code:`
+- **jinaai/jina-code-embeddings-0.5b** (896-d) — official GGUF ready, no conversion.
+
+```sh
+# serve the model (CPU)
+llama-server -m code-embed.gguf --embedding --pooling last --host 127.0.0.1 --port 8090
+
+# point codegraph at it (set in the MCP server's env)
+export CODEGRAPH_EMBED_URL=http://127.0.0.1:8090/v1/embeddings
+export CODEGRAPH_EMBED_QUERY_PREFIX="Represent this query for searching relevant code: "
+export CODEGRAPH_EMBED_DOC_PREFIX=""
+```
+
+`engine_status` reports which backend is active; with the URL unset it degrades
+cleanly to deterministic search. The full embed→store→cosine→RRF pipeline is
+verified against a mock server in `test/smoke.sh --docker`.
+
 The binary is already baked into the agent-api image: `agent-api/Dockerfile`
 runs `COPY --from=codegraph:latest …` (runtime-full stage), `rebuild-docker.sh`
 builds `codegraph:latest` first, the image carries `git` (for `detect_changes` /

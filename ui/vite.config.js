@@ -15,6 +15,8 @@ export default defineConfig(({ mode }) => ({
     },
   },
   server: {
+    port: process.env.PORT ? parseInt(process.env.PORT) : undefined,
+    strictPort: false,
     proxy: {
       '/api': {
         target: 'http://localhost:8000',

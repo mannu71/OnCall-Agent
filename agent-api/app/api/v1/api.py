@@ -6,6 +6,7 @@ from app.api.v1.endpoints import (
     agent_profiles,
     certificates,
     code_analyzer,
+    codegraph,
     crawler,
     curator,
     executions,
@@ -40,6 +41,7 @@ api_router.include_router(insights.router)
 api_router.include_router(curator.router)
 api_router.include_router(code_analyzer.router)
 api_router.include_router(crawler.router)
+api_router.include_router(codegraph.router)
 api_router.include_router(trajectories.router)
 api_router.include_router(settings.router)
 api_router.include_router(tools.router)

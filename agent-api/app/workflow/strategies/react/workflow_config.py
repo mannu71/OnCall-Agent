@@ -294,10 +294,13 @@ def extract_code_analyzer_config(
     name.  First occurrence (BFS order) wins on name conflicts.
 
     Returns:
-        Dict with ``repos`` list, or ``None`` if no code-analyzer node is connected.
+        Dict with ``repos`` list and ``backend`` string, or ``None`` if no
+        code-analyzer node is connected.
     """
     from app.workflow.code_analyzer_config import (
         CODE_ANALYZER_NODE_TYPES,
+        DEFAULT_CODE_ANALYZER_BACKEND,
+        read_code_analyzer_backend,
         read_code_analyzer_repos,
     )
 
@@ -313,10 +316,24 @@ def extract_code_analyzer_config(
 
     merged_repos: List[Dict[str, Any]] = []
     seen_names: Dict[str, str] = {}  # name → first path (for conflict detection)
+    backend: str = DEFAULT_CODE_ANALYZER_BACKEND
+    backend_set = False
 
     for ca_id in connected_ids:
         if ca_id not in ca_nodes:
             continue
+        # First connected node's backend wins; warn on a conflicting second one
+        # (mirrors the repo-name conflict handling below).
+        node_backend = read_code_analyzer_backend(ca_nodes[ca_id])
+        if not backend_set:
+            backend = node_backend
+            backend_set = True
+        elif node_backend != backend:
+            logger.warning(
+                "ReactStrategy: conflicting code-analyzer backends across nodes "
+                "(%r kept, %r ignored on node %s)",
+                backend, node_backend, ca_id,
+            )
         for repo in read_code_analyzer_repos(ca_nodes[ca_id]):
             rname = repo.get("name", "")
             rpath = repo.get("path", "")
@@ -337,9 +354,10 @@ def extract_code_analyzer_config(
         return None
 
     logger.info(
-        "ReactStrategy: %d codeAnalyzer node(s) connected to agent, repos=%s",
+        "ReactStrategy: %d codeAnalyzer node(s) connected to agent, backend=%s, repos=%s",
         len(connected_ids),
+        backend,
         [r.get("name") for r in merged_repos],
     )
 
-    return {"repos": merged_repos}
+    return {"repos": merged_repos, "backend": backend}

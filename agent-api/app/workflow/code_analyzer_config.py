@@ -21,6 +21,12 @@ from typing import Any, Dict, List
 #: Both are accepted everywhere a code-analyzer node is consumed.
 CODE_ANALYZER_NODE_TYPES = ("codeAnalyzer", "code_search_tool")
 
+#: Code-intelligence backends a code-analyzer node can target. ``code_crawler``
+#: is the default Python in-process engine; ``codegraph`` is the native C engine
+#: driven in-process over stdio (see app.workflow.tools.codegraph_tools).
+CODE_ANALYZER_BACKENDS = ("code_crawler", "codegraph")
+DEFAULT_CODE_ANALYZER_BACKEND = "code_crawler"
+
 # Repo names in the LangflowEditor string form are separated by commas,
 # semicolons, or newlines.
 _REPO_SPLIT_RE = re.compile(r"[,\n;]+")
@@ -59,3 +65,23 @@ def read_code_analyzer_repos(node: Dict[str, Any]) -> List[Dict[str, str]]:
     _ingest((node.get("params") or {}).get("repos"))
 
     return out
+
+
+def read_code_analyzer_backend(node: Dict[str, Any]) -> str:
+    """Return the code-intelligence backend for a code-analyzer node.
+
+    Reads ``node['data']['backend']`` (legacy) / ``node['params']['backend']``
+    (new LangflowEditor), normalized to one of :data:`CODE_ANALYZER_BACKENDS`.
+    Anything unset/unrecognized falls back to
+    :data:`DEFAULT_CODE_ANALYZER_BACKEND` so existing nodes are unchanged.
+    """
+    raw = (node.get("params") or {}).get("backend")
+    if raw is None:
+        raw = (node.get("data") or {}).get("backend")
+    val = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if val in CODE_ANALYZER_BACKENDS:
+        return val
+    # Tolerate the UI label form ("Code Crawler", "codegraph") and partials.
+    if "codegraph" in val:
+        return "codegraph"
+    return DEFAULT_CODE_ANALYZER_BACKEND
