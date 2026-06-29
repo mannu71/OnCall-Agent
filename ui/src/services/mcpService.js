@@ -33,20 +33,7 @@ export const loadMCPConfig = async () => {
         cacheTimestamp = now;
         return configCache;
     } catch (error) {
-        console.warn('Agent API not available, falling back to Electron API:', error.message);
-
-        // Fallback to Electron API if available (for desktop app)
-        if (globalThis.electronAPI?.loadMCPConfig) {
-            try {
-                const config = await globalThis.electronAPI.loadMCPConfig();
-                configCache = config || { servers: {}, inputs: [], inputValues: {} };
-                cacheTimestamp = now;
-                return configCache;
-            } catch (electronError) {
-                console.error('Error loading MCP config from Electron:', electronError);
-            }
-        }
-
+        console.warn('Agent API not available:', error.message);
         return { servers: {}, inputs: [], inputValues: {} };
     }
 };
@@ -62,22 +49,7 @@ export const saveMCPConfig = async (config) => {
         cacheTimestamp = Date.now();
         return true;
     } catch (error) {
-        console.warn('Agent API not available, falling back to Electron API:', error.message);
-
-        // Fallback to Electron API
-        if (globalThis.electronAPI?.saveMCPConfig) {
-            try {
-                const result = await globalThis.electronAPI.saveMCPConfig(config);
-                if (result.success) {
-                    configCache = config;
-                    cacheTimestamp = Date.now();
-                    return true;
-                }
-            } catch (electronError) {
-                console.error('Error saving MCP config via Electron:', electronError);
-            }
-        }
-
+        console.warn('Agent API not available:', error.message);
         return false;
     }
 };

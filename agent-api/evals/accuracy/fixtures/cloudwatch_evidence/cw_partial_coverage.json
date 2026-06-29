@@ -1,0 +1,33 @@
+{
+  "data_quality": {
+    "coverage": "partial",
+    "partial": true,
+    "sampled": true,
+    "failures": [
+      {"analysis": "anomaly-detection", "log_group": "/aws/lambda/kyc-core", "reason": "InsufficientLogEvents"}
+    ],
+    "log_groups_requested": 2,
+    "analyses_requested": ["error-patterns", "anomaly-detection"]
+  },
+  "alarms": {
+    "summary": {"total": 0, "in_alarm": 0, "names": []}
+  },
+  "patterns": {
+    "unique_patterns": [
+      {
+        "normalized_pattern": "AccessDenied calling s3:GetObject",
+        "occurrence_count": 12,
+        "affected_streams": 1,
+        "example_message": "2026-06-04T20:05:11Z ERROR [requestId=req-Aa12Bb34Cc] AccessDenied: not authorized to perform s3:GetObject on bucket kyc-docs key profiles/abc.pdf",
+        "first_seen": "2026-06-04T20:00:00Z",
+        "last_seen": "2026-06-04T20:40:00Z"
+      }
+    ],
+    "evidence_grade": "low"
+  },
+  "anomalies": {
+    "anomalies": [],
+    "summary": {"total_anomalies": 0, "critical_severity": 0, "high_severity": 0}
+  },
+  "drilldown": []
+}

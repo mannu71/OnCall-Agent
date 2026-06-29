@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-electron
+dist-ssr
+.git
+*.log
+.env
+.env.*
+AGENTS.md
+README.md
+scripts

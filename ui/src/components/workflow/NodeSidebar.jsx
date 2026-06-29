@@ -157,6 +157,20 @@ const NodeSidebar = () => {
             enableAlerts: false,
             status: 'Ready'
           }
+        },
+        {
+          type: 'codeAnalyzer',
+          icon: '🔍',
+          title: 'Code Analyzer',
+          description: 'Search and analyze multiple code repositories',
+          data: {
+            label: 'Code Analyzer',
+            repos: [],
+            autoIndex: true,
+            staleAfterHours: 24,
+            preSummary: false,
+            status: 'Ready'
+          }
         }
       ]
     },
@@ -211,9 +225,14 @@ const NodeSidebar = () => {
 
   return (
     <div className="node-sidebar">
-      <div className="sidebar-title">🎯 AI Playground</div>
-      <div style={{ fontSize: '12px', color: '#666', marginBottom: '20px' }}>
-        Drag and drop components to build your AI workflow
+      {/* Header */}
+      <div style={{ marginBottom: '20px' }}>
+        <div style={{ fontSize: '14px', fontWeight: '600', color: '#0f172a', marginBottom: '2px' }}>
+          Components
+        </div>
+        <div style={{ fontSize: '11px', color: '#94a3b8' }}>
+          Drag onto the canvas to build
+        </div>
       </div>
 
       {getNodeCategories().map((category, categoryIndex) => (
@@ -237,14 +256,16 @@ const NodeSidebar = () => {
       ))}
 
       <div style={{
-        marginTop: '30px',
-        padding: '10px',
-        background: '#e3f2fd',
-        borderRadius: '6px',
+        marginTop: '24px',
+        padding: '10px 12px',
+        background: '#f0f9ff',
+        borderRadius: '8px',
         fontSize: '11px',
-        color: '#1976d2'
+        color: '#0369a1',
+        border: '1px solid #bae6fd',
+        lineHeight: '1.5',
       }}>
-        💡 <strong>Tip:</strong> Connect Model (bottom left), Memory (bottom center), and Tool (bottom right) to Agents
+        <strong>Tip:</strong> Connect Model (↙), Memory (↓), and Tool (↘) handles to an Agent node.
       </div>
     </div>
   );

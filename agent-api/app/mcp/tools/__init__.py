@@ -3,7 +3,8 @@ from app.mcp.tools.watch_tools import (
     watch_log_groups,
     analyze_log_patterns,
     detect_anomalies,
-    correlate_logs
+    correlate_logs,
+    handle_exceptions,
 )
 from app.mcp.tools.alert_tools import (
     create_alert,
@@ -22,5 +23,7 @@ __all__ = [
     'create_alert',
     'get_alerts',
     'acknowledge_alert',
-    'get_alert_summary'
+    'get_alert_summary',
+    # Shared decorators
+    'handle_exceptions',
 ]

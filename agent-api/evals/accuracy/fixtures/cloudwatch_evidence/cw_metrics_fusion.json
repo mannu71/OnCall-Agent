@@ -1,0 +1,33 @@
+{
+  "data_quality": {
+    "coverage": "full",
+    "partial": false,
+    "sampled": false,
+    "failures": [],
+    "log_groups_requested": 1,
+    "analyses_requested": ["error-patterns", "anomaly-detection", "alarms", "metrics"]
+  },
+  "alarms": {
+    "summary": {"total": 2, "in_alarm": 0, "ok": 2, "insufficient_data": 0}
+  },
+  "patterns": {
+    "unique_patterns": [],
+    "evidence_grade": "medium"
+  },
+  "anomalies": {
+    "anomalies": [],
+    "summary": {"total_anomalies": 0, "critical_severity": 0, "high_severity": 0}
+  },
+  "metrics": {
+    "metrics": {
+      "throttles": {
+        "label": "Lambda Throttles (kyc-auth)",
+        "summary": {"count": 12, "total": 480, "average": 40.0, "maximum": 95.0, "minimum": 0.0, "latest": 95.0}
+      },
+      "concurrent": {
+        "label": "Lambda ConcurrentExecutions (kyc-auth)",
+        "summary": {"count": 12, "total": 12000, "average": 1000.0, "maximum": 1000.0, "minimum": 980.0, "latest": 1000.0}
+      }
+    }
+  }
+}

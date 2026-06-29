@@ -1,0 +1,29 @@
+# Python
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.ruff_cache
+**/.hypothesis
+agent-api/.venv
+agent-api/venv
+
+# Node
+**/node_modules
+ui/dist
+codegraph/graph-ui/dist
+codegraph/graph-ui/tsconfig.tsbuildinfo
+
+# Build artifacts
+codegraph/build
+**/*.o
+
+# Data / secrets
+agent-api/data
+.env
+**/.env
+
+# VCS / IDE
+.git
+.vscode
+.idea

@@ -1,0 +1,6 @@
+// Compile bundled tree-sitter runtime as a single compilation unit.
+// Source: tree-sitter v0.26.0 (DeusData fork)
+//
+// lib.c internally #includes all other runtime .c files, so we only
+// need this one entry point. The runtime headers are at bundled/ts_runtime/src/.
+#include "lib/ts_runtime/src/lib.c"

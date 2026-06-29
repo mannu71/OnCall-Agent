@@ -1,11 +1,15 @@
 // LLM Configuration Service
 // Manages loading and saving LLM configurations via API
 
+import { getApiBaseUrl } from './apiClient';
+
 let configCache = null;
 let cacheTimestamp = 0;
 const CACHE_TTL_MS = 5000;
 
-const API_BASE_URL = 'http://localhost:8000/api/v1';
+// Single source of truth for the backend base URL (honours VITE_API_URL /
+// VITE_AGENT_API_URL); replaces the former hardcoded localhost host.
+const API_BASE_URL = getApiBaseUrl();
 
 export const invalidateCache = () => {
   configCache = null;
@@ -118,9 +122,19 @@ export const loadLLMConfig = async () => {
 /**
  * Get all configured LLMs
  */
-export const getLLMs = async () => {
-  const config = await loadLLMConfig();
-  return config.llms || {};
+export const getLLMs = async (opts = {}) => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/llm-config`, { signal: opts.signal });
+    if (response.ok) {
+      const config = await response.json();
+      return config.llms || {};
+    }
+    return {};
+  } catch (error) {
+    if (error.name === 'AbortError') throw error;
+    console.error('Error loading LLM config:', error);
+    return {};
+  }
 };
 
 /**

@@ -2,70 +2,37 @@ import React from 'react';
 import { Badge } from '@/components/ui/badge';
 import { CheckCircle, XCircle, Clock, Play, Pause } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { statusToVariant } from '@/lib/statusStyles';
 
 /**
- * Status badge component for workflow execution status
+ * Status badge component for workflow execution status.
+ * Color comes from the semantic `Badge` variant (see lib/statusStyles); this
+ * component only owns the per-status label + icon.
  */
-const StatusBadge = ({ status, size = 'medium' }) => {
-    const getStatusConfig = (status) => {
-        switch (status?.toLowerCase()) {
-            case 'running':
-            case 'in_progress':
-                return {
-                    label: 'Running',
-                    className: 'bg-blue-100 text-blue-700 hover:bg-blue-100 border-blue-200',
-                    icon: <Play className="w-3 h-3 mr-1" />
-                };
-            case 'completed':
-            case 'success':
-                return {
-                    label: 'Completed',
-                    className: 'bg-green-100 text-green-700 hover:bg-green-100 border-green-200',
-                    icon: <CheckCircle className="w-3 h-3 mr-1" />
-                };
-            case 'failed':
-            case 'error':
-                return {
-                    label: 'Failed',
-                    className: 'bg-red-100 text-red-700 hover:bg-red-100 border-red-200',
-                    icon: <XCircle className="w-3 h-3 mr-1" />
-                };
-            case 'pending':
-            case 'queued':
-                return {
-                    label: 'Pending',
-                    className: 'bg-yellow-100 text-yellow-700 hover:bg-yellow-100 border-yellow-200',
-                    icon: <Clock className="w-3 h-3 mr-1" />
-                };
-            case 'paused':
-                return {
-                    label: 'Paused',
-                    className: 'bg-gray-100 text-gray-700 hover:bg-gray-100 border-gray-200',
-                    icon: <Pause className="w-3 h-3 mr-1" />
-                };
-            default:
-                return {
-                    label: status || 'Idle',
-                    className: 'bg-gray-100 text-gray-700 hover:bg-gray-100 border-gray-200',
-                    icon: null
-                };
-        }
-    };
+const STATUS_META = {
+    running: { label: 'Running', icon: <Play className="w-3 h-3 mr-1" /> },
+    in_progress: { label: 'Running', icon: <Play className="w-3 h-3 mr-1" /> },
+    completed: { label: 'Completed', icon: <CheckCircle className="w-3 h-3 mr-1" /> },
+    success: { label: 'Completed', icon: <CheckCircle className="w-3 h-3 mr-1" /> },
+    failed: { label: 'Failed', icon: <XCircle className="w-3 h-3 mr-1" /> },
+    error: { label: 'Failed', icon: <XCircle className="w-3 h-3 mr-1" /> },
+    pending: { label: 'Pending', icon: <Clock className="w-3 h-3 mr-1" /> },
+    queued: { label: 'Pending', icon: <Clock className="w-3 h-3 mr-1" /> },
+    paused: { label: 'Paused', icon: <Pause className="w-3 h-3 mr-1" /> },
+};
 
-    const config = getStatusConfig(status);
+const StatusBadge = ({ status, size = 'medium' }) => {
+    const key = status?.toLowerCase();
+    const meta = STATUS_META[key] || { label: status || 'Idle', icon: null };
     const sizeClass = size === 'small' ? 'text-xs px-2 py-0.5' : 'text-sm px-2.5 py-1';
 
     return (
-        <Badge 
-            variant="outline"
-            className={cn(
-                'inline-flex items-center font-medium',
-                config.className,
-                sizeClass
-            )}
+        <Badge
+            variant={statusToVariant(status)}
+            className={cn('inline-flex items-center font-medium', sizeClass)}
         >
-            {config.icon}
-            {config.label}
+            {meta.icon}
+            {meta.label}
         </Badge>
     );
 };

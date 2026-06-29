@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import boto3
 import json
 import time
@@ -76,12 +77,17 @@ class CloudWatchLogsSearchTools:
         start_ts, end_ts = get_time_range(hours, start_time, end_time)
         # Start the query
         query_start_time = time.time()
-        start_query_response = self.logs_client.start_query(
-            logGroupNames=log_group_names,
-            startTime=start_ts,
-            endTime=end_ts,
-            queryString=query,
-            limit=100,
+        loop = asyncio.get_running_loop()
+        start_query_response = await loop.run_in_executor(
+            None,
+            functools.partial(
+                self.logs_client.start_query,
+                logGroupNames=log_group_names,
+                startTime=start_ts,
+                endTime=end_ts,
+                queryString=query,
+                limit=100,
+            ),
         )
         query_id = start_query_response["queryId"]
 
@@ -89,7 +95,10 @@ class CloudWatchLogsSearchTools:
         response = None
         while response is None or response["status"] == "Running":
             await asyncio.sleep(1)  # Wait before checking again
-            response = self.logs_client.get_query_results(queryId=query_id)
+            response = await loop.run_in_executor(
+                None,
+                functools.partial(self.logs_client.get_query_results, queryId=query_id),
+            )
             elapsed_time = time.time() - query_start_time
 
             # Avoid long-running queries
@@ -118,7 +127,7 @@ class CloudWatchLogsSearchTools:
                 result_dict[field["field"]] = field["value"]
             formatted_results["results"].append(result_dict)
 
-        return json.dumps(formatted_results, indent=2)
+        return json.dumps(formatted_results)
 
     @handle_exceptions
     async def filter_log_events(
@@ -143,12 +152,17 @@ class CloudWatchLogsSearchTools:
             JSON string with filtered events
         """
         start_ts, end_ts = get_time_range(hours, start_time, end_time)
-        response = self.logs_client.filter_log_events(
-            logGroupName=log_group_name,
-            filterPattern=filter_pattern,
-            startTime=start_ts,
-            endTime=end_ts,
-            limit=100,
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            functools.partial(
+                self.logs_client.filter_log_events,
+                logGroupName=log_group_name,
+                filterPattern=filter_pattern,
+                startTime=start_ts,
+                endTime=end_ts,
+                limit=100,
+            ),
         )
 
         events = response.get("events", [])
@@ -165,4 +179,4 @@ class CloudWatchLogsSearchTools:
                 }
             )
 
-        return json.dumps(formatted_events, indent=2)
+        return json.dumps(formatted_events)

@@ -15,7 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from app.core.database import AsyncSessionLocal
 from app.models.db_models import (
     LogPatternModel,
-    KnownIssueModel,
+    KnowledgeEntryModel,
     BaselineMetricModel,
     AnalysisHistoryModel
 )
@@ -23,68 +23,160 @@ from app.models.db_models import (
 logger = logging.getLogger(__name__)
 
 
+# AWS error codes that mean "the credentials are no longer usable" — when we see
+# these we rebuild the Bedrock client so a refreshed token (rotated in the DB
+# model_keys store or ~/.aws) is picked up without a process restart.
+_AUTH_ERROR_CODES = frozenset({
+    "ExpiredTokenException", "ExpiredToken", "InvalidClientTokenId",
+    "UnrecognizedClientException", "InvalidSignatureException", "AccessDeniedException",
+})
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    from botocore.exceptions import ClientError, NoCredentialsError
+    if isinstance(exc, NoCredentialsError):
+        return True
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in _AUTH_ERROR_CODES:
+            return True
+    msg = str(exc).lower()
+    return "expired" in msg or "security token" in msg or ("invalid" in msg and "token" in msg)
+
+
 class EmbeddingService:
     """Service for generating embeddings using AWS Bedrock."""
-    
-    def __init__(self, region: str = "us-east-1"):
+
+    def __init__(self, region: Optional[str] = None,
+                 model_id: Optional[str] = None,
+                 dimensions: Optional[int] = None):
         """Initialize embedding service.
-        
+
         Args:
-            region: AWS region for Bedrock
+            region: AWS region for Bedrock. When omitted, resolved from the app
+                settings / DB model-keys store at first use (same source the
+                chat LLM uses) instead of a hardcoded default.
+            model_id: Bedrock embedding model. Defaults to
+                ``settings.embedding_model_id`` (Titan V2).
+            dimensions: Output vector dimension. Defaults to
+                ``settings.embedding_dimensions`` (1024). Only honoured by Titan
+                V2 (``titan-embed-text-v2``); V1 ignores it.
         """
+        from app.config import settings
         self.region = region
+        self.model_id = model_id or settings.embedding_model_id
+        self.dimensions = int(dimensions or settings.embedding_dimensions)
         self._client = None
-    
-    @property
-    def client(self):
-        """Get Bedrock client (lazy initialization)."""
-        if self._client is None:
-            import boto3
-            self._client = boto3.client('bedrock-runtime', region_name=self.region)
+
+    def _reset_client(self) -> None:
+        """Drop the cached client so the next call rebuilds it with fresh creds."""
+        self._client = None
+
+    async def _get_client(self):
+        """Build (and cache) a Bedrock client using the app's resolved creds.
+
+        Uses the shared :func:`resolve_aws_credentials` (DB model_keys / profile)
+        and honours ``AWS_SSL_VERIFY`` so it matches the working chat-LLM path —
+        the previous hardcoded ``us-east-1`` + default credential chain was the
+        cause of "expired/invalid security token" playbook-save failures.
+        """
+        if self._client is not None:
+            return self._client
+
+        import boto3
+        from botocore.config import Config as BotocoreConfig
+        from app.config import settings
+        from app.core.aws_credentials import resolve_aws_credentials
+
+        creds, region = await resolve_aws_credentials(
+            aws_profile=settings.aws_profile,
+            aws_region=self.region or settings.aws_region,
+        )
+        self.region = region
+
+        if creds.get("access_key_id") and creds.get("secret_access_key"):
+            session = boto3.Session(
+                region_name=region,
+                aws_access_key_id=creds["access_key_id"],
+                aws_secret_access_key=creds["secret_access_key"],
+                aws_session_token=creds.get("session_token"),
+            )
+        else:
+            session = boto3.Session(
+                region_name=region, profile_name=creds.get("aws_profile"),
+            )
+
+        self._client = session.client(
+            "bedrock-runtime",
+            region_name=region,
+            verify=settings.aws_ssl_verify,
+            config=BotocoreConfig(retries={"max_attempts": 3}),
+        )
         return self._client
-    
+
     async def generate_embedding(self, text: str) -> List[float]:
         """Generate embedding for text using Amazon Titan.
-        
+
+        Retries once on an auth/expiry error after rebuilding the client, so a
+        rotated credential is picked up without a restart.
+
         Args:
             text: Text to embed
-            
+
         Returns:
-            Embedding vector (1536 dimensions for Titan)
+            Embedding vector (1024 dimensions for Titan V2)
         """
-        import asyncio
-        
-        # Truncate text if too long
+        from app.core.thread_pools import run_in_aws_pool
+
         max_tokens = 8000
         if len(text) > max_tokens:
             text = text[:max_tokens]
-        
-        # Call Bedrock API
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: self.client.invoke_model(
-                modelId='amazon.titan-embed-text-v1',
-                body=json.dumps({'inputText': text})
-            )
-        )
-        
-        result = json.loads(response['body'].read())
-        return result.get('embedding', [])
+        # Titan V2 accepts dimensions + normalize; V1 accepts only inputText
+        # (extra keys are rejected), so include them only for V2.
+        payload = {'inputText': text}
+        if 'v2' in self.model_id:
+            payload['dimensions'] = self.dimensions
+            payload['normalize'] = True
+        body = json.dumps(payload)
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            client = await self._get_client()
+            try:
+                response = await run_in_aws_pool(
+                    lambda: client.invoke_model(
+                        modelId=self.model_id,
+                        body=body,
+                    )
+                )
+                result = json.loads(response['body'].read())
+                return result.get('embedding', [])
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt == 0 and _is_auth_error(exc):
+                    logger.warning(
+                        "EmbeddingService: Bedrock credentials expired/invalid — "
+                        "rebuilding client and retrying once (%s)", exc,
+                    )
+                    self._reset_client()
+                    continue
+                raise
+        raise last_exc  # pragma: no cover — loop always returns or raises above
     
     async def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for multiple texts.
-        
-        Args:
-            texts: List of texts to embed
-            
-        Returns:
-            List of embedding vectors
-        """
-        embeddings = []
-        for text in texts:
-            embedding = await self.generate_embedding(text)
-            embeddings.append(embedding)
-        return embeddings
+        """Generate embeddings for multiple texts (bounded parallel)."""
+        if not texts:
+            return []
+
+        from app.config import settings
+
+        sem = asyncio.Semaphore(settings.embedding_concurrency)
+
+        async def _one(text: str) -> List[float]:
+            async with sem:
+                return await self.generate_embedding(text)
+
+        return list(await asyncio.gather(*[_one(t) for t in texts]))
 
 
 class KnowledgeBaseService:
@@ -173,9 +265,9 @@ class KnowledgeBaseService:
             
             query_str = """
                 SELECT id, name, pattern, pattern_type, severity, description,
-                       1 - (embedding <=> :embedding::vector) as similarity
+                       1 - (embedding <=> CAST(:embedding AS vector)) as similarity
                 FROM log_patterns
-                WHERE 1 - (embedding <=> :embedding::vector) > :threshold
+                WHERE 1 - (embedding <=> CAST(:embedding AS vector)) > :threshold
                 ORDER BY similarity DESC
                 LIMIT :limit
             """
@@ -238,9 +330,9 @@ class KnowledgeBaseService:
             ]
     
     # ============================================
-    # KNOWN ISSUE OPERATIONS
+    # KNOWLEDGE ENTRY OPERATIONS
     # ============================================
-    
+
     async def add_known_issue(
         self,
         title: str,
@@ -268,7 +360,7 @@ class KnowledgeBaseService:
         embedding = await self.embedding_service.generate_embedding(combined_text)
         
         async with AsyncSessionLocal() as session:
-            issue_model = KnownIssueModel(
+            issue_model = KnowledgeEntryModel(
                 title=title,
                 description=description,
                 symptoms=symptoms,
@@ -317,9 +409,9 @@ class KnowledgeBaseService:
 
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(KnownIssueModel).where(
-                    KnownIssueModel.title == title,
-                    KnownIssueModel.category == category,
+                select(KnowledgeEntryModel).where(
+                    KnowledgeEntryModel.title == title,
+                    KnowledgeEntryModel.category == category,
                 )
             )
             existing = result.scalar_one_or_none()
@@ -340,7 +432,7 @@ class KnowledgeBaseService:
                     "action": "updated",
                 }
             else:
-                issue_model = KnownIssueModel(
+                issue_model = KnowledgeEntryModel(
                     title=title,
                     description=solution[:500],
                     symptoms=symptoms,
@@ -370,7 +462,7 @@ class KnowledgeBaseService:
         """Update the solution field of an existing known issue.
 
         Args:
-            issue_id: Primary key of the KnownIssueModel to update.
+            issue_id: Primary key of the KnowledgeEntryModel to update.
             new_solution: Replacement solution text.
             source: Provenance of the update.
 
@@ -379,12 +471,12 @@ class KnowledgeBaseService:
         """
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(KnownIssueModel).where(KnownIssueModel.id == issue_id)
+                select(KnowledgeEntryModel).where(KnowledgeEntryModel.id == issue_id)
             )
             existing = result.scalar_one_or_none()
 
             if not existing:
-                return {"error": f"KnownIssue id={issue_id} not found"}
+                return {"error": f"KnowledgeEntry id={issue_id} not found"}
 
             existing.solution = new_solution
             existing.source = source
@@ -440,9 +532,9 @@ class KnowledgeBaseService:
             
             query_str = f"""
                 SELECT id, title, description, symptoms, solution, category,
-                       1 - (embedding <=> :embedding::vector) as similarity
-                FROM known_issues
-                WHERE 1 - (embedding <=> :embedding::vector) > :threshold
+                       1 - (embedding <=> CAST(:embedding AS vector)) as similarity
+                FROM knowledge_entries
+                WHERE 1 - (embedding <=> CAST(:embedding AS vector)) > :threshold
                 {category_filter}
                 ORDER BY similarity DESC
                 LIMIT :limit
@@ -464,6 +556,27 @@ class KnowledgeBaseService:
             
             return issues
     
+    # ============================================
+    # SKILL RECALL (convenience wrapper)
+    # ============================================
+
+    async def recall_skills_for_agent(
+        self,
+        query: str,
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Return matching skills for injection into the agent prompt.
+
+        Delegates to :class:`~app.core.skills.SkillService`.  Returns an
+        empty list (never raises) so callers don't need to guard.
+        """
+        try:
+            from app.core.skills import skill_service
+            return await skill_service.recall(query, limit=limit)
+        except Exception as exc:
+            logger.debug("knowledge_base.recall_skills_for_agent: %s", exc)
+            return []
+
     # ============================================
     # BASELINE METRIC OPERATIONS
     # ============================================

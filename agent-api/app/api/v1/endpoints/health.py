@@ -4,6 +4,7 @@ from fastapi import APIRouter, Query
 
 from app.models.workflow import HealthResponse
 from app.core.scheduler import workflow_scheduler
+from app.services.execution_state import execution_state
 
 
 router = APIRouter(tags=["health"])
@@ -12,25 +13,25 @@ router = APIRouter(tags=["health"])
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
-    active_executions = workflow_scheduler.get_active_executions()
-    
+    active_records = await execution_state.list_active_records()
+
     return HealthResponse(
         status="healthy",
         timestamp=datetime.now(timezone.utc),
         scheduler_running=workflow_scheduler.is_running(),
-        active_workflows=len(active_executions)
+        active_workflows=len(active_records),
     )
 
 
 @router.get("/status", response_model=dict)
 async def get_status():
     """Get detailed system status."""
-    active_executions = workflow_scheduler.get_active_executions()
+    active_records = await execution_state.list_active_records()
     scheduled_jobs = workflow_scheduler.get_scheduled_jobs()
-    
+
     return {
         "scheduler_running": workflow_scheduler.is_running(),
-        "active_executions": len(active_executions),
+        "active_executions": len(active_records),
         "scheduled_jobs": len(scheduled_jobs),
         "jobs": [
             {
@@ -42,13 +43,13 @@ async def get_status():
         ],
         "executions": [
             {
-                "execution_id": execution.execution_id,
-                "workflow_name": execution.workflow_name,
-                "status": execution.status,
-                "start_time": execution.start_time.isoformat()
+                "execution_id": record.get("execution_id"),
+                "workflow_name": record.get("workflow_name"),
+                "status": record.get("status"),
+                "start_time": record.get("started_at") or record.get("start_time"),
             }
-            for execution in active_executions.values()
-        ]
+            for record in active_records
+        ],
     }
 
 

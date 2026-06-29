@@ -1,0 +1,77 @@
+name: oncall-agent
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: kyc-agent-db
+    environment:
+      POSTGRES_USER: kycuser
+      POSTGRES_PASSWORD: kycpassword
+      POSTGRES_DB: kycagent
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U kycuser -d kycagent" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - oncall-agent
+
+  agent-api:
+    build:
+      context: .
+      dockerfile: agent-api/Dockerfile
+    container_name: kyc-agent-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./agent-api/data:/app/data
+      - ~/.aws:/root/.aws:ro
+      - ${REPOS_HOST_PATH:-./agent-api/data/indexed_repos}:/app/data/indexed_repos
+      - ./agent-api/data/codegraph-cache:/root/.cache/codegraph
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - STORAGE_PATH=/app/data/storage
+      - WORKFLOW_DIR=/app/data/workflows
+      - LOGS_DIR=/app/data/logs
+      - SCHEDULER_TIMEZONE=UTC
+      - MAX_CONCURRENT_WORKFLOWS=5
+      - LOG_LEVEL=INFO
+      - AWS_SSL_VERIFY=false
+      - DATABASE_URL=postgresql://kycuser:kycpassword@postgres:5432/kycagent
+      - REPOS_BASE_PATH=/app/data/indexed_repos
+      - CODEGRAPH_CACHE_DIR=/root/.cache/codegraph
+      - PROVIDER_TRANSPORT=bedrock
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - oncall-agent
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    container_name: kyc-agent-ui
+    ports:
+      - "3000:80"
+    depends_on:
+      - agent-api
+    restart: unless-stopped
+    networks:
+      - oncall-agent
+
+networks:
+  oncall-agent:
+    name: oncall-agent
+    driver: bridge
+
+volumes:
+  postgres_data:
+    name: oncall-agent-postgres-data

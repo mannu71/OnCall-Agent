@@ -1,0 +1,31 @@
+{
+  "data_quality": {
+    "coverage": "partial",
+    "partial": true,
+    "regions": {"us-east-1": "full", "ap-south-1": "none"},
+    "failures": [
+      {"analysis": "error-patterns", "region": "ap-south-1", "error": "AccessDenied: not authorized to perform logs:StartQuery"}
+    ]
+  },
+  "alarms": {
+    "summary": {"total": 1, "in_alarm": 0, "ok": 1}
+  },
+  "patterns": {
+    "unique_patterns": [
+      {
+        "normalized_pattern": "Upstream 503 from billing-svc",
+        "occurrence_count": 60,
+        "affected_streams": 2,
+        "example_message": "2026-06-14T10:02:00Z ERROR Upstream 503 from billing-svc (requestId=req-Useast1Bb)",
+        "region": "us-east-1",
+        "first_seen": "2026-06-14T10:00:00Z",
+        "last_seen": "2026-06-14T10:25:00Z"
+      }
+    ],
+    "evidence_grade": "low"
+  },
+  "anomalies": {
+    "anomalies": [],
+    "summary": {"total_anomalies": 0, "critical_severity": 0, "high_severity": 0}
+  }
+}

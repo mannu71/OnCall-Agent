@@ -1,0 +1,3 @@
+service UserService {
+  rpc GetUser(GetUserRequest) returns (User);
+}

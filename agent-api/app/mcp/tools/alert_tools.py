@@ -12,7 +12,7 @@ from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal
-from app.models.db_models import AlertModel, LogPatternModel, KnownIssueModel
+from app.models.db_models import AlertModel, LogPatternModel, KnowledgeEntryModel
 
 logger = logging.getLogger(__name__)
 
@@ -434,92 +434,104 @@ async def dismiss_alert(
 
 
 @handle_exceptions
-async def get_known_issues(
+async def get_knowledge_entries(
     category: Optional[str] = None,
     limit: int = 50
 ) -> Dict[str, Any]:
-    """Get known issues from the knowledge base.
-    
-    This tool retrieves known issues that can be matched against
+    """Get knowledge entries from the knowledge base.
+
+    This tool retrieves knowledge entries that can be matched against
     detected patterns for automated resolution suggestions.
-    
+
     Args:
         category: Filter by category (database, network, authentication, etc.)
-        limit: Maximum number of issues to return
-        
+        limit: Maximum number of entries to return
+
     Returns:
-        List of known issues
+        List of knowledge entries
     """
     async with AsyncSessionLocal() as session:
-        query = select(KnownIssueModel).limit(limit)
-        
+        query = select(KnowledgeEntryModel).limit(limit)
+
         if category:
-            query = query.where(KnownIssueModel.category == category)
-        
+            query = query.where(KnowledgeEntryModel.category == category)
+
         result = await session.execute(query)
-        issues = result.scalars().all()
-        
+        entries = result.scalars().all()
+
         return {
             "success": True,
-            "issues": [
+            "entries": [
                 {
-                    "id": issue.id,
-                    "title": issue.title,
-                    "description": issue.description,
-                    "symptoms": issue.symptoms,
-                    "solution": issue.solution,
-                    "category": issue.category
+                    "id": entry.id,
+                    "title": entry.title,
+                    "description": entry.description,
+                    "symptoms": entry.symptoms,
+                    "solution": entry.solution,
+                    "category": entry.category,
+                    "source": entry.source,
                 }
-                for issue in issues
+                for entry in entries
             ],
-            "count": len(issues)
+            "count": len(entries)
         }
 
 
+# Backward-compat alias — remove once all callers are updated
+get_known_issues = get_knowledge_entries
+
+
 @handle_exceptions
-async def create_known_issue(
+async def create_knowledge_entry(
     title: str,
     description: str,
     symptoms: List[str],
     solution: str,
     category: str
 ) -> Dict[str, Any]:
-    """Create a new known issue in the knowledge base.
-    
-    This tool adds a known issue that can be used for pattern matching
+    """Create a new knowledge entry in the knowledge base.
+
+    This tool adds a knowledge entry that can be used for pattern matching
     and automated resolution suggestions.
-    
+
     Args:
-        title: Issue title
+        title: Entry title
         description: Detailed description
         symptoms: List of symptoms/signatures to match
         solution: Resolution steps
-        category: Issue category
-        
+        category: Entry category
+
     Returns:
-        Created known issue
+        Created knowledge entry
     """
     async with AsyncSessionLocal() as session:
-        issue = KnownIssueModel(
+        entry = KnowledgeEntryModel(
             title=title,
             description=description,
             symptoms=symptoms,
             solution=solution,
             category=category,
-            created_at=datetime.now(timezone.utc)
+            source="manual",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
         )
-        session.add(issue)
+        session.add(entry)
         await session.commit()
-        await session.refresh(issue)
-        
+        await session.refresh(entry)
+
         return {
             "success": True,
-            "issue": {
-                "id": issue.id,
-                "title": issue.title,
-                "description": issue.description,
-                "symptoms": issue.symptoms,
-                "solution": issue.solution,
-                "category": issue.category
+            "entry": {
+                "id": entry.id,
+                "title": entry.title,
+                "description": entry.description,
+                "symptoms": entry.symptoms,
+                "solution": entry.solution,
+                "category": entry.category,
+                "source": entry.source,
             }
         }
+
+
+# Backward-compat alias
+create_known_issue = create_knowledge_entry

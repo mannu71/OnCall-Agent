@@ -5,10 +5,10 @@ import {
   Workflow,
   Calendar,
   Settings,
-  BarChart3,
   MessageSquare,
-  Eye,
-  ChevronLeft
+  ChevronLeft,
+  Network,
+  Wrench
 } from 'lucide-react'
 
 import {
@@ -24,6 +24,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar"
 import { cn } from "@/lib/utils"
+import { useAgentApiHealth } from "@/hooks/useAgentApiHealth"
 import { version } from '../../../package.json'
 
 // Check if we're in development mode
@@ -43,17 +44,10 @@ const navigationItems = [
     icon: Calendar,
   },
   {
-    id: 'log-watch',
-    title: 'Log Watch',
-    path: '/log-watch',
-    icon: Eye,
-  },
-  {
     id: 'chat',
     title: 'Agent Chat',
     path: '/chat',
     icon: MessageSquare,
-    devOnly: true,
   },
   {
     id: 'workflow',
@@ -62,11 +56,16 @@ const navigationItems = [
     icon: Workflow,
   },
   {
-    id: 'analytics',
-    title: 'Analytics',
-    path: '/analytics',
-    icon: BarChart3,
-    devOnly: true,
+    id: 'codebase-explorer',
+    title: 'Codebase Explorer',
+    path: '/explorer',
+    icon: Network,
+  },
+  {
+    id: 'skills',
+    title: 'Skills',
+    path: '/skills',
+    icon: Wrench,
   },
   {
     id: 'settings',
@@ -79,7 +78,9 @@ const navigationItems = [
 export function AppSidebar({ ...props }) {
   const navigate = useNavigate()
   const location = useLocation()
-  const { toggleSidebar, state } = useSidebar()
+  const { toggleSidebar } = useSidebar()
+
+  const { apiHealth } = useAgentApiHealth({ pollIntervalMs: 30000 })
 
   const isActive = (path) => {
     return location.pathname === path
@@ -159,8 +160,54 @@ export function AppSidebar({ ...props }) {
         </SidebarGroup>
       </SidebarContent>
 
-      {/* Footer */}
-      <SidebarFooter className="p-4 border-t-0 group-data-[collapsible=icon]:p-2">
+      {/* Footer — API reachability from /api/v1/health */}
+      <SidebarFooter className="p-3 border-t-0 group-data-[collapsible=icon]:p-2">
+        <div
+          className="mb-2 p-3 bg-slate-50 rounded-lg border border-slate-100 group-data-[collapsible=icon]:hidden"
+          role="status"
+          aria-label={
+            !apiHealth
+              ? 'Checking API connection'
+              : apiHealth.status === 'healthy'
+                ? 'API healthy'
+                : 'API unreachable'
+          }
+          title={
+            !apiHealth
+              ? 'Checking API…'
+              : apiHealth.status === 'healthy'
+                ? 'API healthy'
+                : apiHealth.message || 'API unreachable'
+          }
+        >
+          <div className="flex items-center gap-2">
+            <span className="relative flex h-2.5 w-2.5 flex-shrink-0">
+              {apiHealth?.status === 'healthy' ? (
+                <>
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-600" />
+                </>
+              ) : apiHealth?.status === 'error' ? (
+                <>
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-600" />
+                </>
+              ) : (
+                <>
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-slate-300 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-slate-400" />
+                </>
+              )}
+            </span>
+            <span className="text-[11px] font-semibold text-slate-900 min-w-0">
+              {!apiHealth
+                ? 'Checking API…'
+                : apiHealth.status === 'healthy'
+                  ? 'API healthy'
+                  : 'API unreachable'}
+            </span>
+          </div>
+        </div>
         <div className="text-xs text-slate-400 group-data-[collapsible=icon]:hidden">
           v{version}
         </div>

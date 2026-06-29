@@ -1,25 +1,48 @@
 /**
  * API Client for communicating with the FastAPI backend.
  * This service provides a unified interface for the UI to interact with the backend,
- * whether running in Electron (packaged) or as a standalone web app.
+ * whether running in Docker (nginx same-origin proxy) or local Vite dev.
  */
 
-const DEFAULT_API_URL = 'http://localhost:8000/api/v1';
+const DEFAULT_API_HOST = 'http://localhost:8000';
+const RELATIVE_API_BASE = '/api/v1';
+const API_PREFIX = '/api/v1';
 
 /**
- * Get the API base URL based on environment
+ * Get the API base URL based on environment — the single source of truth for the
+ * backend base URL across all services.
+ *
+ * The backend mounts every route under ``/api/v1`` (main.py). Honours both env
+ * conventions in use: ``VITE_API_URL`` (apiClient/llmService) preferred, then
+ * ``VITE_AGENT_API_URL`` (agentApiClient/modelKeyService) — they point at the same
+ * agent-api host. The bare host (e.g. ``http://localhost:8000``) is normalised
+ * here: strip trailing slashes and ensure the ``/api/v1`` suffix, whether the env
+ * var includes it or not. Without this, calls like ``/settings/general`` 404.
+ *
+ * When env vars are unset in production builds, defaults to relative ``/api/v1``
+ * so nginx can proxy API traffic on the same origin as the SPA.
  */
-function getApiBaseUrl() {
-    // In packaged Electron app, the API runs on localhost
-    // In development, it also runs on localhost
-    // Can be overridden via environment variable
-    return import.meta.env.VITE_API_URL || DEFAULT_API_URL;
+export function getApiBaseUrl() {
+    const env = import.meta.env.VITE_API_URL || import.meta.env.VITE_AGENT_API_URL;
+    if (!env) {
+        if (import.meta.env.DEV) {
+            const raw = DEFAULT_API_HOST.replace(/\/+$/, '');
+            return raw.endsWith(API_PREFIX) ? raw : `${raw}${API_PREFIX}`;
+        }
+        return RELATIVE_API_BASE;
+    }
+    const raw = env.replace(/\/+$/, '');
+    return raw.endsWith(API_PREFIX) ? raw : `${raw}${API_PREFIX}`;
 }
 
 /**
- * Make an HTTP request to the API
+ * Make an HTTP request to the API.
+ *
+ * Shared fetch wrapper — other services (logWatchService, etc.) should reuse this
+ * (or at least :func:`getApiBaseUrl`) rather than hardcoding ``http://localhost:8000``
+ * so the ``VITE_API_URL`` env rule is honoured in one place.
  */
-async function apiRequest(endpoint, options = {}) {
+export async function apiRequest(endpoint, options = {}) {
     const url = `${getApiBaseUrl()}${endpoint}`;
 
     const defaultHeaders = {
@@ -66,6 +89,21 @@ export async function checkHealth() {
 
 export async function getStatus() {
     return apiRequest('/status');
+}
+
+// ============================================
+// Application Settings APIs
+// ============================================
+
+export async function getAppSettings() {
+    return apiRequest('/settings');
+}
+
+export async function updateGeneralSettings(generalSettings) {
+    return apiRequest('/settings/general', {
+        method: 'PUT',
+        body: JSON.stringify(generalSettings),
+    });
 }
 
 // ============================================
@@ -331,6 +369,53 @@ export async function deleteCertificate(filename) {
 }
 
 // ============================================
+// Code Analyzer APIs
+// ============================================
+
+/**
+ * List repositories discovered under REPOS_BASE_PATH.
+ * Returns { base_path, base_exists, repos: [{name, path, is_git,
+ *   detected_languages, suggested_language, file_count_sample}] }.
+ * When the base directory is missing, ``base_exists`` is false and
+ * ``repos`` is an empty list — never throws on that case.
+ */
+export async function listCodeAnalyzerRepos() {
+    return apiRequest('/code-analyzer/repos');
+}
+
+/**
+ * Fetch metadata for a single repository (jailed under REPOS_BASE_PATH).
+ * 404 if not found, 400 if the name fails the path-jail.
+ */
+export async function getCodeAnalyzerRepo(repoName) {
+    return apiRequest(`/code-analyzer/repos/${encodeURIComponent(repoName)}`);
+}
+
+// ============================================
+// Tool catalog / node schemas / background jobs
+// ============================================
+
+/** List the tool catalog (built-in + MCP-discovered) from the registry. */
+export async function listTools() {
+    return apiRequest('/tools');
+}
+
+/** Canonical per-node-type param contract (backend source of truth). */
+export async function getNodeSchemas() {
+    return apiRequest('/node-schemas');
+}
+
+/** Background jobs; active-only by default. */
+export async function listJobs(activeOnly = true) {
+    return apiRequest(`/jobs?active_only=${activeOnly}`);
+}
+
+/** Live repo-indexing status: { indexing, count, jobs:[{target,progress,total,...}] }. */
+export async function getIndexingStatus() {
+    return apiRequest('/jobs/indexing/status');
+}
+
+// ============================================
 // Utility exports
 // ============================================
 
@@ -385,6 +470,16 @@ export const apiClient = {
     getCertificates,
     uploadCertificate,
     deleteCertificate,
+
+    // Code Analyzer
+    listCodeAnalyzerRepos,
+    getCodeAnalyzerRepo,
+
+    // Tools / node schemas / jobs
+    listTools,
+    getNodeSchemas,
+    listJobs,
+    getIndexingStatus,
 
     // Utility
     getApiBaseUrl,

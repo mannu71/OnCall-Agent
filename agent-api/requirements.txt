@@ -1,47 +1,16 @@
-# Web Framework
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-python-multipart==0.0.6
+# ─────────────────────────────────────────────────────────────────────────────
+# FULL dependency set = core + crawler + openai extra.
+# This installs exactly the same packages as before the dependency-layering
+# change, so existing/full builds are unaffected. For a lighter footprint install
+# only `requirements-core.txt` (no tree-sitter, no langchain-openai).
+#
+# Source of truth is pyproject.toml; these requirements files mirror it for the
+# Docker build (which installs via pip -r).
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Scheduler
-apscheduler==3.10.4
+-r requirements-core.txt
+-r requirements-crawler.txt
 
-# Data Validation
-pydantic>=2.7.4
-pydantic-settings>=2.3.4
-
-# YAML Processing
-pyyaml>=6.0.1
-
-# SSE Support
-sse-starlette==1.8.2
-
-# Utilities
-python-dateutil==2.8.2
-pytz==2023.3
-
-# HTTP Client
-httpx>=0.27.0
-
-# AWS SDK for Bedrock and CloudWatch
-boto3>=1.34.0
-
-# LangChain ecosystem
-langchain>=1.2.0
-langchain-core>=1.2.0
+# openai extra — only needed for provider="openai"/"azure" LLM nodes (Bedrock is
+# primary). Imported lazily in app/workflow/strategies/react/llm_factory.py.
 langchain-openai>=1.1.0
-langchain-aws>=1.4.0
-langgraph>=1.1.0
-langgraph-prebuilt>=1.0.0
-
-# MCP (Model Context Protocol)
-mcp>=1.1.0
-
-# Vector Database (pgvector)
-psycopg2-binary>=2.9.9
-pgvector>=0.2.4
-asyncpg>=0.29.0
-sqlalchemy>=2.0.0
-
-# Async file operations
-aiofiles==23.2.1

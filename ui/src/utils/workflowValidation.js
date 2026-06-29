@@ -1,12 +1,27 @@
-const hasConnectionToType = (nodeId, targetType, nodes, edges) =>
-  edges?.some(edge => {
-    const sourceNode = nodes.find(n => n.id === edge.source);
-    const targetNode = nodes.find(n => n.id === edge.target);
-    return (
-      (sourceNode?.type === targetType && edge.target === nodeId) ||
-      (targetNode?.type === targetType && edge.source === nodeId)
-    );
-  }) || false;
+// ── Node-type awareness ──────────────────────────────────────────────────────
+// Workflows come in two schemas: legacy ReactFlow (llm / tool / cloudwatchAnalyzer)
+// and the newer LangflowEditor (language_model / cloudwatch_tool / postgres_tool …).
+// Treat both consistently so Chat lists agents and the editor validates either.
+const LLM_TYPES = ['llm', 'language_model'];
+const isLlmType = (t) => LLM_TYPES.includes(t);
+
+// Anything wired into the agent that isn't an LLM, a schedule/trigger, or the
+// agent itself is treated as a tool — covers tool, cloudwatch_tool,
+// cloudwatchAnalyzer, postgres_tool, codeAnalyzer, database, wiki, *_tool, …
+const NON_TOOL_TYPES = new Set([
+  'agent', 'llm', 'language_model', 'schedule', 'scheduler', 'trigger', 'memory',
+]);
+const isToolType = (t) => !!t && !NON_TOOL_TYPES.has(t);
+
+/** Types of nodes directly connected (either direction) to the given node. */
+const neighborTypesOf = (nodeId, nodes, edges) =>
+  (edges || [])
+    .filter(e => e.source === nodeId || e.target === nodeId)
+    .map(e => {
+      const otherId = e.source === nodeId ? e.target : e.source;
+      return nodes?.find(n => n.id === otherId)?.type;
+    })
+    .filter(Boolean);
 
 const isNodeConnected = (nodeId, edges) =>
   edges?.some(edge => edge.source === nodeId || edge.target === nodeId) || false;
@@ -18,20 +33,13 @@ const getUnconnectedNodes = (nodes, edges) =>
 const findNodeByType = (nodes, type) =>
   nodes?.find(node => node.type === type);
 
-const agentConnectionRules = [
-  { type: 'llm', message: 'Agent workflow must have an LLM node connected to the Agent.' },
-  { type: 'tool', message: 'Agent workflow must have at least one Tool connected to the Agent.' },
-  { type: 'cloudwatchAnalyzer', message: 'Agent workflow must have at least one Tool connected to the Agent.' }
-];
+// Check if agent has an LLM (llm or language_model) connected.
+const hasLlmConnection = (agentNodeId, nodes, edges) =>
+  neighborTypesOf(agentNodeId, nodes, edges).some(isLlmType);
 
-// Check if agent has any tool connected (tool or cloudwatchAnalyzer)
-const hasToolConnection = (agentNodeId, nodes, edges) => {
-  return edges?.some(edge => {
-    if (edge.target !== agentNodeId) return false;
-    const sourceNode = nodes.find(n => n.id === edge.source);
-    return sourceNode?.type === 'tool' || sourceNode?.type === 'cloudwatchAnalyzer';
-  }) || false;
-};
+// Check if agent has any tool connected (tool / cloudwatch_tool / cloudwatchAnalyzer / …).
+const hasToolConnection = (agentNodeId, nodes, edges) =>
+  neighborTypesOf(agentNodeId, nodes, edges).some(isToolType);
 
 const validators = {
   minNodes: (nodes) => ({
@@ -73,16 +81,12 @@ const validators = {
     const agentNode = findNodeByType(nodes, 'agent');
     if (!agentNode) return { isValid: false, error: 'No agent node found.' };
 
-    // Check LLM connection
-    if (!hasConnectionToType(agentNode.id, 'llm', nodes, edges)) {
+    if (!hasLlmConnection(agentNode.id, nodes, edges)) {
       return { isValid: false, error: 'Agent workflow must have an LLM node connected to the Agent.' };
     }
-
-    // Check Tool connection (tool or cloudwatchAnalyzer)
     if (!hasToolConnection(agentNode.id, nodes, edges)) {
       return { isValid: false, error: 'Agent workflow must have at least one Tool connected to the Agent.' };
     }
-
     return { isValid: true, error: null };
   }
 };
@@ -109,19 +113,29 @@ export const validateWorkflow = (workflowType, nodes, edges) => {
   return { isValid: true, error: null };
 };
 
+/**
+ * Is this workflow usable as a chat agent?
+ *
+ * Agent-centric (NOT keyed on the saved `type`, which is often "workflow"):
+ * a workflow is chat-ready when it has an `agent` node connected to an LLM
+ * (llm/language_model) AND at least one tool (tool/cloudwatch_tool/…).
+ * Standalone schedule/scheduler nodes are ignored — they don't block chat.
+ */
 export const isAgentWorkflowValid = (workflow) => {
-  const { type, nodes, edges } = workflow;
+  if (!workflow) return false;
+  const nodes = workflow.nodes || [];
+  const edges = workflow.edges || [];
 
-  if (type !== 'agent') return false;
-  if (!validators.minNodes(nodes).isValid) return false;
-  if (!validators.allConnected(nodes, edges).isValid) return false;
-  if (!validators.hasAgentNode(nodes).isValid) return false;
-  if (!validators.agentConnections(nodes, edges).isValid) return false;
+  const agentNode = nodes.find(n => n.type === 'agent');
+  if (!agentNode) return false;
 
-  return true;
+  return (
+    hasLlmConnection(agentNode.id, nodes, edges) &&
+    hasToolConnection(agentNode.id, nodes, edges)
+  );
 };
 
-export { validators };
+export { validators, isLlmType, isToolType };
 
 export default {
   validateWorkflow,

@@ -28,6 +28,12 @@ class ClassifiedError:
     should_compress: bool = False
     should_fallback: bool = False
     original_error: Exception | None = field(default=None, repr=False)
+    # Target metadata — populated by the caller (the agent runner knows which
+    # model/region/credential it was using when the error fired). Lets the
+    # fallback-chain router record per-target backoff. Left None when unknown.
+    model_id: str | None = None
+    region: str | None = None
+    provider_key: str | None = None
 
     @property
     def description(self) -> str:
@@ -190,12 +196,14 @@ def _classify_boto_error(error: Exception) -> ClassifiedError:
             return ClassifiedError(
                 reason=FailoverReason.RATE_LIMIT,
                 retryable=True,
+                should_fallback=True,
                 original_error=error,
             )
         if error_code in ("ServiceUnavailable", "InternalFailure", "InternalError"):
             return ClassifiedError(
                 reason=FailoverReason.SERVER_ERROR,
                 retryable=True,
+                should_fallback=True,
                 original_error=error,
             )
         if error_code in ("InvalidClientTokenId", "UnrecognizedClientException"):

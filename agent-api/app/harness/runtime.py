@@ -1,0 +1,84 @@
+"""Shared LangGraph persistence runtime (durable checkpointer + store).
+
+One process-wide psycopg3 connection pool feeds an ``AsyncPostgresSaver`` (durable
+checkpoints → HITL resume, time-travel) and an ``AsyncPostgresStore`` (long-term
+memory for the deepagents path). Initialised once at app startup (``init_persistence``)
+and closed on shutdown. Best-effort: if Postgres/psycopg is unavailable the getters
+return ``None`` and callers fall back to the in-memory checkpointer — startup never
+fails because of this.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+_pool: Optional[Any] = None
+_saver: Optional[Any] = None
+_store: Optional[Any] = None
+
+
+def _psycopg_url() -> str:
+    """psycopg3 wants a plain ``postgresql://`` URL (not the +asyncpg variant)."""
+    from app.config import settings
+    url = settings.database_url
+    return url.replace("postgresql+asyncpg://", "postgresql://")
+
+
+async def init_persistence() -> None:
+    """Open the shared pool and set up the saver + store. Idempotent, best-effort."""
+    global _pool, _saver, _store
+    if _saver is not None:
+        return
+    try:
+        from psycopg_pool import AsyncConnectionPool
+        from psycopg.rows import dict_row
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        from langgraph.store.postgres.aio import AsyncPostgresStore
+
+        _pool = AsyncConnectionPool(
+            conninfo=_psycopg_url(),
+            open=False,
+            max_size=int(__import__("os").getenv("LG_POOL_MAX", "10")),
+            kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+        )
+        await _pool.open(wait=True)
+
+        _saver = AsyncPostgresSaver(_pool)
+        await _saver.setup()
+        _store = AsyncPostgresStore(_pool)
+        await _store.setup()
+        logger.info("LangGraph persistence ready (AsyncPostgresSaver + AsyncPostgresStore)")
+    except Exception as exc:  # noqa: BLE001 — never block startup
+        logger.warning(
+            "LangGraph persistence unavailable (%s) — falling back to in-memory checkpointer", exc
+        )
+        _saver = None
+        _store = None
+        if _pool is not None:
+            try:
+                await _pool.close()
+            except Exception:  # noqa: BLE001
+                pass
+            _pool = None
+
+
+async def close_persistence() -> None:
+    global _pool, _saver, _store
+    if _pool is not None:
+        try:
+            await _pool.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _pool = _saver = _store = None
+
+
+def get_saver() -> Optional[Any]:
+    """Shared durable checkpointer, or None when Postgres persistence is unavailable."""
+    return _saver
+
+
+def get_store() -> Optional[Any]:
+    """Shared LangGraph store (long-term memory), or None when unavailable."""
+    return _store

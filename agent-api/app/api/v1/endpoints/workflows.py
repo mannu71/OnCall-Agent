@@ -13,12 +13,16 @@ from app.models.workflow import (
     WorkflowUpdate,
     WorkflowResponse
 )
-from app.repositories import WorkflowRepository, ExecutionRepository
+from app.infrastructure.persistence import WorkflowRepository, ExecutionRepository
 from app.api.deps import get_workflow_repo, get_execution_repo, verify_workflow_exists
 from app.core.scheduler import workflow_scheduler
 from app.services.visual_workflow_executor import visual_executor
+from app.workflow.routing import execute_workflow as run_workflow, is_workflow_running, is_visual_workflow
+from app.services.workflow_output_extractor import extract_workflow_output
 from app.core.exceptions import NotFoundException
 from app.config import settings
+from app.core.sse import SSE_HEADERS
+from app.workflow.event_adapter import workflow_name_event_stream
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 logger = logging.getLogger(__name__)
@@ -29,9 +33,90 @@ def _get_now_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
+def _node_containers(data: Any) -> List[Dict[str, Any]]:
+    """Candidate dicts that may hold node outputs (mirrors the FE extractor)."""
+    if not isinstance(data, dict):
+        return []
+    return [c for c in (data, data.get("result"), data.get("results"), data.get("output"))
+            if isinstance(c, dict)]
+
+
+def _extract_final_answer(data: Any) -> str:
+    """Dig the agent's final answer out of a node-keyed execute result.
+
+    Server-side mirror of ``extractFinalAnswer`` in agentApiClient.js so a
+    persisted assistant message matches what the chat renders.
+    """
+    if not data:
+        return ""
+    if isinstance(data, str):
+        return data
+    if isinstance(data.get("final_answer"), str) and data["final_answer"]:
+        return data["final_answer"]
+    for c in _node_containers(data):
+        for v in c.values():
+            if isinstance(v, dict) and isinstance(v.get("final_answer"), str) and v["final_answer"]:
+                return v["final_answer"]
+    if isinstance(data.get("output"), str) and data["output"].strip():
+        return data["output"]
+    best = ""
+    for c in _node_containers(data):
+        for v in c.values():
+            if isinstance(v, dict) and isinstance(v.get("output"), str) and len(v["output"]) > len(best):
+                best = v["output"]
+    return best
+
+
+def _extract_node_field(data: Any, field: str) -> Any:
+    """Return the first node value for *field* (e.g. privacy_redactions)."""
+    if not isinstance(data, dict):
+        return None
+    if data.get(field) is not None:
+        return data[field]
+    for c in _node_containers(data):
+        for v in c.values():
+            if isinstance(v, dict) and v.get(field) is not None:
+                return v[field]
+    return None
+
+
+async def _persist_chat_message(session_id: str, *, role: str, content: str,
+                                metadata: Optional[Dict[str, Any]] = None) -> None:
+    """Append one chat message, swallowing all errors (chat persistence is best-effort)."""
+    try:
+        from app.infrastructure.persistence import session_repository
+        await session_repository.append_message(
+            session_id, role=role, content=content, metadata=metadata
+        )
+    except Exception as exc:  # noqa: BLE001 — never fail a run over chat persistence
+        logger.warning("chat persistence: append %s failed (%s)", role, exc)
+
+
+async def _persist_assistant_turn(session_id: str, result_dict: Dict[str, Any]) -> None:
+    """Persist the assistant's final answer + UI metadata for a finished run."""
+    answer = _extract_final_answer(result_dict)
+    if not answer:
+        return
+    metadata = {
+        "input_tokens": result_dict.get("input_tokens", 0) or 0,
+        "output_tokens": result_dict.get("output_tokens", 0) or 0,
+        "total_tokens": result_dict.get("total_tokens", 0) or 0,
+    }
+    redactions = _extract_node_field(result_dict, "privacy_redactions")
+    if redactions:
+        metadata["privacy_redactions"] = redactions
+    skills = _extract_node_field(result_dict, "selected_skills")
+    if skills:
+        metadata["selected_skills"] = skills
+    await _persist_chat_message(session_id, role="assistant", content=answer, metadata=metadata)
+
+
 def _find_scheduler_node(nodes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Find the scheduler node in the nodes list."""
-    return next((n for n in nodes if n.get('type') == 'scheduler'), None)
+    """Find the scheduler node in the nodes list.
+
+    Supports both legacy 'scheduler' type and new 'schedule' type.
+    """
+    return next((n for n in nodes if n.get('type') in ('scheduler', 'schedule')), None)
 
 
 def _clear_schedule_fields(workflow_dict: Dict[str, Any]) -> None:
@@ -40,41 +125,152 @@ def _clear_schedule_fields(workflow_dict: Dict[str, Any]) -> None:
     logger.info("[SYNC] No scheduler node found, clearing schedule")
 
 
+#: Schedule-node weekday label → cron day-of-week number (Sun=0 … Sat=6).
+_DOW_NUM = {'Mon': '1', 'Tue': '2', 'Wed': '3', 'Thu': '4', 'Fri': '5', 'Sat': '6', 'Sun': '0'}
+
+
+def _days_to_cron_dow(days: Any) -> str:
+    """Map the Schedule node's ``days`` ("Mon,Tue,…") to a cron day-of-week field.
+
+    Empty or all-seven selections → ``*`` (every day). Order-independent.
+    """
+    parts = [d.strip() for d in str(days or '').split(',') if d.strip()]
+    nums = [_DOW_NUM[d] for d in parts if d in _DOW_NUM]
+    if not nums or len(set(nums)) == 7:
+        return '*'
+    # Preserve Mon→Sun order for readability.
+    ordered = [_DOW_NUM[d] for d in ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
+               if _DOW_NUM[d] in nums]
+    return ','.join(ordered)
+
+
+def _params_to_cron(params: Dict[str, Any]) -> Optional[str]:
+    """Convert new-schema Schedule node params to a UTC cron expression.
+
+    New Schedule node stores: ``params.frequency``, ``params.time`` (HH:MM local),
+    ``params.days`` ("Mon,Tue,…"). The timezone is the operator-configured GLOBAL
+    timezone (Settings page) — the node no longer carries its own tz.
+    """
+    from app.core.app_timezone import get_global_timezone_name
+
+    frequency = (params.get('frequency') or 'Daily').strip()
+    time_str = params.get('time') or '09:00'
+    # Timezone is global (Settings → global_timezone), not per-node. Any legacy
+    # ``params.tz`` is intentionally ignored so all schedules share one tz.
+    tz_str = get_global_timezone_name()
+
+    freq_lower = frequency.lower()
+
+    # Fixed-interval frequencies — no time conversion needed
+    if freq_lower in ('every 5 min', 'every 5 minutes'):
+        return '*/5 * * * *'
+    if freq_lower in ('every 15 min', 'every 15 minutes'):
+        return '*/15 * * * *'
+    if freq_lower in ('every 30 min', 'every 30 minutes'):
+        return '*/30 * * * *'
+    if freq_lower == 'hourly':
+        return '0 * * * *'
+
+    # Time-based frequencies — convert local time in the global tz to UTC
+    try:
+        hour, minute = (int(p) for p in time_str.split(':'))
+    except (ValueError, AttributeError):
+        hour, minute = 9, 0
+
+    try:
+        from zoneinfo import ZoneInfo
+        local_dt = datetime(2024, 1, 15, hour, minute, tzinfo=ZoneInfo(tz_str))
+        utc_dt = local_dt.astimezone(ZoneInfo('UTC'))
+        utc_hour, utc_minute = utc_dt.hour, utc_dt.minute
+    except Exception:
+        utc_hour, utc_minute = hour, minute
+
+    if freq_lower == 'monthly':
+        return f'{utc_minute} {utc_hour} 1 * *'
+
+    # Daily / Weekly both honour the selected days-of-week. Weekly with no day
+    # selected defaults to Monday; Daily with none → every day.
+    dow = _days_to_cron_dow(params.get('days'))
+    if freq_lower == 'weekly' and dow == '*':
+        dow = '1'
+    return f'{utc_minute} {utc_hour} * * {dow}'
+
+
+def _frequency_to_recurrence(frequency: str) -> str:
+    """Map UI frequency label to legacy recurrence string."""
+    f = (frequency or 'daily').lower()
+    if 'weekly' in f:
+        return 'weekly'
+    if 'monthly' in f:
+        return 'monthly'
+    return 'daily'
+
+
 def _sync_update_to_scheduler_node(scheduler_node: Dict[str, Any], update_data: Dict[str, Any]) -> None:
-    """Sync top-level schedule fields from update_data to scheduler node."""
+    """Sync top-level schedule fields from update_data to scheduler node.
+
+    Handles both old-schema nodes (``data.cronExpression``) and new-schema
+    nodes (``params.frequency`` / ``params.time``).
+    """
     if not update_data:
         return
-    
+
+    params = scheduler_node.get('params')
     node_data = scheduler_node.get('data', {})
-    
-    if schedule := update_data.get('schedule'):
-        node_data['cronExpression'] = schedule
-    if 'enabled' in update_data:
-        node_data['enabled'] = update_data['enabled']
-    if start_time := update_data.get('startTime'):
-        node_data['startTime'] = start_time
-    if recurrence := update_data.get('recurrence'):
-        node_data['recurrence'] = recurrence
+
+    if params is not None:
+        # New schema node — update params directly
+        if 'enabled' in update_data:
+            params['enabled'] = update_data['enabled']
+        # If a raw cron arrives from the Schedule Management page, store it
+        if schedule := update_data.get('schedule'):
+            params['_cronOverride'] = schedule
+    else:
+        # Old schema node — update data fields
+        if schedule := update_data.get('schedule'):
+            node_data['cronExpression'] = schedule
+        if 'enabled' in update_data:
+            node_data['enabled'] = update_data['enabled']
+        if start_time := update_data.get('startTime'):
+            node_data['startTime'] = start_time
+        if recurrence := update_data.get('recurrence'):
+            node_data['recurrence'] = recurrence
 
 
 def _sync_scheduler_to_workflow(scheduler_node: Dict[str, Any], workflow_dict: Dict[str, Any]) -> None:
-    """Sync scheduler node data to workflow-level fields."""
-    node_data = scheduler_node.get('data', {})
-    cron_expression = node_data.get('cronExpression')
-    enabled = node_data.get('enabled', True)
-    
+    """Sync scheduler node data to workflow-level fields.
+
+    Supports both schemas:
+    - Old (legacy): ``node.data.cronExpression`` / ``startTime`` / ``recurrence``
+    - New (LangflowEditor): ``node.params.frequency`` / ``time`` / ``tz``
+    """
+    params = scheduler_node.get('params')
+    node_data = scheduler_node.get('data') or {}
+
+    if params is not None:
+        # New schema — derive cron from params.frequency + time + tz
+        cron_expression = params.get('_cronOverride') or _params_to_cron(params)
+        enabled = params.get('enabled', True)
+        start_time = params.get('time')
+        recurrence = _frequency_to_recurrence(params.get('frequency', 'Daily'))
+    else:
+        # Old schema
+        cron_expression = node_data.get('cronExpression')
+        enabled = node_data.get('enabled', True)
+        start_time = node_data.get('startTime')
+        recurrence = node_data.get('recurrence')
+
     if not cron_expression:
         return
-    
+
     workflow_dict['schedule'] = cron_expression
     workflow_dict['enabled'] = enabled
-    
-    # Also preserve startTime and recurrence at workflow level for frontend convenience
-    if start_time := node_data.get('startTime'):
+
+    if start_time:
         workflow_dict['startTime'] = start_time
-    if recurrence := node_data.get('recurrence'):
+    if recurrence:
         workflow_dict['recurrence'] = recurrence
-    
+
     logger.info(f"[SYNC] Synced from scheduler node: {cron_expression=}, {enabled=}")
 
 
@@ -97,7 +293,8 @@ def _sync_scheduler_node(workflow_dict: Dict[str, Any], update_data: Optional[Di
             _clear_schedule_fields(workflow_dict)
         return
 
-    if 'data' not in scheduler_node:
+    # Ensure old-schema nodes have a data dict; new-schema nodes use params (already present)
+    if scheduler_node.get('params') is None and 'data' not in scheduler_node:
         scheduler_node['data'] = {}
 
     # If update_data has top-level schedule fields, sync them TO the scheduler node first
@@ -111,31 +308,65 @@ def _sync_scheduler_node(workflow_dict: Dict[str, Any], update_data: Optional[Di
 
 def _validate_orchestrator_nodes(workflow_dict: Dict[str, Any]) -> None:
     """Validate that all orchestrator nodes have SQL files attached.
-    
+
+    Supports both schema shapes:
+    - Legacy (ReactFlow):  node['data']['fileName'] / node['data']['fileContent']
+    - New (LangflowEditor): node['params']['sqlFile'] / node['params']['sqlContent']
+
     Args:
         workflow_dict: Workflow dictionary with nodes
-        
+
     Raises:
         HTTPException: If any orchestrator node is missing SQL file
     """
     nodes = workflow_dict.get('nodes', [])
     orchestrator_nodes = [n for n in nodes if n.get('type') == 'orchestrator']
-    
+
     nodes_without_sql = []
     for node in orchestrator_nodes:
-        node_data = node.get('data', {})
-        file_name = node_data.get('fileName')
-        file_content = node_data.get('fileContent')
-        
-        # Must have either fileContent (new upload) or fileName (existing file)
+        # New schema: params.sqlFile / params.sqlContent
+        params = node.get('params', {})
+        file_name = params.get('sqlFile') or params.get('fileName')
+        file_content = params.get('sqlContent') or params.get('fileContent')
+
+        # Legacy schema fallback: data.fileName / data.fileContent
         if not file_name and not file_content:
-            node_label = node_data.get('label', f"Orchestrator {node.get('id', 'unknown')}")
+            node_data = node.get('data', {})
+            file_name = node_data.get('fileName')
+            file_content = node_data.get('fileContent')
+
+        # Must have either content (new upload) or file name (existing file)
+        if not file_name and not file_content:
+            node_label = (
+                params.get('label')
+                or node.get('name')
+                or node.get('data', {}).get('label')
+                or f"Orchestrator {node.get('id', 'unknown')}"
+            )
             nodes_without_sql.append(node_label)
-    
+
     if nodes_without_sql:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"SQL Orchestrator nodes must have an SQL file attached: {', '.join(nodes_without_sql)}"
+        )
+
+
+def _normalize_and_validate(workflow_dict: Dict[str, Any]) -> None:
+    """Normalize node dialect (data.* → params.*) and validate required config.
+
+    Normalization is non-destructive; validation raises HTTP 400 with the list of
+    field-level problems when a node is missing required config (e.g. a CloudWatch
+    node with no log groups, a code analyzer node with no repos).
+    """
+    from app.workflow.schema import normalize_workflow_dialect, validate_workflow
+
+    normalize_workflow_dialect(workflow_dict)
+    errors = validate_workflow(workflow_dict)
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"message": "Workflow validation failed", "errors": errors},
         )
 
 
@@ -176,10 +407,15 @@ async def create_workflow(
     
     now = _get_now_timestamp()
     workflow_dict = workflow_data.model_dump()
-    
+
+    # Normalize legacy data.* → params.* (non-destructive) then validate per-node
+    # required config so a structurally-invalid workflow fails fast at save time
+    # rather than mid-execution.
+    _normalize_and_validate(workflow_dict)
+
     # Validate orchestrator nodes have SQL files
     _validate_orchestrator_nodes(workflow_dict)
-    
+
     # Sync scheduler node and fields
     _sync_scheduler_node(workflow_dict)
     
@@ -190,6 +426,51 @@ async def create_workflow(
     saved_workflow = await workflow_repo.save(workflow_dict)
     await workflow_scheduler.reload_workflows()
     
+    return WorkflowResponse(**saved_workflow)
+
+
+@router.post("/import-spec", response_model=WorkflowResponse, status_code=status.HTTP_201_CREATED)
+async def import_agent_spec(
+    spec: Dict[str, Any] = Body(..., description="Declarative agent spec (see app.spec)"),
+    workflow_repo: WorkflowRepository = Depends(get_workflow_repo),
+):
+    """Import a declarative agent spec as a runnable workflow.
+
+    Validates the spec (policy allowlist, MCP resolvability, builtin/sub-agent
+    references) and converts it into the platform workflow schema, then creates
+    it through the same save path as a UI-built workflow.
+    """
+    from app.spec import SpecValidationError, spec_to_workflow_dict
+
+    try:
+        workflow_dict = spec_to_workflow_dict(spec)
+    except SpecValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"message": "spec validation failed", "errors": exc.errors},
+        )
+    except Exception as exc:  # malformed spec / pydantic error
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid spec: {exc}",
+        )
+
+    name = workflow_dict["name"]
+    if await workflow_repo.exists(name):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Workflow '{name}' already exists",
+        )
+
+    now = _get_now_timestamp()
+    _normalize_and_validate(workflow_dict)
+    _validate_orchestrator_nodes(workflow_dict)
+    _sync_scheduler_node(workflow_dict)
+    workflow_dict["created_at"] = now
+    workflow_dict["updated_at"] = now
+
+    saved_workflow = await workflow_repo.save(workflow_dict)
+    await workflow_scheduler.reload_workflows()
     return WorkflowResponse(**saved_workflow)
 
 
@@ -211,15 +492,20 @@ async def update_workflow(
     workflow_dict = {**existing_workflow, **update_data}
     
     logger.info(f"[UPDATE] Updating workflow '{workflow_name}'")
-    
+
+    # Normalize legacy data.* → params.* (non-destructive) then validate per-node
+    # required config (only when this update carries nodes).
+    if 'nodes' in workflow_dict:
+        _normalize_and_validate(workflow_dict)
+
     # Validate orchestrator nodes have SQL files
     _validate_orchestrator_nodes(workflow_dict)
     
     # Log scheduler node data if present
     if 'nodes' in workflow_dict:
-        scheduler_node = next((n for n in workflow_dict['nodes'] if n.get('type') == 'scheduler'), None)
+        scheduler_node = _find_scheduler_node(workflow_dict['nodes'])
         if scheduler_node:
-            logger.info(f"[UPDATE] Scheduler node data BEFORE sync: {scheduler_node.get('data', {})}")
+            logger.info(f"[UPDATE] Scheduler node BEFORE sync: data={scheduler_node.get('data')}, params={scheduler_node.get('params')}")
     
     # Sync scheduler node and fields
     _sync_scheduler_node(workflow_dict, update_data)
@@ -238,26 +524,165 @@ async def update_workflow(
         if field in existing_workflow:
             workflow_dict[field] = existing_workflow[field]
     
+    # ── Detect codeAnalyzer repos that need indexing ─────────────────────
+    # Split by backend: crawler repos index into repo_abstractions; codegraph
+    # repos index into the native engine. A node carries exactly one backend.
+    repos_to_index = await _extract_unindexed_repos(workflow_dict)
+    codegraph_repos = _extract_codegraph_repos(workflow_dict)
+    if repos_to_index or codegraph_repos:
+        # Disable the workflow while background indexing runs so it cannot
+        # be executed with un-indexed repos.
+        workflow_dict["enabled"] = False
+        workflow_dict["indexing_status"] = "indexing"
+        logger.info(
+            "[UPDATE] workflow='%s' indexing: crawler=%s codegraph=%s — disabling and firing indexer(s)",
+            workflow_name, repos_to_index, codegraph_repos,
+        )
+
     # Pass original workflow_name for rename detection
     saved_workflow = await workflow_repo.save(workflow_dict, original_name=workflow_name)
     await workflow_scheduler.reload_workflows()
-    
+
+    if repos_to_index:
+        # Resolve the model the workflow's LLM node targets so the indexer
+        # uses the same model the user just configured (not the global default).
+        indexer_model_id = await _resolve_workflow_model_id(workflow_dict)
+        # Fire-and-forget: does not block the HTTP response
+        from app.crawler.background_indexer import index_workflow_repos
+        task = asyncio.create_task(
+            index_workflow_repos(saved_workflow["name"], repos_to_index, model_id=indexer_model_id)
+        )
+        visual_executor.background_tasks.add(task)
+        task.add_done_callback(visual_executor.background_tasks.discard)
+
+    if codegraph_repos:
+        # codegraph indexes via its own in-process engine. (If a workflow mixes
+        # both backends, each re-enables on completion — benign for the rare
+        # mixed case; nodes normally share one backend.)
+        from app.crawler.background_indexer import index_workflow_repos_codegraph
+        cg_task = asyncio.create_task(
+            index_workflow_repos_codegraph(saved_workflow["name"], codegraph_repos)
+        )
+        visual_executor.background_tasks.add(cg_task)
+        cg_task.add_done_callback(visual_executor.background_tasks.discard)
+
     return WorkflowResponse(**saved_workflow)
 
 
-def _cleanup_active_executions(workflow_name: str) -> None:
-    """Cancel and cleanup any active executions for a workflow.
-    
-    Args:
-        workflow_name: Name of the workflow
+async def _extract_unindexed_repos(workflow_dict: dict) -> list:
+    """Return crawler-backend repo names not yet in repo_abstractions.
+
+    Only considers code-analyzer nodes whose backend is ``code_crawler`` —
+    codegraph-backend repos index via :func:`_extract_codegraph_repos`. Accepts
+    both node dialects (``codeAnalyzer`` with ``data.repos`` list and
+    ``code_search_tool`` with ``params.repos`` string) via the shared parser.
     """
-    execution_ids_to_clear = [
-        eid for eid, data in visual_executor.active_executions.items()
-        if data.get('workflow_name') == workflow_name
-    ]
-    
-    for execution_id in execution_ids_to_clear:
-        visual_executor.cleanup_execution(execution_id)
+    from app.services.crawler_service import crawler_service
+    from app.workflow.code_analyzer_config import (
+        CODE_ANALYZER_NODE_TYPES,
+        read_code_analyzer_backend,
+        read_code_analyzer_repos,
+    )
+
+    repo_names: list = []
+    for node in workflow_dict.get("nodes") or []:
+        if node.get("type") in CODE_ANALYZER_NODE_TYPES and \
+                read_code_analyzer_backend(node) == "code_crawler":
+            for r in read_code_analyzer_repos(node):
+                if r["name"]:
+                    repo_names.append(r["name"])
+
+    return await crawler_service.filter_unindexed_repos(repo_names)
+
+
+def _extract_codegraph_repos(workflow_dict: dict) -> list:
+    """Return deduped repo names from codegraph-backend code-analyzer nodes.
+
+    codegraph tracks its own index, so we don't filter against repo_abstractions;
+    ``index_repository`` is incremental and dedupes unchanged files on its side.
+    """
+    from app.workflow.code_analyzer_config import (
+        CODE_ANALYZER_NODE_TYPES,
+        read_code_analyzer_backend,
+        read_code_analyzer_repos,
+    )
+
+    repo_names: list = []
+    for node in workflow_dict.get("nodes") or []:
+        if node.get("type") in CODE_ANALYZER_NODE_TYPES and \
+                read_code_analyzer_backend(node) == "codegraph":
+            for r in read_code_analyzer_repos(node):
+                if r["name"]:
+                    repo_names.append(r["name"])
+
+    return list(dict.fromkeys(repo_names))
+
+
+async def _resolve_workflow_model_id(workflow_dict: dict) -> "Optional[str]":
+    """Return the Bedrock model ID (with cross-region prefix) for the workflow's LLM node.
+
+    Looks at the workflow's ``llm`` node to find which LLM config it references,
+    then looks that config up in the DB and applies the same inference-profile
+    remapping that ReactStrategy._build_llm() uses (prepend eu./us./ap.).
+
+    Falls back to None when no llm node is found or the config cannot be
+    resolved — call_llm will then use the first entry from llm_configs as usual.
+    """
+    from app.infrastructure.persistence import llm_config_repository
+
+    # Find the llm node
+    llm_node = next(
+        (n for n in (workflow_dict.get("nodes") or []) if n.get("type") == "llm"),
+        None,
+    )
+    if not llm_node:
+        return None
+
+    data = llm_node.get("data") or {}
+    config_name = data.get("configName") or data.get("llmConfigId") or data.get("model")
+    if not config_name:
+        return None
+
+    try:
+        db_configs = await llm_config_repository.list_all()
+        cfg = db_configs.get(config_name) or next(iter(db_configs.values()), None)
+        if not cfg:
+            return None
+
+        model  = cfg.get("model", "")
+        region = cfg.get("region", "us-east-1")
+
+        # Apply cross-region inference profile prefix (same logic as ReactStrategy)
+        _PROFILE_PREFIXES  = ("us.", "eu.", "ap.")
+        _NEEDS_PROFILE_FOR = ("anthropic.", "amazon.", "meta.", "mistral.")
+        if (model and
+                not any(model.startswith(p) for p in _PROFILE_PREFIXES) and
+                any(model.startswith(p) for p in _NEEDS_PROFILE_FOR)):
+            if region.startswith("eu-"):
+                model = f"eu.{model}"
+            elif region.startswith("ap-"):
+                model = f"ap.{model}"
+            else:
+                model = f"us.{model}"
+
+        logger.info(
+            "_resolve_workflow_model_id: workflow='%s' llm_node config='%s' → model=%s",
+            workflow_dict.get("name"), config_name, model,
+        )
+        return model or None
+    except Exception as exc:
+        logger.warning("_resolve_workflow_model_id: failed (%s), indexer will use default", exc)
+        return None
+
+
+async def _cleanup_active_executions(workflow_name: str) -> None:
+    """Cancel and cleanup any active executions for a workflow."""
+    from app.services.execution_state import execution_state
+
+    await execution_state.cancel_by_workflow_name(workflow_name)
+    for execution_id in list(visual_executor.event_queues.keys()):
+        if execution_id not in execution_state.runtime_cache:
+            visual_executor.event_queues.pop(execution_id, None)
 
 
 async def _cleanup_legacy_sql_files(
@@ -327,7 +752,7 @@ async def delete_workflow(
         )
     
     # Cancel and cleanup any active executions
-    _cleanup_active_executions(workflow_name)
+    await _cleanup_active_executions(workflow_name)
     
     # Delete all execution history for this workflow
     deleted_count = await execution_repo.delete_by_workflow(workflow_name)
@@ -351,92 +776,95 @@ async def delete_workflow(
 async def execute_workflow(
     workflow_name: str,
     background: bool = False,
+    query: Optional[str] = None,
+    input: Optional[str] = None,
+    output_mode: Optional[str] = None,
+    permission_mode: Optional[str] = None,
+    harness: Optional[str] = None,
+    session_id: Optional[str] = None,
     inputs: Optional[Dict[str, Any]] = Body(None),
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
 ):
-    """Manually execute a workflow with optional input parameters."""
+    """Manually execute a workflow with optional input parameters.
+
+    The interactive chat query can arrive as the ``query`` or ``input`` query
+    param OR inside the ``inputs`` body. Normalize all of them to
+    ``inputs['user_query']`` so the agent's ReAct loop actually receives it
+    (previously the chat's ``?input=`` was silently dropped because only the body
+    was read).
+
+    When ``session_id`` is supplied (chat with a persisted session), the user
+    turn is recorded before the run and the assistant turn after it, so the
+    conversation survives a page refresh. With no ``session_id`` the behaviour is
+    unchanged — persistence is purely additive.
+    """
+    _typed_query = query or input
+    if _typed_query:
+        inputs = {**(inputs or {}), "user_query": _typed_query}
+    if output_mode:
+        # "Data Query Mode" — agent returns a validated InvestigationReport too.
+        inputs = {**(inputs or {}), "output_mode": output_mode}
+    if permission_mode:
+        # Tool gatekeeping: default | auto_allow | plan.
+        inputs = {**(inputs or {}), "permission_mode": permission_mode}
+    if harness:
+        # Per-turn agent runtime override: legacy | deepagents (accepts the
+        # 'deepagent' UI spelling too). Stamped into the agent node config in the
+        # strategy so all harness readers agree.
+        inputs = {**(inputs or {}), "harness": harness}
+
     workflow = await workflow_repo.get_by_name(workflow_name)
     if not workflow:
         raise NotFoundException(
             message=f"Workflow '{workflow_name}' not found",
             details={"workflow_name": workflow_name}
         )
-    
+
     # Check if already running (prevents duplicate executions)
-    if visual_executor._is_workflow_running(workflow_name):
+    if await is_workflow_running(workflow_name):
         return {
             "status": "already_running",
             "workflow_name": workflow_name,
             "message": f"Workflow '{workflow_name}' is already running"
         }
-    
+
+    # Persist the user turn up-front (best-effort; never blocks the run).
+    if session_id and _typed_query:
+        await _persist_chat_message(session_id, role="user", content=_typed_query)
+
     if background:
-        task = asyncio.create_task(visual_executor.execute_workflow(workflow, inputs=inputs))
-        visual_executor.background_tasks.add(task)
-        task.add_done_callback(visual_executor.background_tasks.discard)
-        # Keep a local reference to prevent premature garbage collection
-        _ = task  # noqa: F841
+        task = asyncio.create_task(
+            run_workflow(workflow, inputs=inputs, manual=True)
+        )
+        if is_visual_workflow(workflow):
+            visual_executor.background_tasks.add(task)
+            task.add_done_callback(visual_executor.background_tasks.discard)
         return {
             "status": "started",
             "workflow_name": workflow_name,
             "message": f"Workflow '{workflow_name}' execution started in background"
         }
-    
-    return await visual_executor.execute_workflow(workflow, inputs=inputs)
+
+    result = await run_workflow(workflow, inputs=inputs, manual=True)
+    result_dict = result if isinstance(result, dict) else result.model_dump(mode="json")
+
+    # Persist the assistant turn (final answer + token/privacy/skill metadata).
+    if session_id:
+        await _persist_assistant_turn(session_id, result_dict)
+
+    return result_dict
 
 
 @router.get("/{workflow_name}/stream")
 async def stream_workflow_execution(
     workflow_name: str = Depends(verify_workflow_exists),
 ):
-    """Stream events for an already-running workflow execution via SSE.
-    
-    Monitors an existing execution. Does NOT start a new one.
-    
-    Event types emitted:
-    - workflow_started, workflow_completed, workflow_failed
-    - node_started, node_completed, node_failed
-    - llm_token:   real-time LLM output token
-    - tool_call:   agent invoking a tool
-    - tool_result: tool execution result
-    - agent_error: error from agent execution
-    - agent_complete: agent finished
-    - keepalive:   connection keep-alive
-    """
-    
-    async def event_generator():
-        exec_id = visual_executor._is_workflow_running(workflow_name)
-        
-        if not exec_id:
-            yield f"data: {json.dumps({'event': 'no_execution', 'message': 'No active execution found'})}\n\n"
-            return
-        
-        queue = visual_executor.subscribe_to_events(exec_id)
-        try:
-            yield f"data: {json.dumps({'event': 'connected', 'execution_id': exec_id})}\n\n"
-            
-            while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=60.0)
-                    
-                    event_type = event.event_type
-                    event_data = event.dict()
-                    
-                    if event_type in ("llm_token", "tool_call", "tool_result", "agent_error", "agent_complete"):
-                        yield f"event: {event_type}\ndata: {json.dumps(event_data)}\n\n"
-                    else:
-                        yield f"data: {json.dumps(event_data)}\n\n"
-                    
-                    if event_type in ("workflow_completed", "workflow_failed"):
-                        break
-                except asyncio.TimeoutError:
-                    if exec_id not in visual_executor.active_executions:
-                        break
-                    yield f"data: {json.dumps({'event': 'keepalive'})}\n\n"
-        finally:
-            visual_executor.unsubscribe_from_events(exec_id, queue)
-    
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    """Stream events for an already-running workflow execution via SSE."""
+    return StreamingResponse(
+        workflow_name_event_stream(workflow_name),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 
 @router.get("/{workflow_name}/executions", response_model=List[dict])
@@ -446,4 +874,7 @@ async def get_workflow_executions(
     execution_repo: ExecutionRepository = Depends(get_execution_repo)
 ):
     """Get execution history for a workflow."""
-    return await execution_repo.list_by_workflow(workflow_name, limit=limit)
+    # Harmonized with /executions list endpoint: enrich each row with `output`
+    # and top-level token fields via the shared extractor.
+    executions = await execution_repo.list_by_workflow(workflow_name, limit=limit)
+    return [extract_workflow_output(exec) for exec in executions]

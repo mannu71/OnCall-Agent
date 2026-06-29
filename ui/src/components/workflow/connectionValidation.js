@@ -5,12 +5,12 @@
 export const CONNECTION_MAP = {
   // Core nodes
   agent: {
-    outputs: ["gmail", "teams", "chat", "output", "orchestrator"],
+    outputs: ["gmail", "teams", "chat", "output", "orchestrator", "wiki"],
     inputs: {
       input: ["teams", "chat", "scheduler"],
       model: ["llm"],
       memory: ["memory"],
-      tool: ["tool", "database", "cloudwatchAnalyzer"]
+      tool: ["tool", "database", "cloudwatchAnalyzer", "codeAnalyzer"]
     },
     maxInputs: { model: 1, memory: 1 }
   },
@@ -26,13 +26,14 @@ export const CONNECTION_MAP = {
   teams: { outputs: ["agent"] },
   chat: { outputs: ["agent"] },
   output: { inputs: ["agent", "orchestrator"] },
+  wiki: { inputs: { msg: ["agent", "orchestrator"] } },
 
   // Scheduler
   scheduler: { outputs: ["agent", "orchestrator"] },
 
   // Orchestrator
   orchestrator: {
-    outputs: ["agent", "output", "orchestrator"],
+    outputs: ["agent", "output", "orchestrator", "wiki"],
     inputs: {
       input: ["scheduler"],
       tool: ["tool"]
@@ -40,7 +41,10 @@ export const CONNECTION_MAP = {
   },
 
   // CloudWatch Analyzer (behaves like a tool)
-  cloudwatchAnalyzer: { outputs: ["agent"], maxOutputs: 1 }
+  cloudwatchAnalyzer: { outputs: ["agent"], maxOutputs: 1 },
+
+  // Code Analyzer (behaves like a tool)
+  codeAnalyzer: { outputs: ["agent"], maxOutputs: 1 }
 };
 
 // Error messages
@@ -48,7 +52,7 @@ export const ERROR_MESSAGES = {
   maxOutputs: "This node can only have one outgoing connection.",
   invalidTarget: "This connection is not allowed.",
   invalidSource: "This node cannot accept connections from this source.",
-  agentOutput: "Agent output can only connect to Gmail, Teams, Chat, Output or Orchestrator.",
+  agentOutput: "Agent output can only connect to Gmail, Teams, Chat, Output, Wiki or Orchestrator.",
   orchestratorInput: "Orchestrator can only accept Tool or Scheduler connections."
 };
 
@@ -140,8 +144,8 @@ export const nodeCategories = {
   core: ["agent"],
   ai: ["llm"],
   data: ["database"],
-  communication: ["teams", "chat", "output"],
-  tools: ["cloudwatchAnalyzer"],
+  communication: ["teams", "chat", "output", "wiki"],
+  tools: ["cloudwatchAnalyzer", "codeAnalyzer"],
   memory: ["memory"],
   workflow: ["orchestrator"],
   scheduling: ["scheduler"]

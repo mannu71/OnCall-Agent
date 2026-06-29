@@ -1,6 +1,5 @@
 """Database configuration and connection management."""
 import logging
-from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import text
@@ -9,11 +8,18 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Create async engine using settings
+# Create async engine using settings.
+# Pool sized for parallel DAG node execution (see plan §3.2).
+# Override via settings.db_pool_size / settings.db_max_overflow if defined.
 async_engine = create_async_engine(
     settings.async_database_url,
     echo=False,
-    future=True
+    future=True,
+    pool_size=getattr(settings, "db_pool_size", 20),
+    max_overflow=getattr(settings, "db_max_overflow", 40),
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_timeout=30,
 )
 
 # Create async session factory
@@ -47,23 +53,26 @@ async def get_db_session() -> AsyncSession:
 
 
 async def init_db():
-    """Initialize database tables."""
-    # Import models to register them with Base
-    from app.models.db_models import (
-        WorkflowModel, ExecutionModel,
-        LLMConfigModel, MCPServerModel, LogPatternModel,
-        KnownIssueModel, BaselineMetricModel, AnalysisHistoryModel, AlertModel,
-        ModelKeyModel
-    )
-    
-    async with async_engine.begin() as conn:
-        # First create the vector extension
-        try:
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            logger.info("pgvector extension created/verified")
-        except Exception as e:
-            logger.warning(f"Could not create vector extension: {e}")
-        
-        # Then create all tables
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables created")
+    """Verify database connectivity.
+
+    Tables are NOT created here.  All DDL lives in the numbered migration
+    scripts under ``migrations/`` and must be applied before starting the
+    application (see ``migrations/001_initial_schema.sql`` through the latest
+    numbered file in that directory).
+
+    This function only checks that the database is reachable.  A failed
+    connectivity check logs a warning and lets the application continue so
+    that transient Postgres start-up delays do not permanently crash the
+    container.
+    """
+    try:
+        async with async_engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        logger.info("Database connectivity verified")
+    except Exception as exc:
+        logger.warning(
+            "Database connectivity check failed: %s — "
+            "the application will start but DB-backed features may not work. "
+            "Ensure migrations/001–005 have been applied before first use.",
+            exc,
+        )

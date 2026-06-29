@@ -1,9 +1,8 @@
 """Dependency injection container and factory functions."""
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Optional
 
-from app.repositories import WorkflowRepository, ExecutionRepository
-
+from app.infrastructure.persistence import WorkflowRepository, ExecutionRepository
 
 class DependencyContainer:
     """Container for managing application dependencies."""
@@ -12,6 +11,7 @@ class DependencyContainer:
         """Initialize the dependency container."""
         self._workflow_repo: Optional[WorkflowRepository] = None
         self._execution_repo: Optional[ExecutionRepository] = None
+        self._visual_executor: Any = None
     
     def get_workflow_repository(self) -> WorkflowRepository:
         """Get or create workflow repository instance.
@@ -32,11 +32,20 @@ class DependencyContainer:
         if self._execution_repo is None:
             self._execution_repo = ExecutionRepository()
         return self._execution_repo
+
+    def get_visual_executor(self) -> Any:
+        """Get the shared :class:`VisualWorkflowExecutor` singleton."""
+        if self._visual_executor is None:
+            from app.services.visual_workflow_executor import visual_executor
+
+            self._visual_executor = visual_executor
+        return self._visual_executor
     
     def reset(self) -> None:
         """Reset all dependencies (useful for testing)."""
         self._workflow_repo = None
         self._execution_repo = None
+        self._visual_executor = None
 
 
 # Global container instance
@@ -69,3 +78,8 @@ def get_execution_repository() -> ExecutionRepository:
         ExecutionRepository instance
     """
     return get_container().get_execution_repository()
+
+
+def get_visual_executor() -> Any:
+    """FastAPI dependency for the visual workflow executor singleton."""
+    return get_container().get_visual_executor()

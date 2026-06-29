@@ -1,0 +1,39 @@
+{
+  "data_quality": {
+    "coverage": "full",
+    "partial": false,
+    "sampled": false,
+    "failures": [],
+    "log_groups_requested": 1,
+    "analyses_requested": ["alarms", "error-patterns", "anomaly-detection"]
+  },
+  "alarms": {
+    "summary": {
+      "total": 3,
+      "in_alarm": 1,
+      "ok": 2,
+      "insufficient_data": 0,
+      "flapping": ["kyc-payments-error-rate"]
+    },
+    "alarms": [
+      {"name": "kyc-payments-error-rate", "state": "ALARM", "reason": "Threshold Crossed: error rate 7.2% > 5%", "metric_name": "ErrorRate", "namespace": "AWS/ApiGateway", "transitions_24h": 6}
+    ]
+  },
+  "patterns": {
+    "unique_patterns": [
+      {
+        "normalized_pattern": "Payment authorization rejected by processor",
+        "occurrence_count": 34,
+        "affected_streams": 2,
+        "example_message": "ERROR Payment authorization rejected by processor (code=DECLINED)",
+        "first_seen": "2026-06-12T09:00:00Z",
+        "last_seen": "2026-06-12T09:40:00Z"
+      }
+    ],
+    "evidence_grade": "medium"
+  },
+  "anomalies": {
+    "anomalies": [],
+    "summary": {"total_anomalies": 0, "critical_severity": 0, "high_severity": 0}
+  }
+}

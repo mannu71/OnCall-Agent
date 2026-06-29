@@ -1,0 +1,34 @@
+{
+  "data_quality": {
+    "coverage": "partial",
+    "partial": true,
+    "reduced_scope": true,
+    "sampled": false,
+    "failures": [
+      {"analysis": "error-patterns", "log_group": "/aws/lambda/kyc-core", "type": "throttling", "reason": "ThrottlingException persisted after reduced-scope retry"}
+    ],
+    "log_groups_requested": 2,
+    "analyses_requested": ["error-patterns", "anomaly-detection", "alarms"]
+  },
+  "alarms": {
+    "summary": {"total": 2, "in_alarm": 0, "names": ["kyc-auth-5xx", "kyc-core-latency"]}
+  },
+  "patterns": {
+    "unique_patterns": [
+      {
+        "normalized_pattern": "TimeoutException calling downstream identity-verify",
+        "occurrence_count": 88,
+        "affected_streams": 3,
+        "example_message": "2026-06-10T14:22:09Z ERROR [requestId=req-Zz99Yy88Xx] TimeoutException: downstream identity-verify did not respond within 5000ms",
+        "first_seen": "2026-06-10T14:00:00Z",
+        "last_seen": "2026-06-10T14:45:00Z"
+      }
+    ],
+    "evidence_grade": "medium"
+  },
+  "anomalies": {
+    "anomalies": [],
+    "summary": {"total_anomalies": 0, "critical_severity": 0, "high_severity": 0}
+  },
+  "drilldown": []
+}

@@ -1,12 +1,17 @@
-const API_BASE_URL = 'http://localhost:8000/api/v1';
+import { getApiBaseUrl } from './apiClient';
 
-export const getModelKeys = async () => {
+// Single source of truth for the backend base URL (honours VITE_API_URL /
+// VITE_AGENT_API_URL). Previously built inline from VITE_AGENT_API_URL only.
+const API_BASE_URL = getApiBaseUrl();
+
+export const getModelKeys = async (opts = {}) => {
   try {
-    const response = await fetch(`${API_BASE_URL}/model-keys`);
+    const response = await fetch(`${API_BASE_URL}/model-keys`, { signal: opts.signal });
     if (!response.ok) throw new Error('Failed to fetch model keys');
     const data = await response.json();
     return data.keys || [];
   } catch (error) {
+    if (error.name === 'AbortError') throw error;
     console.error('Error fetching model keys:', error);
     return [];
   }

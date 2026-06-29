@@ -1,95 +1,49 @@
 """Execution history API routes."""
-from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, HTTPException, status, Query, Depends
+import asyncio
+import json
+import logging
+from typing import Any, Dict, List, Optional
 
-from app.repositories import ExecutionRepository
+from fastapi import APIRouter, HTTPException, status, Query, Depends, Body
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from app.infrastructure.persistence import ExecutionRepository
 from app.api.deps import get_execution_repo
+from app.services.workflow_output_extractor import extract_workflow_output
+from app.workflow.event_adapter import execution_event_stream
+from app.core.sse import SSE_HEADERS
 
-
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/executions", tags=["executions"])
 
 
-def _extract_workflow_output(execution: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract the main workflow output from execution results."""
-    results = execution.get('results') or {}
-    
-    orchestrator_output = next(
-        (v for v in results.values() if isinstance(v, dict) and 'queries_executed' in v),
-        None
-    )
-    
-    if orchestrator_output:
-        output = {
-            'queries_executed': orchestrator_output.get('queries_executed', 0),
-            'failures': orchestrator_output.get('failures', 0),
-            'results': orchestrator_output.get('results', [])
-        }
-        if orchestrator_output.get('error'):
-            output['error'] = orchestrator_output['error']
-        execution['output'] = output
-    
-    if not orchestrator_output:
-        cloudwatch_output = next(
-            (v for v in results.values() if isinstance(v, dict) and 'analysis_type' in v),
-            None
-        )
-        if cloudwatch_output:
-            output = {
-                'analysis_type': cloudwatch_output.get('analysis_type'),
-                'log_groups_analyzed': cloudwatch_output.get('log_groups_analyzed', []),
-                'time_range': cloudwatch_output.get('time_range'),
-                'results': cloudwatch_output.get('data', {}),
-                            User Query
-                    │
-                    ▼
-                KB Recall (knowledge_base.search_known_issues / search_similar_patterns)
-                    │  prepends matching past resolutions as <memory-context> to the query
-                    ▼
-                _extract_cloudwatch_config()
-                    │  BFS over workflow edges — finds all cloudwatchAnalyzer nodes
-                    │  reachable from an agent node, merges their logGroups/region/profile
-                    ▼
-                _setup_tools()  (MCP tools)
-                    │  connects to MCP servers → LangChain BaseTool list
-                    ▼
-                build_cloudwatch_agent_tools()  [only if CW node is wired up]
-                    │  resolves AWS credentials via resolve_aws_credentials()
-                    │  wraps 5 async functions as LangChain StructuredTools
-                    │  appends them to the tool list
-                    ▼
-                cloudwatch_context injection (if upstream CW analysis already ran)
-                    │  prepends [Pre-computed CloudWatch Analysis] JSON into augmented query
-                    ▼
-                _build_agent()  → LangGraph create_react_agent StateGraph
-                    │  LLM + all tools → ReAct graph
-                    ▼
-                _execute_agent()  → agent.astream_events()
-                    │  ReAct loop: Thought → Tool Call → Observation → repeat → Final Answer
-                    ▼
-                _auto_learn()  → knowledge_base.record_analysis / add_known_issue    'output': cloudwatch_output.get('output'),
-                'model': cloudwatch_output.get('model'),
-            }
-            if cloudwatch_output.get('alerts'):
-                output['alerts'] = cloudwatch_output['alerts']
-            execution['output'] = output
+# ─────────────────────────────────────────────────────────────────────────────
+# HITL request / response models
+# ─────────────────────────────────────────────────────────────────────────────
 
-    if not orchestrator_output and not execution.get('output'):
-        react_output = next(
-            (v for v in results.values() if isinstance(v, dict) and v.get('type') == 'react'),
-            None
-        )
-        if react_output:
-            execution['output'] = {
-                'type': 'react',
-                'final_answer': react_output.get('final_answer'),
-                'user_query': react_output.get('user_query'),
-                'message_count': react_output.get('message_count', 0),
-                'tool_calls': react_output.get('tool_calls', []),
-                'model': react_output.get('model'),
-                'provider': react_output.get('provider'),
-            }
+class HITLApproveRequest(BaseModel):
+    request_id: str
+    approved: bool = True
+    reason: Optional[str] = None
 
-    return execution
+
+class HITLApproveResponse(BaseModel):
+    execution_id: str
+    request_id: str
+    approved: bool
+    message: str
+
+
+class SteerRequest(BaseModel):
+    note: str
+    """Engineer note to inject into the running agent at the next tool boundary."""
+
+
+class SteerResponse(BaseModel):
+    execution_id: str
+    queued: bool
+    message: str
 
 
 @router.get("", response_model=List[dict])
@@ -107,69 +61,60 @@ async def list_executions(
         executions = executions[:limit]
     
     # Add output field to each execution for easy access
-    return [_extract_workflow_output(exec) for exec in executions]
+    return [extract_workflow_output(exec) for exec in executions]
 
 
 @router.get("/active", response_model=List[str])
 async def get_active_workflows():
-    """Get list of currently running workflow names."""
-    from app.services.visual_workflow_executor import visual_executor
-    
-    active = [
-        exec_data.get('workflow_name') 
-        for exec_data in visual_executor.active_executions.values() 
-        if exec_data.get('status') == 'running'
-    ]
-    # Filter out duplicates (if any) and None values
-    return list(set(filter(None, active)))
+    """Get list of currently running workflow names (DB-backed)."""
+    from app.services.execution_state import execution_state
+
+    return await execution_state.list_active_workflow_names()
 
 
 @router.delete("/active", status_code=status.HTTP_200_OK)
 async def clear_active_executions():
-    """Clear all stuck/running workflow executions from memory."""
+    """Clear all stuck/running workflow executions."""
+    from app.services.execution_state import execution_state
     from app.services.visual_workflow_executor import visual_executor
-    
-    cleared_count = len(visual_executor.active_executions)
-    cleared_names = [
-        exec_data.get('workflow_name') 
-        for exec_data in visual_executor.active_executions.values()
-    ]
-    
-    # Clean up all executions
-    for execution_id in list(visual_executor.active_executions.keys()):
+
+    active_before = await execution_state.list_active_records()
+    cleared_names = [r.get("workflow_name") for r in active_before]
+    cleared_count = await execution_state.cancel_all_active(
+        reason="Cleared by operator",
+    )
+
+    for execution_id in list(visual_executor.mcp_managers.keys()):
         await visual_executor.cleanup_execution(execution_id)
-    
+
     return {
         "message": f"Cleared {cleared_count} active executions",
         "cleared_count": cleared_count,
-        "cleared_workflows": list(filter(None, cleared_names))
+        "cleared_workflows": list(filter(None, cleared_names)),
     }
 
 
 @router.delete("/active/{workflow_name}", status_code=status.HTTP_200_OK)
 async def cancel_workflow_by_name(workflow_name: str):
     """Cancel/clear a specific workflow by name from active executions."""
+    from app.services.execution_state import execution_state
     from app.services.visual_workflow_executor import visual_executor
-    
-    # Find execution IDs matching the workflow name
-    execution_ids_to_clear = [
-        exec_id for exec_id, exec_data in visual_executor.active_executions.items()
-        if exec_data.get('workflow_name') == workflow_name
-    ]
-    
-    if not execution_ids_to_clear:
+
+    cancelled_count = await execution_state.cancel_by_workflow_name(workflow_name)
+    if cancelled_count == 0:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No active execution found for workflow '{workflow_name}'"
+            detail=f"No active execution found for workflow '{workflow_name}'",
         )
-    
-    # Clean up all matching executions
-    for execution_id in execution_ids_to_clear:
-        await visual_executor.cleanup_execution(execution_id)
-    
+
+    for execution_id in list(visual_executor.mcp_managers.keys()):
+        cached = execution_state.get_cache(execution_id)
+        if cached and cached.get("workflow_name") == workflow_name:
+            await visual_executor.cleanup_execution(execution_id)
+
     return {
-        "message": f"Cancelled {len(execution_ids_to_clear)} execution(s) for workflow '{workflow_name}'",
-        "cancelled_count": len(execution_ids_to_clear)
+        "message": f"Cancelled {cancelled_count} execution(s) for workflow '{workflow_name}'",
+        "cancelled_count": cancelled_count,
     }
 
 
@@ -187,7 +132,7 @@ async def get_execution(
             detail=f"Execution '{execution_id}' not found"
         )
     
-    return _extract_workflow_output(execution)
+    return extract_workflow_output(execution)
 
 
 @router.delete("/{execution_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -214,3 +159,220 @@ async def delete_all_executions(
     """Delete all execution history."""
     deleted_count = await execution_repo.delete_all()
     return {"message": f"Deleted {deleted_count} executions", "deleted_count": deleted_count}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSE stream
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/{execution_id}/stream")
+async def stream_execution_events(execution_id: str):
+    """Stream live execution events as Server-Sent Events.
+
+    Returns:
+        SSE stream of WorkflowEvent objects. Closes after workflow_completed /
+        workflow_failed or after the 10-minute hard timeout.
+    """
+    from app.services.visual_workflow_executor import visual_executor
+
+    exec_data = await visual_executor.get_execution_status(execution_id)
+    workflow_name = (exec_data or {}).get("workflow_name", execution_id)
+
+    return StreamingResponse(
+        execution_event_stream(execution_id, workflow_name),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HITL approve / reject
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/{execution_id}/approve", response_model=HITLApproveResponse)
+async def approve_hitl_request(
+    execution_id: str,
+    body: HITLApproveRequest = Body(...),
+):
+    """Resume a paused HITL execution.
+
+    When the execution engine emits a ``hitl_pause`` event the workflow is
+    suspended waiting for human approval.  POST here with ``approved=true``
+    (or false to reject) to resume.
+
+    The payload is placed on the execution's HITL queue so the running
+    LangGraph coroutine can pick it up and continue (or abort) the graph.
+    """
+    from app.services.visual_workflow_executor import visual_executor
+    from app.workflow.event_schema import hitl_approved, hitl_rejected
+
+    exec_data = await visual_executor.get_execution_status(execution_id)
+    if exec_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active execution '{execution_id}' found",
+        )
+
+    # Tool-approval gates register a per-request_id Future (tool_permissions.py);
+    # the supervisor/interrupt path uses the legacy single hitl_queue. Accept
+    # either so a single approve call always reaches the right waiter.
+    tool_approvals: dict = exec_data.get("tool_approvals") or {}
+    hitl_queue: asyncio.Queue | None = exec_data.get("hitl_queue")
+    if not tool_approvals and hitl_queue is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Execution '{execution_id}' is not waiting for HITL approval",
+        )
+
+    decision = {
+        "request_id": body.request_id,
+        "approved": body.approved,
+        "reason": body.reason,
+    }
+    # Route to the exact gate that published this request_id. With several
+    # ask-tool calls pending at once, this guarantees the right one unblocks
+    # (and the others keep waiting for their own approval).
+    fut = tool_approvals.get(body.request_id)
+    if fut is not None and not fut.done():
+        fut.set_result(decision)
+    elif hitl_queue is not None:
+        await hitl_queue.put(decision)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"No pending approval matching request '{body.request_id}'",
+        )
+
+    # Publish SSE event so the frontend updates immediately
+    event = (
+        hitl_approved(execution_id, body.request_id)
+        if body.approved
+        else hitl_rejected(execution_id, body.request_id, reason=body.reason or "")
+    )
+    await visual_executor._publish_event(execution_id, event.event_type, event.data)
+
+    logger.info(
+        "HITL %s for execution %s (request_id=%s)",
+        "approved" if body.approved else "rejected",
+        execution_id,
+        body.request_id,
+    )
+
+    return HITLApproveResponse(
+        execution_id=execution_id,
+        request_id=body.request_id,
+        approved=body.approved,
+        message="Decision recorded — execution will resume shortly."
+        if body.approved
+        else "Execution rejected — workflow will be stopped.",
+    )
+
+
+@router.get("/{execution_id}/approvals")
+async def list_tool_approvals(execution_id: str) -> Dict[str, Any]:
+    """Return the durable tool-approval audit trail for an execution.
+
+    Reads the ``tool_approvals`` table (written by the permission gate in
+    ``tool_permissions.py``) so operators — and the HITL history UI — can see
+    every approve / deny / timeout decision, independent of any browser state.
+    """
+    from app.infrastructure.persistence import tool_approval_repository
+
+    records = await tool_approval_repository.list_for_execution(execution_id)
+    return {"execution_id": execution_id, "approvals": records}
+
+
+@router.get("/{execution_id}/history")
+async def execution_checkpoint_history(execution_id: str) -> Dict[str, Any]:
+    """Time-travel: list the LangGraph checkpoints for this execution's thread.
+
+    Backed by the durable ``AsyncPostgresSaver`` (thread_id == execution_id), so
+    operators can inspect each step of a run and (later) resume/fork from a given
+    checkpoint. Returns newest-first checkpoint metadata + message counts.
+    """
+    from app.harness.runtime import get_saver
+
+    saver = get_saver()
+    if saver is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Durable checkpointer unavailable (Postgres persistence not initialised).",
+        )
+    config = {"configurable": {"thread_id": str(execution_id)}}
+    history: List[Dict[str, Any]] = []
+    try:
+        async for ct in saver.alist(config):
+            cp = getattr(ct, "checkpoint", {}) or {}
+            meta = getattr(ct, "metadata", {}) or {}
+            cfg = getattr(ct, "config", {}) or {}
+            msgs = ((cp.get("channel_values") or {}).get("messages")) or []
+            history.append({
+                "checkpoint_id": (cfg.get("configurable") or {}).get("checkpoint_id"),
+                "ts": cp.get("ts"),
+                "step": meta.get("step"),
+                "source": meta.get("source"),
+                "message_count": len(msgs) if isinstance(msgs, list) else None,
+            })
+    except Exception as exc:  # noqa: BLE001 — history is read-only/diagnostic
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read checkpoint history: {exc}",
+        )
+    return {"execution_id": execution_id, "checkpoints": history, "count": len(history)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /steer — mid-run engineer note injection
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/{execution_id}/steer", response_model=SteerResponse)
+async def steer_execution(
+    execution_id: str,
+    body: SteerRequest = Body(...),
+):
+    """Inject an engineer note into a running execution at the next tool boundary.
+
+    Unlike the approve endpoint (which resumes a *paused* execution), steer
+    queues a note for a **running** execution.  The ReAct agent picks it up
+    as a HumanMessage at the next tool boundary without stopping or restarting
+    the investigation.
+
+    This is the in-context correction channel for running investigations.
+    """
+    from app.services.visual_workflow_executor import visual_executor
+
+    exec_data = await visual_executor.get_execution_status(execution_id)
+    if exec_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active execution '{execution_id}' found",
+        )
+
+    if exec_data.get("status") != "running":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Execution '{execution_id}' is not currently running (status={exec_data.get('status')})",
+        )
+
+    # Append to the steer_notes list — consumed by ReactStrategy._execute_agent_stream
+    steer_notes: list = exec_data.setdefault("steer_notes", [])
+    steer_notes.append(body.note)
+
+    # Notify the frontend via SSE so the operator sees the note was registered.
+    await visual_executor._publish_event(
+        execution_id,
+        "steer_queued",
+        {"note": body.note[:500], "queue_depth": len(steer_notes)},
+    )
+
+    logger.info(
+        "Steer note queued for execution %s (queue_depth=%d)",
+        execution_id,
+        len(steer_notes),
+    )
+
+    return SteerResponse(
+        execution_id=execution_id,
+        queued=True,
+        message=f"Note queued — will be injected at the next tool boundary (queue depth: {len(steer_notes)}).",
+    )

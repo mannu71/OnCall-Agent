@@ -1,0 +1,1 @@
+{"id": "smoke-001", "workflow": "noop-smoke", "inputs": {"probe": "hello"}, "expected_substrings": ["hello"], "expected_tools": [], "max_total_tokens": 5000}

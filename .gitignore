@@ -21,6 +21,9 @@ yarn-error.log*
 venv/
 env/
 
+# Claude
+.claude/
+
 # OS files
 .DS_Store
 Thumbs.db
@@ -54,8 +57,8 @@ worker/output/
 agent/data/
 agent-api/data/
 
-# Hermes agent (submodule/reference)
-hermes-agent-main/
+# Code graph
+# codegraph/
 
 # Temporary files
 tmp/

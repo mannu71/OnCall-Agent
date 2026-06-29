@@ -16,9 +16,13 @@ class BaseStrategy(ABC):
     """
     Abstract base class for workflow execution strategies.
     
-    Each strategy implements a different way of executing workflows:
-    - OrchestratorStrategy: Sequential SQL-based workflows
-    - ReactStrategy: AI agent workflows using LangChain
+    Each strategy implements agent-style execution invoked from node handlers:
+    - ReactStrategy: AI agent workflows using LangChain / LangGraph
+    - BatchReactStrategy: Parallel agent batches
+    - RouterStrategy: Semantic routing between agents
+
+    SQL orchestration runs via ``workflow/executor/handlers/orchestrator.py``
+    and ``services/sql_pipeline/``.
     """
     
     def __init__(self):
