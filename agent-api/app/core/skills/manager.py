@@ -71,39 +71,47 @@ class SkillManager:
         self._disabled_skills = disabled_skills or set()
         self._preloaded_skills = preloaded_skills or []
     
+    # Bundled seed skills shipped with the app (tracked in git, unlike
+    # ``data/`` which is gitignored/dockerignored) — a starter cookbook so a
+    # fresh deployment has useful auto-selectable skills before any are
+    # learned/authored. User-authored skills under ``skills_dir`` with the
+    # same name take precedence (see ``scan_skills``).
+    _SEED_DIR = Path(__file__).resolve().parent / "seed"
+
     def scan_skills(self) -> Dict[str, Skill]:
         """Scan skills directory for SKILL.md files.
-        
-        Skips skills that are in the disabled_skills set.
-        
+
+        Merges the bundled seed skills (``_SEED_DIR``) with any user-authored
+        skills under ``self.skills_dir`` — a user skill with the same name
+        overrides the bundled default. Skips skills in the disabled_skills set.
+
         Returns:
             Dict mapping skill names to Skill objects
         """
         self._skills.clear()
-        
-        if not self.skills_dir.exists():
-            logger.warning(f"Skills directory does not exist: {self.skills_dir}")
-            return self._skills
-        
-        # Find all SKILL.md files recursively
-        skill_files = list(self.skills_dir.rglob("SKILL.md"))
-        
-        for skill_file in skill_files:
-            try:
-                skill = self._load_skill_file(skill_file)
-                if skill:
-                    # Skip disabled skills (Requirement 7.8)
-                    if skill.name in self._disabled_skills:
-                        logger.info(f"Skipping disabled skill: {skill.name}")
-                        continue
-                    
-                    self._skills[skill.name] = skill
-                    logger.info(f"Loaded skill: {skill.name}")
-            except Exception as e:
-                logger.error(f"Failed to load skill from {skill_file}: {e}")
-        
+
+        for source_dir in (self._SEED_DIR, self.skills_dir):
+            if not source_dir.exists():
+                if source_dir is self.skills_dir:
+                    logger.warning(f"Skills directory does not exist: {source_dir}")
+                continue
+
+            for skill_file in source_dir.rglob("SKILL.md"):
+                try:
+                    skill = self._load_skill_file(skill_file)
+                    if skill:
+                        # Skip disabled skills (Requirement 7.8)
+                        if skill.name in self._disabled_skills:
+                            logger.info(f"Skipping disabled skill: {skill.name}")
+                            continue
+
+                        self._skills[skill.name] = skill
+                        logger.info(f"Loaded skill: {skill.name} (from {source_dir})")
+                except Exception as e:
+                    logger.error(f"Failed to load skill from {skill_file}: {e}")
+
         self._loaded = True
-        logger.info(f"Loaded {len(self._skills)} skills from {self.skills_dir}")
+        logger.info(f"Loaded {len(self._skills)} skills (seed + {self.skills_dir})")
         return self._skills
     
     def _load_skill_file(self, skill_file: Path) -> Optional[Skill]:
@@ -157,21 +165,32 @@ class SkillManager:
             setup_note=setup_note,
         )
     
-    def select_for_query(self, query: str, k: int = 2) -> List[Skill]:
+    def select_for_query(
+        self, query: str, k: int = 2, allowed: Optional[Set[str]] = None,
+    ) -> List[Skill]:
         """Return up to *k* skills most relevant to *query* (RAG-style auto-select).
 
         Lexical relevance over each skill's name + description (token overlap,
         weighted toward the name). Deterministic and dependency-free — no DB or
         embedding call on the hot path. A future upgrade can swap in the Titan
         embeddings used by semantic memory; the call site is stable.
+
+        ``allowed``: when given (non-empty), only skills whose name is in this
+        set are considered — used for per-agent skill scoping (Skills picker on
+        the Agent node). ``None`` = no scoping, every loaded skill is a
+        candidate (the global-default behavior).
         """
         if not self._loaded:
             self.scan_skills()
         q_tokens = _tokenize(query)
         if not q_tokens or not self._skills:
             return []
+        candidates = (
+            [s for s in self._skills.values() if s.name in allowed]
+            if allowed else list(self._skills.values())
+        )
         scored: List[tuple] = []
-        for skill in self._skills.values():
+        for skill in candidates:
             name_tokens = _tokenize(skill.name.replace("-", " ").replace("_", " "))
             desc_tokens = _tokenize(skill.description)
             # Name matches are strong signals; description matches are supporting.
@@ -310,17 +329,82 @@ class SkillManager:
         
         return self._skills.get(name)
     
-    def delete_skill(self, name: str) -> bool:
-        """Delete a filesystem skill by removing its directory.
+    def get_skill_source(self, name: str) -> Optional[Dict[str, Any]]:
+        """Return the raw SKILL.md source for *name*, for viewing/editing.
 
-        Returns True if the skill was found and deleted, False otherwise.
-        Never raises — logs errors instead.
+        ``editable`` is False for bundled seed skills (their file lives inside
+        the app package, under ``_SEED_DIR``) — the UI should offer "save as
+        override" instead of in-place edit, since :meth:`write_skill` always
+        writes to ``skills_dir`` anyway (which shadows a same-named seed skill).
         """
         if not self._loaded:
             self.scan_skills()
 
         skill = self._skills.get(name)
         if skill is None:
+            return None
+
+        skill_file = skill.skill_dir / "SKILL.md"
+        try:
+            content = skill_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("SkillManager: failed to read %s: %s", skill_file, exc)
+            return None
+
+        return {
+            "name": skill.name,
+            "content": content,
+            "editable": not skill.skill_dir.is_relative_to(self._SEED_DIR),
+        }
+
+    def write_skill(self, name: str, content: str) -> Skill:
+        """Create or overwrite a user-authored SKILL.md file under ``skills_dir``.
+
+        Always writes to ``self.skills_dir`` (never ``_SEED_DIR``) — a
+        user-authored skill here shadows a bundled seed skill of the same
+        name (see ``scan_skills``), so this doubles as "override a seed
+        skill". Raises ``ValueError`` if *content* has no valid YAML
+        frontmatter or is missing the required ``name`` field.
+        """
+        slug = re.sub(r"[^\w-]", "_", name.strip().lower()) or "unnamed_skill"
+        skill_dir = self.skills_dir / slug
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text(content, encoding="utf-8")
+
+        loaded = self._load_skill_file(skill_file)
+        if loaded is None:
+            skill_file.unlink(missing_ok=True)
+            raise ValueError(
+                "Invalid SKILL.md content — requires YAML frontmatter with a 'name' field"
+            )
+
+        self._skills[loaded.name] = loaded
+        self._loaded = True
+        logger.info("SkillManager: wrote filesystem skill '%s' to %s", loaded.name, skill_file)
+        return loaded
+
+    def delete_skill(self, name: str) -> bool:
+        """Delete a filesystem skill by removing its directory.
+
+        Returns True if the skill was found and deleted, False otherwise.
+        Never raises — logs errors instead. Refuses to delete a bundled seed
+        skill's source (under ``_SEED_DIR``, part of the app package, not
+        user data) — only user-authored skills under ``skills_dir`` can be
+        deleted this way.
+        """
+        if not self._loaded:
+            self.scan_skills()
+
+        skill = self._skills.get(name)
+        if skill is None:
+            return False
+
+        if skill.skill_dir.is_relative_to(self._SEED_DIR):
+            logger.warning(
+                "SkillManager: refusing to delete bundled seed skill '%s' at %s",
+                name, skill.skill_dir,
+            )
             return False
 
         try:

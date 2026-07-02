@@ -39,10 +39,13 @@ async def run_supervised(
     logger_instance: Any,
     wall_clock_budget: float,
     execution_port: Any = None,
-) -> Tuple[Dict[str, Any], int, int]:
+) -> Tuple[Dict[str, Any], int, int, int, int]:
     """Run the agent under supervisor review with hard termination bounds.
 
-    Returns ``(result, accum_input_tokens, accum_output_tokens, accum_cache_read_tokens)``.
+    Returns ``(result, accum_input_tokens, accum_output_tokens,
+    accum_cache_read_tokens, accum_cache_creation_tokens)``. ``input_tokens`` is
+    already the non-cached portion — cache_read/cache_creation are additional,
+    not a subset of it (see ``TokenUsageCallback`` in ``core/streaming/callbacks.py``).
     """
     # Lazy imports to avoid the import cycle documented at module top.
     from app.workflow.strategies.react.helpers import estimate_confidence
@@ -54,6 +57,7 @@ async def run_supervised(
     accum_input_tokens = 0
     accum_output_tokens = 0
     accum_cache_read_tokens = 0
+    accum_cache_creation_tokens = 0
     _cfg = getattr(supervisor, "_cfg", None) if supervisor else None
     token_budget = getattr(_cfg, "token_budget", 0) or 0
 
@@ -95,6 +99,7 @@ async def run_supervised(
         accum_input_tokens += result.get("input_tokens", 0) or 0
         accum_output_tokens += result.get("output_tokens", 0) or 0
         accum_cache_read_tokens += result.get("cache_read_tokens", 0) or 0
+        accum_cache_creation_tokens += result.get("cache_creation_tokens", 0) or 0
 
         final_answer = result.get("final_answer") or ""
         confidence = estimate_confidence(final_answer, result.get("tool_calls", []))
@@ -112,11 +117,12 @@ async def run_supervised(
             result["supervisor_token_budget_exhausted"] = True
             break
 
-        verdict = supervisor.evaluate(
+        verdict = await supervisor.evaluate(
             final_answer=final_answer,
             tool_calls=result.get("tool_calls", []),
             confidence=confidence,
             retry_count=supervisor_retry_count,
+            messages=result.get("messages", []),
         )
 
         if verdict.action == SupervisorAction.PASS:
@@ -151,4 +157,7 @@ async def run_supervised(
             break
         break
 
-    return result, accum_input_tokens, accum_output_tokens, accum_cache_read_tokens
+    return (
+        result, accum_input_tokens, accum_output_tokens,
+        accum_cache_read_tokens, accum_cache_creation_tokens,
+    )

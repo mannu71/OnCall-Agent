@@ -70,6 +70,380 @@ def test_tool_router() -> None:
     check("tool_router passthrough when no MCP", filter_tools(specials, "x") == specials)
 
 
+# ── error_classifier: Bedrock context-overflow rung ──────────────────────────
+def test_boto_context_overflow_classifier() -> None:
+    """_classify_boto_error must route Bedrock's plain ValidationException
+    context-overflow messages to CONTEXT_OVERFLOW/should_compress, not UNKNOWN —
+    otherwise neither engine's reactive-compact-and-retry rung ever fires."""
+    from botocore.exceptions import ClientError
+    from app.core.error_classifier import classify_error, FailoverReason
+
+    def _ve(message: str) -> ClientError:
+        return ClientError({"Error": {"Code": "ValidationException", "Message": message}}, "Converse")
+
+    overflow_messages = [
+        "Input is too long for requested model.",
+        "Malformed input request: too many tokens in the input, please reduce",
+        "This model's maximum context length is 200000 tokens.",
+    ]
+    for msg in overflow_messages:
+        ce = classify_error(_ve(msg))
+        check(
+            f"boto ValidationException overflow→CONTEXT_OVERFLOW ({msg[:30]!r})",
+            ce.reason == FailoverReason.CONTEXT_OVERFLOW and ce.should_compress,
+            f"reason={ce.reason} should_compress={ce.should_compress}",
+        )
+
+    ce_other = classify_error(_ve("The requested schema is invalid."))
+    check(
+        "boto ValidationException non-overflow→UNKNOWN",
+        ce_other.reason == FailoverReason.UNKNOWN and not ce_other.should_compress,
+        f"reason={ce_other.reason}",
+    )
+
+
+# ── engine: resolve_engine() flag resolution + native NotImplementedError ────
+def test_engine_resolution() -> None:
+    from app.harness.engine import resolve_engine, ENGINE_LANGGRAPH, ENGINE_NATIVE
+
+    check("engine: defaults to langgraph", resolve_engine({}) == ENGINE_LANGGRAPH)
+    check("engine: defaults to langgraph with no config", resolve_engine(None) == ENGINE_LANGGRAPH)
+    check(
+        "engine: per-workflow override via agent_config['engine']",
+        resolve_engine({"engine": "native"}) == ENGINE_NATIVE,
+    )
+    check(
+        "engine: per-workflow override via params mirror",
+        resolve_engine({"params": {"engine": "native"}}) == ENGINE_NATIVE,
+    )
+    check(
+        "engine: unknown value falls back to langgraph",
+        resolve_engine({"engine": "bogus"}) == ENGINE_LANGGRAPH,
+    )
+    check(
+        "engine: hitl_enabled clamps native→langgraph",
+        resolve_engine({"engine": "native", "hitl_enabled": True}) == ENGINE_LANGGRAPH,
+    )
+
+
+def _fake_ai_message(content: str = "", tool_calls=None, truncated: bool = False):
+    from langchain_core.messages import AIMessage
+    return AIMessage(
+        content=content,
+        tool_calls=tool_calls or [],
+        response_metadata={"stopReason": "max_tokens"} if truncated else {},
+    )
+
+
+class _FakeToolBoundLLM:
+    """Stands in for a tool-bound chat model. Not Bedrock/Anthropic-named, so
+    TurnLoop.__init__ exercises the generic bind_tools() fallback path."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+
+    def bind_tools(self, tools):
+        return self
+
+    def bind(self, **kwargs):
+        return self
+
+    async def ainvoke(self, messages, config=None):
+        idx = min(self.calls, len(self._responses) - 1)
+        msg = self._responses[idx]
+        self.calls += 1
+        return msg
+
+
+class _FakeTool:
+    def __init__(self, name: str, result: str = "tool output"):
+        self.name = name
+        self._result = result
+
+    async def ainvoke(self, args):
+        return self._result
+
+
+async def test_turn_loop_happy_path() -> None:
+    """A model that answers with no tool_calls on turn 1 completes immediately."""
+    from app.harness.engine.turn_loop import TurnLoop
+    from app.harness import AgentSpec
+
+    from langchain_core.messages import HumanMessage
+
+    llm = _FakeToolBoundLLM([_fake_ai_message("The answer is 42.")])
+    loop = TurnLoop(llm, [], "You are a helpful agent.", agent_config={}, max_turns=5)
+    result = await loop.run([HumanMessage(content="what is the answer?")])
+    check("turn_loop: happy path final_answer", result["final_answer"] == "The answer is 42.")
+    check("turn_loop: happy path no truncation", not result.get("truncated"))
+    check("turn_loop: happy path single model call", llm.calls == 1)
+
+
+async def test_turn_loop_tool_call_then_complete() -> None:
+    """Turn 1 calls a tool, turn 2 synthesizes from the tool result."""
+    from app.harness.engine.turn_loop import TurnLoop
+    from langchain_core.messages import HumanMessage
+
+    tool_call = {"name": "fake_tool", "args": {"x": 1}, "id": "call_1"}
+    llm = _FakeToolBoundLLM([
+        _fake_ai_message("", tool_calls=[tool_call]),
+        _fake_ai_message("Done, found it via fake_tool."),
+    ])
+    loop = TurnLoop(llm, [_FakeTool("fake_tool")], "sys", agent_config={}, max_turns=5)
+    result = await loop.run([HumanMessage(content="investigate")])
+    check("turn_loop: tool round-trip completes", result["final_answer"] == "Done, found it via fake_tool.")
+    check("turn_loop: tool round-trip records tool_calls", len(result["tool_calls"]) == 1)
+    check("turn_loop: tool round-trip 2 model calls", llm.calls == 2)
+
+
+async def test_turn_loop_max_turns_forced_synthesis() -> None:
+    """A model that never stops calling tools gets a forced-synthesis nudge
+    once, then hits a hard MAX_TURNS-equivalent stop shortly after."""
+    from app.harness.engine.turn_loop import TurnLoop
+    from app.harness.engine.loop_state import StopReason
+    from langchain_core.messages import HumanMessage
+
+    tool_call = {"name": "fake_tool", "args": {}, "id": "call_x"}
+    # Always returns a tool call — never lets the loop terminate naturally.
+    llm = _FakeToolBoundLLM([_fake_ai_message("", tool_calls=[tool_call])] * 20)
+    loop = TurnLoop(llm, [_FakeTool("fake_tool")], "sys", agent_config={}, max_turns=1)
+    result = await loop.run([HumanMessage(content="loop forever")])
+    check("turn_loop: max_turns eventually stops", llm.calls < 20, f"calls={llm.calls}")
+    check("turn_loop: max_turns produces a final_answer key", "final_answer" in result)
+
+
+async def test_engine_native_dispatch() -> None:
+    """run_agent_once(engine='native') routes through TurnLoop, not the
+    LangGraph path — verified by monkeypatching the native entry point."""
+    import app.harness.engine as engine_mod
+    from app.harness import AgentSpec
+
+    spec = AgentSpec(agent_config={}, has_cloudwatch=False, has_code_analyzer=False,
+                      permission_mode="auto_allow", session_id="x")
+    called = {}
+
+    async def _fake_run_native(spec_, llm, tools, user_query, **kw):
+        called["hit"] = True
+        called["user_query"] = user_query
+        return {"final_answer": "native ran", "messages": [], "tool_calls": [],
+                "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0}
+
+    orig = engine_mod._run_native
+    engine_mod._run_native = _fake_run_native
+    try:
+        result = await engine_mod.run_agent_once(
+            spec, llm="LLM", tools=[], user_query="hi", engine=engine_mod.ENGINE_NATIVE,
+        )
+        check("engine: native dispatch reaches _run_native", called.get("hit") is True)
+        check("engine: native dispatch passes query through", called.get("user_query") == "hi")
+        check("engine: native dispatch returns its result", result.get("final_answer") == "native ran")
+    finally:
+        engine_mod._run_native = orig
+
+
+# ── engine: compression pipeline / preserved-tail contract ───────────────────
+def test_compression_split_preserved_tail() -> None:
+    """The tail boundary must never orphan a ToolMessage from the AIMessage
+    that requested it — a split pair would make Bedrock reject the retry
+    this splitter exists to protect (INVALID_CHAT_HISTORY)."""
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+    from app.core.memory.compaction import _msg_token_estimate
+    from app.harness.engine.compression import split_preserved_tail
+
+    messages = [
+        HumanMessage(content="q1"),
+        AIMessage(content="", tool_calls=[{"name": "t", "args": {}, "id": "a1"}]),
+        ToolMessage(content="result1", tool_call_id="a1"),
+        HumanMessage(content="q2"),
+        AIMessage(content="", tool_calls=[{"name": "t", "args": {}, "id": "b1"}]),
+        ToolMessage(content="result2", tool_call_id="b1"),
+    ]
+    # Tuned so the naive backward walk lands exactly on the LAST ToolMessage
+    # alone — the failure mode the pairing-safety extension must catch.
+    last_tokens = _msg_token_estimate(messages[-1])
+    head, tail = split_preserved_tail(messages, keep_recent_tokens=last_tokens)
+    check(
+        "compression: tail never starts on an orphaned ToolMessage",
+        not (tail and isinstance(tail[0], ToolMessage)),
+        f"tail[0]={type(tail[0]).__name__ if tail else None}",
+    )
+    check(
+        "compression: tail includes the AIMessage that requested its tool result",
+        bool(tail) and isinstance(tail[0], AIMessage) and tail[0].tool_calls[0]["id"] == "b1",
+    )
+    check("compression: head+tail reconstruct the original list", head + tail == messages)
+
+    # A boundary that's already safe (lands on a plain HumanMessage) needs no
+    # adjustment — head/tail split exactly where the token walk says.
+    safe_tokens = sum(_msg_token_estimate(m) for m in messages[3:])
+    head2, tail2 = split_preserved_tail(messages, keep_recent_tokens=safe_tokens)
+    check(
+        "compression: already-safe boundary is left unadjusted",
+        tail2 == messages[3:], f"tail2 len={len(tail2)} expected={len(messages[3:])}",
+    )
+
+
+def test_compression_split_preserved_tail_empty() -> None:
+    from app.harness.engine.compression import split_preserved_tail
+
+    check(
+        "compression: empty messages -> empty head/tail",
+        split_preserved_tail([], 100) == ([], []),
+    )
+
+
+async def test_compression_pipeline_delegates() -> None:
+    """CompressionPipeline is a thin dispatcher — verify it calls through to
+    the manager's compact_if_needed / force_compact, not its own logic."""
+    from app.harness.engine.compression import CompressionPipeline
+
+    class _FakeMgr:
+        def __init__(self):
+            self.compact_if_needed_calls = 0
+            self.force_compact_calls = 0
+
+        async def compact_if_needed(self, messages):
+            self.compact_if_needed_calls += 1
+            return messages
+
+        async def force_compact(self, messages):
+            self.force_compact_calls += 1
+            return messages
+
+    fake = _FakeMgr()
+    pipeline = CompressionPipeline(fake)
+    await pipeline.maybe_compact(["m1"])
+    await pipeline.reactive_compact(["m1"])
+    check("compression: maybe_compact delegates to compact_if_needed", fake.compact_if_needed_calls == 1)
+    check("compression: reactive_compact delegates to force_compact", fake.force_compact_calls == 1)
+
+
+async def test_turn_loop_reactive_compact_retry() -> None:
+    """A context-overflow error on turn 1 triggers exactly one reactive
+    compact-and-retry, then the (now-shorter) request succeeds on turn 2."""
+    from botocore.exceptions import ClientError
+    from langchain_core.messages import HumanMessage
+    from app.harness.engine.turn_loop import TurnLoop
+
+    class _OverflowThenOkLLM(_FakeToolBoundLLM):
+        def __init__(self, ok_response):
+            super().__init__([ok_response])
+            self.attempts = 0
+
+        async def ainvoke(self, messages, config=None):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ClientError(
+                    {"Error": {"Code": "ValidationException", "Message": "Input is too long for requested model."}},
+                    "Converse",
+                )
+            return await super().ainvoke(messages, config=config)
+
+    llm = _OverflowThenOkLLM(_fake_ai_message("Recovered after compaction."))
+    loop = TurnLoop(llm, [], "sys", agent_config={}, max_turns=5)
+
+    async def _fake_reactive_compact(messages):
+        return messages  # no-op stand-in; only call-count matters here
+
+    loop._compression.reactive_compact = _fake_reactive_compact
+    result = await loop.run([HumanMessage(content="huge context")])
+    check("turn_loop: recovers after one reactive compact", result["final_answer"] == "Recovered after compaction.")
+    check("turn_loop: exactly 2 model attempts (overflow + retry)", llm.attempts == 2)
+
+
+async def test_turn_loop_truncation_escalation_recovers() -> None:
+    """Turn 1 is truncated -> escalate max_output_tokens once -> turn 2 (now
+    with the higher ceiling bound) completes cleanly."""
+    from langchain_core.messages import HumanMessage
+    from app.harness.engine.turn_loop import TurnLoop
+
+    llm = _FakeToolBoundLLM([
+        _fake_ai_message("half a tho", truncated=True),
+        _fake_ai_message("...ught, now complete."),
+    ])
+    loop = TurnLoop(llm, [], "sys", agent_config={}, max_turns=5)
+    result = await loop.run([HumanMessage(content="long investigation")])
+    check("turn_loop: truncation escalation recovers", result["final_answer"] == "...ught, now complete.")
+    check("turn_loop: truncation escalation not flagged truncated", not result.get("truncated"))
+    check("turn_loop: truncation escalation used exactly 2 calls", llm.calls == 2)
+
+
+async def test_turn_loop_truncation_ladder_exhausts() -> None:
+    """A model that stays truncated through escalation + all recovery turns
+    gets an honest partial answer, never a confident half-thought."""
+    from langchain_core.messages import HumanMessage
+    from app.harness.engine.turn_loop import TurnLoop
+    from app.harness.engine.recovery import MAX_OUTPUT_TOKENS_RECOVERY_LIMIT
+
+    always_truncated = [_fake_ai_message("still going", truncated=True)] * 10
+    llm = _FakeToolBoundLLM(always_truncated)
+    loop = TurnLoop(llm, [], "sys", agent_config={}, max_turns=20)
+    result = await loop.run([HumanMessage(content="long investigation")])
+    check("turn_loop: exhausted ladder flags truncated", result.get("truncated") is True)
+    check(
+        "turn_loop: exhausted ladder final_answer is honest partial",
+        (result["final_answer"] or "").startswith("Investigation was cut off"),
+    )
+    # 1 initial + 1 escalation + MAX_OUTPUT_TOKENS_RECOVERY_LIMIT resume attempts.
+    check(
+        "turn_loop: exhausted ladder used bounded call count",
+        llm.calls == 2 + MAX_OUTPUT_TOKENS_RECOVERY_LIMIT,
+        f"calls={llm.calls}",
+    )
+
+
+async def test_turn_loop_midthought_continuation() -> None:
+    """A short mid-investigation preamble ('Let me search for...') gets one
+    extra turn to actually conclude, instead of being returned as the answer."""
+    from langchain_core.messages import HumanMessage
+    from app.harness.engine.turn_loop import TurnLoop
+
+    llm = _FakeToolBoundLLM([
+        _fake_ai_message("Let me search for more details on this."),
+        _fake_ai_message("Root cause: the retry queue overflowed."),
+    ])
+    loop = TurnLoop(llm, [], "sys", agent_config={}, max_turns=5)
+    result = await loop.run([HumanMessage(content="why did it fail?")])
+    check(
+        "turn_loop: mid-thought preamble gets a continuation",
+        result["final_answer"] == "Root cause: the retry queue overflowed.",
+    )
+    check("turn_loop: mid-thought continuation used exactly 2 calls", llm.calls == 2)
+
+
+async def test_recovery_call_model_with_backoff() -> None:
+    """call_model_with_backoff retries a transient error in place and
+    respects a retry_predicate that vetoes in-place retry."""
+    import asyncio
+    from app.harness.engine.recovery import call_model_with_backoff
+
+    class _FlakyOnce:
+        def __init__(self):
+            self.attempts = 0
+
+        async def __call__(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise asyncio.TimeoutError("transient")
+            return "ok"
+
+    flaky = _FlakyOnce()
+    result = await call_model_with_backoff(flaky, max_retries=2)
+    check("recovery: transient error retried in place", result == "ok" and flaky.attempts == 2)
+
+    async def _always_fails():
+        raise asyncio.TimeoutError("transient")
+
+    vetoed = False
+    try:
+        await call_model_with_backoff(_always_fails, retry_predicate=lambda ce: False, max_retries=3)
+    except asyncio.TimeoutError:
+        vetoed = True
+    check("recovery: retry_predicate=False stops in-place retry immediately", vetoed)
+
+
 # ── spec_factory + build_agent_from_spec ─────────────────────────────────────
 def test_spec_and_facade() -> None:
     from app.harness import build_agent_from_spec, AgentSpec
@@ -81,11 +455,8 @@ def test_spec_and_facade() -> None:
                             has_cloudwatch=True, has_code_analyzer=False, session_id="x")
     check("spec_factory builds spec", spec.permission_mode == "auto_allow" and spec.has_cloudwatch and spec.session_id == "x")
 
-    # The legacy ReAct builder moved to app.legacy.react_agent; build_agent_from_spec
-    # routes there only under harness=legacy (default is now deepagents). Force the
-    # legacy flag and patch the moved builder to verify the AgentSpec→kwargs mapping.
-    import app.legacy.react_agent as ab
-    from app.config import settings as _s
+    # Patch the sole ReAct builder to verify the AgentSpec→kwargs mapping.
+    import app.harness.react_agent as ab
     captured: dict = {}
 
     def fake_build_agent(llm, tools, agent_config, **kw):
@@ -93,9 +464,7 @@ def test_spec_and_facade() -> None:
         return "AGENT"
 
     orig = ab.build_agent
-    orig_harness = _s.harness
     ab.build_agent = fake_build_agent
-    _s.harness = "legacy"
     try:
         s = AgentSpec(agent_config={"x": 1}, has_cloudwatch=True, has_code_analyzer=False,
                       permission_mode="auto_allow", session_id="exec-9")
@@ -107,7 +476,6 @@ def test_spec_and_facade() -> None:
         check("build_agent_from_spec maps AgentSpec→kwargs", ok, str(captured))
     finally:
         ab.build_agent = orig
-        _s.harness = orig_harness
 
 
 # ── supervisor_loop ──────────────────────────────────────────────────────────
@@ -127,14 +495,14 @@ async def test_supervisor_loop() -> None:
         def __init__(self, v):
             self._v = v; self._i = 0; self._cfg = Cfg()
 
-        def evaluate(self, **k):
+        async def evaluate(self, **k):
             x = self._v[min(self._i, len(self._v) - 1)]; self._i += 1; return x
 
     # PASS first
     runs = {"n": 0}
     async def ra(a, q):
         runs["n"] += 1; return {"final_answer": "done", "input_tokens": 10, "output_tokens": 5, "tool_calls": []}
-    res, ti, to, tc = await run_supervised(agent="a0", run_agent=ra, rebuild_agent=lambda: "a",
+    res, ti, to, tc, tcc = await run_supervised(agent="a0", run_agent=ra, rebuild_agent=lambda: "a",
         supervisor=FakeSup([V(SupervisorAction.PASS)]), base_query="Q", execution_id="e",
         logger_instance=log, wall_clock_budget=900)
     check("supervisor_loop PASS = 1 run", runs["n"] == 1 and ti == 10 and to == 5)
@@ -143,13 +511,13 @@ async def test_supervisor_loop() -> None:
     runs = {"n": 0}; rebuilds = {"n": 0}
     async def ra2(a, q):
         runs["n"] += 1; return {"final_answer": "x", "input_tokens": 7, "output_tokens": 3, "tool_calls": []}
-    res, ti, to, tc = await run_supervised(agent="a0", run_agent=ra2, rebuild_agent=lambda: (rebuilds.__setitem__("n", rebuilds["n"] + 1) or "a2"),
+    res, ti, to, tc, tcc = await run_supervised(agent="a0", run_agent=ra2, rebuild_agent=lambda: (rebuilds.__setitem__("n", rebuilds["n"] + 1) or "a2"),
         supervisor=FakeSup([V(SupervisorAction.RETRY), V(SupervisorAction.PASS)]), base_query="Q",
         execution_id="e", logger_instance=log, wall_clock_budget=900)
     check("supervisor_loop RETRY→PASS rebuilds once", runs["n"] == 2 and rebuilds["n"] == 1 and ti == 14 and to == 6)
 
     # ESCALATE sets flag
-    res, _, _, _ = await run_supervised(agent="a0",
+    res, _, _, _, _ = await run_supervised(agent="a0",
         run_agent=lambda a, q: _coro({"final_answer": "weak", "input_tokens": 1, "output_tokens": 1, "tool_calls": []}),
         rebuild_agent=lambda: "a", supervisor=FakeSup([V(SupervisorAction.ESCALATE)]), base_query="Q",
         execution_id="e", logger_instance=log, wall_clock_budget=900)
@@ -188,30 +556,21 @@ def test_context_builder() -> None:
 # ── tool_assembler.add_extension_tools ───────────────────────────────────────
 def test_extension_tools() -> None:
     from app.harness.tool_assembler import add_extension_tools
-    from app.config import settings as _s
     log = logging.getLogger("t")
-    # Scratch filesystem (fs_*) is the LEGACY harness's offload mechanism; on the
-    # deepagents harness it's skipped (deepagents provides its own filesystem). So
-    # force legacy here to assert base is preserved + fs_* added.
-    _oh = _s.harness
-    _s.harness = "legacy"
-    try:
-        out = add_extension_tools(tools=["base"], llm="LLM", agent_config={}, code_analyzer_config=None,
-                                  execution_id="e", logger_instance=log)
-    finally:
-        _s.harness = _oh
+    out = add_extension_tools(tools=["base"], llm="LLM", agent_config={}, code_analyzer_config=None,
+                              execution_id="e", logger_instance=log)
     _names0 = [getattr(t, "name", t) for t in out]
-    check("add_extension_tools(legacy) keeps base + adds vfs",
-          "base" in _names0 and "fs_write" in _names0 and "fs_grep" in _names0, str(_names0))
-    # On deepagents, fs_* is NOT added (deepagents built-in filesystem).
-    _s.harness = "deepagents"
-    try:
-        out_da = add_extension_tools(tools=["base"], llm="LLM", agent_config={}, code_analyzer_config=None,
-                                     execution_id="e", logger_instance=log)
-    finally:
-        _s.harness = _oh
-    _da_names = [getattr(t, "name", t) for t in out_da]
-    check("add_extension_tools(deepagents) skips vfs", "fs_write" not in _da_names, str(_da_names))
+    check("add_extension_tools keeps base tool", "base" in _names0, str(_names0))
+    check("add_extension_tools: filesystem:false (default) omits fs_* tools (#15 fix)",
+          "fs_write" not in _names0 and "fs_grep" not in _names0, str(_names0))
+
+    # AgentSpec.filesystem:true → fs_* tools ARE added.
+    out_fs = add_extension_tools(tools=["base"], llm="LLM", agent_config={"filesystem": True},
+                                 code_analyzer_config=None, execution_id="e", logger_instance=log)
+    _names_fs = [getattr(t, "name", t) for t in out_fs]
+    check("add_extension_tools: filesystem:true adds fs_* tools",
+          "fs_write" in _names_fs and "fs_grep" in _names_fs, str(_names_fs))
+
     # with code config → appends delegate (+ edit, best-effort)
     out2 = add_extension_tools(tools=[], llm="LLM", agent_config={"instructions": "x"},
                                code_analyzer_config={"repos": []}, execution_id="e", logger_instance=log)
@@ -1231,23 +1590,134 @@ def test_conversational_intent() -> None:
 
 
 def test_cloudwatch_prescan_gate() -> None:
-    """_should_skip_prescan honours tool_mode + intent; _prescan_skipped_seed is inert. DB-free."""
+    """_should_skip_prescan honours tool_mode + is_chat_turn + intent.
+
+    ``auto`` mode now means "agent routes" for ANY interactive chat turn
+    (first message or follow-up alike) — a scheduled/manual run (no chat
+    session) is the only case that still gets the deterministic pipeline
+    unconditionally. This replaced the narrower history+keyword-based
+    ``_is_followup_reuse`` gate (now removed — is_chat_turn subsumes it: a
+    chat turn skips regardless of history/keywords, since the agent's own
+    bound tools route the call). DB-free.
+    """
     from app.workflow.executor.handlers.cloudwatch import (
-        _should_skip_prescan, _prescan_skipped_seed,
+        _should_skip_prescan, _prescan_skipped_seed, is_chat_turn,
     )
 
-    # agent mode: always skip; prescan mode: never skip
-    check("gate agent mode always skips", _should_skip_prescan("agent", "why errors?") is True)
-    check("gate prescan mode never skips", _should_skip_prescan("prescan", "Hi") is False)
-    # auto mode: skip greetings, run investigations
-    check("gate auto skips greeting", _should_skip_prescan("auto", "Hi") is True)
-    check("gate auto runs investigation", _should_skip_prescan("auto", "why are errors spiking?") is False)
+    _chat_ctx = {"inputs": {"_chat_session_id": "s1"}}
+    _no_session_ctx = {"inputs": {}}
+
+    check("is_chat_turn true with chat session", is_chat_turn(_chat_ctx) is True)
+    check("is_chat_turn false without chat session", is_chat_turn(_no_session_ctx) is False)
+
+    # agent mode: always skip; prescan mode: never skip — context irrelevant either way
+    check("gate agent mode always skips",
+          _should_skip_prescan("agent", "why errors?", _no_session_ctx) is True)
+    check("gate prescan mode never skips",
+          _should_skip_prescan("prescan", "Hi", _chat_ctx) is False)
+
+    # auto + scheduled/manual (no chat session): unchanged deterministic behavior
+    check("gate auto scheduled skips greeting",
+          _should_skip_prescan("auto", "Hi", _no_session_ctx) is True)
+    check("gate auto scheduled runs investigation",
+          _should_skip_prescan("auto", "why are errors spiking?", _no_session_ctx) is False)
+
+    # auto + any chat turn: agent routes, regardless of query shape
+    check("gate auto chat skips greeting",
+          _should_skip_prescan("auto", "Hi", _chat_ctx) is True)
+    check("gate auto chat skips investigation (agent routes instead)",
+          _should_skip_prescan("auto", "why are errors spiking?", _chat_ctx) is True)
 
     # the skipped seed must NOT look like a pre-computed analysis (so agent.py won't inject it)
     seed = _prescan_skipped_seed({"log_groups": ["/a"], "aws_region": "us-east-1", "time_range": "1h"},
-                                 "conversational")
+                                 "agent_routed")
     check("gate seed has no analysis_type/output", not seed.get("analysis_type") and not seed.get("output"))
     check("gate seed marks skip", seed.get("prescan_skipped") is True and seed.get("status") == "success")
+
+
+async def test_tool_assembler_degrade_not_abort() -> None:
+    """_sts_expired's safety contract: only a CONFIRMED ExpiredTokenException
+
+    returns True; every other failure (network error, wrong credentials, a
+    transient AWS blip) returns False — "cannot confirm expiry" is never
+    treated as "expired". This is what stops one flaky/misconfigured tool
+    builder from aborting the whole turn (see tool_assembler.py's module
+    docstring). Hermetic: mocks run_in_aws_pool so it never touches the network
+    or real credentials (this container's ambient AWS creds may themselves be
+    expired, which would make an unmocked STS call flaky here).
+    """
+    import unittest.mock as _mock
+    import logging as _logging
+    from botocore.exceptions import ClientError
+    from app.harness.tool_assembler import _sts_expired
+
+    _quiet_logger = _logging.getLogger("harness_selftest._sts_expired_probe")
+    _quiet_logger.disabled = True
+
+    async def _call(side_effect) -> bool:
+        with _mock.patch(
+            "app.core.thread_pools.run_in_aws_pool", side_effect=side_effect,
+        ):
+            return await _sts_expired(
+                {}, "us-east-1",
+                logger_instance=_quiet_logger, execution_id=None, label="test",
+            )
+
+    _expired_err = ClientError(
+        {"Error": {"Code": "ExpiredTokenException", "Message": "token expired"}},
+        "GetCallerIdentity",
+    )
+    _other_err = ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "not authorized"}},
+        "GetCallerIdentity",
+    )
+
+    check("_sts_expired: ExpiredTokenException -> True",
+          await _call(_expired_err) is True)
+    check("_sts_expired: unrelated ClientError -> False (not confirmed-expired)",
+          await _call(_other_err) is False)
+    check("_sts_expired: generic exception (e.g. network) -> False",
+          await _call(RuntimeError("connection reset")) is False)
+    check("_sts_expired: success -> False",
+          await _call(None) is False)
+
+
+async def test_context_compaction_tiers() -> None:
+    """Microcompact (cheap) is tried before the LLM-summary tier. DB-free."""
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+    from app.core.memory.compaction_manager import ContextCompactionManager
+
+    class _FailingTransport:
+        """Raises if compact() ever reaches the LLM-summary call — proves the
+        microcompact-sufficient path skipped it."""
+        async def complete(self, *a, **k):
+            raise AssertionError("LLM summarization should not have been called")
+
+    # Small window so a handful of large messages cross both thresholds.
+    mgr = ContextCompactionManager(
+        _FailingTransport(), session_id="cc-test", window_size=2_000, reserve_tokens=0,
+        compaction_threshold_fraction=0.85, microcompact_threshold_fraction=0.70,
+    )
+
+    # Under the microcompact threshold (70% of 2000 = 1400 tokens) — no-op.
+    small = [HumanMessage(content="hi")]
+    result = await mgr.compact_if_needed(small)
+    check("compaction: under microcompact threshold is a no-op", result is small)
+
+    # Over microcompact but microcompact alone brings it back under the hard
+    # threshold — large stale ToolMessages get dropped, no LLM call happens
+    # (the FailingTransport would raise if it did).
+    big_tool_content = "x" * 4000  # ~1000 tokens each
+    messages = (
+        [HumanMessage(content="investigate the error")]
+        + [ToolMessage(content=big_tool_content, tool_call_id=f"t{i}") for i in range(3)]
+        + [AIMessage(content="a"), AIMessage(content="b"), AIMessage(content="c"), AIMessage(content="final answer")]
+    )
+    result2 = await mgr.compact_if_needed(messages)
+    check("compaction: microcompact drops stale ToolMessages",
+          not any(isinstance(m, ToolMessage) for m in result2))
+    check("compaction: microcompact keeps head + tail",
+          result2[0].content == "investigate the error" and result2[-1].content == "final answer")
 
 
 def test_configurable_agents() -> None:
@@ -1265,10 +1735,10 @@ def test_configurable_agents() -> None:
 
     # ── output-schema registry ──
     from app.workflow.strategies.react.output_registry import resolve_output_schema, schema_names
-    check("output default is InvestigationReport",
-          resolve_output_schema(None).__name__ == "InvestigationReport")
+    check("output default is GenericReport",
+          resolve_output_schema(None).__name__ == "GenericReport")
     check("output unknown falls back",
-          resolve_output_schema("nope").__name__ == "InvestigationReport")
+          resolve_output_schema("nope").__name__ == "GenericReport")
     check("output support schema resolves",
           resolve_output_schema("support_resolution").__name__ == "SupportResolution")
     check("output catalog has 4", len(schema_names()) >= 4)
@@ -1330,6 +1800,207 @@ def test_configurable_agents() -> None:
           _parse_proposals('[{"kind":"prompt","suggestion":"x","rationale":"y"}]')[0]["status"] == "draft")
 
 
+async def test_subagent_engine_routing() -> None:
+    """_run_child dispatches through app.harness.engine.run_agent_once with
+    the SAME engine resolution as the parent (per-def agent_config['engine']
+    override, or the global AGENT_ENGINE default) — not a hardcoded
+    LangGraph path. Also verifies the max_turns*2 -> recursion_limit unit
+    both engines share, and that a child keeps a skill tool it was scoped
+    (execute_skill isn't in the blocked-tools list)."""
+    import json
+    import app.harness.engine as engine_mod
+    from app.workflow.strategies.react import subagent_factory as sf
+
+    class _RoutingFakeTool:
+        def __init__(self, name):
+            self.name = name
+
+    captured = {}
+
+    async def _fake_run_agent_once(spec, llm, tools, user_query, **kw):
+        captured["engine"] = kw.get("engine")
+        captured["recursion_limit"] = kw.get("recursion_limit")
+        captured["tool_names"] = sorted(getattr(t, "name", "") for t in tools)
+        return {"final_answer": "child done", "messages": [], "tool_calls": []}
+
+    orig = engine_mod.run_agent_once
+    engine_mod.run_agent_once = _fake_run_agent_once
+    try:
+        result = await sf._run_child(
+            llm=None, sub_tools=[_RoutingFakeTool("execute_skill")], agent_config={"engine": "native"},
+            name="test-child", role_prompt=None, capabilities=[], output_schema=None,
+            model_name=None, depth_remaining=1, parent_execution_id="parent-1",
+            timeout_s=0, output_max=4000, task="do the thing", max_turns=3,
+        )
+        parsed = json.loads(result)
+        check("subagent: dispatch honors per-def engine override", captured.get("engine") == "native")
+        check("subagent: recursion_limit = max_turns*2", captured.get("recursion_limit") == 6)
+        check("subagent: child keeps the skill tool it was scoped", "execute_skill" in captured.get("tool_names", []))
+        check("subagent: child result envelope status ok", parsed.get("status") == "ok")
+        check("subagent: child result carries answer", parsed.get("answer") == "child done")
+
+        captured.clear()
+        await sf._run_child(
+            llm=None, sub_tools=[], agent_config={}, name="test-child2", role_prompt=None,
+            capabilities=[], output_schema=None, model_name=None, depth_remaining=1,
+            parent_execution_id="parent-1", timeout_s=0, output_max=4000, task="do it",
+        )
+        check(
+            "subagent: no per-def override falls back to global AGENT_ENGINE default",
+            captured.get("engine") == engine_mod.ENGINE_LANGGRAPH,
+        )
+    finally:
+        engine_mod.run_agent_once = orig
+
+
+async def test_delegation_phase_b() -> None:
+    """Phase B delegation: config bounds, BLOCKED_TOOLS safety, parallel/async tools."""
+    from app.workflow.strategies.react import subagent_factory as sf
+    from app.config import settings as _s
+
+    # ── 1. Config bounds resolve from settings ──────────────────────────────────
+    orig_depth = _s.delegation_max_depth
+    orig_conc = _s.delegation_max_concurrent
+    orig_timeout = _s.delegation_child_timeout_seconds
+    orig_output = _s.delegation_output_max_chars
+    try:
+        _s.delegation_max_depth = 2
+        _s.delegation_max_concurrent = 5
+        _s.delegation_child_timeout_seconds = 60.0
+        _s.delegation_output_max_chars = 4000
+        max_d, max_c, timeout, output_max, _ = sf._delegation_bounds({})
+        check("delegation bounds: max_depth from settings", max_d == 2)
+        check("delegation bounds: max_concurrent from settings", max_c == 5)
+        check("delegation bounds: timeout from settings", timeout == 60.0)
+        check("delegation bounds: output_max from settings", output_max == 4000)
+        # Per-node override wins for max_concurrent
+        _, mc_node, _, _, _ = sf._delegation_bounds({"delegation_max_concurrent": "2"})
+        check("delegation bounds: node override wins", mc_node == 2)
+    finally:
+        _s.delegation_max_depth = orig_depth
+        _s.delegation_max_concurrent = orig_conc
+        _s.delegation_child_timeout_seconds = orig_timeout
+        _s.delegation_output_max_chars = orig_output
+
+    # ── 2. BLOCKED_TOOLS safety — children never get dangerous tools ─────────────
+    from app.core.vfs import build_vfs_tools
+
+    class _FakeTool:
+        def __init__(self, name): self.name = name
+
+    parent_tools = [
+        _FakeTool("cloudwatch_scan"), _FakeTool("apply_fix"), _FakeTool("fs_write"),
+        _FakeTool("delegate_to_other"), _FakeTool("run_command"),
+    ]
+    blocked = ["delegate_*", "apply_fix", "fs_write*", "run_command"]
+    scoped, unmatched0 = sf._scope_tools(parent_tools, None, blocked, depth_remaining=1)
+    scoped_names = {t.name for t in scoped}
+    check("blocked tools stripped: apply_fix", "apply_fix" not in scoped_names)
+    check("blocked tools stripped: fs_write", "fs_write" not in scoped_names)
+    check("blocked tools stripped: delegate_*", "delegate_to_other" not in scoped_names)
+    check("blocked tools stripped: run_command", "run_command" not in scoped_names)
+    check("blocked tools keeps safe tool", "cloudwatch_scan" in scoped_names)
+    check("wildcard/omitted tools = no unmatched globs", unmatched0 == [])
+
+    # fnmatch allow-list intersection: child can't gain a tool parent lacks
+    scoped2, unmatched2 = sf._scope_tools(parent_tools, ["cloudwatch_*", "apply_fix"], blocked, depth_remaining=1)
+    scoped2_names = {t.name for t in scoped2}
+    check("allow-list + blocked: apply_fix still stripped", "apply_fix" not in scoped2_names)
+    check("allow-list + blocked: cloudwatch_scan kept", "cloudwatch_scan" in scoped2_names)
+
+    # explicit wildcard ["*"] behaves identically to omitting tool_globs
+    scoped_wild, unmatched_wild = sf._scope_tools(parent_tools, ["*"], blocked, depth_remaining=1)
+    check("explicit wildcard ['*'] == omitted tool_globs",
+          {t.name for t in scoped_wild} == scoped_names and unmatched_wild == [])
+
+    # unmatched allow-list glob is reported, not silently dropped
+    _, unmatched_bad = sf._scope_tools(parent_tools, ["nonexistent_*"], blocked, depth_remaining=1)
+    check("unmatched glob reported", unmatched_bad == ["nonexistent_*"])
+
+    # disallowedTools subtracts on top of the allow-list
+    scoped_dis, _ = sf._scope_tools(
+        parent_tools, ["cloudwatch_*"], blocked, depth_remaining=1,
+        disallowed_globs=["cloudwatch_scan"],
+    )
+    check("disallowedTools subtracts allowed tool", scoped_dis == [])
+
+    # ── 3. delegate_parallel tool builds and has expected structure ──────────────
+    from app.workflow.strategies.react.subagent_factory import (
+        build_delegate_parallel_tool, build_subagent_tools,
+    )
+    defs = [
+        {"name": "cloud-spec", "description": "CW specialist", "tools": ["cloudwatch_*"]},
+        {"name": "code-spec", "description": "code specialist", "tools": ["crawler_*"]},
+    ]
+    parallel_tool = build_delegate_parallel_tool(
+        llm=None, base_tools=parent_tools, agent_config={}, subagent_defs=defs,
+        parent_execution_id="test-parent",
+    )
+    check("delegate_parallel tool built", parallel_tool is not None)
+    check("delegate_parallel name", parallel_tool.name == "delegate_parallel")
+    check("delegate_parallel returns None for empty defs",
+          build_delegate_parallel_tool(llm=None, base_tools=[], agent_config={},
+                                       subagent_defs=[]) is None)
+
+    # ── 4. no fire-and-forget delegation surface ─────────────────────────────────
+    # delegate_async / collect_delegations / _ASYNC_REGISTRY were removed — they
+    # leaked asyncio.Task handles because nothing cleared the registry on run
+    # teardown. Serial + delegate_parallel cover concurrency without standing state.
+    check("no delegate_async attribute", not hasattr(sf, "build_async_delegation_tools"))
+    check("no _ASYNC_REGISTRY attribute", not hasattr(sf, "_ASYNC_REGISTRY"))
+    check("no clear_async_registry attribute", not hasattr(sf, "clear_async_registry"))
+
+    # ── 5. tool_assembler wires parallel tools when subagents defined ───────────
+    from app.harness.tool_assembler import add_extension_tools
+    import logging as _log
+    vfs_tools = build_vfs_tools("tb-test")
+    ext = add_extension_tools(
+        tools=list(vfs_tools),
+        llm=None,
+        agent_config={"subagents": defs},
+        code_analyzer_config=None,
+        execution_id="tb-exec",
+        logger_instance=_log.getLogger("t"),
+    )
+    ext_names = {getattr(t, "name", "") for t in ext}
+    check("assembler adds delegate_to_cloud_spec", "delegate_to_cloud_spec" in ext_names, str(ext_names))
+    check("assembler adds delegate_parallel", "delegate_parallel" in ext_names, str(ext_names))
+    check("assembler does not add delegate_async", "delegate_async" not in ext_names, str(ext_names))
+
+    # ── 6. retired subagent.py — delegate_investigation now built by the
+    #    consolidated factory whenever code-analyzer tools are configured ──────
+    from app.workflow.strategies.react.subagent_factory import build_generic_delegate_tool
+    generic_tool = build_generic_delegate_tool(
+        llm=None, base_tools=parent_tools, agent_config={}, parent_execution_id="tp",
+    )
+    check("generic delegate tool name unchanged", generic_tool.name == "delegate_investigation")
+    check("generic delegate returns None at depth 0",
+          build_generic_delegate_tool(llm=None, base_tools=[], agent_config={},
+                                      depth_remaining=0) is None)
+    import importlib.util as _ilu
+    check("subagent.py module retired",
+          _ilu.find_spec("app.workflow.strategies.react.subagent") is None)
+
+    # ── 7. unified subagent-def schema: disallowedTools / max_turns /
+    #    permission_mode / model="inherit" all thread through _run_child ──────
+    crawler_tool = _FakeTool("crawler_find_symbol")
+    defs_full = [{
+        "name": "scoped-spec", "description": "scoped specialist",
+        "tools": ["crawler_*", "cloudwatch_*"],
+        "disallowedTools": ["cloudwatch_scan"],
+        "model": "inherit",
+        "max_turns": 4,
+        "permission_mode": "default",
+    }]
+    scoped_tool = build_subagent_tools(
+        llm=None, base_tools=parent_tools + [crawler_tool], agent_config={},
+        subagent_defs=defs_full, parent_execution_id="tp",
+    )[0]
+    check("unified schema builds delegate_to_scoped_spec", scoped_tool.name == "delegate_to_scoped_spec")
+    has_ca, has_cw = sf._infer_child_context_flags([crawler_tool])
+    check("has_code_analyzer inferred from crawler_* tools", has_ca is True and has_cw is False)
+
+
 async def test_file_skills() -> None:
     # File-backed SkillService: create/list/get/recall/execute/audit/delete, no DB.
     import tempfile, json as _json
@@ -1362,10 +2033,132 @@ async def test_file_skills() -> None:
     check("file skill delete_all clears store", (await svc.list_skills(status="all")) == [])
 
 
+async def test_chat_session_compaction() -> None:
+    """Per-chat-session compaction helpers — role mapping + replay fix. DB-free."""
+    from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+    from app.core.memory.compaction_manager import _chat_dicts_to_messages
+
+    rows = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "system", "content": "SUMMARY TEXT"},
+        {"role": "user", "content": "follow up"},
+        {"role": "tool", "content": "ignored — chat_messages never has this role"},
+        {"role": "assistant", "content": ""},  # empty content dropped
+    ]
+    msgs = _chat_dicts_to_messages(rows)
+    check("chat compaction: role mapping length", len(msgs) == 4)
+    check("chat compaction: user -> HumanMessage", isinstance(msgs[0], HumanMessage))
+    check("chat compaction: assistant -> AIMessage", isinstance(msgs[1], AIMessage))
+    check("chat compaction: system -> SystemMessage", isinstance(msgs[2], SystemMessage))
+    check("chat compaction: empty content dropped", len(msgs) == 4 and msgs[-1].content == "follow up")
+
+    # execute_agent's conversation_history replay must NOT silently drop a
+    # role="system" entry (that's exactly how a session summary is replayed) —
+    # it should surface as a labelled HumanMessage, not a skipped/no-op.
+    _prior_messages = []
+    for _m in [{"role": "system", "content": "SUMMARY TEXT"}]:
+        _role = str(_m.get("role") or "").lower()
+        _text = _m.get("content") or ""
+        if _role == "system":
+            _prior_messages.append(HumanMessage(content=f"[Prior conversation summary]\n{_text}"))
+    check("chat compaction: system history entry survives replay as HumanMessage",
+          len(_prior_messages) == 1 and "SUMMARY TEXT" in _prior_messages[0].content)
+
+
+async def test_loop_engineering() -> None:
+    """Loop 2 + Loop 4 regression cases — DB-free."""
+
+    # ── Loop 2: supervisor with llm_scoring OFF is byte-for-byte heuristic path ──
+    from app.core.supervisor import InvestigationSupervisor, SupervisorConfig, SupervisorAction
+
+    cfg_off = SupervisorConfig(llm_scoring_enabled=False)
+    sup_off = InvestigationSupervisor(cfg_off)
+    verdict_off = await sup_off.evaluate(
+        final_answer="root cause identified: the service restarted due to OOM.",
+        tool_calls=[{"tool": "cloudwatch_get_logs", "args_keys": ["log_group"]}],
+        confidence=0.85,
+        messages=[],
+    )
+    check("loop2: grader OFF returns heuristic PASS", verdict_off.action == SupervisorAction.PASS)
+    check("loop2: grader OFF breakdown has no grader_score",
+          "grader_score" not in verdict_off.score_breakdown)
+
+    # ── Loop 2: grader fail-soft — when grader raises, heuristic verdict survives ──
+    import unittest.mock as _mock
+
+    cfg_on = SupervisorConfig(llm_scoring_enabled=True)
+    sup_on = InvestigationSupervisor(cfg_on)
+    with _mock.patch("app.core.grader.grade_answer", side_effect=RuntimeError("boom")):
+        verdict_failsoft = await sup_on.evaluate(
+            final_answer="root cause: the pod was evicted.",
+            tool_calls=[],
+            confidence=0.9,
+            messages=[{"role": "tool", "content": "pod evicted by kubelet"}],
+        )
+    check("loop2: grader fail-soft returns heuristic verdict",
+          verdict_failsoft.action == SupervisorAction.PASS)
+
+    # ── Loop 2: grader returns None (no evidence) — heuristic verdict used ──
+    with _mock.patch("app.core.grader.grade_answer", return_value=None):
+        verdict_none = await sup_on.evaluate(
+            final_answer="root cause: the pod was evicted.",
+            tool_calls=[],
+            confidence=0.9,
+            messages=[],
+        )
+    check("loop2: grader None -> heuristic verdict", verdict_none.action == SupervisorAction.PASS)
+
+    # ── Loop 4: apply_proposals dry_run=True makes zero writes ──
+    from app.core.improvement.analyzer import ImprovementReport
+    from app.core.improvement.apply import apply_proposals
+
+    report = ImprovementReport(
+        profile=None,
+        sample_size=5,
+        proposals=[
+            {"kind": "skill", "target": "test", "suggestion": "Add a skill for X", "status": "draft"},
+            {"kind": "prompt", "target": "role", "suggestion": "Rewrite role prompt", "status": "draft"},
+            {"kind": "reliability", "target": "error", "suggestion": "Fix recurring error", "status": "draft"},
+        ],
+    )
+    dry = await apply_proposals(report, dry_run=True)
+    check("loop4: dry_run returns eligible=2 (skill+reliability)", dry["eligible"] == 2)
+    check("loop4: dry_run applied=0", dry["applied"] == 0)
+    check("loop4: prompt proposal excluded from eligible", dry["eligible"] == 2)
+    check("loop4: guard_passed is None on dry_run", dry["guard_passed"] is None)
+
+    # ── Loop 4: ineligible (prompt/policy) proposals never reach apply ──
+    report_ineligible = ImprovementReport(
+        profile=None,
+        sample_size=3,
+        proposals=[
+            {"kind": "prompt", "target": "role", "suggestion": "Rewrite", "status": "draft"},
+            {"kind": "policy", "target": "supervisor", "suggestion": "Lower threshold", "status": "draft"},
+        ],
+    )
+    dry2 = await apply_proposals(report_ineligible, dry_run=True)
+    check("loop4: prompt+policy proposals not eligible", dry2["eligible"] == 0)
+
+
 async def _main() -> int:
     print("=== Agent Harness self-test ===")
     test_envelopes()
     test_tool_router()
+    test_boto_context_overflow_classifier()
+    test_engine_resolution()
+    await test_engine_native_dispatch()
+    await test_turn_loop_happy_path()
+    await test_turn_loop_tool_call_then_complete()
+    await test_turn_loop_max_turns_forced_synthesis()
+    test_compression_split_preserved_tail()
+    test_compression_split_preserved_tail_empty()
+    await test_compression_pipeline_delegates()
+    await test_turn_loop_reactive_compact_retry()
+    await test_turn_loop_truncation_escalation_recovers()
+    await test_turn_loop_truncation_ladder_exhausts()
+    await test_turn_loop_midthought_continuation()
+    await test_recovery_call_model_with_backoff()
     test_spec_and_facade()
     test_policy_engine()
     test_sandbox()
@@ -1403,10 +2196,21 @@ async def _main() -> int:
     test_seed_skill_library()
     test_conversational_intent()
     test_cloudwatch_prescan_gate()
+    await test_tool_assembler_degrade_not_abort()
+    # ── context compaction: microcompact tier before the LLM-summary tier ──
+    await test_context_compaction_tiers()
+    # ── per-chat-session compaction: role mapping + system-history replay ──
+    await test_chat_session_compaction()
     # ── configurable agents (capabilities/output/profiles) + deep-agent (planning/vfs/subagents) + self-improvement ──
     test_configurable_agents()
+    # ── Phase B delegation: bounds / safety / parallel / async ──
+    await test_delegation_phase_b()
+    # ── Phase 5: delegated children route through the engine flag ──
+    await test_subagent_engine_routing()
     # ── file-backed skills (no DB) ──
     await test_file_skills()
+    # ── loop engineering: Loop 2 grader + Loop 4 hill-climbing ──
+    await test_loop_engineering()
     print("-" * 40)
     if _FAILURES:
         print(f"FAILED: {len(_FAILURES)} check(s): {', '.join(_FAILURES)}")

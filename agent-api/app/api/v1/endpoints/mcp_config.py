@@ -1,6 +1,6 @@
 """MCP Configuration API routes."""
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel, Field
 
@@ -23,7 +23,7 @@ class MCPServerConfig(BaseModel):
     """MCP Server configuration model."""
     command: str = Field(..., description=_DESC_COMMAND)
     args: List[str] = Field(default_factory=list, description=_DESC_ARGS)
-    env: Dict[str, str] = Field(default_factory=dict, description=_DESC_ENV)
+    env: Dict[str, Any] = Field(default_factory=dict, description=_DESC_ENV)
     description: Optional[str] = Field(None, description=_DESC_DESCRIPTION)
     icon: Optional[str] = Field(None, description=_DESC_ICON)
     disabled: Optional[bool] = Field(False, description=_DESC_DISABLED)
@@ -34,7 +34,7 @@ class MCPServerCreate(BaseModel):
     name: str = Field(..., description="Server name")
     command: str = Field(..., description=_DESC_COMMAND)
     args: List[str] = Field(default_factory=list, description=_DESC_ARGS)
-    env: Dict[str, str] = Field(default_factory=dict, description=_DESC_ENV)
+    env: Dict[str, Any] = Field(default_factory=dict, description=_DESC_ENV)
     description: Optional[str] = Field(None, description=_DESC_DESCRIPTION)
     icon: Optional[str] = Field(None, description=_DESC_ICON)
     disabled: Optional[bool] = Field(False, description=_DESC_DISABLED)
@@ -45,7 +45,7 @@ class MCPServerUpdate(BaseModel):
     name: Optional[str] = Field(None, description="New server name (for rename)")
     command: Optional[str] = Field(None, description=_DESC_COMMAND)
     args: Optional[List[str]] = Field(None, description=_DESC_ARGS)
-    env: Optional[Dict[str, str]] = Field(None, description=_DESC_ENV)
+    env: Optional[Dict[str, Any]] = Field(None, description=_DESC_ENV)
     description: Optional[str] = Field(None, description=_DESC_DESCRIPTION)
     icon: Optional[str] = Field(None, description=_DESC_ICON)
     disabled: Optional[bool] = Field(None, description=_DESC_DISABLED)

@@ -52,6 +52,9 @@ MIGRATIONS=(
   "migrations/023_skill_confidence.sql"
   "migrations/024_drop_known_issues_leftover.sql"
   "migrations/025_agent_profiles.sql"
+  "migrations/026_workflow_type.sql"
+  "migrations/027_multiagent_profile.sql"
+  "migrations/028_session_tokens_and_chat_source.sql"
 )
 
 for migration in "${MIGRATIONS[@]}"; do

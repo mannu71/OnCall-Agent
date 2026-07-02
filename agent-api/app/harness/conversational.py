@@ -4,9 +4,8 @@ When a turn is purely conversational (a greeting, a thank-you, or a "what can yo
 do / what tools are available" meta-question — see
 ``app.core.intent.is_conversational``), it needs no logs, no code search, and no
 DB. Routing it through the full agent build is wasteful: the model would still
-receive the entire investigation system prompt PLUS every bound tool schema
-(crawler, DB-schema, vfs, planning, edit, delegate). That measured ~28K input
-tokens for a one-word "Hi".
+receive the full system prompt PLUS every bound tool schema (crawler, DB-schema,
+vfs, planning, edit, delegate). That measured ~28K input tokens for a one-word "Hi".
 
 This module answers such turns with a SINGLE model call against a tiny,
 capability-aware system prompt and NO tools — cutting the prompt to a few hundred
@@ -57,9 +56,8 @@ def _build_system_prompt(
         )
     )
     return (
-        "You are the assistant for an AI investigation platform. The user's message is small "
-        "talk or a question about your capabilities — reply directly and concisely, and do NOT "
-        "call any tools.\n\n"
+        "You are a helpful assistant. The user's message is small talk or a question about "
+        "your capabilities — reply directly and concisely, and do NOT call any tools.\n\n"
         "On a real request you can:\n"
         f"{caps}\n\n"
         "If the user asks what you can do or what tools are available, summarize the capabilities "

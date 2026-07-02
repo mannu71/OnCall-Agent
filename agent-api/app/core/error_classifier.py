@@ -219,6 +219,20 @@ def _classify_boto_error(error: Exception) -> ClassifiedError:
                 retryable=False,
                 original_error=error,
             )
+        # Bedrock Converse reports context overflow as a plain ValidationException
+        # ("Input is too long for requested model", "too many total text bytes" /
+        # "too many tokens") rather than a dedicated error code, so it fell through
+        # to UNKNOWN and never triggered compaction-and-retry. Reuse the same
+        # message-pattern check the OpenAI/Anthropic branches rely on.
+        if error_code == "ValidationException":
+            from app.core.model_metadata import is_context_overflow_error
+            if is_context_overflow_error(error):
+                return ClassifiedError(
+                    reason=FailoverReason.CONTEXT_OVERFLOW,
+                    retryable=False,
+                    should_compress=True,
+                    original_error=error,
+                )
 
     return ClassifiedError(
         reason=FailoverReason.UNKNOWN,

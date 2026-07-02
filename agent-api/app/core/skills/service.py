@@ -418,10 +418,15 @@ class SkillService:
         self,
         query: str,
         limit: int = 3,
+        allowed: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
-        """Return up to *limit* active skills whose trigger_patterns match *query*."""
+        """Return up to *limit* active skills whose trigger_patterns match *query*.
+
+        ``allowed``: when given (non-empty), only skills whose name is in this
+        set are considered — per-agent skill scoping. ``None`` = no scoping.
+        """
         try:
-            return await self._keyword_recall(query, limit)
+            return await self._keyword_recall(query, limit, allowed=allowed)
         except Exception as exc:
             logger.debug("SkillService.recall: failed — %s", exc)
             return []
@@ -430,6 +435,7 @@ class SkillService:
         self,
         query: str,
         limit: int,
+        allowed: Optional[set] = None,
     ) -> List[Dict[str, Any]]:
         await _ensure_store()
         query_lower = query.lower()
@@ -437,6 +443,8 @@ class SkillService:
         matched: List[Tuple[Dict[str, Any], int]] = []
         for skill in _CACHE.values():
             if skill.get("status") != "active":
+                continue
+            if allowed and skill.get("name") not in allowed:
                 continue
             patterns = skill.get("trigger_patterns") or []
             score = 0

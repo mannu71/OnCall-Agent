@@ -317,7 +317,11 @@ export default function Dashboard() {
   const loadExecutions = useCallback(async () => {
     try {
       const history = await agentApiClient.listAllExecutions(100);
-      setExecutions(history);
+      // Every chat message reuses the same /workflows/{name}/execute endpoint
+      // as a real scheduled/manual workflow run, so ad-hoc chat turns
+      // (chat_session_id set) would otherwise flood "Recent runs" and skew
+      // the stats tiles. Real workflow runs have chat_session_id == null.
+      setExecutions(history.filter(e => !e.chat_session_id));
     } catch (error) {
       console.error('Error loading executions:', error);
     } finally {
@@ -1166,16 +1170,20 @@ export default function Dashboard() {
               const totalTok  = selectedRun?.total_tokens  || _agentTok?.total_tokens  || (inputTok + outputTok) || 0;
               if (!totalTok) return null;
 
-              // Bedrock sums cache-read tokens INTO input_tokens. Back them out so
-              // the panel shows what was actually reprocessed at full price vs.
-              // served cheaply from the prompt cache. cache reads bill ≈10% of
-              // fresh input, so "effective" input ≈ non-cached + 10% of cached.
+              // Bedrock/Anthropic report cache_read / cache_creation as SEPARATE,
+              // ADDITIVE counters — input_tokens is already the non-cached
+              // (full-price) portion, it is NOT inclusive of them. True total
+              // input actually processed = input + cache_read + cache_creation.
+              // cache_read bills at ~10% of fresh input; cache_creation bills at
+              // a premium (~125% for Anthropic models) for the write.
               const cacheReadTok = selectedRun?.cache_read_tokens || _agentTok?.cache_read_tokens || 0;
-              const nonCachedTok = Math.max(0, inputTok - cacheReadTok);
-              const cacheHitPct = inputTok > 0 ? Math.round((cacheReadTok / inputTok) * 100) : 0;
-              const effInputTok = Math.round(nonCachedTok + cacheReadTok * 0.1);
-              const savedTok = Math.max(0, inputTok - effInputTok);
-              const savedPct = inputTok > 0 ? Math.round((savedTok / inputTok) * 100) : 0;
+              const cacheCreationTok = selectedRun?.cache_creation_tokens || _agentTok?.cache_creation_tokens || 0;
+              const nonCachedTok = inputTok;
+              const trueInputTok = inputTok + cacheReadTok + cacheCreationTok;
+              const cacheHitPct = trueInputTok > 0 ? Math.round((cacheReadTok / trueInputTok) * 100) : 0;
+              const effInputTok = Math.round(inputTok + cacheReadTok * 0.1 + cacheCreationTok * 1.25);
+              const savedTok = Math.max(0, trueInputTok - effInputTok);
+              const savedPct = trueInputTok > 0 ? Math.round((savedTok / trueInputTok) * 100) : 0;
 
               return (
                 <div className="bg-white rounded-lg border border-slate-200 p-6">

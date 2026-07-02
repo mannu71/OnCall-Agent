@@ -139,19 +139,55 @@ def _user_query_from_context(context: Dict[str, Any]) -> str:
     )
 
 
-def _should_skip_prescan(tool_mode: str, user_query: str) -> bool:
+def is_chat_turn(context: Dict[str, Any]) -> bool:
+    """True when this run is an interactive chat turn, not a scheduled/manual one.
+
+    A chat turn has a live ReAct loop that can route its own tool calls — the
+    agent decides for itself whether it needs CloudWatch/code-search/etc. based
+    on the query, exactly as the reference ReAct implementation does (no
+    upfront, query-keyword tool routing anywhere in it). A scheduled or manual
+    run (cron, the workflow "Run" button, a bare API trigger) has no human or
+    follow-up turn to correct course, so deterministic pre-work (a CloudWatch
+    pre-scan, a code pre-summary) IS the deliverable there and must still run.
+
+    ``_chat_session_id`` is the generic signal for this — stamped once, on
+    every chat turn, by the ``/execute`` endpoint
+    (``app/api/v1/endpoints/workflows.py``) — not something specific to
+    CloudWatch. Any node handler doing unconditional pre-work that duplicates a
+    tool the agent already has bound should gate on this same check.
+    """
+    return bool((context.get("inputs") or {}).get("_chat_session_id"))
+
+
+def _should_skip_prescan(tool_mode: str, user_query: str, context: Dict[str, Any]) -> bool:
     """Decide whether to skip the deterministic pre-scan for this turn.
 
     * ``agent``   → always skip (agent drives the bound tools itself).
-    * ``prescan`` → never skip (always run the pipeline).
-    * ``auto``    → skip only for clearly conversational turns.
+    * ``prescan`` → never skip (always run the pipeline — explicit operator
+                    opt-in to "always scan", unaffected by chat-vs-scheduled).
+    * ``auto``    → skip for a clearly conversational turn, OR any interactive
+                    chat turn at all (see ``is_chat_turn`` — the agent's own
+                    bound CloudWatch tools route the call instead). Scheduled/
+                    manual runs (no chat session) still get the deterministic
+                    pipeline.
     """
     if tool_mode == "agent":
         return True
     if tool_mode == "prescan":
         return False
+    if is_chat_turn(context):
+        return True
     from app.core.intent import is_conversational
     return is_conversational(user_query)
+
+
+def _skip_reason(tool_mode: str, context: Dict[str, Any]) -> str:
+    """Trace-friendly reason string for a skip decided by ``_should_skip_prescan``."""
+    if tool_mode == "agent":
+        return "agent_mode"
+    if is_chat_turn(context):
+        return "agent_routed"
+    return "conversational"
 
 
 def _prescan_skipped_seed(cfg: Dict[str, Any], reason: str) -> Dict[str, Any]:
@@ -218,12 +254,14 @@ async def execute_tool_provider(executor, node: Dict[str, Any], context: Dict[st
     cfg = _read_cw_config(node)
     log_groups = cfg["log_groups"]
 
-    # Query-aware gate: skip the credentialed pre-scan for agent mode or a purely
-    # conversational turn (e.g. "Hi"). The agent still has the live CloudWatch
-    # tools bound by ReactStrategy, so it can investigate on demand.
+    # Query-aware gate: skip the credentialed pre-scan for agent mode, a purely
+    # conversational turn (e.g. "Hi"), or ANY interactive chat turn (the agent's
+    # own bound CloudWatch tools route the call — see is_chat_turn). Only a
+    # scheduled/manual run (no chat session) still gets the deterministic
+    # pipeline unconditionally.
     user_query = _user_query_from_context(context)
-    if _should_skip_prescan(cfg["tool_mode"], user_query):
-        reason = "agent_mode" if cfg["tool_mode"] == "agent" else "conversational"
+    if _should_skip_prescan(cfg["tool_mode"], user_query, context):
+        reason = _skip_reason(cfg["tool_mode"], context)
         logger.info("cloudwatch_tool: skipping pre-scan (mode=%s, reason=%s)",
                     cfg["tool_mode"], reason)
         return _prescan_skipped_seed(cfg, reason)
@@ -350,12 +388,12 @@ async def execute_tool_provider(executor, node: Dict[str, Any], context: Dict[st
 @register("cloudwatchAnalyzer")
 async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     """Execute CloudWatch Analyzer node via ``LogWatchService``."""
-    # Same query-aware gate as the new node: skip the scan for agent mode or a
-    # conversational turn so a greeting never triggers an AWS call.
+    # Same query-aware gate as the new node: skip the scan for agent mode, a
+    # conversational turn, or any interactive chat turn (see is_chat_turn).
     _cfg = _read_cw_config(node)
     _user_query = _user_query_from_context(context)
-    if _should_skip_prescan(_cfg["tool_mode"], _user_query):
-        reason = "agent_mode" if _cfg["tool_mode"] == "agent" else "conversational"
+    if _should_skip_prescan(_cfg["tool_mode"], _user_query, context):
+        reason = _skip_reason(_cfg["tool_mode"], context)
         logger.info("cloudwatchAnalyzer: skipping scan (mode=%s, reason=%s)",
                     _cfg["tool_mode"], reason)
         return _prescan_skipped_seed(_cfg, reason)

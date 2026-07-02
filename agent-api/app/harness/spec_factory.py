@@ -37,26 +37,6 @@ def resolve_policies(
     return None
 
 
-def resolve_harness(agent_config: Dict[str, Any]) -> str:
-    """Resolve the effective agent harness for this node: ``legacy`` | ``deepagents``.
-
-    Per-node config wins (agent node ``harness`` or ``params.harness``); when unset
-    or invalid it falls back to the server-wide ``settings.harness``. This lets a
-    single workflow pin a harness without flipping the global default — and is the
-    one source of truth shared by the agent builder, the prompt composer, and the
-    tool assembler so all three agree on which harness a run uses.
-    """
-    cfg = agent_config if isinstance(agent_config, dict) else {}
-    params = cfg.get("params") if isinstance(cfg.get("params"), dict) else {}
-    val = cfg.get("harness") or params.get("harness")
-    if isinstance(val, str) and val.strip().lower() in ("legacy", "deepagents"):
-        return val.strip().lower()
-    try:
-        from app.config import settings
-        return getattr(settings, "harness", "legacy")
-    except Exception:  # noqa: BLE001 — never break a run on a config read
-        return "legacy"
-
 
 def resolve_permission_mode(context: Dict[str, Any], agent_config: Dict[str, Any]) -> str:
     """Resolve the effective permission mode (default | auto_allow | plan).
@@ -118,6 +98,10 @@ def resolve_profile_fields(agent_config: Dict[str, Any]) -> Dict[str, Any]:
         "planning": _as_bool(_pick("planning")),
         "filesystem": _as_bool(_pick("filesystem")),
         "subagents": _coerce_subagents(_pick("subagents")),
+        # Skills this agent is scoped to (names, from the Agent node's Skills
+        # picker). Empty = no scoping — the agent auto-selects from the
+        # global skill library (see build_recall_query's allowed_skills).
+        "skills": _as_str_list(_pick("skills")),
         "auto_learn": _as_bool(_pick("autoLearn", "auto_learn")),
         "sandbox": _as_bool(_pick("sandbox")),
         # Edit→verify→fix loop: operator-configured command run against the real
@@ -128,7 +112,6 @@ def resolve_profile_fields(agent_config: Dict[str, Any]) -> Dict[str, Any]:
         # Explicit per-node override; the authoritative signal is graph
         # connectivity (``has_memory``), resolved in build_agent_spec().
         "memory": _as_bool(_pick("memory")),
-        "harness": resolve_harness(cfg),
     }
 
 
@@ -193,5 +176,4 @@ def build_agent_spec(
         verify_command=profile["verify_command"],
         verify_image=profile["verify_image"],
         verify_timeout=(int(profile["verify_timeout"]) if profile["verify_timeout"] else None),
-        harness=profile["harness"],
     )

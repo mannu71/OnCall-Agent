@@ -78,6 +78,63 @@ const DB_RCA_SYSTEM = `You are a data/database RCA specialist. This incident was
 
 export const WORKFLOW_TEMPLATES = [
   {
+    id: 'multi-agent-rca',
+    label: 'Multi-Agent Incident RCA',
+    description: 'An orchestrator agent delegates to named subagents you define — CloudWatch, code, database or any domain. Edit the "Subagent Definitions" field to configure your own roles.',
+    icon: 'users',
+    type: 'workflow',
+    nodes: [
+      { id: 'mar_schedule', type: 'schedule', x: 820, y: 40, name: 'Schedule', status: 'idle',
+        params: { frequency: 'Daily', time: '09:00', days: 'Mon,Tue,Wed,Thu,Fri', tz: 'UTC', enabled: false } },
+      { id: 'mar_lm', type: 'language_model', x: 120, y: 120, name: 'Language Model', status: 'idle',
+        params: { llm: '', temp: '0.2' } },
+      { id: 'mar_cw', type: 'cloudwatch_tool', x: 120, y: 380, name: 'CloudWatch Tool', status: 'idle',
+        params: { region: 'us-east-1', profile: '', groups: '', analysis: 'error-patterns',
+                  range: '1h', threshold: '10', alerts: 'false', activeAlarmsOnly: 'false', analysis_depth: 'deep' } },
+      { id: 'mar_code', type: 'code_search_tool', x: 120, y: 640, name: 'Code Crawler', status: 'idle',
+        params: { repos: '' } },
+      { id: 'mar_db', type: 'database', x: 120, y: 880, name: 'Database', status: 'idle',
+        params: { server: '' } },
+      { id: 'mar_agent', type: 'agent', x: 820, y: 400, name: 'Incident Commander', status: 'idle',
+        params: {
+          maxIter: '15',
+          supervisor_enabled: 'true',
+          system: 'You are the lead incident commander. Decompose the incident and delegate evidence-gathering to your subagents rather than gathering it yourself. Synthesise their summaries into a single root-cause analysis.\n\nDELEGATION PROTOCOL\n1. Issue all relevant delegate_to_* calls before synthesising.\n2. Only call raw tools directly for quick cross-checks the subagents did not cover.\n\nOUTPUT FORMAT\n**Summary**: one sentence.\n**Root Cause**: specific error, code path, or data condition.\n**Evidence**: cite subagent findings.\n**Recommended Action**: concrete next step.\n**Confidence**: high / medium / low.',
+          subagents: JSON.stringify([
+            {
+              name: 'cloudwatch-subagent',
+              description: 'Analyse CloudWatch logs, metrics and alarms. Returns top error patterns, anomalies and example log lines.',
+              role_prompt: 'You are a CloudWatch subagent. Investigate using the CloudWatch tools: list alarms, detect anomalies, analyse error patterns, and drill into raw logs. Cite log group, time range, occurrence count and example message.',
+              capabilities: ['cloudwatch'],
+              tools: ['cloudwatch_*'],
+            },
+            {
+              name: 'code-subagent',
+              description: 'Investigate source code: locate the error origin, trace call paths, map log errors to file and line.',
+              role_prompt: 'You are a code investigation subagent. Use the code crawler to find where the incident originates. MANDATORY: confirm every finding in code before asserting it. Cite repo, file path, symbol and line numbers.',
+              capabilities: ['code_analyzer'],
+              tools: ['crawler_*'],
+            },
+            {
+              name: 'db-subagent',
+              description: 'Run targeted read-only diagnostic SQL to confirm any data condition behind the incident.',
+              role_prompt: 'You are a database subagent. Discover tables lazily (db_list_tables), describe only what you need, run targeted read-only queries. Never dump information_schema or use SELECT *.',
+              capabilities: ['database', 'rds_performance'],
+              tools: ['db_*', 'query'],
+            },
+          ], null, 2),
+        },
+      },
+    ],
+    edges: [
+      { id: 'mar_e_lm',   source: 'mar_lm',       sourceSlot: 'lm',      target: 'mar_agent', targetSlot: 'lm' },
+      { id: 'mar_e_cw',   source: 'mar_cw',        sourceSlot: 'tool',    target: 'mar_agent', targetSlot: 'tools' },
+      { id: 'mar_e_code', source: 'mar_code',      sourceSlot: 'tool',    target: 'mar_agent', targetSlot: 'tools' },
+      { id: 'mar_e_db',   source: 'mar_db',        sourceSlot: 'tool',    target: 'mar_agent', targetSlot: 'tools' },
+      { id: 'mar_e_sched',source: 'mar_schedule',  sourceSlot: 'trigger', target: 'mar_agent', targetSlot: 'trigger' },
+    ],
+  },
+  {
     id: 'cloudwatch-rca',
     label: 'CloudWatch RCA',
     description: 'Investigate a CloudWatch incident: pulls error patterns, anomalies and alarms, then an agent performs root-cause analysis.',
@@ -92,7 +149,7 @@ export const WORKFLOW_TEMPLATES = [
         params: { region: 'us-east-1', profile: '', groups: '', analysis: 'error-patterns',
                   range: '1h', threshold: '10', alerts: 'false', activeAlarmsOnly: 'false', analysis_depth: 'deep' } },
       { id: 'cwrca_agent', type: 'agent', x: 1030, y: 240, name: 'RCA Agent', status: 'idle',
-        params: { maxIter: '10', system: CLOUDWATCH_RCA_SYSTEM } },
+        params: { maxIter: '10', system: CLOUDWATCH_RCA_SYSTEM, supervisor_enabled: 'false' } },
     ],
     edges: [
       { id: 'cwrca_e_lm', source: 'cwrca_lm', sourceSlot: 'lm', target: 'cwrca_agent', targetSlot: 'lm' },
@@ -113,7 +170,7 @@ export const WORKFLOW_TEMPLATES = [
         // Select one or more repos; the agent searches across all of them.
         params: { repos: '' } },
       { id: 'ccinv_agent', type: 'agent', x: 660, y: 200, name: 'Investigation Agent', status: 'idle',
-        params: { maxIter: '10', system: CODE_INVESTIGATION_SYSTEM } },
+        params: { maxIter: '10', system: CODE_INVESTIGATION_SYSTEM, supervisor_enabled: 'false' } },
     ],
     edges: [
       { id: 'ccinv_e_tool', source: 'ccinv_tool', sourceSlot: 'tool', target: 'ccinv_agent', targetSlot: 'tools' },
@@ -162,7 +219,7 @@ export const WORKFLOW_TEMPLATES = [
       { id: 'fsr_db', type: 'database', x: 120, y: 880, name: 'Database', status: 'idle',
         params: { server: '' } },
       { id: 'fsr_agent', type: 'agent', x: 780, y: 380, name: 'Full-Stack RCA Agent', status: 'idle',
-        params: { maxIter: '15', system: FULLSTACK_RCA_SYSTEM } },
+        params: { maxIter: '15', system: FULLSTACK_RCA_SYSTEM, supervisor_enabled: 'false' } },
     ],
     edges: [
       { id: 'fsr_e_lm', source: 'fsr_lm', sourceSlot: 'lm', target: 'fsr_agent', targetSlot: 'lm' },
@@ -174,8 +231,8 @@ export const WORKFLOW_TEMPLATES = [
   },
   {
     id: 'routed-rca-specialists',
-    label: 'Routed RCA Specialists',
-    description: 'A semantic router classifies the incident from its CloudWatch errors and dispatches to a specialist agent — code-defect (code crawler) or data (database).',
+    label: 'Routed RCA Agents',
+    description: 'A semantic router classifies the incident from its CloudWatch errors and dispatches to a dedicated agent — code-defect (code crawler) or data (database).',
     icon: 'route',
     type: 'workflow',
     nodes: [
@@ -199,9 +256,9 @@ export const WORKFLOW_TEMPLATES = [
       { id: 'rr_db', type: 'database', x: 460, y: 780, name: 'Database', status: 'idle',
         params: { server: '' } },
       { id: 'rr_code_agent', type: 'agent', x: 860, y: 60, name: 'Code-RCA Agent', status: 'idle',
-        params: { maxIter: '12', system: CODE_RCA_SYSTEM } },
+        params: { maxIter: '12', system: CODE_RCA_SYSTEM, supervisor_enabled: 'false' } },
       { id: 'rr_db_agent', type: 'agent', x: 860, y: 380, name: 'DB-RCA Agent', status: 'idle',
-        params: { maxIter: '12', system: DB_RCA_SYSTEM } },
+        params: { maxIter: '12', system: DB_RCA_SYSTEM, supervisor_enabled: 'false' } },
     ],
     edges: [
       { id: 'rr_e_lm_router', source: 'rr_lm', sourceSlot: 'lm', target: 'rr_router', targetSlot: 'model' },

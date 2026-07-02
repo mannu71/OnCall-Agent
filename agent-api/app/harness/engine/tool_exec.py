@@ -1,0 +1,165 @@
+"""Native turn-loop engine — tool dispatch.
+
+Executes the ``tool_calls`` on one AIMessage and returns the matching
+``ToolMessage`` list, applying the same governance/guardrail/steer-note
+machinery ``agent_runner.execute_agent_stream`` applies for the LangGraph
+path (policy tool-count ceiling, ``ToolCallGuardrailController``,
+failure classification, steer-note injection at the tool boundary) so both
+engines behave identically from the model's point of view.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ToolExecResult:
+    tool_messages: List[Any]
+    steer_messages: List[Any] = field(default_factory=list)
+
+
+async def _invoke_one(
+    tool: Any,
+    tool_name: str,
+    args: Dict[str, Any],
+) -> str:
+    try:
+        result = await tool.ainvoke(args)
+        return result if isinstance(result, str) else str(result)
+    except Exception as exc:  # noqa: BLE001 — surfaced to the model, not raised
+        return f"Error: {exc}\n Please fix your mistakes."
+
+
+async def execute_tool_calls(
+    ai_message: Any,
+    tools_by_name: Dict[str, Any],
+    *,
+    logger_instance: Any = None,
+    execution_id: Optional[str] = None,
+    execution_port: Any = None,
+    stream_callback: Any = None,
+    tool_call_count_before: int = 0,
+) -> ToolExecResult:
+    """Run every ``tool_calls`` entry on ``ai_message`` concurrently.
+
+    Mirrors LangGraph's ``ToolNode``: tool calls on a single AIMessage run
+    in parallel (``asyncio.gather``); each raised exception is caught and
+    surfaced to the model as ToolMessage content rather than aborting the
+    turn. Returns the ToolMessages in the original tool_calls order, plus
+    any steer notes drained at the tool boundary.
+    """
+    from langchain_core.messages import HumanMessage, ToolMessage
+    from app.core.tool_guardrails import (
+        ToolCallGuardrailController,
+        classify_tool_failure,
+        append_toolguard_guidance,
+    )
+
+    log = logger_instance or logger
+    tool_calls = list(getattr(ai_message, "tool_calls", None) or [])
+    if not tool_calls:
+        return ToolExecResult(tool_messages=[])
+
+    _resolved_policy = None
+    try:
+        from app.core import policy as _policy_mod
+        _resolved_policy = _policy_mod.get_current()
+    except Exception:  # noqa: BLE001 — governance must never break a run
+        _resolved_policy = None
+
+    guardrail = ToolCallGuardrailController(
+        getattr(_resolved_policy, "guardrail_config", None)
+    )
+    tool_call_count = tool_call_count_before
+
+    async def _run_one(tc: Dict[str, Any]) -> ToolMessage:
+        nonlocal tool_call_count
+        tc_name = tc.get("name") or ""
+        tc_args = tc.get("args") or {}
+        tc_id = tc.get("id")
+
+        tool_call_count += 1
+        if _resolved_policy is not None:
+            try:
+                from app.core.policy.runtime import evaluate_tool_count
+                quota = evaluate_tool_count(_resolved_policy, tool_call_count)
+                if quota.blocks and stream_callback is not None:
+                    try:
+                        await stream_callback.on_error(f"[Policy] {quota.reason}")
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception:  # noqa: BLE001 — governance must never break a run
+                pass
+
+        gc_pre = guardrail.before_call(tc_name, tc_args)
+        if gc_pre.should_halt and stream_callback is not None:
+            try:
+                await stream_callback.on_error(f"[Guardrail HALT] {gc_pre.message}")
+            except Exception:  # noqa: BLE001
+                pass
+
+        if stream_callback is not None:
+            try:
+                await stream_callback.on_tool_call(tc_name, tc_args)
+            except Exception:  # noqa: BLE001
+                pass
+
+        tool = tools_by_name.get(tc_name)
+        if tool is None:
+            output_str = f"Error: tool '{tc_name}' is not available."
+        else:
+            output_str = await _invoke_one(tool, tc_name, tc_args)
+
+        is_failed, _reason = classify_tool_failure(tc_name, output_str)
+        gc_post = guardrail.after_call(tc_name, tc_args, output_str, failed=is_failed)
+        if gc_post.action in ("warn", "block", "halt"):
+            output_str = append_toolguard_guidance(output_str, gc_post)
+            log.warning(
+                "engine: guardrail %s after tool '%s' (count=%d) — %s",
+                gc_post.action.upper(), tc_name, gc_post.count, gc_post.message,
+                extra={"execution_id": execution_id},
+            )
+            if gc_post.action == "halt":
+                if stream_callback is not None:
+                    try:
+                        await stream_callback.on_error(
+                            f"Tool '{tc_name}' halted the run: {gc_post.message}"
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                raise RuntimeError(
+                    f"Tool '{tc_name}' halted the agent run: {gc_post.message}"
+                )
+
+        if stream_callback is not None:
+            try:
+                await stream_callback.on_tool_result(tc_name, output_str[:2000])
+            except Exception:  # noqa: BLE001
+                pass
+
+        return ToolMessage(content=output_str, tool_call_id=tc_id)
+
+    tool_messages = await asyncio.gather(*(_run_one(tc) for tc in tool_calls))
+
+    # ── /steer injection ──────────────────────────────────────────────
+    # Drain any engineer notes queued via POST /steer, injected at the tool
+    # boundary (after all of this turn's tool results, before the next
+    # model call) — same point LangGraph's on_tool_end handler injects them.
+    steer_messages: List[Any] = []
+    if execution_id and execution_port is not None:
+        for note in execution_port.drain_steer_notes(execution_id):
+            steer_messages.append(HumanMessage(content=f"[Engineer Note] {note}"))
+            log.info(
+                "engine: injected steer note at tool boundary (execution_id=%s)",
+                execution_id,
+            )
+
+    return ToolExecResult(tool_messages=list(tool_messages), steer_messages=steer_messages)
+
+
+__all__ = ["ToolExecResult", "execute_tool_calls"]

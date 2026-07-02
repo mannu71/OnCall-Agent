@@ -14,5 +14,13 @@ from app.core.improvement.analyzer import (
     analyze_recent,
     compute_signals,
 )
+from app.core.improvement.apply import apply_proposals
+from app.core.improvement.guard import run_selftest_guard
 
-__all__ = ["ImprovementReport", "analyze_recent", "compute_signals"]
+__all__ = [
+    "ImprovementReport",
+    "analyze_recent",
+    "apply_proposals",
+    "compute_signals",
+    "run_selftest_guard",
+]

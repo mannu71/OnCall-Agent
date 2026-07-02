@@ -177,6 +177,11 @@ class SessionRepository(BaseAsyncRepository):
     ) -> Optional[Dict[str, Any]]:
         """Append one message and bump the session's counters in one txn.
 
+        When ``metadata`` carries token counts (assistant turns), the parent
+        session's cumulative totals are incremented in the same transaction —
+        this is the ONLY place session-level token rollup happens, mirroring
+        how ``message_count`` already accumulates here.
+
         Returns None when the parent session no longer exists — guards against
         the "a stream/tool callback outlives a session delete" race
         (never orphan a chat_messages row).
@@ -200,6 +205,11 @@ class SessionRepository(BaseAsyncRepository):
             parent.message_count = (parent.message_count or 0) + 1
             parent.last_message_at = now
             parent.updated_at = now
+            if metadata:
+                parent.total_input_tokens = (parent.total_input_tokens or 0) + (metadata.get("input_tokens", 0) or 0)
+                parent.total_output_tokens = (parent.total_output_tokens or 0) + (metadata.get("output_tokens", 0) or 0)
+                parent.total_cache_read_tokens = (parent.total_cache_read_tokens or 0) + (metadata.get("cache_read_tokens", 0) or 0)
+                parent.total_cache_creation_tokens = (parent.total_cache_creation_tokens or 0) + (metadata.get("cache_creation_tokens", 0) or 0)
             # First user turn names the chat from its text.
             if parent.message_count == 1 and role == "user" and content:
                 parent.title = content.strip().splitlines()[0][:60] or parent.title
@@ -292,6 +302,10 @@ class SessionRepository(BaseAsyncRepository):
             "created_at": row.created_at.isoformat() if row.created_at else None,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
             "last_message_at": row.last_message_at.isoformat() if row.last_message_at else None,
+            "total_input_tokens": row.total_input_tokens or 0,
+            "total_output_tokens": row.total_output_tokens or 0,
+            "total_cache_read_tokens": row.total_cache_read_tokens or 0,
+            "total_cache_creation_tokens": row.total_cache_creation_tokens or 0,
         }
 
     @staticmethod

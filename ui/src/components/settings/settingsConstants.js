@@ -117,14 +117,9 @@ export function buildSections({ serverCount, llmCount, certCount }) {
     ];
 }
 
-export function buildGauges({ apiHealth, systemStatus, llmCount, connectedLlms }) {
+export function buildGauges({ apiHealth, llmCount, hasBedrockCredentials }) {
     const apiChecking = apiHealth == null;
     const apiOk = apiHealth?.status === 'healthy';
-    const schedulerRunning = systemStatus?.scheduler_running ?? apiHealth?.scheduler_running;
-    const jobCount = systemStatus?.scheduled_jobs ?? 0;
-    const activeExec = systemStatus?.active_executions ?? apiHealth?.active_workflows ?? 0;
-    const testedLlms = connectedLlms || 0;
-    const idleLlms = Math.max(0, llmCount - testedLlms);
 
     return [
         {
@@ -133,45 +128,25 @@ export function buildGauges({ apiHealth, systemStatus, llmCount, connectedLlms }
             meta: apiChecking
                 ? 'Contacting API…'
                 : apiOk
-                  ? `${apiHealth.latencyMs ?? '—'} ms · v${version}`
+                  ? (apiHealth.latencyMs != null
+                      ? `${apiHealth.latencyMs} ms · v${version}`
+                      : `v${version}`)
                   : apiHealth.message || 'Check connection',
             v: apiChecking ? 0 : apiOk ? 100 : 12,
             c: apiChecking ? '#94a3b8' : apiOk ? '#10b981' : '#ef4444',
             num: apiChecking ? '—' : apiOk ? '✓' : '!',
         },
         {
-            label: 'Scheduler',
-            value: schedulerRunning ? 'Running' : 'Stopped',
-            meta: `${jobCount} jobs queued`,
-            v: schedulerRunning && jobCount > 0
-                ? Math.min(92, 28 + jobCount * 16)
-                : jobCount > 0
-                  ? Math.min(48, jobCount * 16)
-                  : 0,
-            c: '#3b82f6',
-            num: String(jobCount),
-        },
-        {
             label: 'Models',
-            value: testedLlms > 0 ? `${testedLlms} live` : llmCount ? `${llmCount}\u00A0configured` : 'None',
-            meta: llmCount
-                ? `${idleLlms} idle · ${llmCount} total`
-                : 'None configured',
-            v: llmCount
-                ? (testedLlms > 0
-                    ? Math.min(100, Math.round((testedLlms / llmCount) * 100))
-                    : 0)
-                : 0,
+            value: llmCount === 1 ? '1 configured' : llmCount ? `${llmCount} configured` : 'None',
+            meta: !llmCount
+                ? 'None configured'
+                : hasBedrockCredentials
+                  ? 'Provider credentials configured'
+                  : 'Add provider credentials in Models',
+            v: !llmCount ? 0 : hasBedrockCredentials ? 100 : 45,
             c: '#7c3aed',
-            num: llmCount ? `${testedLlms}/${llmCount}` : '0',
-        },
-        {
-            label: 'Executions',
-            value: `${activeExec} active`,
-            meta: 'In-memory runs',
-            v: activeExec > 0 ? Math.min(100, activeExec * 22 + 24) : 0,
-            c: '#f59e0b',
-            num: String(activeExec),
+            num: String(llmCount),
         },
     ];
 }

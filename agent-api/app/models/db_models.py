@@ -92,6 +92,11 @@ class ExecutionModel(Base):
     input_tokens  = Column(Integer, default=0)
     output_tokens = Column(Integer, default=0)
     total_tokens  = Column(Integer, default=0)
+    # Set only when this execution was triggered by a chat turn (migration 028)
+    # — every chat message reuses the same /execute endpoint as a real
+    # scheduled/manual workflow run. NULL = a real workflow run; non-NULL lets
+    # the Dashboard exclude ad-hoc chat turns from "Recent runs" / stats.
+    chat_session_id = Column(String(36), nullable=True, index=True)
 
 
 class LLMConfigModel(Base):
@@ -196,6 +201,12 @@ class ChatSessionModel(Base):
     created_at = Column(DateTime(timezone=True), default=_utcnow)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
     last_message_at = Column(DateTime(timezone=True))
+    # Cumulative token usage across every turn in this conversation (migration
+    # 028) — distinct from a single turn's counts in chat_messages.metadata.
+    total_input_tokens = Column(Integer, nullable=False, default=0)
+    total_output_tokens = Column(Integer, nullable=False, default=0)
+    total_cache_read_tokens = Column(Integer, nullable=False, default=0)
+    total_cache_creation_tokens = Column(Integer, nullable=False, default=0)
 
     __table_args__ = (
         Index("idx_chat_sessions_active", "archived", "last_message_at"),

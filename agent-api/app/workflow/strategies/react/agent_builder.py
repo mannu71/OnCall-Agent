@@ -1,9 +1,9 @@
-"""Shared system-prompt composition (used by both the legacy and deepagents harnesses).
+"""Shared system-prompt composition for the in-house ReAct harness.
 
-The legacy in-house ReAct construction (``build_agent`` / ``_finish_build_agent``)
-moved to ``app/legacy/react_agent.py`` as part of the deepagents migration. This
-module now only assembles the deterministic system prompt — the Bedrock cachePoint
-prefix — which BOTH harnesses use, so the prompt (and accuracy) stays identical.
+The agent construction (``build_agent`` / ``_finish_build_agent``) lives in
+``app/harness/react_agent.py``. This module assembles the deterministic system
+prompt — the Bedrock cachePoint prefix — so accuracy stays identical across
+all agent builds.
 """
 from __future__ import annotations
 
@@ -27,9 +27,8 @@ def compose_system_prompt(
 ) -> str:
     """Assemble the deterministic system prompt (the Bedrock cachePoint prefix).
 
-    Extracted so both the legacy ReAct builder and the deepagents harness compose
-    the *same* prompt — the accuracy-critical, cache-stable text. Never inject
-    run-specific data here (see the CACHE CONTRACT note below).
+    Assembles the accuracy-critical, cache-stable text used by the in-house ReAct
+    harness. Never inject run-specific data here (see the CACHE CONTRACT note below).
     """
     # Build system prompt from agent instructions if provided
     instructions = agent_config.get("instructions", "")
@@ -58,6 +57,7 @@ def compose_system_prompt(
     _active_ids: List[str] = []
     if has_db_tools:
         _active_ids.append("database")
+        _active_ids.append("rds_performance")
     if has_cloudwatch:
         _active_ids.append("cloudwatch")
     if has_code_analyzer:
@@ -151,19 +151,8 @@ def compose_system_prompt(
         if _cap.section:
             system_parts.append(_cap.section)
 
-    # On the deepagents harness, planning (write_todos via TodoListMiddleware) and
-    # the filesystem (ls/read_file/write_file/edit_file/glob/grep) are provided by
-    # deepagents' own middleware + system prompt, so we DON'T emit our overlapping
-    # planning/scratch-filesystem sections (and don't inject our fs_*/write_todos
-    # tools — see tool_assembler). Avoids duplicate tools + a write_todos name clash.
-    try:
-        from app.harness.spec_factory import resolve_harness
-        _deepagents_builtins = resolve_harness(agent_config) == "deepagents"
-    except Exception:  # noqa: BLE001
-        _deepagents_builtins = False
-
     # ── Deep-agent capability instructions (profile-gated, config-stable) ──────
-    if planning and not _deepagents_builtins:
+    if planning:
         system_parts.append(
             "# Planning\n"
             "You have write_todos and update_todo. For a genuinely multi-step task, call "
@@ -171,9 +160,7 @@ def compose_system_prompt(
             "calling update_todo to mark each item in_progress then completed as the tool "
             "evidence supports it. Skip the plan for a single-lookup question."
         )
-    # Scratch filesystem (legacy harness only — deepagents has its own filesystem).
-    if not _deepagents_builtins:
-        system_parts.append(
+    system_parts.append(
         "# Scratch filesystem\n"
         "You have a session-scoped virtual filesystem (fs_write, fs_read, fs_ls, fs_grep). "
         "When a tool returns a large result you only partly need, fs_write it to a file and "

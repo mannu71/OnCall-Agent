@@ -1,4 +1,4 @@
-"""Planning / todo tools (deepagents ``write_todos`` pattern).
+"""Planning / todo tools (write_todos + update_todo).
 
 Promotes the prompt-only "write a markdown task list" guidance into real tools so
 a multi-step agent maintains an explicit, inspectable plan: ``write_todos`` sets

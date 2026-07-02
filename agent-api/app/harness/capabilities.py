@@ -2,14 +2,17 @@
 
 Each capability contributes a role-sentence fragment and an optional system-prompt
 section. Pulling these out of ``agent_builder.build_agent`` lets an agent *profile*
-(Phase 1) declare an arbitrary set of capabilities instead of the platform
-hard-coding the investigation trio (database / CloudWatch / code analysis).
+declare an arbitrary set of capabilities instead of the platform hard-coding a fixed
+trio. An agent node can declare any combination and the prompt adapts accordingly.
 
-BEHAVIOUR CONTRACT: the three builtins below carry the *exact* text and ordering
-that ``build_agent`` previously had inline, so the composed system prompt — which
-is the Bedrock cachePoint prefix — is byte-identical for the investigation path.
-The ``order`` field reproduces the original sequence (DB → CloudWatch → code); any
-custom capability registered later (order default 100) appends after them.
+The three builtin sections (database / cloudwatch / code_analyzer) are deliberately
+scenario-agnostic: they describe *how to use the tools well* for any task, not how to
+run a specific investigation workflow. The ``order`` field keeps them stable (DB →
+CloudWatch → code); any custom capability registered later (order default 100) appends.
+
+Note: these section texts were previously byte-identical to the original inline prompt
+to preserve the Bedrock cachePoint prefix. They have been updated to remove
+scenario-specific framing; the accuracy eval must be re-baselined after this change.
 """
 from __future__ import annotations
 
@@ -43,7 +46,84 @@ _DATABASE_SECTION = (
     "[server]). IMPORTANT: if a filtered lookup returns nothing, broaden or drop the "
     "name_like and retry before concluding the table/column does not exist — the "
     "unfiltered list is complete. When querying data, prefer targeted queries over full "
-    "table scans: use WHERE clauses, date ranges, and LIMIT."
+    "table scans: use WHERE clauses, date ranges, and LIMIT.\n"
+    "SQL discipline — apply to EVERY query you write:\n"
+    "- Always include LIMIT (≤100 for diagnostic queries, ≤10 for heavy joins).\n"
+    "- Prefix expensive diagnostic queries with SET LOCAL statement_timeout = '15s' so a "
+    "runaway query cannot block the agent or the database.\n"
+    "- Read-only only: SELECT and EXPLAIN only; never EXPLAIN ANALYZE a write statement.\n"
+    "- Fully qualify every column in catalog and pg_stat_* queries to avoid 'column "
+    "reference is ambiguous' errors — e.g. c.relname, s.relname, a.query — never bare "
+    "relname or query when the FROM clause touches more than one table."
+)
+
+_RDS_PERFORMANCE_SECTION = (
+    "# RDS / Postgres performance investigation protocol\n"
+    "Follow this protocol whenever the investigation involves CPU, load, latency, slow "
+    "queries, connection saturation, or any 'database performance' alarm:\n\n"
+    "1. TOP SQL BY DB LOAD — query pg_stat_statements (if available) ordered by "
+    "total_exec_time DESC, then mean_exec_time DESC, then calls DESC; fetch top 10. "
+    "Always qualify columns (s.query, s.total_exec_time, s.calls, s.mean_exec_time, "
+    "s.rows). If pg_stat_statements is not installed, fall back to pg_stat_activity and "
+    "note the limitation.\n"
+    "   Example:\n"
+    "   SET LOCAL statement_timeout = '15s';\n"
+    "   SELECT s.queryid, LEFT(s.query, 120) AS query_snippet,\n"
+    "          s.calls, ROUND(s.total_exec_time::numeric, 2) AS total_ms,\n"
+    "          ROUND(s.mean_exec_time::numeric, 2) AS mean_ms, s.rows\n"
+    "   FROM pg_stat_statements s\n"
+    "   ORDER BY s.total_exec_time DESC LIMIT 10;\n\n"
+    "2. ACTIVE SESSIONS & WAIT EVENTS — query pg_stat_activity for currently active "
+    "sessions; capture a.query, a.wait_event_type, a.wait_event, a.query_start, "
+    "a.usename, a.application_name, a.state; group by wait_event_type to see the "
+    "dominant bottleneck (Lock / IO / CPU / Client).\n"
+    "   Example:\n"
+    "   SET LOCAL statement_timeout = '15s';\n"
+    "   SELECT a.pid, a.usename, a.application_name, a.state,\n"
+    "          a.wait_event_type, a.wait_event,\n"
+    "          NOW() - a.query_start AS duration,\n"
+    "          LEFT(a.query, 100) AS query_snippet\n"
+    "   FROM pg_stat_activity a\n"
+    "   WHERE a.state = 'active' AND a.pid <> pg_backend_pid()\n"
+    "   ORDER BY duration DESC NULLS LAST LIMIT 20;\n\n"
+    "3. HOT TABLES & INDEX HEALTH — check pg_stat_user_tables for high seq_scan + "
+    "seq_tup_read with low idx_scan (signals a missing index). Check "
+    "pg_stat_user_indexes for indexes with idx_scan = 0 (bloat candidates).\n"
+    "   Example:\n"
+    "   SET LOCAL statement_timeout = '15s';\n"
+    "   SELECT t.relname AS table_name, t.seq_scan, t.seq_tup_read,\n"
+    "          t.idx_scan, t.n_live_tup\n"
+    "   FROM pg_stat_user_tables t\n"
+    "   ORDER BY t.seq_tup_read DESC LIMIT 15;\n\n"
+    "4. BLOCKING — identify blockers via pg_locks ⋈ pg_stat_activity; look for "
+    "granted=false rows and join to find the blocking PID.\n"
+    "   Example:\n"
+    "   SET LOCAL statement_timeout = '15s';\n"
+    "   SELECT blocked.pid AS blocked_pid,\n"
+    "          LEFT(blocked_activity.query, 80) AS blocked_query,\n"
+    "          blocking.pid AS blocking_pid,\n"
+    "          LEFT(blocking_activity.query, 80) AS blocking_query\n"
+    "   FROM pg_locks blocked\n"
+    "   JOIN pg_stat_activity blocked_activity ON blocked_activity.pid = blocked.pid\n"
+    "   JOIN pg_locks blocking ON blocking.transactionid = blocked.transactionid\n"
+    "     AND blocking.pid <> blocked.pid AND blocking.granted\n"
+    "   JOIN pg_stat_activity blocking_activity ON blocking_activity.pid = blocking.pid\n"
+    "   WHERE NOT blocked.granted LIMIT 10;\n\n"
+    "5. CROSS-CHECK INSTANCE METRICS — call cloudwatch_get_metric_data for the RDS "
+    "instance: CPUUtilization, ReadIOPS, WriteIOPS, DatabaseConnections, ReadLatency, "
+    "WriteLatency, FreeableMemory. Also run SELECT pg_is_in_recovery() to determine "
+    "whether you are on the writer or a read replica — this affects which metrics matter.\n\n"
+    "6. CONCLUDE WITH NAMED RESOURCES + TUNING — your conclusion MUST:\n"
+    "   a. Name the specific offending queries (queryid / first 120 chars of normalized "
+    "      text) and their load share.\n"
+    "   b. Name sessions / application_name causing wait events or blocking.\n"
+    "   c. Name hot tables and whether the problem is a missing index or full scans.\n"
+    "   d. Give concrete tuning recommendations tied to each evidence row — e.g. add "
+    "      index on table.column (because seq_scan=X, idx_scan=0), rewrite query Y to "
+    "      use bind params, raise work_mem for sort-heavy queries, add connection pooling "
+    "      (PgBouncer) if DatabaseConnections is near max_connections.\n"
+    "   A vague 'high read load on the instance' conclusion is NOT acceptable — name the "
+    "   specific resource."
 )
 
 _CLOUDWATCH_SECTION = (
@@ -55,7 +135,7 @@ _CLOUDWATCH_SECTION = (
     "specific findings: cloudwatch_search_logs (drill_down=true) for raw events "
     "behind a pattern/anomaly, cloudwatch_correlate_logs to trace one request across "
     "groups, cloudwatch_discover_log_groups only if a referenced group is missing. "
-    "If the user gives a correlation id / request id / trace id (or the pre-computed "
+    "If the user provides a correlation id / request id / trace id (or the pre-computed "
     "block is a 'correlation-lookup'), LEAD with cloudwatch_correlate_logs for that "
     "id and build the cross-service timeline before anything else. "
     "Cite log_group, timestamp, z_score/occurrence_count, and normalized_pattern. "
@@ -91,14 +171,13 @@ _CODE_ANALYZER_SECTION = (
     "grep across the connected repos for the evidence (base URLs, route paths, "
     "queue/topic names, client usages), read the matching files, and reason from what "
     "you find — do not assume a fixed set of integration channels.\n"
-    "MANDATORY drill-in: whenever a finding (a CloudWatch error pattern, stack trace, log "
-    "line, or alert) names a source location — a file path, file:line (e.g. "
-    "'ReportService.cs:427'), class, method, or symbol — you MUST confirm it in code before "
-    "stating a root cause. Call crawler_investigate_alert(<the error/stack trace>, repo) or "
-    "crawler_find_symbol(<symbol>, repo), then crawler_get_body(handle) to read the "
-    "responsible lines. Do NOT conclude root cause from the log text alone when the code is "
-    "reachable. Map the failing service to its repo by name (e.g. a "
-    "'compliance_kyc-protect-api' log group → the 'compliance-api' repo).\n"
+    "MANDATORY source confirmation: whenever a finding or claim names a source location — "
+    "a file path, file:line (e.g. 'ReportService.cs:427'), class, method, or symbol — "
+    "you MUST confirm it in code before asserting it. Call crawler_find_symbol(<symbol>, repo) "
+    "or crawler_investigate_alert(<error/stack trace>, repo), then crawler_get_body(handle) to "
+    "read the responsible lines. Do NOT draw conclusions from names or log text alone when the "
+    "code is reachable. Map a service to its repo by name (e.g. a log group named after a "
+    "service → the repo with that service's code).\n"
     "Tool-selection protocol:\n"
     "1. LOCATE — if you know the symbol name, use crawler_find_symbol(symbol, repo) (exact, "
     "fastest). If you only have a concept/description, use crawler_search_semantic(query, repo). "
@@ -144,13 +223,19 @@ def all_ids() -> List[str]:
     return [c.id for c in sorted(_REGISTRY.values(), key=lambda c: (c.order, c.id))]
 
 
-# ── Register the three investigation builtins (exact original ordering) ───────
+# ── Register the investigation builtins ───────────────────────────────────────
 
 register(Capability(
     id="database",
     role_fragment="database and MCP tools",
     section=_DATABASE_SECTION,
     order=10,
+))
+register(Capability(
+    id="rds_performance",
+    role_fragment="RDS/Postgres performance diagnostics",
+    section=_RDS_PERFORMANCE_SECTION,
+    order=15,
 ))
 register(Capability(
     id="cloudwatch",

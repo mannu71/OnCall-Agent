@@ -39,11 +39,10 @@ import {
   Square
 } from 'lucide-react';
 import { isAgentWorkflowValid } from '../utils/workflowValidation.js';
-import agentApiClient from '../services/agentApiClient.js';
+import agentApiClient, { isAbortError } from '../services/agentApiClient.js';
 import ChatMessage, { MESSAGE_TYPES } from '../components/chat/ChatMessage.jsx';
 import SendButton from '../components/chat/SendButton.jsx';
 import DensityToggle, { DENSITIES } from '../components/chat/DensityToggle.jsx';
-import HarnessToggle from '../components/chat/HarnessToggle.jsx';
 import TraceTimeline from '../components/chat/TraceTimeline.jsx';
 import { formatClock } from '../lib/formatTime.js';
 import { useChatSessionsQuery } from '../hooks/queries/useChatSessionsQuery.js';
@@ -135,9 +134,6 @@ function Chat() {
   const [searchQuery, setSearchQuery] = useState('');
   const [showToolsList, setShowToolsList] = useState(false);
   const [timeRange, setTimeRange] = useState('24h');
-  // Per-turn agent runtime override ('legacy' | 'deepagents'). Defaults to the
-  // current server default so chatting is unchanged until the user flips it.
-  const [harness, setHarness] = useState('deepagents');
   const [agentSheetOpen, setAgentSheetOpen] = useState(false);
 
   // Persistent chat sessions (migration 022). `sessionId` is created lazily on
@@ -215,11 +211,46 @@ function Chat() {
 
   // Token metrics — zero until a real run reports usage.
   const [tokens, setTokens] = useState({ input: 0, output: 0, total: 0 });
+  // Session-cumulative tokens (finalized on the SESSION, not per-turn/workflow
+  // run — see chat_sessions.total_* columns, migration 028). Seeded from the
+  // persisted session on resume, incremented locally as each turn completes.
+  const [sessionTokens, setSessionTokens] = useState({ input: 0, output: 0, cacheRead: 0, cacheCreation: 0 });
+  // Context-window fullness for the LATEST turn (not cumulative) — how full
+  // the model's context window is right now. Mirrors claude-code-main's
+  // context bar: current-turn fullness, color-coded as it fills.
+  const [contextUsage, setContextUsage] = useState({ pct: 0, used: 0, window: 0 });
   // A single model turn can emit SEVERAL gated tool calls (e.g. multiple
   // edit_file), each needing its own approval. Track them as a FIFO queue and
   // surface the head; resolving one (by its requestId) reveals the next.
   const [pendingApprovals, setPendingApprovals] = useState([]); // [{ tool, args, requestId, executionId }]
   const pendingApproval = pendingApprovals[0] || null;
+
+  // ── Stuck-run recovery: abort handle + silence watchdog ──────────────────
+  // The composer used to wait indefinitely on the synchronous /execute POST;
+  // if the backend orphaned a run and never returned, isLoading stayed true
+  // forever with no way to Stop or send a new message. Two independent
+  // safeguards now exist:
+  //  1. abortControllerRef lets handleStop cancel the in-flight POST directly
+  //     from the client, so the composer unlocks immediately regardless of
+  //     what the server-side cancel does.
+  //  2. The watchdog flags a run as possibly-stuck after a period of total
+  //     silence (no SSE token/tool/status event) so Stop is never the user's
+  //     only recourse if they don't think to click it.
+  const abortControllerRef = useRef(null);
+  const lastActivityRef = useRef(0);
+  const [watchdogStale, setWatchdogStale] = useState(false);
+  const WATCHDOG_SILENCE_MS = 90_000;
+  const WATCHDOG_POLL_MS = 15_000;
+
+  useEffect(() => {
+    if (!isLoading) { setWatchdogStale(false); return undefined; }
+    const id = setInterval(() => {
+      if (Date.now() - lastActivityRef.current > WATCHDOG_SILENCE_MS) {
+        setWatchdogStale(true);
+      }
+    }, WATCHDOG_POLL_MS);
+    return () => clearInterval(id);
+  }, [isLoading]);
 
   const agentDetails = useMemo(() => {
     if (!selectedAgent) {
@@ -317,6 +348,8 @@ function Chat() {
     setMessages([welcomeMessage()]);
     setTraceSteps([]);
     setTokens({ input: 0, output: 0, total: 0 });
+    setSessionTokens({ input: 0, output: 0, cacheRead: 0, cacheCreation: 0 });
+    setContextUsage({ pct: 0, used: 0, window: 0 });
     setPendingApprovals([]);
     setSessionSheetOpen(false);
   };
@@ -339,6 +372,21 @@ function Chat() {
       setMessages(hydrated.length ? hydrated : [welcomeMessage()]);
       setTraceSteps([]);
       setTokens({ input: 0, output: 0, total: 0 });
+      setSessionTokens({
+        input: data.total_input_tokens || 0,
+        output: data.total_output_tokens || 0,
+        cacheRead: data.total_cache_read_tokens || 0,
+        cacheCreation: data.total_cache_creation_tokens || 0,
+      });
+      // Context fullness is per-turn — restore it from the last assistant
+      // message's metadata so a resumed session shows where it left off.
+      const lastAssistantMsg = [...(data.messages || [])].reverse().find(m => m.role === 'assistant');
+      const lastCtx = lastAssistantMsg?.metadata || {};
+      setContextUsage({
+        pct: lastCtx.context_used_pct || 0,
+        used: lastCtx.context_used_tokens || 0,
+        window: lastCtx.context_window_size || 0,
+      });
       if (data.workflow_name) {
         const match = agentsList.find((a) => a.name === data.workflow_name);
         if (match) setSelectedAgent(match);
@@ -446,6 +494,13 @@ function Chat() {
     const thinkingId = addMessage(MESSAGE_TYPES.AGENT, '', { isLoading: true, statusHistory: [], steps: [], streaming: false });
     setIsLoading(true);
 
+    // Fresh abort handle for this turn — handleStop() calls .abort() on it to
+    // cancel the in-flight POST client-side. Reset the watchdog clock too.
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    lastActivityRef.current = Date.now();
+    setWatchdogStale(false);
+
     // Dynamic metrics simulation
     const startTime = Date.now();
 
@@ -460,6 +515,7 @@ function Chat() {
         });
       const pushStatus = (msg) => {
         if (!msg) return;
+        lastActivityRef.current = Date.now();
         setMessages(prev => prev.map(m => m.id === thinkingId
           ? {
               ...m,
@@ -489,6 +545,7 @@ function Chat() {
       };
       const onToken = (tok) => {
         if (!tok) return;
+        lastActivityRef.current = Date.now();
         streamedContent += tok;
         if (!flushTimer) flushTimer = setTimeout(flushStream, 40);
       };
@@ -498,10 +555,12 @@ function Chat() {
       const syncSteps = () => setMessages(prev => prev.map(m =>
         m.id === thinkingId ? { ...m, steps: [...steps] } : m));
       const onStepCall = (name, args) => {
+        lastActivityRef.current = Date.now();
         steps.push({ id: `${name}-${steps.length}`, name, args, status: 'running', startedAt: Date.now() });
         syncSteps();
       };
       const onStepResult = (name, result) => {
+        lastActivityRef.current = Date.now();
         for (let i = steps.length - 1; i >= 0; i--) {
           if (steps[i].status === 'running' && steps[i].name === name) {
             steps[i] = { ...steps[i], status: 'done', result, durationMs: Date.now() - steps[i].startedAt };
@@ -521,12 +580,18 @@ function Chat() {
       };
 
       // Conversation memory: replay prior completed turns so follow-ups keep
-      // context. The current question is sent separately as the query, so drop
-      // any trailing user turn equal to it.
+      // context. Includes SYSTEM-type messages — a per-chat-session
+      // compaction summary (see compact_chat_session_if_needed) collapses
+      // older turns into one of these, and it must survive the replay or
+      // that context is silently lost. The current question is sent
+      // separately as the query, so drop any trailing user turn equal to it.
       const history = (messages || [])
-        .filter(m => (m.type === MESSAGE_TYPES.USER || m.type === MESSAGE_TYPES.AGENT)
+        .filter(m => (m.type === MESSAGE_TYPES.USER || m.type === MESSAGE_TYPES.AGENT || m.type === MESSAGE_TYPES.SYSTEM)
           && !m.isLoading && (m.content || m.text))
-        .map(m => ({ role: m.type === MESSAGE_TYPES.USER ? 'user' : 'assistant', content: m.content || m.text }))
+        .map(m => ({
+          role: m.type === MESSAGE_TYPES.USER ? 'user' : m.type === MESSAGE_TYPES.SYSTEM ? 'system' : 'assistant',
+          content: m.content || m.text,
+        }))
         .slice(-12);
       while (history.length && history[history.length - 1].role === 'user'
              && history[history.length - 1].content === question) history.pop();
@@ -534,13 +599,21 @@ function Chat() {
       const result = await agentApiClient.runAgentStream(agent.name, question, {
         history,
         sessionId: sid,
-        harness,
+        signal: controller.signal,
         onToken,
         onToolCall: (name, args) => { onStepCall(name, args); pushTrace('tool', `Calling ${name}…`); pushStatus(`Calling ${name}…`); },
         onToolResult: (name, res) => { onStepResult(name, res); pushTrace('tool', `${name} returned`); },
         onNode: (nodeId, status) => pushTrace('think', `${nodeId} ${status}`),
         onStatus: (msg) => pushStatus(msg),
-        onTokens: (t) => setTokens(t),
+        onTokens: (t) => {
+          // Fires after EVERY LLM call now, not just once at run end — this is
+          // what makes the counters move live during a run AND survive a
+          // mid-run crash (the last live value simply stays, since nothing
+          // here or in the catch block below ever resets it to zero).
+          lastActivityRef.current = Date.now();
+          setTokens({ input: t.input, output: t.output, total: t.total });
+          if (t.context) setContextUsage(t.context);
+        },
         onHitlPause: (p) => {
           pushStatus(`Awaiting approval: ${p.tool}…`);
           // Append (dedup by requestId — SSE can redeliver on reconnect).
@@ -585,28 +658,52 @@ function Chat() {
       });
       pushTrace('answer', 'Returned final analysis + recommendations.');
 
-      if (result.tokens && (result.tokens.input || result.tokens.output || result.tokens.total)) {
-        const inp = result.tokens.input || 0;
-        const out = result.tokens.output || 0;
-        setTokens({ input: inp, output: out, total: result.tokens.total || inp + out });
-      } else {
-        const promptTokens = Math.floor(question.length * 1.3) + 1200;
-        const completionTokens = Math.floor((result.finalAnswer || '').length * 0.4) + 150;
-        setTokens({ input: promptTokens, output: completionTokens, total: promptTokens + completionTokens });
-      }
-    } catch (error) {
-      updateMessage(thinkingId, {
-        content: `Error: ${error.message}`,
-        isLoading: false,
-        isError: true
+      // result.tokens carries the backend's real, measured per-run counts
+      // (agent_runner.py's TokenUsageCallback). Show exactly what was
+      // measured — including a genuine 0 for a no-LLM-call turn — rather
+      // than fabricating an estimate from message length when the field is
+      // merely absent (e.g. an error before any LLM call was made).
+      const inp = result.tokens?.input || 0;
+      const out = result.tokens?.output || 0;
+      setTokens({ input: inp, output: out, total: result.tokens?.total || (inp + out) });
+
+      // Session-cumulative tokens (finalized on the session, not per-turn) —
+      // increment locally rather than refetching the session list every turn.
+      const cacheRead = result.raw?.cache_read_tokens || 0;
+      const cacheCreation = result.raw?.cache_creation_tokens || 0;
+      setSessionTokens(prev => ({
+        input: prev.input + inp,
+        output: prev.output + out,
+        cacheRead: prev.cacheRead + cacheRead,
+        cacheCreation: prev.cacheCreation + cacheCreation,
+      }));
+
+      // Context-window fullness for THIS turn (not cumulative) — how full the
+      // model's context window is right now.
+      setContextUsage({
+        pct: result.raw?.context_used_pct || 0,
+        used: result.raw?.context_used_tokens || 0,
+        window: result.raw?.context_window_size || 0,
       });
-      setTraceSteps(prev => [
-        ...prev,
-        { l: "answer", t: "—", text: `Fatal error: ${error.message}` }
-      ]);
+    } catch (error) {
+      // handleStop() already set "Stopped by user." on this message and
+      // unlocked the composer directly — don't clobber that with a second,
+      // redundant "Error: canceled" render.
+      if (!isAbortError(error)) {
+        updateMessage(thinkingId, {
+          content: `Error: ${error.message}`,
+          isLoading: false,
+          isError: true
+        });
+        setTraceSteps(prev => [
+          ...prev,
+          { l: "answer", t: "—", text: `Fatal error: ${error.message}` }
+        ]);
+      }
     } finally {
       setIsLoading(false);
       invalidateSessions();
+      if (abortControllerRef.current === controller) abortControllerRef.current = null;
     }
   };
 
@@ -665,8 +762,19 @@ function Chat() {
   const handleStop = async () => {
     if (isStopping || !isLoading) return;
     setIsStopping(true);
+    // Client-side abort FIRST — this alone unlocks the composer even if the
+    // server never responds to the cancel call below (e.g. it's the very
+    // thing that's stuck). The pending POST's rejection is caught by
+    // askAgent's catch block and ignored there (isAbortError), since this
+    // function is the one source of truth for the "Stopped by user." message.
+    abortControllerRef.current?.abort();
     try {
       if (selectedAgent?.name) {
+        // Server-side: actually cancels the backend asyncio.Task (see
+        // execution_state.cancel_execution) so the orphaned run stops for
+        // real instead of continuing after the client walks away — this is
+        // what clears is_workflow_running so the NEXT message isn't rejected
+        // with already_running.
         await agentApiClient.cancelWorkflow(selectedAgent.name);
       }
     } catch (_) {
@@ -844,6 +952,40 @@ function Chat() {
             </div>
           </div>
 
+          {/* Context-window fullness (this turn) + session-cumulative tokens.
+              Context bar mirrors claude-code-main's status line: current-turn
+              fullness, color-coded, NOT the session total (tracked separately
+              below — finalized on the session, not per-workflow-run). */}
+          {contextUsage.window > 0 && (
+            <div className="hidden md:flex items-center gap-3 shrink-0 px-2" title={`${contextUsage.used.toLocaleString()} / ${contextUsage.window.toLocaleString()} tokens this turn`}>
+              <div className="flex items-center gap-1.5">
+                <div className="w-16 h-1.5 rounded-full bg-slate-100 dark:bg-white/10 overflow-hidden">
+                  <div
+                    className={cn(
+                      'h-full rounded-full transition-all duration-500',
+                      contextUsage.pct >= 90 ? 'bg-red-500' : contextUsage.pct >= 70 ? 'bg-amber-500' : 'bg-emerald-500'
+                    )}
+                    style={{ width: `${Math.max(4, contextUsage.pct)}%` }}
+                  />
+                </div>
+                <span className={cn(
+                  'text-[10px] font-semibold tabular-nums',
+                  contextUsage.pct >= 90 ? 'text-red-600' : contextUsage.pct >= 70 ? 'text-amber-600' : 'text-slate-400'
+                )}>
+                  {contextUsage.pct}%
+                </span>
+              </div>
+              {(sessionTokens.input + sessionTokens.output) > 0 && (
+                <span
+                  className="text-[10px] text-slate-400 font-medium whitespace-nowrap"
+                  title={`Session total — in: ${sessionTokens.input.toLocaleString()}, out: ${sessionTokens.output.toLocaleString()}, cache-read: ${sessionTokens.cacheRead.toLocaleString()}`}
+                >
+                  {(sessionTokens.input + sessionTokens.output).toLocaleString()} session tok
+                </span>
+              )}
+            </div>
+          )}
+
           <div className="flex items-center gap-1 sm:gap-2 shrink-0">
             <DensityToggle value={density} onChange={changeDensity} />
 
@@ -1020,7 +1162,7 @@ function Chat() {
                   </div>
                 </div>
               ) : (pendingApproval.args && Object.keys(pendingApproval.args).length > 0 && (
-                <div className="mb-2 space-y-1 text-[11px]">
+                <div className="mb-2 space-y-1 text-[11px] max-h-48 overflow-auto rounded bg-white/40 border border-amber-200/60 p-2">
                   {Object.entries(pendingApproval.args).map(([k, v]) => (
                     <div key={k} className="flex gap-1.5">
                       <span className="font-semibold text-amber-900/80 flex-shrink-0">{k}:</span>
@@ -1105,22 +1247,53 @@ function Chat() {
                     </Select>
                   </>
                 )}
-
-                {/* Runtime pick for this turn: Legacy (ReAct) vs Deepagent. */}
-                <HarnessToggle value={harness} onChange={setHarness} />
               </div>
 
               <div className="flex shrink-0 items-center justify-end gap-2 sm:ml-2">
+                {/* Model + status cluster, like the Claude Code composer's
+                    "Sonnet 5 · High ⟳" indicator. modelName can be a long
+                    multi-model list ("Claude Sonnet 4.6, Claude Haiku 4.5"),
+                    and this row's available width depends on the sidebar
+                    panels, not the viewport — so it must truncate rather than
+                    rely on a viewport breakpoint (which caused it to overlap
+                    "Trace ID" whenever the chat column was narrow but the
+                    browser itself was wide). */}
+                {modelName && modelName !== '—' && (
+                  <span
+                    className="hidden sm:flex items-center gap-1.5 min-w-0 max-w-[7rem] shrink text-[10px] font-semibold text-slate-400"
+                    title={modelName}
+                  >
+                    <span className="truncate">{modelName.split(',')[0].trim()}</span>
+                    {isLoading && <Loader2 className="size-3 shrink-0 animate-spin text-primary" />}
+                  </span>
+                )}
+                {isLoading && watchdogStale && !isStopping && (
+                  // Watchdog: no SSE activity for WATCHDOG_SILENCE_MS. Most
+                  // stuck runs would otherwise leave the user staring at a
+                  // spinner with no signal that anything is wrong or any
+                  // action to take beyond guessing to click Stop.
+                  <span
+                    className="hidden md:inline text-[10px] font-medium text-amber-600"
+                    title="No activity from the agent in over 90s — it may be stuck. Stop and try again."
+                  >
+                    still running…
+                  </span>
+                )}
                 {isLoading && (
                   <button
                     type="button"
                     onClick={handleStop}
                     disabled={isStopping}
-                    title="Stop agent"
-                    className="flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold bg-red-50 text-red-600 border border-red-200 hover:bg-red-100 hover:border-red-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    title={watchdogStale ? 'Force stop (no response in 90s+)' : 'Stop agent'}
+                    className={cn(
+                      "flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold border transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                      watchdogStale
+                        ? "bg-amber-50 text-amber-700 border-amber-300 hover:bg-amber-100 animate-pulse"
+                        : "bg-red-50 text-red-600 border-red-200 hover:bg-red-100 hover:border-red-300"
+                    )}
                   >
                     <Square className="size-3 fill-current" />
-                    {isStopping ? 'Stopping…' : 'Stop'}
+                    {isStopping ? 'Stopping…' : watchdogStale ? 'Force stop' : 'Stop'}
                   </button>
                 )}
                 <SendButton

@@ -482,6 +482,16 @@ class TokenUsageCallback:
         # 2nd+ LLM call confirms the cached prefix is being reused.
         self.cache_read_tokens:     int = 0
         self.cache_creation_tokens: int = 0
+        # ── Live SSE publish (optional; set by the caller after construction) ──
+        # When all three are set, every LLM completion pushes a fresh
+        # token_usage_delta so the UI's token counter and context-window bar
+        # move DURING the run, not just once at the end. This is also what
+        # makes the display resilient to a mid-run crash: whatever was burned
+        # before a failure was already streamed on the prior LLM turn, so the
+        # frontend never has to fall back to zero.
+        self.execution_port: Any = None
+        self.execution_id: Optional[str] = None
+        self.model_name: Optional[str] = None
 
     # ── Catch-all: silently absorb any LangChain callback method we don't ────
     # implement (e.g. on_llm_new_token, on_chain_start, on_tool_start …).
@@ -501,6 +511,38 @@ class TokenUsageCallback:
     async def on_llm_end_async(self, response: Any, **kwargs: Any) -> None:  # noqa: ANN401
         """Async variant — LangChain calls whichever is present."""
         self._accumulate(response)
+        await self._publish_live()
+
+    async def _publish_live(self) -> None:
+        """Best-effort live token_usage_delta after every LLM call.
+
+        No-ops unless the caller wired execution_port/execution_id (see
+        agent_runner.execute_agent). Mirrors the fields the end-of-run result
+        already carries (strategy.py's context-window block) so the UI's live
+        and final values use the same shape.
+        """
+        if self.execution_port is None or not self.execution_id:
+            return
+        try:
+            totals: Dict[str, Any] = {
+                "input_tokens":  self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "total_tokens":  self.input_tokens + self.output_tokens,
+                "cache_read_tokens":     self.cache_read_tokens,
+                "cache_creation_tokens": self.cache_creation_tokens,
+            }
+            if self.model_name:
+                from app.core.model_metadata import window_size_for_model
+                window = window_size_for_model(self.model_name)
+                used = self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
+                totals["context_window_size"] = window
+                totals["context_used_tokens"] = used
+                totals["context_used_pct"] = (
+                    min(100, round(used / window * 100)) if window else 0
+                )
+            await self.execution_port.publish_token_usage(self.execution_id, totals)
+        except Exception:  # noqa: BLE001 — telemetry must never break a run
+            pass
 
     # ── Token extraction ─────────────────────────────────────────────────────
 

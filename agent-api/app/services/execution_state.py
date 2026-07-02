@@ -7,6 +7,7 @@ only for the lifetime of an in-process run.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
@@ -27,6 +28,15 @@ class ExecutionStateService:
         self.repo = repo or ExecutionRepository()
         # Ephemeral per-process state keyed by execution_id (DB id as string).
         self.runtime_cache: Dict[str, Dict[str, Any]] = {}
+        # The asyncio.Task actually running this execution (foreground /execute
+        # path wraps run_workflow() in create_task() — see workflows.py — and
+        # visual_workflow_executor registers it here right after the execution_id
+        # is minted). Cancelling THIS task is what makes "Stop" real: without it,
+        # cancel_execution only marked the DB row cancelled while the coroutine
+        # kept running orphaned (see prior incident — the run never actually
+        # stopped, so the workflow stayed "running" and rejected the next
+        # message with already_running).
+        self._run_tasks: Dict[str, "asyncio.Task"] = {}
 
     async def start_execution(
         self,
@@ -138,14 +148,37 @@ class ExecutionStateService:
         """Drop ephemeral runtime state after a run finishes."""
         self.runtime_cache.pop(execution_id, None)
 
+    def register_task(self, execution_id: str, task: "asyncio.Task") -> None:
+        """Record the asyncio.Task actually executing *execution_id*.
+
+        Call this once, right after the execution_id is minted, from INSIDE the
+        task itself (``asyncio.current_task()``) — never a task handle captured
+        from an outer scope, since only the task that will actually keep running
+        the ReAct loop can be meaningfully cancelled.
+        """
+        self._run_tasks[execution_id] = task
+
+    def unregister_task(self, execution_id: str) -> None:
+        """Drop the task handle once a run finishes (success, failure, or cancel)."""
+        self._run_tasks.pop(execution_id, None)
+
+    def _cancel_task(self, execution_id: str) -> bool:
+        """Best-effort ``task.cancel()`` for a registered run. Returns True if found."""
+        task = self._run_tasks.pop(execution_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            return True
+        return False
+
     async def cancel_execution(
         self,
         execution_id: str,
         *,
         reason: str = "Cancelled by operator",
     ) -> bool:
-        """Mark an execution cancelled in the DB and drop its cache."""
+        """Mark an execution cancelled in the DB, cancel its task, and drop its cache."""
         ok = await self.repo.mark_cancelled(execution_id, reason=reason)
+        self._cancel_task(execution_id)
         self.runtime_cache.pop(execution_id, None)
         return ok
 
@@ -166,6 +199,7 @@ class ExecutionStateService:
             if data.get("workflow_name") == workflow_name
         ]
         for eid in to_drop:
+            self._cancel_task(eid)
             self.runtime_cache.pop(eid, None)
         return count
 
@@ -176,6 +210,8 @@ class ExecutionStateService:
     ) -> int:
         """Cancel every active execution and clear runtime caches."""
         count = await self.repo.cancel_all_active(reason=reason)
+        for eid in list(self._run_tasks.keys()):
+            self._cancel_task(eid)
         self.runtime_cache.clear()
         return count
 

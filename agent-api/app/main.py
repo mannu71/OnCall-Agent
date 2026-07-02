@@ -129,8 +129,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Tool registry load skipped: {e}")
 
-    # Shared LangGraph persistence (durable checkpointer + store) for the
-    # deepagents harness path. Best-effort; falls back to in-memory if unavailable.
+    # Shared LangGraph persistence (durable checkpointer) for HITL resume.
+    # Best-effort; falls back to in-memory if unavailable.
     try:
         from app.harness.runtime import init_persistence
 

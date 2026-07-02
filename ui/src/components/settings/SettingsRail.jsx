@@ -4,15 +4,15 @@ import { cn } from './settings-ui';
 
 function SettingsRail({ sections, active, onChange }) {
     return (
-        <aside className="w-full shrink-0 border-b border-border bg-card xl:min-h-svh xl:border-b-0 xl:border-r">
-            <div className="px-4 py-6 sm:px-6 xl:px-[26px] xl:py-8">
-                <div className="mb-4 flex items-center gap-2 xl:mb-[22px]">
+        <aside className="w-full shrink-0 border-b border-border bg-card lg:min-h-0 lg:border-b-0 lg:border-r">
+            <div className="px-4 py-5 sm:px-5 lg:px-6 lg:py-6">
+                <div className="mb-4 flex items-center gap-2 lg:mb-5">
                     <SettingsIcon className="size-4 shrink-0 text-red-600" />
                     <p className="m-0 text-base font-bold tracking-tight text-foreground">Settings</p>
                 </div>
 
                 <nav
-                    className="-mx-1 flex gap-1 overflow-x-auto overscroll-x-contain pb-1 [-ms-overflow-style:none] [scrollbar-width:none] xl:mx-0 xl:flex-col xl:overflow-visible xl:pb-0 [&::-webkit-scrollbar]:hidden"
+                    className="-mx-1 flex gap-1 overflow-x-auto overscroll-x-contain pb-1 [-ms-overflow-style:none] [scrollbar-width:none] lg:mx-0 lg:flex-col lg:overflow-visible lg:pb-0 [&::-webkit-scrollbar]:hidden"
                     aria-label="Settings sections"
                 >
                     {sections.map((s) => {
@@ -23,7 +23,7 @@ function SettingsRail({ sections, active, onChange }) {
                                 key={s.id}
                                 type="button"
                                 className={cn(
-                                    'flex min-w-[168px] shrink-0 items-center gap-3 rounded-[10px] border-0 px-2.5 py-2 text-left transition-colors xl:min-w-0 xl:w-full',
+                                    'flex min-w-[168px] shrink-0 items-center gap-3 rounded-[10px] border-0 px-2.5 py-2 text-left transition-colors lg:min-w-0 lg:w-full',
                                     isActive
                                         ? 'bg-slate-100 text-foreground'
                                         : 'text-slate-600 hover:bg-slate-50 hover:text-foreground',

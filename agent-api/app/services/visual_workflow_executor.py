@@ -162,6 +162,15 @@ class VisualWorkflowExecutor:
                 inputs=inputs,
                 workflow=workflow,
             )
+            # Register the task actually running this coroutine so a later
+            # "Stop" can genuinely cancel it (not just mark the DB row cancelled
+            # — see execution_state.cancel_execution / _cancel_task). The
+            # foreground /execute path (workflows.py) wraps run_workflow() in
+            # asyncio.create_task(), so current_task() here IS that task
+            # regardless of how many awaits deep we are.
+            _cur_task = asyncio.current_task()
+            if _cur_task is not None:
+                self._execution_state.register_task(execution_id, _cur_task)
             start_time = datetime.now(timezone.utc)
 
             logger.info(f"Starting workflow execution: {workflow_name} (ID: {execution_id})")
@@ -191,6 +200,12 @@ class VisualWorkflowExecutor:
                     if isinstance(node_result, dict) and node_result.get('status') == 'failed'
                 ]
 
+                # Set only when this run was triggered by a chat turn (the
+                # /execute endpoint stashes it here rather than as a top-level
+                # workflow input, to avoid colliding with a real workflow
+                # input the user might separately name "session_id").
+                _chat_session_id = (inputs or {}).get("_chat_session_id")
+
                 if failed_nodes:
                     error_messages = []
                     for node_id in failed_nodes:
@@ -201,12 +216,14 @@ class VisualWorkflowExecutor:
                     result = build_result(
                         execution_id, "failed", start_time, len(executed),
                         sanitized_results=sanitize_results(execution_results),
-                        error=f"Node(s) failed: {'; '.join(error_messages)}"
+                        error=f"Node(s) failed: {'; '.join(error_messages)}",
+                        chat_session_id=_chat_session_id,
                     )
                 else:
                     result = build_result(
                         execution_id, "success", start_time, len(executed),
-                        sanitized_results=sanitize_results(execution_results)
+                        sanitized_results=sanitize_results(execution_results),
+                        chat_session_id=_chat_session_id,
                     )
 
                 self._execution_state.mirror_status(
@@ -216,20 +233,21 @@ class VisualWorkflowExecutor:
                     duration=result['duration'],
                 )
 
-                _itok = sum(v.get('input_tokens', 0) or 0 for v in execution_results.values() if isinstance(v, dict))
-                _otok = sum(v.get('output_tokens', 0) or 0 for v in execution_results.values() if isinstance(v, dict))
                 await self._publish_event(execution_id, "workflow_completed", {
                     "execution_id": execution_id,
                     "status": "success",
                     "duration": result['duration'],
                     "nodes_executed": len(executed),
-                    "input_tokens":  _itok,
-                    "output_tokens": _otok,
-                    "total_tokens":  _itok + _otok,
+                    "input_tokens":  result['input_tokens'],
+                    "output_tokens": result['output_tokens'],
+                    "total_tokens":  result['total_tokens'],
                 })
 
             except Exception as e:
-                result = build_result(execution_id, "failed", start_time, error=str(e))
+                result = build_result(
+                    execution_id, "failed", start_time, error=str(e),
+                    chat_session_id=(inputs or {}).get("_chat_session_id"),
+                )
                 logger.error(f"Workflow execution failed: {execution_id} - {e}")
 
                 if execution_id in self.active_executions:
@@ -248,7 +266,34 @@ class VisualWorkflowExecutor:
 
             finally:
                 if result:
-                    await self._persist_execution(result, workflow, execution_id)
+                    try:
+                        await self._persist_execution(result, workflow, execution_id)
+                    except Exception as persist_exc:  # noqa: BLE001
+                        # The rich persist path (execution_repo.save(), with
+                        # trajectory + token fields) has real surface area to
+                        # fail on — e.g. the same network blip that just
+                        # failed the workflow can also disrupt this DB write.
+                        # If it throws, the execution row is left at
+                        # status='running' — which is exactly what the
+                        # "already running" duplicate-run guard checks,
+                        # permanently blocking every future run of this
+                        # workflow until someone finds and clears it manually.
+                        # Fall back to a minimal, low-surface-area write that
+                        # just flips the status so the lock always releases.
+                        logger.error(
+                            f"Rich persist failed for execution {execution_id}, "
+                            f"falling back to minimal status write: {persist_exc}"
+                        )
+                        try:
+                            await ExecutionRepository().mark_failed(
+                                execution_id,
+                                error=result.get("error") or str(persist_exc),
+                            )
+                        except Exception as fallback_exc:  # noqa: BLE001
+                            logger.error(
+                                f"Fallback status write also failed for "
+                                f"execution {execution_id}: {fallback_exc}"
+                            )
                 await self.cleanup_execution(execution_id)
 
             return result
@@ -391,6 +436,7 @@ class VisualWorkflowExecutor:
                 logger.warning(f"Error during MCP cleanup of {execution_id}: {e}")
         
         self._execution_state.cleanup_cache(execution_id)
+        self._execution_state.unregister_task(execution_id)
         self.event_queues.pop(execution_id, None)
 
 

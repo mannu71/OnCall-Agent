@@ -115,6 +115,58 @@ def sanitize_messages_for_model(messages: list) -> list:
     return repaired
 
 
+def build_initial_messages(
+    conversation_history: Optional[list],
+    user_query: str,
+    logger_instance: Any,
+) -> list:
+    """Replay prior chat turns (if any) then append this turn's query.
+
+    Shared by both agent engines (LangGraph and the native turn loop) so a
+    resumed/follow-up conversation looks identical regardless of which one
+    ran. Compaction downstream trims this when it grows large.
+    """
+    from langchain_core.messages import HumanMessage, AIMessage
+
+    _prior_messages = []
+    for _m in (conversation_history or []):
+        try:
+            _role = str(_m.get("role") or "").lower()
+            _text = _m.get("content") or ""
+            if not _text:
+                continue
+            if _role in ("assistant", "ai", "agent"):
+                _prior_messages.append(AIMessage(content=_text))
+            elif _role in ("user", "human"):
+                _prior_messages.append(HumanMessage(content=_text))
+            elif _role == "system":
+                # A per-chat-session compaction summary (see
+                # compact_chat_session_if_needed) replaces older turns with one
+                # role="system" history entry. Replay it as a HumanMessage
+                # (clearly labelled) rather than a LangChain SystemMessage —
+                # this keeps the CACHE CONTRACT's "exactly one system prompt,
+                # at the start" invariant intact while still surfacing the
+                # summary as visible context, mid-history.
+                _prior_messages.append(
+                    HumanMessage(content=f"[Prior conversation summary]\n{_text}")
+                )
+            elif _role == "tool":
+                logger_instance.debug(
+                    "ReactStrategy: skipping tool message from conversation history"
+                )
+            else:
+                logger_instance.warning(
+                    "ReactStrategy: dropping conversation history message with unrecognised role %r",
+                    _role,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger_instance.debug(
+                "ReactStrategy: skipping malformed conversation history entry: %s", exc
+            )
+            continue
+    return _prior_messages + [HumanMessage(content=user_query)]
+
+
 async def execute_agent(
     agent: Any,
     user_query: str,
@@ -125,6 +177,8 @@ async def execute_agent(
     execution_port: Optional[ExecutionPort] = None,
     conversation_history: Optional[list] = None,
     retry_predicate: Optional[Any] = None,
+    recursion_limit: Optional[int] = None,
+    model_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Execute the LangGraph ReAct agent with the user's query.
@@ -142,6 +196,10 @@ async def execute_agent(
         logger_instance: Logger for execution-scoped logging.
         execution_id: Execution ID for logging.
         stream_callback: Optional streaming callback protocol.
+        model_name: Model id used for THIS run — enables the live
+            token_usage_delta events to include context-window fields
+            (window size / used tokens / used %). Omitted → live events still
+            carry raw token counts, just without context sizing.
 
     Returns:
         Dict with:
@@ -154,39 +212,9 @@ async def execute_agent(
 
     logger_instance.info("ReactStrategy: invoking agent with query: %.100s", user_query)
 
-    # Conversation memory: replay prior chat turns so follow-up questions keep
-    # context (claude-code keeps a messages array and replays it). Compaction
-    # below trims this when it grows large.
-    _prior_messages = []
-    for _m in (conversation_history or []):
-        try:
-            _role = str(_m.get("role") or "").lower()
-            _text = _m.get("content") or ""
-            if not _text:
-                continue
-            if _role in ("assistant", "ai", "agent"):
-                _prior_messages.append(AIMessage(content=_text))
-            elif _role in ("user", "human"):
-                _prior_messages.append(HumanMessage(content=_text))
-            elif _role == "system":
-                logger_instance.debug(
-                    "ReactStrategy: skipping system message from conversation history"
-                )
-            elif _role == "tool":
-                logger_instance.debug(
-                    "ReactStrategy: skipping tool message from conversation history"
-                )
-            else:
-                logger_instance.warning(
-                    "ReactStrategy: dropping conversation history message with unrecognised role %r",
-                    _role,
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger_instance.debug(
-                "ReactStrategy: skipping malformed conversation history entry: %s", exc
-            )
-            continue
-    input_state = {"messages": _prior_messages + [HumanMessage(content=user_query)]}
+    input_state = {
+        "messages": build_initial_messages(conversation_history, user_query, logger_instance)
+    }
 
     # Task #7: compact accumulated messages before invoking the agent.
     # On a fresh call ``input_state["messages"]`` has just one
@@ -248,13 +276,17 @@ async def execute_agent(
     # transition; each ReAct iteration is ~2 steps (agent + tool node).
     # recursion_limit=12 ≈ 6 iterations — above that the agent is usually
     # thrashing and burning tokens for marginal value. Override via the
-    # AGENT_RECURSION_LIMIT env var if a workflow legitimately needs more.
-    run_config["recursion_limit"] = settings.agent_recursion_limit
+    # AGENT_RECURSION_LIMIT env var if a workflow legitimately needs more,
+    # or pass an explicit ``recursion_limit`` (e.g. a subagent's max_turns cap).
+    run_config["recursion_limit"] = recursion_limit if recursion_limit is not None else settings.agent_recursion_limit
 
     # Attach a token-usage callback so we get exact counts regardless of
     # streaming mode or provider (Bedrock, Anthropic, OpenAI).
     from app.core.streaming.callbacks import TokenUsageCallback
     token_cb = TokenUsageCallback()
+    token_cb.execution_port = execution_port
+    token_cb.execution_id = execution_id
+    token_cb.model_name = model_name
     run_config.setdefault("callbacks", [])
     run_config["callbacks"].append(token_cb)
 
@@ -523,6 +555,15 @@ async def execute_agent(
         " [truncated]" if parsed.get("truncated") else "",
     )
 
+    # cache_read_tokens / cache_creation_tokens: Bedrock (and Anthropic natively)
+    # report these as SEPARATE, ADDITIVE counters — input_tokens is already the
+    # non-cached (full-price) portion, it does NOT include cache reads or cache
+    # writes. True total input processed = input_tokens + cache_read_tokens +
+    # cache_creation_tokens. cache_read bills at ~10% of fresh input; cache
+    # creation bills at a premium (~125% for Anthropic models) for the write.
+    _cache_read_tokens = getattr(token_cb, "cache_read_tokens", 0) or 0
+    _cache_creation_tokens = getattr(token_cb, "cache_creation_tokens", 0) or 0
+
     # Live token surfacing: push a token_usage_delta SSE event so the chat's
     # token counter updates from the stream (the final sync result carries the
     # same totals). Best-effort — never blocks or fails the run.
@@ -532,17 +573,12 @@ async def execute_agent(
                 "input_tokens":  total_input_tokens,
                 "output_tokens": total_output_tokens,
                 "total_tokens":  total_input_tokens + total_output_tokens,
-                "cache_read_tokens": getattr(token_cb, "cache_read_tokens", 0),
+                "cache_read_tokens": _cache_read_tokens,
+                "cache_creation_tokens": _cache_creation_tokens,
             })
         except Exception:  # noqa: BLE001
             pass
 
-    # cache_read_tokens: how many input tokens were served from the Bedrock
-    # prompt cache (≈10% the price of fresh input). The provider sums cache
-    # reads INTO input_tokens, so input_tokens − cache_read = the true
-    # non-cached (full-price) portion. Surfacing it lets the UI show real
-    # savings instead of a number inflated by cache reuse.
-    _cache_read_tokens = getattr(token_cb, "cache_read_tokens", 0) or 0
     result: Dict[str, Any] = {
         "final_answer":   final_answer,
         "messages":       serialized_messages,
@@ -551,6 +587,7 @@ async def execute_agent(
         "output_tokens":  total_output_tokens,
         "total_tokens":   total_input_tokens + total_output_tokens,
         "cache_read_tokens": _cache_read_tokens,
+        "cache_creation_tokens": _cache_creation_tokens,
     }
     if parsed.get("truncated"):
         result["truncated"] = True
@@ -611,6 +648,7 @@ def _serialize_agent_result(result_state: Dict[str, Any]) -> Dict[str, Any]:
     messages = result_state.get("messages", [])
     serialized_messages = []
     tool_calls_summary = []
+    tool_calls_by_id: Dict[str, Dict[str, Any]] = {}  # tool_call_id -> summary entry (status backfill)
     final_answer = ""
     last_content = ""          # last AIMessage content regardless of tool_calls
     evidence_ids: set = set()  # ID-like tokens seen in FULL tool outputs (grounding)
@@ -641,9 +679,14 @@ def _serialize_agent_result(result_state: Dict[str, Any]) -> Dict[str, Any]:
                     for tc in msg.tool_calls
                 ]
                 for tc in msg.tool_calls:
-                    tool_calls_summary.append(
-                        {"tool": tc.get("name"), "args_keys": list((tc.get("args") or {}).keys())}
-                    )
+                    summary_entry = {
+                        "tool": tc.get("name"),
+                        "args_keys": list((tc.get("args") or {}).keys()),
+                    }
+                    tool_calls_summary.append(summary_entry)
+                    tcid = tc.get("id")
+                    if tcid:
+                        tool_calls_by_id[tcid] = summary_entry
 
             # Fallback: AIMessage.usage_metadata (LangChain ≥ 0.1)
             usage = getattr(msg, "usage_metadata", None) or {}
@@ -671,9 +714,24 @@ def _serialize_agent_result(result_state: Dict[str, Any]) -> Dict[str, Any]:
                 evidence_ids.update(extract_ids(_full))
             except Exception:  # noqa: BLE001 — a telemetry guard must never break a run
                 pass
+
+            # Backfill the matching tool_calls_summary entry with real
+            # success/failure status (content-based, not name-substring —
+            # see app.core.supervisor._score_tool_health).
+            _tcid = getattr(msg, "tool_call_id", "")
+            _summary_entry = tool_calls_by_id.get(_tcid)
+            if _summary_entry is not None:
+                try:
+                    from app.core.tool_guardrails import classify_tool_failure
+                    _failed, _ = classify_tool_failure(_summary_entry.get("tool", ""), _full)
+                    _summary_entry["ok"] = not _failed
+                    _summary_entry["status"] = "error" if _failed else "ok"
+                except Exception:  # noqa: BLE001 — telemetry must never break a run
+                    pass
+
             serialized_messages.append({
                 "role": "tool",
-                "tool_call_id": getattr(msg, "tool_call_id", ""),
+                "tool_call_id": _tcid,
                 "content": _full[:2000],
             })
 
@@ -722,15 +780,24 @@ async def invoke_agent(
     agent: Any,
     input_state: Dict[str, Any],
     run_config: Optional[Dict[str, Any]] = None,
+    timeout_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Non-streaming invocation with timeout."""
+    """Non-streaming invocation with timeout.
+
+    Defaults to ``settings.agent_invoke_timeout_seconds`` (override via
+    AGENT_INVOKE_TIMEOUT_SECONDS) rather than a hardcoded value, so a caller
+    that wraps this in its own longer wait_for (e.g. subagent delegation's
+    DELEGATION_CHILD_TIMEOUT_SECONDS) isn't silently cut short by a shorter
+    inner ceiling.
+    """
+    _timeout = timeout_seconds if timeout_seconds is not None else settings.agent_invoke_timeout_seconds
     try:
         result_state = await asyncio.wait_for(
             agent.ainvoke(input_state, config=run_config or {}),
-            timeout=300.0,
+            timeout=_timeout,
         )
     except asyncio.TimeoutError:
-        raise RuntimeError("ReAct agent timed out after 300 seconds.")
+        raise RuntimeError(f"ReAct agent timed out after {_timeout:.0f} seconds.")
     return result_state
 
 async def execute_agent_stream(
@@ -806,7 +873,7 @@ async def execute_agent_stream(
                 # ChatBedrockConverse streams content as a LIST of blocks
                 # (e.g. [{"type":"text","text":"…"}]) rather than a str, so extract
                 # the text from both shapes — otherwise tokens are silently dropped
-                # (this is why the deepagents path showed 0 streamed tokens).
+                # (content can be a list of blocks on Bedrock — extract text).
                 _text = ""
                 if isinstance(content, str):
                     _text = content

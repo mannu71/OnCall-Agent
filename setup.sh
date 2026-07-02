@@ -80,7 +80,7 @@ resolve_python() {
 }
 
 run_compose() {
-  (cd "$AGENT_API" && docker compose -f docker-compose.yml "$@")
+  (cd "$ROOT" && docker compose -f docker-compose.yml "$@")
 }
 
 create_env_file() {
@@ -165,7 +165,7 @@ if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   if docker compose version >/dev/null 2>&1; then
     run_compose up -d postgres
   elif command -v docker-compose >/dev/null 2>&1; then
-    (cd "$AGENT_API" && docker-compose -f docker-compose.yml up -d postgres)
+    (cd "$ROOT" && docker-compose -f docker-compose.yml up -d postgres)
   else
     fail "Docker Compose not found"
   fi
@@ -180,6 +180,16 @@ if [[ "$SKIP_MIGRATIONS" -eq 0 ]]; then
     step "Applying database migrations (via Docker)"
     run_migrations_docker
   fi
+fi
+
+if [[ "$SKIP_DOCKER" -eq 0 ]]; then
+  step "Building and starting the full Docker stack (agent-api, headroom, ui)"
+  if docker compose version >/dev/null 2>&1; then
+    run_compose up --build -d
+  else
+    (cd "$ROOT" && docker-compose -f docker-compose.yml up --build -d)
+  fi
+  ok "Full stack is running"
 fi
 
 if [[ "$SKIP_DEPS" -eq 0 ]]; then
@@ -198,19 +208,38 @@ fi
 echo ""
 echo "Setup complete."
 echo ""
-echo "Next steps:"
-echo "  Option A — Full Docker stack (from repo root):"
-echo "       docker compose up --build -d"
-echo "       Open http://localhost:3000"
-echo "  Option B — Local dev (backend + Vite UI):"
-echo "  1. Edit agent-api/.env if you need AWS profile or provider settings"
-echo "  2. Start the backend:"
-echo "       cd agent-api"
-echo "       source venv/bin/activate"
-echo "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
-echo "  3. Start the UI (new terminal):"
-echo "       cd ui"
-echo "       npm run dev"
-echo ""
-echo "API health check: http://localhost:8000/api/v1/health"
+
+if [[ "$SKIP_DOCKER" -eq 0 ]]; then
+  echo "Next steps:"
+  echo "  The full Docker stack is up and running:"
+  echo "       UI:            http://localhost:3000"
+  echo "       API health:    http://localhost:8000/api/v1/health"
+  echo ""
+  echo "  Prefer local dev instead (backend + Vite UI, with hot reload)?"
+  echo "  1. Stop the containerized agent-api/ui: docker compose stop agent-api ui"
+  echo "  2. Edit agent-api/.env if you need AWS profile or provider settings"
+  echo "  3. Start the backend:"
+  echo "       cd agent-api"
+  echo "       source venv/bin/activate"
+  echo "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
+  echo "  4. Start the UI (new terminal):"
+  echo "       cd ui"
+  echo "       npm run dev"
+else
+  echo "Next steps (Docker was skipped):"
+  echo "  Option A — Full Docker stack (from repo root):"
+  echo "       docker compose up --build -d"
+  echo "       Open http://localhost:3000"
+  echo "  Option B — Local dev (backend + Vite UI):"
+  echo "  1. Edit agent-api/.env if you need AWS profile or provider settings"
+  echo "  2. Start the backend:"
+  echo "       cd agent-api"
+  echo "       source venv/bin/activate"
+  echo "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
+  echo "  3. Start the UI (new terminal):"
+  echo "       cd ui"
+  echo "       npm run dev"
+  echo ""
+  echo "API health check: http://localhost:8000/api/v1/health"
+fi
 echo ""

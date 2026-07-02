@@ -163,9 +163,13 @@ class Settings(BaseSettings):
     # out to grep over source files (the one non-graph, potentially slow tool); the
     # fast graph tools inherit the default MCP tool timeout. Capping it stops a
     # single broad grep from exhausting an agent run's time/iteration budget — the
-    # agent gets a recoverable tool error and falls back to the graph tools.
+    # agent gets a recoverable tool error and falls back to the graph tools. A
+    # timeout no longer forces an MCP reconnect (the session survives it safely —
+    # see mcp_client_manager.execute_tool), so this only needs to be generous
+    # enough that a normal grep over a large repo (e.g. the 9GB compliance-api)
+    # rarely trips it; 120s (matches the container's CODEGRAPH_SEARCH_TIMEOUT env).
     codegraph_search_timeout_seconds: float = Field(
-        default=12.0,
+        default=120.0,
         validation_alias="CODEGRAPH_SEARCH_TIMEOUT",
     )
     code_analyzer_list_cache_ttl_seconds: float = 60.0
@@ -276,6 +280,21 @@ class Settings(BaseSettings):
     # the limit mid-investigation and returned a "Let me search…" preamble.
     # Override via AGENT_RECURSION_LIMIT.
     agent_recursion_limit: int = Field(default=25, validation_alias="AGENT_RECURSION_LIMIT")
+    # Which ReAct loop engine drives an agent run. "langgraph" (default) keeps
+    # today's langgraph.prebuilt.create_react_agent behavior untouched. "native"
+    # opts into the hand-rolled turn loop (app.harness.engine) being built out
+    # incrementally — gated on the accuracy eval before it becomes the default.
+    # Per-workflow override: agent_config["engine"] / params["engine"].
+    agent_engine: str = Field(default="langgraph", validation_alias="AGENT_ENGINE")
+    # Non-streaming agent invocation wall-clock cap (agent_runner.invoke_agent).
+    # Used by the workflow-executor's non-streaming fallback and by subagent
+    # delegation (subagent_factory._run_child calls execute_agent with no
+    # stream_callback). Previously hardcoded to 300s with no override, which
+    # could silently cut a run short even when a caller's OWN wait_for wrapped
+    # it with a higher timeout (e.g. DELEGATION_CHILD_TIMEOUT_SECONDS > 300).
+    agent_invoke_timeout_seconds: float = Field(
+        default=300.0, validation_alias="AGENT_INVOKE_TIMEOUT_SECONDS"
+    )
     # Bedrock client read timeout (seconds). Botocore's 60s default is too short
     # for large-context synthesis calls (200K+ tokens, including the forced
     # recovery synthesis after a recursion-limit hit), which raised
@@ -442,14 +461,27 @@ class Settings(BaseSettings):
     )
     skills_dir: str = Field(default="data/skills", validation_alias="SKILLS_DIR")
 
-    # ── Harness backend (official LangChain stack migration) ─────────────────
-    # 'legacy' = the in-house ReAct harness; 'deepagents' = the official deep
-    # agent stack (deepagents + LangGraph saver/store + LangMem). Default legacy
-    # until the deepagents path passes the accuracy eval.
-    harness: str = Field(default="deepagents", validation_alias="HARNESS")
-    # Memory backend: 'legacy' = semantic_memory (FTS+vector RRF); 'langmem' =
-    # LangGraph PostgresStore + LangMem. Default legacy until eval-gated.
-    memory_backend: str = Field(default="legacy", validation_alias="MEMORY_BACKEND")
+    # ── Delegation (multi-agent) ─────────────────────────────────────────────
+    # Bounds for the orchestrator→specialist delegation layer.  All per-node /
+    # per-profile overrides layer on top via spec_factory.resolve_profile_fields.
+    delegation_max_depth: int = Field(
+        default=1, validation_alias="DELEGATION_MAX_DEPTH"
+    )
+    delegation_max_concurrent: int = Field(
+        default=3, validation_alias="DELEGATION_MAX_CONCURRENT"
+    )
+    delegation_child_timeout_seconds: float = Field(
+        default=180.0, validation_alias="DELEGATION_CHILD_TIMEOUT_SECONDS"
+    )
+    delegation_output_max_chars: int = Field(
+        default=8000, validation_alias="DELEGATION_OUTPUT_MAX_CHARS"
+    )
+    # CSV of fnmatch patterns always stripped from child tool sets.
+    # Children are investigate/read-only by default; orchestrator owns mutations.
+    delegation_blocked_tools: str = Field(
+        default="delegate_*,apply_fix,edit_file,fs_write*,run_command,write_todos,send_*,wiki_*",
+        validation_alias="DELEGATION_BLOCKED_TOOLS",
+    )
 
     # ── Self-improvement (hill-climbing) loop ────────────────────────────────
     # OFF by default. When enabled, an on-demand analyzer samples recent execution
@@ -460,6 +492,14 @@ class Settings(BaseSettings):
     )
     self_improvement_sample: int = Field(
         default=30, validation_alias="SELF_IMPROVEMENT_SAMPLE"
+    )
+
+    # Loop 4 — hill-climbing auto-apply (OFF by default).
+    # When True the scheduler job promotes safe proposals (skill drafts,
+    # reliability notes) to active after passing the eval guardrail.
+    # 'prompt' / 'policy' proposals are always left as human-reviewed drafts.
+    hillclimb_apply_enabled: bool = Field(
+        default=False, validation_alias="HILLCLIMB_APPLY_ENABLED"
     )
 
     # ── Pinned-facts memory tier ─────────────────────────────────────────────
@@ -476,6 +516,19 @@ class Settings(BaseSettings):
     )
     pinned_promote_recall_threshold: int = Field(
         default=3, validation_alias="PINNED_PROMOTE_RECALL_THRESHOLD"
+    )
+    # ── Per-chat-session compaction ──────────────────────────────────────────
+    # Chat.jsx replays the last ~12 messages every turn; each can carry a full
+    # multi-KB investigation report. This budget is about keeping THAT replay
+    # light (distinct from the model's full context window, which the
+    # per-execution ContextCompactionManager already governs) — when a
+    # session's stored messages exceed it, older turns collapse into one
+    # system summary + a recent tail (session_repository.replace_with_summary).
+    chat_session_compaction_tokens: int = Field(
+        default=6_000, validation_alias="CHAT_SESSION_COMPACTION_TOKENS"
+    )
+    chat_session_keep_recent_tokens: int = Field(
+        default=1_500, validation_alias="CHAT_SESSION_KEEP_RECENT_TOKENS"
     )
     # How often the scheduler runs the self-improvement curator (hours). The
     # cheap promotions run every cycle; LLM consolidation stays gated by
@@ -626,6 +679,8 @@ class Settings(BaseSettings):
         "semantic_memory_enabled",
         "memory_fact_extraction_enabled",
         "memory_audit_enabled",
+        "self_improvement_enabled",
+        "hillclimb_apply_enabled",
         mode="before",
     )
     @classmethod

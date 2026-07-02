@@ -26,6 +26,15 @@ class SkillBody(BaseModel):
     workflow_name: Optional[str] = Field(default=None)
 
 
+class FsSkillBody(BaseModel):
+    name: str = Field(..., description="Skill name (slugified into the directory name)")
+    content: str = Field(..., description="Full SKILL.md content, including YAML frontmatter")
+
+
+class FsSkillUpdateBody(BaseModel):
+    content: str = Field(..., description="Full SKILL.md content, including YAML frontmatter")
+
+
 @router.get("", response_model=Dict[str, Any])
 async def list_skills() -> Dict[str, Any]:
     """List DB skills (all statuses) and read-only filesystem skills."""
@@ -95,6 +104,44 @@ async def update_skill(name: str, body: SkillBody) -> Dict[str, Any]:
         workflow_name=body.workflow_name,
     )
     return {"success": True, "skill": skill}
+
+
+@router.get("/fs/{name}", response_model=Dict[str, Any])
+async def get_fs_skill(name: str) -> Dict[str, Any]:
+    """Return the raw SKILL.md source for a single filesystem skill."""
+    manager = get_default_skill_manager()
+    source = manager.get_skill_source(name)
+    if source is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"filesystem skill '{name}' not found")
+    return {"success": True, "skill": source}
+
+
+@router.post("/fs", response_model=Dict[str, Any])
+async def create_fs_skill(body: FsSkillBody) -> Dict[str, Any]:
+    """Create a new markdown SKILL.md file under the user skills directory."""
+    if not body.name.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="name is required")
+    manager = get_default_skill_manager()
+    try:
+        skill = manager.write_skill(body.name, body.content)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {"success": True, "skill": {"name": skill.name, "description": skill.description}}
+
+
+@router.put("/fs/{name}", response_model=Dict[str, Any])
+async def update_fs_skill(name: str, body: FsSkillUpdateBody) -> Dict[str, Any]:
+    """Update (overwrite) an existing markdown SKILL.md file's content."""
+    manager = get_default_skill_manager()
+    if manager.get_skill_source(name) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"filesystem skill '{name}' not found")
+    try:
+        skill = manager.write_skill(name, body.content)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {"success": True, "skill": {"name": skill.name, "description": skill.description}}
 
 
 @router.delete("/fs/{name}", response_model=Dict[str, Any])

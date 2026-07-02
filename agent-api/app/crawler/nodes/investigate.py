@@ -53,7 +53,7 @@ class ParseAlert(AsyncNode):
         import yaml
 
         t0 = time.monotonic()
-        prompt = f"""You are an on-call engineer analysing an alert.
+        prompt = f"""You are an expert software engineer analysing an alert or issue.
 
 Alert text:
 \"\"\"{prep_res['alert']}\"\"\"
@@ -383,7 +383,7 @@ class SynthesizeRootCause(AsyncNode):
             f"\nError message: {prep_res['error_message']}" if prep_res["error_message"] else ""
         )
 
-        prompt = f"""You are an on-call engineer performing root-cause analysis.
+        prompt = f"""You are an expert software engineer performing root-cause analysis.
 
 Project: "{prep_res['repo']}"
 Alert: "{prep_res['alert_summary']}"

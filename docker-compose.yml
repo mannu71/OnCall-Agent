@@ -46,7 +46,12 @@ services:
       - DATABASE_URL=postgresql://kycuser:kycpassword@postgres:5432/kycagent
       - REPOS_BASE_PATH=/app/data/indexed_repos
       - CODEGRAPH_CACHE_DIR=/root/.cache/codegraph
-      - CODEGRAPH_SEARCH_TIMEOUT=30
+      - CODEGRAPH_SEARCH_TIMEOUT=120
+      # 256MB — up from the 64MB engine default (cg_store_resolve_mmap_size,
+      # store.c:308) so the whole ~100MB compliance-api store fits in the
+      # mmap window for cold reads. Cheap, safe: just raises a read-cache
+      # ceiling, no schema/index/query changes.
+      - CG_SQLITE_MMAP_SIZE=268435456
       - PROVIDER_TRANSPORT=bedrock
       - COMPRESSION_ENABLED=true
       - COMPRESSION_ENDPOINT=http://headroom:8787

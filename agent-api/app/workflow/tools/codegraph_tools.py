@@ -18,6 +18,7 @@ so the full tool set stays available on demand without bloating the prompt.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from app.config import settings
@@ -36,6 +37,23 @@ def codegraph_inline_config() -> Dict[str, Any]:
     on the image, and ``connect_server`` merges ``os.environ`` over this dict.
     """
     return {"command": settings.codegraph_bin, "args": ["serve"], "env": {}}
+
+
+def cg_project_name(short_name: str) -> str:
+    """Derive codegraph's canonical (full-path-based) project name.
+
+    codegraph keys projects internally by their absolute indexed path with
+    every path-unsafe char (including ``/``) mapped to ``-`` — e.g.
+    ``/app/data/indexed_repos/compliance-api`` → ``app-data-indexed_repos-
+    compliance-api``. This mirrors the upstream engine's
+    ``cbm_project_name_from_path`` (codebase-memory-mcp/src/pipeline/fqn.c) and
+    is deliberate: two repos sharing a basename at different paths must not
+    collide. Agents and users should only ever see ``short_name``; this is the
+    only place that derives the canonical name, and ``build_codegraph_tools()``
+    uses it to alias tool ``project=`` args back to it before each MCP call.
+    """
+    abs_path = os.path.join(settings.repos_base_path, short_name)
+    return abs_path.lstrip('/').replace('/', '-')
 
 
 async def build_codegraph_tools(
@@ -86,14 +104,24 @@ async def build_codegraph_tools(
     # default timeout. A single slow grep then errors out at the cap instead of
     # stalling the whole agent run; the agent recovers via the graph tools.
     _search_timeout = settings.codegraph_search_timeout_seconds
+    _repo_names = [r.get("name", "") for r in (repos or []) if r.get("name")]
+    # Clean-name → codegraph's canonical name, applied to every tool's `project`
+    # arg at call time (MCPToolWrapper._arun) so the agent only ever needs to
+    # know the short name — the ugly internal name never reaches the prompt or
+    # the model. Idempotent: a value not in this map (e.g. the agent already
+    # passed the canonical name) is left unchanged.
+    _project_aliases = {name: cg_project_name(name) for name in _repo_names}
     for _t in tools:
         if getattr(_t, "name", "") == f"{CODEGRAPH_SERVER_ID}__search_code":
             try:
                 _t.tool_timeout = _search_timeout
             except Exception:  # noqa: BLE001 — never break tool build on this
                 logger.debug("build_codegraph_tools: could not cap search_code timeout")
+        try:
+            _t.project_aliases = _project_aliases
+        except Exception:  # noqa: BLE001 — never break tool build on this
+            logger.debug("build_codegraph_tools: could not set project_aliases on %s", getattr(_t, "name", "?"))
 
-    _repo_names = [r.get("name", "") for r in (repos or []) if r.get("name")]
     logger.info(
         "build_codegraph_tools: exposed %d codegraph tools (repos=%s)",
         len(tools), _repo_names or "none",

@@ -41,6 +41,20 @@ client.interceptors.response.use(
     }
 );
 
+/**
+ * True when *error* came from a client-side AbortController.abort() (axios
+ * CanceledError, ERR_CANCELED, or a plain DOMException 'AbortError') OR from
+ * the server confirming a cancellation (executeWorkflow's synthetic
+ * `code: 'CANCELLED'` when the sync POST resolved with status:'cancelled').
+ * Chat's handleStop() already renders "Stopped by user." directly, so callers
+ * use this to skip rendering a second, redundant "Error: ..." on top of it.
+ */
+export function isAbortError(error) {
+    if (!error) return false;
+    return error.code === 'ERR_CANCELED' || error.code === 'CANCELLED'
+        || error.name === 'CanceledError' || error.name === 'AbortError';
+}
+
 // ── Result extraction helpers ────────────────────────────────────────────────
 // A visual-workflow execute response is keyed by node id, e.g.
 //   { workflow_name, "agent_…": { final_answer, … }, "cloudwatch_tool_…": { output }, … }
@@ -191,9 +205,6 @@ export const agentApiClient = {
         if (o.userQuery) params.query = o.userQuery;
         if (o.outputMode) params.output_mode = o.outputMode;
         if (o.permissionMode) params.permission_mode = o.permissionMode;
-        // Per-turn runtime override: 'legacy' | 'deepagents'. Overrides the
-        // agent node's harness setting (and the server default) for this run.
-        if (o.harness) params.harness = o.harness;
         // When a persisted chat session is active, the backend records the user
         // and assistant turns against it so the conversation survives a refresh.
         if (o.sessionId) params.session_id = o.sessionId;
@@ -211,7 +222,12 @@ export const agentApiClient = {
             // healthy run mid-flight ("timeout of 30000ms exceeded" →
             // "Workflow Terminated"), so disable the per-request timeout here and
             // let the server own the run's lifetime.
-            { params, timeout: 0 },
+            //
+            // o.signal (AbortController.signal) is the CLIENT-side stop: Chat's
+            // handleStop() aborts it so this pending POST rejects immediately and
+            // the composer unlocks right away, instead of waiting on whatever the
+            // server-side cancel (DELETE .../active/{name}) takes to land.
+            { params, timeout: 0, signal: o.signal },
         );
         return response.data;
     },
@@ -264,10 +280,20 @@ export const agentApiClient = {
             on('agent_progress', (e) => { const d = parse(e); h.onStatus && h.onStatus(d.message || ''); });
             on('token_usage_delta', (e) => {
                 const d = parse(e);
+                // Fired after EVERY LLM call now (not just once at run end — see
+                // TokenUsageCallback._publish_live), so this is the live counter.
+                // context_* fields are present once the run has a resolved model;
+                // omitted (not zeroed) otherwise so the UI can tell "no data yet"
+                // from "genuinely 0%".
                 h.onTokens && h.onTokens({
                     input: d.input_tokens || 0,
                     output: d.output_tokens || 0,
                     total: d.total_tokens || ((d.input_tokens || 0) + (d.output_tokens || 0)),
+                    context: (d.context_window_size != null) ? {
+                        pct: d.context_used_pct || 0,
+                        used: d.context_used_tokens || 0,
+                        window: d.context_window_size || 0,
+                    } : null,
                 });
             });
             on('hitl_pause', (e) => {
@@ -289,10 +315,20 @@ export const agentApiClient = {
         try {
             const data = await this.executeWorkflow(workflowName, {
                 background: false, userQuery, history: h.history, sessionId: h.sessionId,
-                harness: h.harness,
+                signal: h.signal,
             });
             if (data && data.status === 'already_running') {
                 throw new Error(`Agent "${workflowName}" is already running. Wait for it to finish.`);
+            }
+            if (data && data.status === 'cancelled') {
+                // The server-side task.cancel() (see execution_state.cancel_execution)
+                // won the race and the sync POST resolved normally with this status
+                // instead of the client's AbortController rejecting it. Tag it the
+                // same way so the caller's catch block doesn't render a duplicate
+                // "Error: ..." on top of handleStop's own "Stopped by user." message.
+                const cancelled = new Error('Workflow execution was cancelled.');
+                cancelled.code = 'CANCELLED';
+                throw cancelled;
             }
             const finalAnswer = extractFinalAnswer(data);
             const tokens = extractTokens(data);
@@ -668,6 +704,15 @@ export const agentApiClient = {
         return response.data; // { success, output_schemas, capabilities }
     },
 
+    /**
+     * List DB-backed executable skills + read-only filesystem (SKILL.md) skills,
+     * for the Agent node's Skills picker.
+     */
+    async listSkills() {
+        const response = await client.get('/api/v1/skills');
+        return response.data; // { success, db: [...], filesystem: [...] }
+    },
+
     async getAgentProfile(name) {
         const response = await client.get(`/api/v1/agent-profiles/${encodeURIComponent(name)}`);
         return response.data;
@@ -724,6 +769,21 @@ export const agentApiClient = {
 
     async deleteFsSkill(name) {
         const response = await client.delete(`/api/v1/skills/fs/${encodeURIComponent(name)}`);
+        return response.data;
+    },
+
+    async getFsSkill(name) {
+        const response = await client.get(`/api/v1/skills/fs/${encodeURIComponent(name)}`);
+        return response.data; // { success, skill: { name, content, editable } }
+    },
+
+    async createFsSkill(name, content) {
+        const response = await client.post('/api/v1/skills/fs', { name, content });
+        return response.data;
+    },
+
+    async updateFsSkill(name, content) {
+        const response = await client.put(`/api/v1/skills/fs/${encodeURIComponent(name)}`, { content });
         return response.data;
     },
 

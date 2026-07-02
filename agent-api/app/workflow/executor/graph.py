@@ -20,6 +20,17 @@ from typing import Any, Awaitable, Callable, Dict, List
 # indefinitely. Override via env when long-running agent nodes need more time.
 _NODE_TIMEOUT_SECONDS = float(os.getenv("WORKFLOW_NODE_TIMEOUT_SECONDS", "300"))
 
+# Agent nodes run a full multi-tool ReAct loop (CloudWatch + code crawler + DB
+# queries can each take tens of seconds, and a deep investigation chains many
+# of them) — the blanket 300s node timeout above routinely kills legitimate
+# in-progress investigations partway through. Give "agent" nodes their own,
+# higher default ceiling, independently overridable.
+_AGENT_NODE_TIMEOUT_SECONDS = float(os.getenv("WORKFLOW_AGENT_NODE_TIMEOUT_SECONDS", "900"))
+
+
+def _node_timeout_seconds(node_type: str) -> float:
+    return _AGENT_NODE_TIMEOUT_SECONDS if node_type == "agent" else _NODE_TIMEOUT_SECONDS
+
 logger = logging.getLogger(__name__)
 
 
@@ -108,26 +119,62 @@ async def execute_nodes_bfs(
         if not node:
             return node_id, None, False  # skip unknown
         async with semaphore:
+            node_type = node.get("type")
+            node_timeout = _node_timeout_seconds(node_type)
             logger.info(
-                "Executing node: %s (%s) [exec=%s]",
-                node_id, node.get("type"), execution_id,
+                "Executing node: %s (%s) [exec=%s, timeout=%.0fs]",
+                node_id, node_type, execution_id, node_timeout,
             )
             try:
                 result = await asyncio.wait_for(
                     execute_node_fn(execution_id, node, execution_results),
-                    timeout=_NODE_TIMEOUT_SECONDS,
+                    timeout=node_timeout,
                 )
             except asyncio.TimeoutError:
                 logger.error(
                     "Node '%s' (%s) timed out after %.0fs [exec=%s]",
-                    node_id, node.get("type"), _NODE_TIMEOUT_SECONDS, execution_id,
+                    node_id, node_type, node_timeout, execution_id,
+                )
+                _env_var = (
+                    "WORKFLOW_AGENT_NODE_TIMEOUT_SECONDS" if node_type == "agent"
+                    else "WORKFLOW_NODE_TIMEOUT_SECONDS"
                 )
                 result = {
                     "status": "failed",
                     "error": (
-                        f"Node timed out after {_NODE_TIMEOUT_SECONDS:.0f}s — "
-                        "set WORKFLOW_NODE_TIMEOUT_SECONDS to a higher value for "
+                        f"Node timed out after {node_timeout:.0f}s — "
+                        f"set {_env_var} to a higher value for "
                         "long-running agent or MCP nodes."
+                    ),
+                }
+            except asyncio.CancelledError:
+                # A CancelledError here is a BaseException, so the `except
+                # Exception` below would NOT catch it — without this clause it
+                # escapes _run_one, is logged blank by the gather catch-all, and
+                # the node is silently DROPPED (never marked failed), letting a
+                # half-streamed answer pass as the run's final result.
+                #
+                # Distinguish a genuine cancel of THIS task (app shutdown / an
+                # explicit task.cancel) from collateral cancellation bubbling up
+                # from a lower layer (e.g. a cross-task anyio cancel-scope
+                # teardown in an MCP tool). Only the former sets cancelling()>0;
+                # honour it by re-raising. Otherwise the cancellation was not
+                # meant for us — record the node as failed so the failure is
+                # surfaced instead of masked.
+                _cur = asyncio.current_task()
+                if _cur is not None and _cur.cancelling() > 0:
+                    raise
+                logger.error(
+                    "Node '%s' (%s) hit a stray CancelledError [exec=%s] — "
+                    "recording as failed (collateral cancellation from a lower "
+                    "layer, not a shutdown of this run)",
+                    node_id, node_type, execution_id,
+                )
+                result = {
+                    "status": "failed",
+                    "error": (
+                        "Node was cancelled by a lower layer (e.g. a tool/MCP "
+                        "timeout reset) rather than completing — see logs."
                     ),
                 }
             except Exception as exc:  # noqa: BLE001

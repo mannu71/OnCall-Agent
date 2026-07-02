@@ -1,13 +1,23 @@
 """Tool assembly — the harness's "action space" builder.
 
 Assembles the agent's base tool set from the workflow's tool/CloudWatch/code/DB
-config: MCP tools, CloudWatch tools (with a cheap STS credential pre-flight that
-aborts before the LLM is invoked if the session token is expired), code-crawler
-tools, DB-schema lookup tools, then prunes the result with the relevance router.
+config: MCP tools, CloudWatch tools, code-crawler/codegraph tools, DB-schema
+lookup tools, then prunes the result with progressive tool disclosure.
 
-Extracted verbatim (behaviour-preserving) from ``ReactStrategy.execute``. The
-``_expired_creds_msg`` is returned to the caller rather than early-returning from
-here, so the strategy keeps ownership of the user-facing result envelope.
+Every builder follows ONE uniform pattern: try to build it, and if it fails
+(missing config, expired credentials, a dead connection, whatever), skip that
+builder, note *why* in ``degraded``, and keep going — never abort the whole
+turn over one tool family. This mirrors the reference ReAct implementation
+(no builder-specific preflight kills a turn there either; a failed tool just
+returns an error the model adapts to). The turn is only short-circuited before
+the LLM is invoked when there is truly nothing the agent could do: zero tools
+built at all, or the model's own credentials are confirmed dead (checked via
+the same cheap STS probe, and only when something already degraded — no need
+to pay for an extra AWS round-trip on the common, everything-built-fine path).
+
+Extracted (and later generalized) from ``ReactStrategy.execute``. The
+``expired_creds_msg`` is returned to the caller rather than early-returning
+from here, so the strategy keeps ownership of the user-facing result envelope.
 
 Subagent-delegate and edit tools are added by the caller *after* the LLM is
 built (they need the model), so they are intentionally NOT part of this base set.
@@ -17,6 +27,56 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.redact import redact
+
+
+async def _sts_expired(
+    creds: Dict[str, Any],
+    region: str,
+    *,
+    logger_instance: Any,
+    execution_id: Optional[str],
+    label: str,
+) -> bool:
+    """Cheap ``get_caller_identity`` probe. True ONLY on a confirmed
+    ``ExpiredTokenException`` — any other probe failure (network blip, no
+    creds configured, missing botocore) is "cannot confirm expiry", never
+    treated as a reason to abort a turn.
+    """
+    try:
+        import boto3
+        from botocore.exceptions import ClientError as _BotoClientError
+        from app.core.thread_pools import run_in_aws_pool
+
+        _sts_kwargs: Dict[str, Any] = {"region_name": region}
+        if creds.get("aws_profile"):
+            _sts_session = boto3.Session(
+                profile_name=creds["aws_profile"], region_name=region
+            )
+            _sts_client = _sts_session.client("sts")
+        else:
+            if creds.get("access_key_id"):
+                _sts_kwargs["aws_access_key_id"] = creds["access_key_id"]
+                _sts_kwargs["aws_secret_access_key"] = creds.get("secret_access_key", "")
+                if creds.get("session_token"):
+                    _sts_kwargs["aws_session_token"] = creds["session_token"]
+            _sts_client = boto3.client("sts", **_sts_kwargs)
+        await run_in_aws_pool(_sts_client.get_caller_identity)
+        return False
+    except _BotoClientError as _sts_err:  # noqa: F821 — bound above unless import itself failed
+        _ec = _sts_err.response.get("Error", {}).get("Code", "")
+        if _ec == "ExpiredTokenException" or "ExpiredToken" in str(_sts_err):
+            logger_instance.warning(
+                "ReactStrategy: %s AWS credentials expired (exec=%s)",
+                label, execution_id, extra={"execution_id": execution_id},
+            )
+            return True
+        return False
+    except Exception as _sts_probe_err:  # noqa: BLE001 — a probe failure is never fatal
+        logger_instance.debug(
+            "ReactStrategy: %s STS credential pre-flight skipped (%s)",
+            label, redact(str(_sts_probe_err)), extra={"execution_id": execution_id},
+        )
+        return False
 
 
 async def assemble_base_tools(
@@ -30,22 +90,31 @@ async def assemble_base_tools(
     user_query: str,
     logger_instance: Any,
     crawler_model_id: Optional[str] = None,
-) -> Tuple[List[Any], Optional[str]]:
-    """Build the base tool set. Returns ``(tools, expired_creds_msg)``.
+    llm_config: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Any], Optional[str], List[str]]:
+    """Build the base tool set. Returns ``(tools, expired_creds_msg, degraded)``.
 
-    When ``expired_creds_msg`` is non-None the caller should short-circuit with a
-    credential-refresh message instead of invoking the LLM.
+    ``degraded`` lists short, agent-facing notes for any builder that could not
+    run this turn (e.g. "CloudWatch tools are unavailable — AWS credentials
+    expired"). The caller should prepend these to the turn's query so the model
+    knows what's missing instead of discovering it by a tool call failing.
+
+    ``expired_creds_msg`` is non-None only when NOTHING could be built, or the
+    model's own credentials are confirmed dead — the caller should short-circuit
+    with a credential-refresh message instead of invoking the LLM in that case.
+    ``llm_config`` (the resolved main-model config, same shape as CloudWatch's
+    resolved credentials — see ``app.workflow.llm_config.LLMConfig.to_dict``)
+    is optional so existing/test callers that don't have it degrade gracefully
+    too: without it, a dead LLM credential surfaces at the first model call
+    instead of pre-flight, same as before this generic-degrade fix existed.
     """
     from app.workflow.strategies.react.tool_setup import setup_tools
 
     tools = await setup_tools(tools_config, mcp_manager, execution_id)
-
-    expired_creds_msg: Optional[str] = None
+    degraded: List[str] = []
 
     # Query-aware gate: a purely conversational turn (e.g. "Hi") needs no logs, so
-    # skip binding CloudWatch tools — this also skips the STS credential pre-flight
-    # that would otherwise abort the whole turn on an expired token. Real queries
-    # still bind the tools (and still get the expired-creds guard).
+    # skip binding CloudWatch tools entirely — not a degradation, just nothing to do.
     from app.core.intent import is_conversational
     if cloudwatch_config and is_conversational(user_query):
         logger_instance.info(
@@ -65,47 +134,15 @@ async def assemble_base_tools(
                 aws_region=cloudwatch_config.get("aws_region", "us-east-1"),
             )
 
-            # Pre-flight: validate credentials before invoking the LLM.
-            # A cheap STS call costs nothing vs. a full agent loop.
-            try:
-                import boto3
-                from botocore.exceptions import ClientError as _BotoClientError
-                from app.core.thread_pools import run_in_aws_pool
-
-                _sts_kwargs: Dict[str, Any] = {"region_name": cw_region}
-                if cw_creds.get("aws_profile"):
-                    _sts_session = boto3.Session(
-                        profile_name=cw_creds["aws_profile"], region_name=cw_region
-                    )
-                    _sts_client = _sts_session.client("sts")
-                else:
-                    if cw_creds.get("access_key_id"):
-                        _sts_kwargs["aws_access_key_id"] = cw_creds["access_key_id"]
-                        _sts_kwargs["aws_secret_access_key"] = cw_creds.get("secret_access_key", "")
-                        if cw_creds.get("session_token"):
-                            _sts_kwargs["aws_session_token"] = cw_creds["session_token"]
-                    _sts_client = boto3.client("sts", **_sts_kwargs)
-                await run_in_aws_pool(_sts_client.get_caller_identity)
-            except _BotoClientError as _sts_err:
-                _ec = _sts_err.response.get("Error", {}).get("Code", "")
-                if _ec == "ExpiredTokenException" or "ExpiredToken" in str(_sts_err):
-                    expired_creds_msg = (
-                        "AWS credentials are expired. Please refresh your AWS session token "
-                        "in the LLM configuration settings and retry the workflow."
-                    )
-                    logger_instance.warning(
-                        "ReactStrategy: AWS credentials expired — aborting before LLM invocation (exec=%s)",
-                        execution_id,
-                        extra={"execution_id": execution_id},
-                    )
-            except Exception as _sts_probe_err:
-                logger_instance.debug(
-                    "ReactStrategy: STS credential pre-flight skipped (%s)",
-                    redact(str(_sts_probe_err)),
-                    extra={"execution_id": execution_id},
+            if await _sts_expired(
+                cw_creds, cw_region,
+                logger_instance=logger_instance, execution_id=execution_id, label="CloudWatch",
+            ):
+                degraded.append(
+                    "CloudWatch/log tools are unavailable this turn (AWS credentials "
+                    "expired — refresh them in the LLM configuration settings)."
                 )
-
-            if not expired_creds_msg:
+            else:
                 tools.extend(
                     build_cloudwatch_agent_tools(
                         region=cw_region,
@@ -120,11 +157,7 @@ async def assemble_base_tools(
                 redact(str(_cw_err)),
                 extra={"execution_id": execution_id},
             )
-
-    if expired_creds_msg:
-        # Short-circuit: caller will return the refresh message. Tools built so
-        # far are irrelevant.
-        return tools, expired_creds_msg
+            degraded.append("CloudWatch tools failed to initialize this turn (see server logs).")
 
     if code_analyzer_config:
         backend = (code_analyzer_config.get("backend") or "code_crawler")
@@ -166,6 +199,9 @@ async def assemble_base_tools(
                 redact(str(_cr_err)),
                 extra={"execution_id": execution_id},
             )
+            degraded.append(
+                f"Code-analysis tools (backend={backend}) failed to initialize this turn."
+            )
 
     # Bounded, cached DB schema lookup tools — added only when a database node is
     # wired. Lets the agent find the right table with a small filtered lookup
@@ -181,6 +217,43 @@ async def assemble_base_tools(
                 redact(str(_db_err)),
                 extra={"execution_id": execution_id},
             )
+            degraded.append("Database schema lookup tools failed to initialize this turn.")
+
+    # ── Generic go/no-go check — runs once, after every builder, never per-tool ──
+    # special logic. Short-circuit before the LLM only when there is truly
+    # nothing the agent could do with this turn.
+    expired_creds_msg: Optional[str] = None
+    if not tools:
+        expired_creds_msg = (
+            "No tools could be initialized for this turn"
+            + (f": {' '.join(degraded)}" if degraded else ".")
+        )
+    elif degraded and llm_config is not None:
+        # Only worth the extra STS round-trip when something already failed —
+        # this tells us whether it's an account-wide credential problem (abort
+        # now with a clear message, since nothing else will work either) or
+        # narrowly scoped to the tool(s) that failed (degrade and continue with
+        # what's available).
+        llm_creds = {
+            "aws_profile":       llm_config.get("aws_profile"),
+            "access_key_id":     llm_config.get("access_key_id"),
+            "secret_access_key": llm_config.get("secret_access_key"),
+            "session_token":     llm_config.get("session_token"),
+        }
+        llm_region = llm_config.get("region") or "us-east-1"
+        if await _sts_expired(
+            llm_creds, llm_region,
+            logger_instance=logger_instance, execution_id=execution_id, label="Model",
+        ):
+            expired_creds_msg = (
+                "AWS credentials are expired. Please refresh your AWS session token "
+                "in the LLM configuration settings and retry the workflow."
+            )
+
+    if expired_creds_msg:
+        # Short-circuit: caller will return the refresh message. Tools built so
+        # far are irrelevant.
+        return tools, expired_creds_msg, degraded
 
     # Progressive tool disclosure: when an MCP server exposes a large open-ended
     # tool set, defer it behind search_tools/call_tool so the AGENT discovers and
@@ -200,7 +273,7 @@ async def assemble_base_tools(
                 extra={"execution_id": execution_id},
             )
 
-    return tools, expired_creds_msg
+    return tools, expired_creds_msg, degraded
 
 
 def add_extension_tools(
@@ -219,7 +292,9 @@ def add_extension_tools(
     1. **Code path** (only when code tools are present): the depth-1
        ``delegate_investigation`` tool (built from a snapshot of the current
        tools, so it never includes itself or the edit tool) and the gated
-       code-edit tool — unchanged behaviour.
+       code-edit tool. ``delegate_investigation`` is built by
+       ``subagent_factory.build_generic_delegate_tool`` — the same engine as
+       every other delegation tool (unified LLM resolution / tool scoping).
     2. **Deep-agent capabilities** (gated by the agent profile flags resolved from
        ``agent_config``): planning (write_todos), virtual filesystem (fs_*), and
        generalized named subagents (delegate_to_<name>). All OFF by default, so an
@@ -229,14 +304,15 @@ def add_extension_tools(
     """
     if code_analyzer_config:
         # On-demand subagent delegation (depth-1). The sub-agent is built from a
-        # snapshot WITHOUT this tool, so it cannot fan out further.
+        # snapshot WITHOUT this tool, so it cannot fan out further. Built on the
+        # same subagent_factory engine as the named delegate_to_<name> tools.
         try:
-            from app.workflow.strategies.react.subagent import build_delegate_tool
-            tools.append(
-                build_delegate_tool(
-                    llm, list(tools), agent_config, parent_execution_id=execution_id,
-                )
+            from app.workflow.strategies.react.subagent_factory import build_generic_delegate_tool
+            _generic = build_generic_delegate_tool(
+                llm, list(tools), agent_config, parent_execution_id=execution_id,
             )
+            if _generic is not None:
+                tools.append(_generic)
         except Exception as _de:  # noqa: BLE001
             logger_instance.warning("ReactStrategy: delegate tool skipped (%s)", _de)
 
@@ -255,25 +331,17 @@ def add_extension_tools(
     except Exception:  # noqa: BLE001
         _flags = {"planning": False, "filesystem": False, "subagents": []}
 
-    # On the deepagents harness, planning (write_todos via TodoListMiddleware) and
-    # the filesystem are deepagents built-ins, so we skip our overlapping fs_*/
-    # write_todos tools (avoids duplicate tools + a write_todos name clash). The
-    # legacy harness still gets them here.
-    try:
-        from app.harness.spec_factory import resolve_harness
-        _deepagents = resolve_harness(agent_config) == "deepagents"
-    except Exception:  # noqa: BLE001
-        _deepagents = False
-
-    if _flags.get("planning") and not _deepagents:
+    if _flags.get("planning"):
         try:
             from app.workflow.strategies.react.planning_tools import build_planning_tools
             tools.extend(build_planning_tools(execution_id))
         except Exception as _pe:  # noqa: BLE001
             logger_instance.warning("ReactStrategy: planning tools skipped (%s)", _pe)
 
-    # Scratch filesystem (legacy harness only — deepagents provides its own).
-    if not _deepagents:
+    # VFS tools are gated on the filesystem flag (AgentSpec.filesystem defaults
+    # False — see resolve_profile_fields). Previously this flag was ignored and
+    # fs_* tools were always added regardless of profile config.
+    if _flags.get("filesystem"):
         try:
             from app.core.vfs import build_vfs_tools, bind_session
             bind_session(execution_id)
@@ -283,13 +351,24 @@ def add_extension_tools(
 
     if _flags.get("subagents"):
         try:
-            from app.workflow.strategies.react.subagent_factory import build_subagent_tools
+            from app.workflow.strategies.react.subagent_factory import (
+                build_subagent_tools,
+                build_delegate_parallel_tool,
+            )
+            _sub_defs = _flags["subagents"]
+            _base_snapshot = list(tools)  # snapshot before appending delegation tools
             tools.extend(
                 build_subagent_tools(
-                    llm, list(tools), agent_config, _flags["subagents"],
+                    llm, _base_snapshot, agent_config, _sub_defs,
                     parent_execution_id=execution_id,
                 )
             )
+            _parallel = build_delegate_parallel_tool(
+                llm, _base_snapshot, agent_config, _sub_defs,
+                parent_execution_id=execution_id,
+            )
+            if _parallel is not None:
+                tools.append(_parallel)
         except Exception as _se:  # noqa: BLE001
             logger_instance.warning("ReactStrategy: subagent tools skipped (%s)", _se)
 

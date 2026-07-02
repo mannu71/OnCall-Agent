@@ -34,6 +34,20 @@ const Settings = () => {
     } = useSettingsPage();
 
     const pageHeadActions = useMemo(() => {
+        if (active === 'general') {
+            return (
+                <SButton
+                    variant="outline"
+                    size="sm"
+                    icon={<RefreshCw className={hero.healthLoading ? 'size-3.5 animate-spin' : 'size-3.5'} />}
+                    onClick={hero.healthCheck}
+                    disabled={hero.healthLoading}
+                >
+                    Run health check
+                </SButton>
+            );
+        }
+
         if (active === 'mcp') {
             const serverCount = Object.keys(mcp.servers).length;
             return (
@@ -74,25 +88,16 @@ const Settings = () => {
         }
 
         return null;
-    }, [active, mcp, certs.certUploadLoading]);
+    }, [active, hero.healthCheck, hero.healthLoading, mcp, certs.certUploadLoading]);
 
     return (
-        <div className="min-h-0 w-full min-w-0 overflow-x-hidden bg-slate-50 font-sans text-sm text-slate-800 lg:min-h-svh">
-            <div className="flex w-full min-w-0 flex-col xl:grid xl:min-h-svh xl:grid-cols-[256px_minmax(0,1fr)]">
+        <div className="flex min-h-0 w-full flex-1 flex-col overflow-x-hidden bg-slate-50 font-sans text-sm text-slate-800">
+            <div className="flex w-full min-w-0 flex-1 flex-col lg:grid lg:min-h-0 lg:grid-cols-[minmax(0,240px)_minmax(0,1fr)]">
                 <SettingsRail sections={sections} active={active} onChange={setActive} />
-                <main className="min-w-0 px-4 py-6 pb-8 sm:px-6 md:px-8 lg:px-10 lg:py-8 xl:px-12">
-                    {active === 'general' ? (
-                        <WorkspaceHero
-                            workspaceName={hero.workspaceName}
-                            timezone={hero.timezoneLabel}
-                            apiHealth={hero.apiHealth}
-                            gauges={hero.gauges}
-                            onHealthCheck={hero.healthCheck}
-                            healthLoading={hero.healthLoading}
-                        />
-                    ) : (
-                        <SettingsPageHead section={activeSection} actions={pageHeadActions} />
-                    )}
+                <main className="@container min-w-0 flex-1 px-4 py-5 sm:px-5 md:px-6 lg:px-8 lg:py-6">
+                    <div className="mx-auto w-full max-w-5xl min-w-0">
+                    <SettingsPageHead section={activeSection} actions={pageHeadActions} />
+                    {active === 'general' && <WorkspaceHero gauges={hero.gauges} />}
 
                     <Suspense fallback={<SectionFallback />}>
                         {active === 'general' && (
@@ -101,10 +106,6 @@ const Settings = () => {
                                 onWorkspaceNameChange={general.setWorkspaceName}
                                 timezone={general.timezone}
                                 onTimezoneChange={general.setTimezone}
-                                agentTimeout={general.agentTimeout}
-                                onAgentTimeoutChange={general.setAgentTimeout}
-                                confirmDestructive={general.confirmDestructive}
-                                onConfirmDestructiveChange={general.setConfirmDestructive}
                             />
                         )}
                         {active === 'mcp' && (
@@ -142,6 +143,7 @@ const Settings = () => {
                             />
                         )}
                     </Suspense>
+                    </div>
                 </main>
             </div>
 

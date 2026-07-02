@@ -166,12 +166,13 @@ class InvestigationSupervisor:
     # Public
     # ------------------------------------------------------------------
 
-    def evaluate(
+    async def evaluate(
         self,
         final_answer:  str,
         tool_calls:    List[Dict[str, Any]],
         confidence:    float,
         retry_count:   int = 0,
+        messages:      Optional[List[Dict[str, Any]]] = None,
     ) -> SupervisorVerdict:
         """Score the investigation and return a routing verdict.
 
@@ -181,6 +182,8 @@ class InvestigationSupervisor:
             confidence:    Caller-supplied confidence score in [0.0, 1.0].
             retry_count:   How many times this investigation has already been
                            retried (used to cap retry loops).
+            messages:      Serialized conversation messages (used by the LLM
+                           grader to extract tool-output evidence).
 
         Returns:
             :class:`SupervisorVerdict`
@@ -188,12 +191,52 @@ class InvestigationSupervisor:
         answer     = (final_answer or "").strip()
         score, breakdown = self._composite_score(answer, tool_calls, confidence)
 
+        grader_result: Optional[Dict[str, Any]] = None
+        if self._cfg.llm_scoring_enabled and answer:
+            try:
+                from app.core.grader import build_evidence, grade_answer
+                evidence = build_evidence(messages or [])
+                grader_result = await grade_answer(
+                    final_answer=answer,
+                    evidence=evidence,
+                )
+                if grader_result is not None:
+                    g_score = float(grader_result.get("score", 0.5))
+                    score = score * 0.80 + g_score * 0.20
+                    score = max(0.0, min(1.0, score))
+                    breakdown["grader_score"] = round(g_score, 3)
+                    breakdown["grader_verdict"] = grader_result.get("verdict", "unknown")
+                    breakdown["composite"] = round(score, 3)
+            except Exception as _ge:  # noqa: BLE001 — grader must never break the loop
+                logger.warning(
+                    "InvestigationSupervisor: grader skipped (%s)", _ge
+                )
+
         logger.debug(
             "InvestigationSupervisor: score=%.3f breakdown=%s retry_count=%d",
             score, breakdown, retry_count,
         )
 
-        return self._route(score, breakdown, answer, retry_count)
+        verdict = self._route(score, breakdown, answer, retry_count)
+
+        # Enrich retry guidance with the grader's reasoning when available.
+        if (
+            grader_result is not None
+            and verdict.action == SupervisorAction.RETRY
+            and grader_result.get("reasoning")
+        ):
+            verdict = SupervisorVerdict(
+                action=verdict.action,
+                score=verdict.score,
+                reason=verdict.reason,
+                retry_guidance=(
+                    verdict.retry_guidance
+                    + f"\n• Grader assessment: {grader_result['reasoning']}"
+                ),
+                score_breakdown=verdict.score_breakdown,
+            )
+
+        return verdict
 
     # ------------------------------------------------------------------
     # Scoring
@@ -255,20 +298,38 @@ class InvestigationSupervisor:
 
     @staticmethod
     def _score_tool_health(tool_calls: List[Dict[str, Any]]) -> float:
-        """Fraction of successful tool calls."""
+        """Fraction of successful tool calls.
+
+        Reads the actual per-call outcome (``ok`` / ``status``) populated by
+        ``agent_runner._serialize_agent_result`` from the tool's real output via
+        ``classify_tool_failure`` — NOT the tool name. A tool named
+        ``cloudwatch_get_error_logs`` that succeeds must not be counted as failed.
+
+        Call summaries that predate this status field (``ok``/``status`` both
+        absent) are treated as unknown/neutral per-call, matching the prior
+        no-signal behaviour rather than assuming success or failure.
+        """
         if not tool_calls:
             # No tools used — ambiguous; give a neutral score
             return 0.60
 
-        failed = sum(
-            1 for tc in tool_calls
-            if any(
-                kw in str(tc.get("tool", "")).lower()
-                for kw in ("error", "fail", "exception")
-            )
-        )
-        success_rate = 1.0 - (failed / len(tool_calls))
-        return max(0.0, success_rate)
+        scored = 0
+        successes = 0.0
+        for tc in tool_calls:
+            if "ok" in tc:
+                scored += 1
+                successes += 1.0 if tc.get("ok") else 0.0
+            elif "status" in tc:
+                scored += 1
+                successes += 0.0 if str(tc.get("status")).lower() == "error" else 1.0
+            else:
+                # No status recorded for this call — neutral contribution.
+                scored += 1
+                successes += 0.60
+
+        if scored == 0:
+            return 0.60
+        return max(0.0, min(1.0, successes / scored))
 
     @staticmethod
     def _score_certainty(answer: str) -> float:

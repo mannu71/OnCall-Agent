@@ -39,21 +39,46 @@ async def build_recall_query(
     execution_id: Optional[str],
     code_analyzer_config: Optional[Dict[str, Any]] = None,
     memory_enabled: bool = False,
+    allowed_skills: Optional[list] = None,
+    has_history: bool = False,
 ) -> Tuple[str, int, list]:
     """Return ``(augmented_query, recall_hits, selected_skills)`` with blocks prepended.
 
-    Prepends, in priority order under a per-turn token budget: (a) always-injected
-    pinned facts, (b) bank-scoped learned semantic memory (when enabled), (c) the
-    KB recall block (issues/patterns/skills), and (d) RAG-auto-selected markdown
-    skills. ``selected_skills`` is the list of auto-selected skill names (for the
-    UI badge). Every leg is best-effort — a failure never blocks the run.
+    Prepends, in priority order under a per-turn token budget: (a') a follow-up
+    directive (when ``has_history``), (a) always-injected pinned facts, (b)
+    bank-scoped learned semantic memory (when enabled), (c) the KB recall block
+    (issues/patterns/skills), and (d) RAG-auto-selected markdown skills.
+    ``selected_skills`` is the list of auto-selected skill names (for the UI
+    badge). Every leg is best-effort — a failure never blocks the run.
+
+    ``allowed_skills``: when non-empty (an agent has skills explicitly picked on
+    its node), both the DB-skill recall and the markdown auto-select are
+    restricted to that set by name. ``None``/empty = no scoping — the global
+    skill library applies (backward-compatible default).
+
+    ``has_history``: True when the chat turn carries prior conversation history
+    (``execute_agent``'s ``conversation_history`` replay is non-empty). Prepends
+    a short directive to the USER TURN (never the cached system prompt, so the
+    CACHE CONTRACT holds) telling the model to answer from the conversation
+    above rather than restarting the investigation — mirrors the corresponding
+    pre-scan skip in the CloudWatch node handlers (``is_chat_turn`` — any chat
+    turn now lets the agent route CloudWatch tool calls itself instead of a
+    keyword-gated deterministic re-scan).
     """
+    _allowed_set = set(allowed_skills) if allowed_skills else None
     from app.config import settings
     recall_hits = 0
     repos = repos_from_code_analyzer(code_analyzer_config)
     # Memory blocks in priority order: pinned (always) > learned semantic > KB.
     # Assembled under a per-turn token budget below.
     blocks: list[str] = []
+
+    if has_history:
+        blocks.append(
+            "[Follow-up turn — the prior conversation is in the message history "
+            "above. Answer from it when possible; only call tools for genuinely "
+            "NEW information the user is now asking for.]"
+        )
 
     # ── (a) Pinned facts — always injected, NOT similarity-gated ─────────────
     try:
@@ -107,7 +132,7 @@ async def build_recall_query(
                     if _p.get("id") not in seen:
                         _patterns.append(_p)
                         seen.add(_p.get("id"))
-        _skills = await _kb.recall_skills_for_agent(user_query, limit=3)
+        _skills = await _kb.recall_skills_for_agent(user_query, limit=3, allowed=_allowed_set)
         recall_hits += len(_issues) + len(_patterns) + len(_skills)
         recall_block = build_recall_context(_issues, _patterns, _skills)
         if recall_block:
@@ -125,7 +150,9 @@ async def build_recall_query(
         if getattr(settings, "skill_rag_selection_enabled", True):
             from app.core.skills import get_default_skill_manager
             _mgr = get_default_skill_manager()
-            _hits = _mgr.select_for_query(user_query, k=getattr(settings, "skill_rag_k", 2))
+            _hits = _mgr.select_for_query(
+                user_query, k=getattr(settings, "skill_rag_k", 2), allowed=_allowed_set,
+            )
             if _hits:
                 selected_skills = [s.name for s in _hits]
                 lines = ["## Suggested skills (auto-selected for this query)"]

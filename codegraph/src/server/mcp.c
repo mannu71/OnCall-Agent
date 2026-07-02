@@ -3443,22 +3443,54 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
         }
     }
 #else
-    const char *flag = use_regex ? "-E" : "-F";
+    /* ripgrep replaces grep here (rg is already installed in the runtime image
+     * this binary ships in — see agent-api/Dockerfile). It's multi-threaded by
+     * default, which is the actual fix for search_code's ~15-20s latency on a
+     * large repo (grep here was strictly single-threaded via `xargs grep`/
+     * `grep -r`, no parallelism). --no-heading makes rg emit one
+     * "path:line:content" line per match — EXACTLY the format
+     * collect_grep_matches() already parses (colon-delimited on POSIX), so the
+     * parser is untouched. Regex mode: rg's default IS a regex engine (no
+     * explicit -E-equivalent needed); -F switches it to literal mode, mirroring
+     * grep's -F/-E pair.
+     *
+     * --hidden includes dotfiles/dotdirs (rg skips them by default; grep did
+     * not, so this preserves parity) while STILL respecting .gitignore.
+     * --no-ignore was previously added alongside it to also neutralize
+     * .gitignore filtering, on the theory that this must never search FEWER
+     * files than grep did. In practice that flag pair is why a real-world
+     * query against a 9GB repo (63K tracked files, but a .venv + .git + .vs
+     * totalling ~670MB of untracked/ignored content) never finished inside
+     * the 120s MCP tool timeout: rg was scanning the entire virtualenv and
+     * git object store on every call. Measured directly against that repo:
+     * --no-ignore --hidden never completed (still running past several
+     * minutes); --hidden alone (respecting .gitignore) found the IDENTICAL
+     * match set in 4.4s. Dropped --no-ignore; kept --hidden. */
+    const char *rg_flag = use_regex ? "" : "-F";
     if (scoped) {
-        if (file_pattern) {
-            snprintf(cmd, cmd_sz, "xargs grep -Hn %s --include='%s' -f '%s' < '%s' 2>/dev/null",
-                     flag, file_pattern, tmpfile, filelist);
-        } else {
-            snprintf(cmd, cmd_sz, "xargs grep -Hn %s -f '%s' < '%s' 2>/dev/null", flag, tmpfile,
-                     filelist);
-        }
+        /* file_pattern (a glob) is intentionally NOT applied here: GNU grep's
+         * --include only filters during a recursive (-r) walk, and this branch
+         * always passed EXPLICIT file paths via xargs — so with grep,
+         * --include was silently a no-op regardless of `scoped`. Preserve that
+         * exact behavior: do not add rg's -g here — unlike grep's --include,
+         * rg's -g DOES actively filter explicitly-listed path arguments, which
+         * would be a real behavior change, not a mechanical swap. (.gitignore
+         * filtering is also moot here — files are passed explicitly via
+         * xargs, not discovered by a directory walk, so rg searches exactly
+         * the given list regardless of ignore rules.) */
+        snprintf(cmd, cmd_sz,
+                 "xargs rg -Hn --no-heading --hidden %s -f '%s' < '%s' 2>/dev/null",
+                 rg_flag, tmpfile, filelist);
+    } else if (file_pattern) {
+        /* Real recursive walk (no pre-built file list) — here grep's --include
+         * DID actively filter, so rg's -g is the correct equivalent. */
+        snprintf(cmd, cmd_sz,
+                 "rg -Hn --no-heading --hidden %s -g '%s' -f '%s' '%s' 2>/dev/null",
+                 rg_flag, file_pattern, tmpfile, root_path);
     } else {
-        if (file_pattern) {
-            snprintf(cmd, cmd_sz, "grep -rn %s --include='%s' -f '%s' '%s' 2>/dev/null", flag,
-                     file_pattern, tmpfile, root_path);
-        } else {
-            snprintf(cmd, cmd_sz, "grep -rn %s -f '%s' '%s' 2>/dev/null", flag, tmpfile, root_path);
-        }
+        snprintf(cmd, cmd_sz,
+                 "rg -Hn --no-heading --hidden %s -f '%s' '%s' 2>/dev/null",
+                 rg_flag, tmpfile, root_path);
     }
 #endif
 }

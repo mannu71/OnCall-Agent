@@ -101,6 +101,11 @@ async def _persist_assistant_turn(session_id: str, result_dict: Dict[str, Any]) 
         "input_tokens": result_dict.get("input_tokens", 0) or 0,
         "output_tokens": result_dict.get("output_tokens", 0) or 0,
         "total_tokens": result_dict.get("total_tokens", 0) or 0,
+        "cache_read_tokens": result_dict.get("cache_read_tokens", 0) or 0,
+        "cache_creation_tokens": result_dict.get("cache_creation_tokens", 0) or 0,
+        "context_window_size": result_dict.get("context_window_size", 0) or 0,
+        "context_used_tokens": result_dict.get("context_used_tokens", 0) or 0,
+        "context_used_pct": result_dict.get("context_used_pct", 0) or 0,
     }
     redactions = _extract_node_field(result_dict, "privacy_redactions")
     if redactions:
@@ -271,6 +276,12 @@ def _sync_scheduler_to_workflow(scheduler_node: Dict[str, Any], workflow_dict: D
         recurrence = node_data.get('recurrence')
 
     if not cron_expression:
+        workflow_dict['schedule'] = None
+        return
+
+    if not enabled:
+        workflow_dict['schedule'] = None
+        workflow_dict['enabled'] = False
         return
 
     workflow_dict['schedule'] = cron_expression
@@ -790,7 +801,6 @@ async def execute_workflow(
     input: Optional[str] = None,
     output_mode: Optional[str] = None,
     permission_mode: Optional[str] = None,
-    harness: Optional[str] = None,
     session_id: Optional[str] = None,
     inputs: Optional[Dict[str, Any]] = Body(None),
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
@@ -817,11 +827,12 @@ async def execute_workflow(
     if permission_mode:
         # Tool gatekeeping: default | auto_allow | plan.
         inputs = {**(inputs or {}), "permission_mode": permission_mode}
-    if harness:
-        # Per-turn agent runtime override: legacy | deepagents (accepts the
-        # 'deepagent' UI spelling too). Stamped into the agent node config in the
-        # strategy so all harness readers agree.
-        inputs = {**(inputs or {}), "harness": harness}
+    if session_id:
+        # Marks this execution as chat-triggered (Dashboard "Recent runs"
+        # excludes these by default — see build_result/persist_execution).
+        # Prefixed to avoid colliding with a real workflow input also named
+        # "session_id".
+        inputs = {**(inputs or {}), "_chat_session_id": session_id}
 
     workflow = await workflow_repo.get_by_name(workflow_name)
     if not workflow:
@@ -863,12 +874,40 @@ async def execute_workflow(
             "message": f"Workflow '{workflow_name}' execution started in background"
         }
 
-    result = await run_workflow(workflow, inputs=inputs, manual=True)
+    # Run as a registered, genuinely-cancellable task (not a bare await): the
+    # foreground path used to just `await run_workflow(...)` directly, which
+    # gave "Stop" nothing to cancel — cancel_execution could only mark the DB
+    # row cancelled while this coroutine kept running orphaned, so the
+    # workflow stayed "running" and the next message was rejected with
+    # already_running. visual_workflow_executor.execute_workflow registers
+    # this exact task (via asyncio.current_task()) against the execution_id
+    # the instant it's minted, so cancel_execution's task.cancel() now reaches
+    # here for real.
+    fg_task = asyncio.create_task(run_workflow(workflow, inputs=inputs, manual=True))
+    try:
+        result = await fg_task
+    except asyncio.CancelledError:
+        logger.info(
+            "Workflow '%s' execution cancelled (Stop / operator cancel)", workflow_name,
+        )
+        return {
+            "status": "cancelled",
+            "workflow_name": workflow_name,
+            "message": f"Workflow '{workflow_name}' was cancelled",
+        }
     result_dict = result if isinstance(result, dict) else result.model_dump(mode="json")
 
     # Persist the assistant turn (final answer + token/privacy/skill metadata).
     if session_id:
         await _persist_assistant_turn(session_id, result_dict)
+        # Best-effort: collapse older turns into a summary once the session's
+        # replay grows past budget, so a long conversation doesn't keep
+        # resending every prior full report every turn.
+        try:
+            from app.core.memory.compaction_manager import compact_chat_session_if_needed
+            await compact_chat_session_if_needed(session_id)
+        except Exception as _cc_exc:  # noqa: BLE001 — never fail a run over compaction
+            logger.warning("chat session compaction skipped (%s)", _cc_exc)
 
     return result_dict
 

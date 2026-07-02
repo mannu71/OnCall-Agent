@@ -111,8 +111,10 @@ def compact_input_state(input_state: Dict[str, Any]) -> Dict[str, Any]:
     - Replace ToolMessage entries in the middle with a single HumanMessage
       summary notice so the model understands context was dropped.
 
-    This is called only after a context-overflow error — it is a recovery path,
-    not a routine pre-call step.
+    Two call sites: (1) a context-overflow recovery path (agent_runner.py), and
+    (2) the cheap "microcompact" tier tried before an LLM-summary compaction
+    (ContextCompactionManager.compact_if_needed) — in both cases the shape
+    (dict with a "messages" key) and behavior are identical.
     """
     from langchain_core.messages import HumanMessage, ToolMessage
 

@@ -176,6 +176,14 @@ export const NODE_TYPES = {
   },
 
   // ── Agents ───────────────────────────────────────────────────
+  subagents: {
+    category: 'Agents', label: 'Subagents', icon: 'workflow',
+    desc: 'Define named subagents · wire to Agent',
+    slots: [
+      { kind: 'subagents-editor', id: 'subagents', label: 'Subagent Definitions' },
+      { kind: 'port-out', id: 'specialists', label: 'Subagents', portType: 'data' },
+    ],
+  },
   agent: {
     category: 'Agents', label: 'Agent', icon: 'workflow',
     desc: 'ReAct loop over tools + memory',
@@ -183,12 +191,15 @@ export const NODE_TYPES = {
     slots: [
       { kind: 'port-in',  id: 'trigger',  label: 'Trigger',        portType: 'trigger', optional: true },
       { kind: 'port-in',  id: 'lm',       label: 'Language Model', portType: 'model'   },
-      { kind: 'port-in',  id: 'subagent', label: 'Subagent model', portType: 'model', optional: true },
       { kind: 'port-in',  id: 'memory',   label: 'Memory',         portType: 'memory', optional: true },
       { kind: 'port-in',  id: 'tools',    label: 'Tools',          portType: 'tool',   multi: true },
       { kind: 'port-in',  id: 'input',    label: 'Input',          portType: 'message', optional: true },
+      { kind: 'port-in',  id: 'specialists', label: 'Subagents', portType: 'data', optional: true },
+      { kind: 'field',    id: 'profile',  label: 'Profile (optional)', mono: true,
+        placeholder: 'e.g. incident-rca-multiagent' },
       { kind: 'textarea', id: 'system',   label: 'Agent instructions' },
       { kind: 'field',    id: 'maxIter',  label: 'Max iterations', suffix: 'steps' },
+      { kind: 'skills-picker', id: 'skills', label: 'Skills' },
       { kind: 'toggle',   id: 'autoLearn',   label: 'Auto-learn' },
       { kind: 'toggle',   id: 'sandbox',     label: 'Sandbox shell' },
       { kind: 'toggle',   id: 'supervisor_enabled', label: 'Supervisor (human review)' },
@@ -232,7 +243,8 @@ export const NODE_DEFAULTS = {
   schedule:    { frequency: 'Every 15 min', time: '09:00', days: 'Mon,Tue,Wed,Thu,Fri', tz: 'UTC' },
   vector_memory: { collection: '', topK: '5' },
   cloudwatch_tool: { region: 'us-east-1', profile: '', groups: '', analysis: 'error-patterns', analysis_depth: 'auto', tool_mode: 'auto', range: '15m', threshold: '10', alerts: 'false' },
-  agent:       { system: '', maxIter: '10', harness: '', autoLearn: 'false', sandbox: 'false', supervisor_enabled: 'true' },
+  subagents:   { subagents: '[]' },
+  agent:       { system: '', maxIter: '10', skills: '', autoLearn: 'false', sandbox: 'false', supervisor_enabled: 'true' },
   if:          { condition: '' },
   wiki:        { format: 'Summary', platform: 'Azure DevOps Wiki', wikiUrl: '', pagePath: '', project: '', pat: '', tokenVar: 'ADO_WIKI_PAT' },
   orchestrator: { sqlFile: '' },

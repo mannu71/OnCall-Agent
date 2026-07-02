@@ -112,7 +112,14 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
         }
 
     pre_summary_results: Dict[str, Any] = {}
-    if pre_summary and all_indexed:
+    # Skip the deterministic pre-summary search for an interactive chat turn —
+    # the agent already has live code-search/codegraph tools bound and can
+    # search on demand exactly when the query needs it (same reasoning as the
+    # CloudWatch pre-scan gate; see is_chat_turn's docstring in cloudwatch.py).
+    # A scheduled/manual run (no chat session) still gets it, since there's no
+    # agent follow-up loop there to fall back on.
+    from app.workflow.executor.handlers.cloudwatch import is_chat_turn
+    if pre_summary and all_indexed and not is_chat_turn(context):
         inputs = context.get('inputs', {})
         search_query = (
             inputs.get('service_name')
@@ -177,39 +184,39 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
 
     if backend == "codegraph":
         # codegraph projects are PRE-INDEXED on workflow save (background, fast
-        # mode). The project name is derived from the absolute path by stripping
-        # the leading slash and replacing remaining slashes with dashes — e.g.
-        # /app/data/indexed_repos/compliance-api → app-data-indexed_repos-compliance-api.
-        # Steer the agent to query the existing graph directly.
-        def _cg_project_name(short_name: str) -> str:
-            abs_path = os.path.join(repos_base_path, short_name)
-            return abs_path.lstrip('/').replace('/', '-')
+        # mode). Internally the engine keys each project by its full indexed path
+        # with '/' -> '-' (deliberate — avoids basename collisions across repos at
+        # different paths; see cg_project_name's docstring). The agent should
+        # never see that internal name: it always passes the SHORT repo name, and
+        # every codegraph tool call rewrites it to the canonical name before
+        # hitting the MCP server (app.workflow.mcp.mcp_langchain_adapter
+        # MCPToolWrapper.project_aliases, wired in
+        # app.workflow.tools.codegraph_tools.build_codegraph_tools).
+        from app.workflow.tools.codegraph_tools import cg_project_name
 
-        codegraph_project_names = {
-            name: _cg_project_name(name)
-            for name in all_indexed
-        }
         result['codegraph_repo_paths'] = {
-            cg_name: os.path.join(repos_base_path, short_name)
-            for short_name, cg_name in codegraph_project_names.items()
+            short_name: os.path.join(repos_base_path, short_name)
+            for short_name in all_indexed
         }
-        _names = ", ".join(codegraph_project_names.values())
+        result['codegraph_project_aliases'] = {
+            short_name: cg_project_name(short_name)
+            for short_name in all_indexed
+        }
+        _names = ", ".join(f'"{n}"' for n in all_indexed)
+        _example_name = all_indexed[0] if all_indexed else "<repo name>"
         result['output'] = (
-            f'Repos pre-indexed in codegraph (exact project names: {_names}). '
-            f'ALWAYS pass the exact project name above — codegraph will reject '
-            f'short names like "compliance-api" (use the full name, e.g. '
-            f'"app-data-indexed_repos-compliance-api"). '
+            f'Repos pre-indexed in codegraph (project names: {_names}). '
             f'Query the GRAPH tools first — they are sub-second and ~500 tokens '
             f'each: prefer search_graph / find_symbol / query_graph / '
             f'search_semantic / trace_path / get_code_snippet, always with '
-            f'project="<exact project name>". '
+            f'project="<repo name>" (e.g. project="{_example_name}"). '
             f'AVOID search_code for discovery — it greps source files and is far '
             f'slower and more token-heavy (~80K). Use search_code ONLY as a '
             f'last-resort literal-text fallback, and always scope it with '
             f'path_filter (e.g. path_filter="src/") or file_pattern. '
             f'Do NOT re-index; only if a tool reports the project is missing, '
             f'call index_repository once with '
-            f'repo_path="{repos_base_path}/<short-name>" and mode="fast".'
+            f'repo_path="{repos_base_path}/<repo name>" and mode="fast".'
         )
 
     return result

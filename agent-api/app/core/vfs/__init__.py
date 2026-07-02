@@ -1,8 +1,8 @@
 """Virtual filesystem — session-scoped scratch space for context offload.
 
-A deep-agent capability (deepagents / Claude harness "tool output offloading"):
-instead of letting a large tool result bloat every subsequent LLM turn, the agent
-can write it to a virtual file and later read back just the part it needs. The
+Context-offload scratch space: instead of letting a large tool result bloat every
+subsequent LLM turn, the agent can write it to a virtual file and later read back
+just the part it needs. The
 backend is pluggable; the default is a per-session in-memory store with the same
 lifecycle as the privacy vault (bound at run start, dropped at run end) so nothing
 persists beyond the run.

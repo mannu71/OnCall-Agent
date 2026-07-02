@@ -257,10 +257,12 @@ foreach ($dir in $dataDirs) {
 }
 Write-Ok "Ensured agent-api/data directories exist"
 
+$RootComposeFile = Join-Path $Root "docker-compose.yml"
+
 if (-not $SkipDocker) {
     Write-Step "Starting PostgreSQL (Docker)"
     $compose = Get-DockerComposeCommand
-    Invoke-External -ExeAndArgs ($compose + @("-f", (Join-Path $AgentApi "docker-compose.yml"), "up", "-d", "postgres")) -WorkingDirectory $AgentApi
+    Invoke-External -ExeAndArgs ($compose + @("-f", $RootComposeFile, "up", "-d", "postgres")) -WorkingDirectory $Root
     Wait-PostgresHealthy -ComposeCommand $compose
 }
 
@@ -284,6 +286,12 @@ if (-not $SkipMigrations) {
     }
 }
 
+if (-not $SkipDocker) {
+    Write-Step "Building and starting the full Docker stack (agent-api, headroom, ui)"
+    Invoke-External -ExeAndArgs ($compose + @("-f", $RootComposeFile, "up", "--build", "-d")) -WorkingDirectory $Root
+    Write-Ok "Full stack is running"
+}
+
 if (-not $SkipDeps) {
     Write-Step "Installing Python dependencies"
     if (-not (Test-Path $VenvDir)) {
@@ -303,19 +311,39 @@ if (-not $SkipDeps) {
 Write-Host ""
 Write-Host "Setup complete." -ForegroundColor Green
 Write-Host ""
-Write-Host "Next steps:"
-Write-Host "  Option A — Full Docker stack (from repo root):"
-Write-Host "       docker compose up --build -d"
-Write-Host "       Open http://localhost:3000"
-Write-Host "  Option B — Local dev (backend + Vite UI):"
-Write-Host "  1. Edit agent-api/.env if you need AWS profile or provider settings"
-Write-Host "  2. Start the backend:"
-Write-Host "       cd agent-api"
-Write-Host "       .\venv\Scripts\activate"
-Write-Host "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
-Write-Host "  3. Start the UI (new terminal):"
-Write-Host "       cd ui"
-Write-Host "       npm run dev"
-Write-Host ""
-Write-Host "API health check: http://localhost:8000/api/v1/health"
+
+if (-not $SkipDocker) {
+    Write-Host "Next steps:"
+    Write-Host "  The full Docker stack is up and running:"
+    Write-Host "       UI:            http://localhost:3000"
+    Write-Host "       API health:    http://localhost:8000/api/v1/health"
+    Write-Host ""
+    Write-Host "  Prefer local dev instead (backend + Vite UI, with hot reload)?"
+    Write-Host "  1. Stop the containerized agent-api/ui: docker compose stop agent-api ui"
+    Write-Host "  2. Edit agent-api/.env if you need AWS profile or provider settings"
+    Write-Host "  3. Start the backend:"
+    Write-Host "       cd agent-api"
+    Write-Host "       .\venv\Scripts\activate"
+    Write-Host "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
+    Write-Host "  4. Start the UI (new terminal):"
+    Write-Host "       cd ui"
+    Write-Host "       npm run dev"
+}
+else {
+    Write-Host "Next steps (Docker was skipped):"
+    Write-Host "  Option A - Full Docker stack (from repo root):"
+    Write-Host "       docker compose up --build -d"
+    Write-Host "       Open http://localhost:3000"
+    Write-Host "  Option B - Local dev (backend + Vite UI):"
+    Write-Host "  1. Edit agent-api/.env if you need AWS profile or provider settings"
+    Write-Host "  2. Start the backend:"
+    Write-Host "       cd agent-api"
+    Write-Host "       .\venv\Scripts\activate"
+    Write-Host "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
+    Write-Host "  3. Start the UI (new terminal):"
+    Write-Host "       cd ui"
+    Write-Host "       npm run dev"
+    Write-Host ""
+    Write-Host "API health check: http://localhost:8000/api/v1/health"
+}
 Write-Host ""

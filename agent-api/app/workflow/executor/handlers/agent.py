@@ -191,10 +191,17 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
             'input_tokens':  result.get('input_tokens',  0) or 0,
             'output_tokens': result.get('output_tokens', 0) or 0,
             'total_tokens':  result.get('total_tokens',  0) or 0,
-            # cache_read is the slice of input_tokens served from the prompt
-            # cache (~10% price). Carry it through so the UI can show real
-            # savings instead of a number inflated by cache reuse.
+            # cache_read / cache_creation are ADDITIONAL to input_tokens, not a
+            # subset of it (Bedrock/Anthropic report them as separate counters).
+            # cache_read bills at ~10% of fresh input; cache_creation at a
+            # premium for the write. Carried through so the UI can show real
+            # cache savings instead of misreading input_tokens as inclusive.
             'cache_read_tokens': result.get('cache_read_tokens', 0) or 0,
+            'cache_creation_tokens': result.get('cache_creation_tokens', 0) or 0,
+            # Context-window fullness for this turn (Chat UI context bar).
+            'context_window_size': result.get('context_window_size', 0) or 0,
+            'context_used_tokens': result.get('context_used_tokens', 0) or 0,
+            'context_used_pct': result.get('context_used_pct', 0) or 0,
         }
 
     except Exception as e:

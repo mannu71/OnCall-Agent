@@ -134,6 +134,11 @@ class MCPClientManager:
         self.tool_objects: Dict[str, Dict[str, Any]] = {}  # server_id -> {tool_name -> MCP Tool obj}
         self._exit_stacks: Dict[str, AsyncExitStack] = {}  # server_id -> exit stack
         self.last_errors: Dict[str, str] = {}  # server_id -> last connection failure reason
+        # server_id -> last config used to connect. Survives a _forget_connection()
+        # (unlike self.connections, which is cleared) so a later call can lazily
+        # reconnect with the same command/args/env — mirrors the reference client's
+        # memoize-and-invalidate model (connectToServer cache + ensureConnectedClient).
+        self._server_configs: Dict[str, Dict[str, Any]] = {}
         # server_id -> list of fnmatch patterns restricting which discovered tools
         # are exposed to the agent. Empty/missing = expose all. Lets a node pick a
         # handful of tools (e.g. wit_*) from a server that advertises dozens, so
@@ -232,11 +237,12 @@ class MCPClientManager:
             
             command = config.get('command')
             args = config.get('args', [])
-            custom_env = config.get('env', {}).copy()
-            
+            raw_env = config.get('env', {}) or {}
+            custom_env = {k: v if isinstance(v, str) else str(v) for k, v in raw_env.items()}
+
             _transform_cert_path(custom_env)
             _auto_detect_certificate(custom_env, args)
-            
+
             env = {**os.environ, **custom_env} if custom_env else None
             
             if not command:
@@ -318,6 +324,7 @@ class MCPClientManager:
                 'read': read,
                 'write': write,
             }
+            self._server_configs[server_id] = config
             self.tools[server_id] = tool_names
             # Store full tool objects for schema/description access by LangChain adapter
             self.tool_objects[server_id] = {tool.name: tool for tool in tools_result.tools}
@@ -365,8 +372,13 @@ class MCPClientManager:
             Tool execution result dict with ``success``, ``content``,
             ``isError`` keys.
         """
-        if server_id not in self.connections:
-            raise ValueError(f"Not connected to server: {server_id}")
+        # Lazy reconnect (mirrors the reference client's ensureConnectedClient):
+        # a prior call may have _forget_connection()'d a dead session (see the
+        # BrokenPipe branch below). Reconnecting HERE — in the task that is
+        # about to make the call — keeps the exit stack's anyio cancel scope
+        # owned by a task that isn't a throwaway subtask. Raises only if we
+        # have never connected to this server at all (no remembered config).
+        await self._ensure_connected(server_id)
 
         # SSRF guard: reject any URL-shaped argument that targets a private range.
         # This is a cooperative defence layer — the real boundary is OS isolation.
@@ -399,22 +411,27 @@ class MCPClientManager:
                 try:
                     return await _call_tool()
                 except asyncio.TimeoutError:
-                    # asyncio.wait_for cancels the in-flight coroutine when it times out,
-                    # leaving the MCP session's internal state machine waiting for a
-                    # response we've abandoned. The next call_tool would get a mismatched
-                    # response frame. Reconnect to get a fresh session before re-raising
-                    # so with_retry's next attempt starts from a clean state.
+                    # asyncio.wait_for cancels the in-flight session.call_tool()
+                    # coroutine, but this does NOT corrupt the session: the mcp
+                    # SDK's ClientSession runs its _receive_loop as an INDEPENDENT
+                    # background task (owned by the session's own task group, not
+                    # by whichever task called us) and dispatches every response
+                    # strictly by request_id via self._response_streams. Cancelling
+                    # our local await on that one response stream just abandons it
+                    # — the receive loop, and every other in-flight/future request
+                    # on this session, is unaffected. So on a plain timeout we do
+                    # NOT reconnect: the session stays valid, and reconnecting would
+                    # only add a slow, unnecessary connect round-trip (previously
+                    # this branch forced a reconnect, and reconnecting via
+                    # disconnect_server's cross-task aclose() is exactly what broke
+                    # runs — see the BrokenPipe branch below for why THAT case still
+                    # must forget-not-close).
                     logger.warning(
-                        "MCP server '%s' tool '%s' timed out — reconnecting to reset session state",
-                        server_id, tool_name,
+                        "MCP server '%s' tool '%s' timed out after %.1fs — "
+                        "session remains valid (independent receive loop, "
+                        "ID-demuxed responses); not reconnecting",
+                        server_id, tool_name, timeout_secs or 0,
                     )
-                    config = (self.connections.get(server_id) or {}).get('config')
-                    if config:
-                        try:
-                            await self.disconnect_server(server_id)
-                            await self.connect_server(server_id, config)
-                        except Exception:
-                            pass
                     raise
                 except (BrokenPipeError, ConnectionResetError, EOFError, OSError) as exc:
                     # The MCP server process died (common for npx servers after a long
@@ -423,9 +440,13 @@ class MCPClientManager:
                         "MCP server '%s' pipe broken (%s) — attempting reconnect",
                         server_id, exc,
                     )
-                    config = (self.connections.get(server_id) or {}).get('config')
+                    config = self._server_configs.get(server_id)
+                    # Forget WITHOUT aclose, then reconnect fresh in this task. Using
+                    # disconnect_server here would exit the dead connection's anyio
+                    # cancel scope from a foreign task and cancel the owning agent-node
+                    # task — the same cross-task hazard as the timeout path above.
+                    self._forget_connection(server_id)
                     if config:
-                        await self.disconnect_server(server_id)
                         reconnected = await self.connect_server(server_id, config)
                         if reconnected:
                             logger.info("MCP server '%s' reconnected — retrying tool call", server_id)
@@ -466,7 +487,7 @@ class MCPClientManager:
                 'success': False,
                 'error': str(e),
                 'isError': True,
-                'terminal': True,
+                'terminal': False,  # application error — return to agent for self-correction
             }
     
     @staticmethod
@@ -504,6 +525,55 @@ class MCPClientManager:
         for server_id in tuple(self._exit_stacks.keys()):
             await self.disconnect_server(server_id)
     
+    def _forget_connection(self, server_id: str) -> None:
+        """Drop all references to a connection WITHOUT closing its exit stack.
+
+        The stdio_client/ClientSession anyio cancel scope is bound to the task
+        that opened it (in ``connect_server``). Calling ``exit_stack.aclose()``
+        from any OTHER task makes anyio fire a ``CancelledError`` into the owning
+        task — and on the tool-timeout path that owner is the agent node running
+        the tool call, so the cross-task close silently kills the whole run.
+
+        This helper is the task-safe alternative: it only drops the manager's
+        references. The orphaned stdio subprocess is reaped by GC — the same
+        trade-off ``disconnect_server`` already accepts ("resources will be
+        garbage collected anyway"). The next ``execute_tool`` for this server
+        reconnects fresh. Use this (never ``disconnect_server``) from a task that
+        did not open the connection.
+        """
+        self._exit_stacks.pop(server_id, None)
+        self.connections.pop(server_id, None)
+        self.tools.pop(server_id, None)
+        self.tool_objects.pop(server_id, None)
+
+    async def _ensure_connected(self, server_id: str) -> None:
+        """Lazily (re)connect to *server_id* if it isn't currently connected.
+
+        Mirrors the reference MCP client's ``ensureConnectedClient``: called at
+        the top of every ``execute_tool``, not just once at setup. If a prior
+        call ``_forget_connection()``'d a dead session (see the BrokenPipe
+        branch in ``execute_tool``), this transparently reconnects using the
+        remembered config — in the CALLING task, so the new exit stack's anyio
+        cancel scope is owned by whichever task is actually about to use it,
+        never left dangling in a subtask that already returned.
+
+        Raises ``ValueError`` if this server has never been connected (no
+        remembered config — same contract as the old hard guard in
+        ``execute_tool``). Raises ``RuntimeError`` if a reconnect attempt fails.
+        """
+        if server_id in self.connections:
+            return
+        config = self._server_configs.get(server_id)
+        if not config:
+            raise ValueError(f"Not connected to server: {server_id}")
+        logger.info("MCP server '%s' not connected — lazily reconnecting", server_id)
+        connected = await self.connect_server(server_id, config)
+        if not connected:
+            raise RuntimeError(
+                f"MCP server '{server_id}' reconnect failed: "
+                f"{self.last_errors.get(server_id, 'unknown error')}"
+            )
+
     async def disconnect_server(self, server_id: str):
         """Disconnect from a specific MCP server."""
         if server_id not in self._exit_stacks:

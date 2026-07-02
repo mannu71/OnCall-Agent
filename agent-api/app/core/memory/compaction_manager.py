@@ -143,6 +143,7 @@ class ContextCompactionManager:
         keep_recent_tokens: int = 20_000,
         summarization_model: Optional[str] = None,
         compaction_threshold_fraction: float = 0.85,
+        microcompact_threshold_fraction: float = 0.70,
     ) -> None:
         self._transport = transport
         self._session_id = session_id
@@ -161,6 +162,13 @@ class ContextCompactionManager:
         self._compaction_threshold = int(
             (window_size - reserve_tokens) * compaction_threshold_fraction
         )
+        # Cheap deterministic tier (drop stale tool results, no LLM call) tried
+        # BEFORE the expensive LLM-summary tier — mirrors claude-code-main's
+        # microcompact vs full-compact split. Fires earlier (lower fraction)
+        # than the hard threshold so the common case never needs a summary call.
+        self._microcompact_threshold = int(
+            (window_size - reserve_tokens) * microcompact_threshold_fraction
+        )
 
     # ──────────────────────────────────────────────────────────────────
     # Public API
@@ -174,18 +182,45 @@ class ContextCompactionManager:
         self,
         messages: List[BaseMessage],
     ) -> List[BaseMessage]:
-        """Compact the message list if the token estimate exceeds the threshold.
+        """Compact the message list if the token estimate exceeds a threshold.
 
-        Returns either the original list (under threshold) or a compacted
-        list starting with a SystemMessage summary.
+        Two tiers, cheapest first:
+          1. Below the microcompact threshold (default 70%) — no-op.
+          2. Above it — try the deterministic microcompact (drop stale
+             ToolMessages, no LLM call). If that alone brings the estimate
+             back under the hard threshold (default 85%), return it — the
+             common case never pays for a summary call.
+          3. Still over the hard threshold after microcompact — fall through
+             to the existing LLM-summary ``compact()``, run over the
+             already-microcompacted (smaller) message list.
+
+        Returns either the original list (under threshold), the
+        microcompacted list, or a compacted list starting with a
+        SystemMessage summary.
         """
         total = self.estimate_tokens(messages)
-        if total <= self._compaction_threshold:
+        if total <= self._microcompact_threshold:
             logger.debug(
                 "ContextCompactionManager[%s]: no compaction needed (%d <= %d tokens)",
-                self._session_id, total, self._compaction_threshold,
+                self._session_id, total, self._microcompact_threshold,
             )
             return messages
+
+        from app.workflow.strategies.react.helpers import compact_input_state
+        micro_messages = compact_input_state({"messages": messages})["messages"]
+        micro_total = self.estimate_tokens(micro_messages) if micro_messages is not messages else total
+
+        if micro_total <= self._compaction_threshold:
+            if len(micro_messages) != len(messages):
+                logger.info(
+                    "ContextCompactionManager[%s]: microcompact sufficient "
+                    "(%d → %d tokens, %d → %d messages) — skipping LLM summary",
+                    self._session_id, total, micro_total, len(messages), len(micro_messages),
+                )
+            return micro_messages
+
+        messages = micro_messages
+        total = micro_total
 
         logger.info(
             "ContextCompactionManager[%s]: compacting %d messages (%d tokens > threshold %d)",
@@ -213,6 +248,47 @@ class ContextCompactionManager:
             getattr(new_summary, "summary_id", None),
         )
 
+        return compacted
+
+    async def force_compact(self, messages: List[BaseMessage]) -> List[BaseMessage]:
+        """Force a summary regardless of the threshold gate.
+
+        Used by the native engine's reactive-compact rung: reached only after
+        a genuine context-overflow error from the model, so waiting for
+        ``compact_if_needed``'s threshold check (which the overflowing
+        request already exceeded) would be pointless. The recent tail is
+        chosen via :func:`app.harness.engine.compression.split_preserved_tail`
+        so ``compact()``'s own tail-walk lands on the same pairing-safe
+        boundary — this call exists specifically to make the RETRY succeed,
+        and a tail that splits a tool_use/tool_result pair would make Bedrock
+        reject that retry too.
+        """
+        if not messages:
+            return messages
+
+        from app.harness.engine.compression import split_preserved_tail
+        _, safe_tail = split_preserved_tail(messages, self._keep_recent_tokens)
+        safe_keep_tokens = self.estimate_tokens(safe_tail) if safe_tail else self._keep_recent_tokens
+        safe_keep_tokens = max(1, safe_keep_tokens)
+
+        prior_summary = await self._load_summary()
+        compacted, new_summary = await compact(
+            messages,
+            transport=self._transport,
+            window_size=self._window_size,
+            reserve_tokens=self._reserve_tokens,
+            keep_recent_tokens=safe_keep_tokens,
+            prior_summary=prior_summary,
+            summarization_model=await self._resolve_summarization_model(),
+        )
+        await self._save_summary(new_summary)
+
+        logger.info(
+            "ContextCompactionManager[%s]: reactive compaction complete. "
+            "Before=%d msgs, after=%d msgs. summary_id=%s",
+            self._session_id, len(messages), len(compacted),
+            getattr(new_summary, "summary_id", None),
+        )
         return compacted
 
     async def _resolve_summarization_model(self) -> str:
@@ -271,3 +347,84 @@ class ContextCompactionManager:
         """
         _summary_store[self._session_id] = summary
         await _db_save_summary(self._session_id, summary)
+
+
+# ---------------------------------------------------------------------------
+# Per-chat-session compaction (distinct from per-execution compaction above).
+# ---------------------------------------------------------------------------
+#
+# Chat.jsx replays a session's last ~12 messages every turn (see the `history`
+# builder), and each can carry a full multi-KB investigation report. Without
+# this, a long conversation keeps resending every prior report in full. This
+# reuses the exact same ContextCompactionManager (two-tier compaction,
+# DB-configured summarization model, Postgres-persisted StructuredSummary) —
+# just keyed by the chat session's stable id instead of a per-turn execution
+# id, and with a much smaller budget appropriate for chat replay rather than
+# the model's full context window.
+
+def _chat_dicts_to_messages(rows: list) -> list:
+    """Convert chat_messages rows ({role, content, ...}) to LangChain messages."""
+    from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+
+    role_map = {"user": HumanMessage, "assistant": AIMessage, "system": SystemMessage}
+    out = []
+    for row in rows:
+        cls = role_map.get(row.get("role"))
+        if cls and row.get("content"):
+            out.append(cls(content=row["content"]))
+    return out
+
+
+async def compact_chat_session_if_needed(session_id: str) -> Optional[Dict[str, Any]]:
+    """Collapse a chat session's older messages into one summary if it has
+    grown past ``settings.chat_session_compaction_tokens``.
+
+    Best-effort — a failure here must never break the chat turn that just
+    completed; it only degrades to "no compaction this turn". Returns the
+    ``replace_with_summary`` result dict, or ``None`` when no compaction was
+    needed/possible.
+    """
+    try:
+        from app.config import settings
+        from app.core.transport import get_transport
+        from app.infrastructure.persistence import session_repository
+        from langchain_core.messages import SystemMessage
+
+        rows = await session_repository.get_messages(session_id)
+        if len(rows) < 4:  # too short to be worth summarizing
+            return None
+
+        messages = _chat_dicts_to_messages(rows)
+        mgr = ContextCompactionManager(
+            transport=get_transport(),
+            session_id=f"chat:{session_id}",
+            window_size=settings.chat_session_compaction_tokens,
+            reserve_tokens=0,
+            keep_recent_tokens=settings.chat_session_keep_recent_tokens,
+        )
+        result = await mgr.compact_if_needed(messages)
+
+        # compact_if_needed only prepends a SystemMessage summary when the
+        # (expensive) LLM-summary tier actually ran — the no-op and
+        # microcompact-only paths return without one. Chat messages are never
+        # ToolMessages, so microcompact never has anything to prune here; only
+        # the summary tier can shrink a chat session's replay.
+        if not result or not isinstance(result[0], SystemMessage):
+            return None
+
+        summary_text = result[0].content
+        keep_recent = len(result) - 1
+        outcome = await session_repository.replace_with_summary(
+            session_id, summary=summary_text, keep_recent=keep_recent,
+        )
+        if outcome:
+            logger.info(
+                "compact_chat_session_if_needed[%s]: collapsed %d messages, kept %d recent",
+                session_id, outcome.get("compacted", 0), keep_recent,
+            )
+        return outcome
+    except Exception as exc:  # noqa: BLE001 — best-effort, never break a chat turn
+        logger.warning(
+            "compact_chat_session_if_needed[%s]: skipped (%s)", session_id, exc,
+        )
+        return None

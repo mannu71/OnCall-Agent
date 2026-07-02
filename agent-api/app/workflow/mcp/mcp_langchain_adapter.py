@@ -184,6 +184,13 @@ class MCPToolWrapper(BaseTool):
     # operator's deliberate allowlist. The relevance router must NOT prune these
     # (the user already chose them); see app.harness.tool_router.filter_tools.
     router_pinned: bool = False
+    # Optional clean→canonical rewrite applied to the `project` arg before the
+    # MCP call (e.g. codegraph's "compliance-api" → "app-data-indexed_repos-
+    # compliance-api" — see app.workflow.tools.codegraph_tools.cg_project_name).
+    # Keeps internal naming schemes out of the agent's prompt/tool-call surface.
+    # Idempotent: a value already in canonical form (not a key in the map) is
+    # left unchanged.
+    project_aliases: Optional[Dict[str, str]] = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -211,6 +218,11 @@ class MCPToolWrapper(BaseTool):
         # validation reject explicit null for optional params that they'd accept
         # as absent. The ADO MCP server is a known case (project, fields, etc.).
         clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+        if self.project_aliases and "project" in clean_kwargs:
+            _p = clean_kwargs["project"]
+            clean_kwargs["project"] = self.project_aliases.get(_p, _p)
+
         result = await self.mcp_manager.execute_tool(
             server_id=self.server_id,
             tool_name=self.tool_name,

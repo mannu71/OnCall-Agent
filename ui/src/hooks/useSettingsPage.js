@@ -21,7 +21,7 @@ import { usePersistedState, useSettingsToast } from './usePersistedState';
 import { useMcpConfigQuery } from './queries/useConfigQueries';
 import { useLlmConfigQuery, useCertificatesQuery } from './queries/useConfigQueries';
 import { useModelKeysQuery } from './queries/useModelKeysQuery';
-import { useSettingsQuery, useStatusQuery } from './queries/useSettingsQuery';
+import { useSettingsQuery } from './queries/useSettingsQuery';
 import { queryKeys } from '../lib/queryKeys';
 import {
     discoverBedrockModels,
@@ -38,7 +38,6 @@ import {
     EMPTY_BEDROCK_CREDS,
     EMPTY_LLM_FORM,
     EMPTY_MCP_FORM,
-    LS_CONFIRM_DESTRUCTIVE,
     LS_TIMEZONE,
     LS_WORKSPACE,
     TIMEZONE_LABELS,
@@ -60,18 +59,12 @@ export function useSettingsPage() {
 
     const [workspaceName, setWorkspaceName] = usePersistedState(LS_WORKSPACE, DEFAULT_WORKSPACE);
     const [timezone, setTimezone] = usePersistedState(LS_TIMEZONE, DEFAULT_TIMEZONE);
-    const [confirmDestructive, setConfirmDestructive] = usePersistedState(LS_CONFIRM_DESTRUCTIVE, true);
-    const [agentTimeout, setAgentTimeout] = useState('180');
-
     const queryClient = useQueryClient();
     const { data: settingsData } = useSettingsQuery();
-    const { data: statusData } = useStatusQuery();
     const { data: mcpData } = useMcpConfigQuery();
     const { data: llmData } = useLlmConfigQuery();
     const { data: certData } = useCertificatesQuery();
     const { data: keysData } = useModelKeysQuery();
-
-    const systemStatus = statusData ?? null;
 
     // Sync timezone from settings query (single source — no duplicate getAppSettings)
     useEffect(() => {
@@ -79,12 +72,6 @@ export function useSettingsPage() {
             setTimezone(settingsData.global_timezone);
         }
     }, [settingsData?.global_timezone, setTimezone]);
-
-    useEffect(() => {
-        if (settingsData?.agent_timeout_seconds != null) {
-            setAgentTimeout(String(settingsData.agent_timeout_seconds));
-        }
-    }, [settingsData?.agent_timeout_seconds]);
 
     // Persist timezone changes to the backend (and keep the localStorage cache).
     const handleTimezoneChange = useCallback((tz) => {
@@ -145,10 +132,6 @@ export function useSettingsPage() {
 
     const serverCount = Object.keys(servers).length;
     const llmCount = Object.keys(llms).length;
-    const connectedLlms = useMemo(
-        () => Object.values(llmConnectionStatus).filter((s) => s?.status === 'connected').length,
-        [llmConnectionStatus],
-    );
 
     const sections = useMemo(
         () => buildSections({ serverCount, llmCount, certCount: certificates.length }),
@@ -161,8 +144,8 @@ export function useSettingsPage() {
     );
 
     const gauges = useMemo(
-        () => buildGauges({ apiHealth, systemStatus, llmCount, connectedLlms }),
-        [apiHealth, systemStatus, llmCount, connectedLlms],
+        () => buildGauges({ apiHealth, llmCount, hasBedrockCredentials }),
+        [apiHealth, llmCount, hasBedrockCredentials],
     );
 
     const timezoneLabel = TIMEZONE_LABELS[timezone] || timezone.replace('/', ' / ');
@@ -556,10 +539,6 @@ export function useSettingsPage() {
             setWorkspaceName,
             timezone,
             setTimezone: handleTimezoneChange,
-            agentTimeout,
-            setAgentTimeout,
-            confirmDestructive,
-            setConfirmDestructive,
         },
         hero: {
             apiHealth,

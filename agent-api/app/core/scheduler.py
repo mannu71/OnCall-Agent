@@ -97,6 +97,21 @@ class WorkflowScheduler:
         except Exception as exc:  # noqa: BLE001 — curator is best-effort
             logger.warning("scheduler: curator scheduling skipped (%s)", exc)
 
+        # Loop 4 — hill-climbing: analyze traces, apply safe proposals (gated).
+        # Runs at twice the curator interval; always leader-locked. Dry-run when
+        # hillclimb_apply_enabled=False so no writes occur but the analysis runs.
+        try:
+            _hc_hours = max(1, int(getattr(settings, "curator_interval_hours", 6))) * 2
+            self.scheduler.add_job(
+                self._run_hillclimb_wrapper,
+                IntervalTrigger(hours=_hc_hours),
+                id="hillclimb_loop",
+                replace_existing=True,
+            )
+            logger.info("Scheduled hill-climbing loop every %dh", _hc_hours)
+        except Exception as exc:  # noqa: BLE001 — hill-climb is best-effort
+            logger.warning("scheduler: hill-climbing scheduling skipped (%s)", exc)
+
         logger.info("Workflow scheduler started")
 
     async def _run_curator_wrapper(self):
@@ -110,6 +125,33 @@ class WorkflowScheduler:
             logger.info("scheduler: curator run complete — %s", result)
         except Exception as exc:  # noqa: BLE001 — never let the curator sink the loop
             logger.warning("scheduler: curator run failed (%s)", exc)
+
+    async def _run_hillclimb_wrapper(self):
+        """Leader-gated Loop 4: analyze traces and apply safe proposals."""
+        if not await self._ensure_leader():
+            logger.debug("scheduler: not leader — skipping hill-climb run")
+            return
+        try:
+            from app.config import settings as _s
+            from app.core.improvement.analyzer import analyze_recent
+            from app.core.improvement.apply import apply_proposals
+
+            if not getattr(_s, "self_improvement_enabled", False):
+                logger.debug("scheduler: hill-climb skipped (self_improvement_enabled=false)")
+                return
+
+            report = await analyze_recent()
+            dry_run = not getattr(_s, "hillclimb_apply_enabled", False)
+            result = await apply_proposals(report, dry_run=dry_run)
+            logger.info(
+                "scheduler: hill-climb complete — eligible=%d applied=%d skipped=%d dry_run=%s",
+                result.get("eligible", 0),
+                result.get("applied", 0),
+                result.get("skipped", 0),
+                result.get("dry_run", True),
+            )
+        except Exception as exc:  # noqa: BLE001 — never let hill-climb sink the loop
+            logger.warning("scheduler: hill-climb run failed (%s)", exc)
 
     def stop(self):
         """Stop the scheduler."""

@@ -55,9 +55,5 @@ class AgentSpec:
     verify_command: Optional[str] = None
     verify_image: Optional[str] = None
     verify_timeout: Optional[int] = None
-    # Effective harness backend for THIS agent: 'legacy' | 'deepagents'. Resolved
-    # from node config (else the global ``settings.harness``) so a single workflow
-    # can pin a harness. None defers to the global default at build time.
-    harness: Optional[str] = None
     # Carried for completeness / future use by the loop engine.
     metadata: Dict[str, Any] = field(default_factory=dict)

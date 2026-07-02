@@ -361,3 +361,59 @@ def extract_code_analyzer_config(
     )
 
     return {"repos": merged_repos, "backend": backend}
+
+
+def extract_subagents_config(workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return specialist subagent definitions from any ``subagents`` nodes wired to the agent.
+
+    A ``subagents`` node holds ``params.subagents`` as a JSON array of
+    ``{name, system, tools}`` dicts (serialized by the UI editor).  All
+    connected nodes are merged in BFS order; duplicates by ``name`` are skipped
+    (first occurrence wins).
+    """
+    import json as _json
+
+    nodes = workflow.get("nodes", [])
+    connected_ids = set(get_connected_node_ids(workflow, "subagents"))
+
+    if not connected_ids:
+        return []
+
+    subagent_nodes = [n for n in nodes if n.get("type") == "subagents" and n.get("id") in connected_ids]
+
+    merged: List[Dict[str, Any]] = []
+    seen_names: set = set()
+
+    for node in subagent_nodes:
+        params = node.get("params") or node.get("data") or {}
+        raw = params.get("subagents", "")
+        if not raw:
+            continue
+        if isinstance(raw, list):
+            defs = raw
+        elif isinstance(raw, str):
+            try:
+                defs = _json.loads(raw)
+                if not isinstance(defs, list):
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+        else:
+            continue
+
+        for d in defs:
+            if not isinstance(d, dict) or not d.get("name"):
+                continue
+            name = d["name"].strip()
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            merged.append(d)
+
+    if merged:
+        logger.info(
+            "ReactStrategy: %d subagent specialist(s) from %d wired subagents node(s)",
+            len(merged), len(subagent_nodes),
+        )
+
+    return merged

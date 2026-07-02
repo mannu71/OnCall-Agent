@@ -262,7 +262,7 @@ function ToastStack({ messages }) {
       {messages.map(m => (
         <div key={m.id} className={`flex items-center gap-2.5 min-w-[260px] max-w-sm px-4 py-3 rounded-xl border text-sm font-medium shadow-lg ${styles[m.type] || styles.info}`}>
           {icons[m.type]}
-          <span>{m.msg}</span>
+          <span className="whitespace-pre-line">{m.msg}</span>
         </div>
       ))}
     </div>
@@ -421,7 +421,21 @@ function WorkflowPage() {
       setPendingTemplate(null);
       setShowEditor(false);
       showMessage('Workflow saved', 'success');
-    } catch (err) { showMessage(`Save failed: ${err.message}`, 'error'); }
+    } catch (err) {
+      const d = err?.response?.data;
+      // Middleware wraps HTTPException as { error, message: { message, errors[] } }
+      // FastAPI default is { detail: string | object }
+      const inner = d?.message ?? d?.detail;
+      let msg;
+      if (inner && typeof inner === 'object' && inner.errors?.length) {
+        msg = inner.errors.join('\n');
+      } else if (typeof inner === 'string') {
+        msg = inner;
+      } else {
+        msg = err.message;
+      }
+      showMessage(`Save failed: ${msg}`, 'error');
+    }
   };
 
   // ── Derived stats + filtering ───────────────────────────────────────────────

@@ -13,7 +13,7 @@ import React, {
 import { getDisplayTimezone } from '../../lib/formatTime.js';
 import { getLLMs } from '../../services/llmService.js';
 import { getMCPServers } from '../../services/mcpService.js';
-import { getAppSettings } from '../../services/apiClient.js';
+import { getAppSettings, listTools } from '../../services/apiClient.js';
 import { useWorkflowStatus } from '../../context/WorkflowStatusContext.jsx';
 import { useWorkflowExecutionsQuery } from '../../hooks/queries/useExecutionsQuery.js';
 import { validateConnection, getValidDropTargets, slotsForNode, modelNamesOf, reconcileModelEdges, mcpServerNamesOf, reconcileMcpEdges, workflowWarnings } from './portValidation.js';
@@ -209,6 +209,8 @@ function rowHeight(slot) {
   if (slot.kind === 'toggle')                                  return TOGGLE_H;
   if (slot.kind === 'segment')                                 return SEGMENT_H;
   if (slot.kind === 'chips')                                   return CHIPS_H;
+  if (slot.kind === 'subagents-editor')                        return CHIPS_H;
+  if (slot.kind === 'skills-picker')                           return CHIPS_H;
   return ROW_H;
 }
 function rowOffset(slots, idx) {
@@ -569,6 +571,42 @@ function SlotRow({ slot, value, gtz }) {
           <span style={{ fontSize: 10, color: '#94a3b8', background: '#f1f5f9', padding: '1px 5px', borderRadius: 4, fontWeight: 700 }}>
             {routesCount} active
           </span>
+        </div>
+      </div>
+    );
+  }
+  if (slot.kind === 'subagents-editor') {
+    // Parse JSON array or fall back to empty list.
+    const subs = (() => {
+      if (!value) return [];
+      if (Array.isArray(value)) return value;
+      try { const p = JSON.parse(value); return Array.isArray(p) ? p : []; } catch { return []; }
+    })();
+    return (
+      <div style={{ padding: '6px 12px 4px', height: CHIPS_H, boxSizing: 'border-box' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 4 }}>
+          <span style={{ fontSize: 10.5, color: '#64748b', fontWeight: 600,
+                         letterSpacing: '0.02em', textTransform: 'uppercase' }}>{slot.label}</span>
+          <span style={{ fontSize: 9.5, color: '#7c3aed', background: '#f5f3ff', padding: '1px 5px',
+                         borderRadius: 4, fontWeight: 700 }}>
+            {subs.length} subagent{subs.length !== 1 ? 's' : ''}
+          </span>
+        </div>
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'nowrap', overflow: 'hidden', alignItems: 'center',
+                      height: 32, padding: '4px 6px',
+                      background: '#faf5ff', border: '1px solid #ede9fe', borderRadius: 6 }}>
+          {subs.length === 0
+            ? <span style={{ fontSize: 11, color: '#94a3b8' }}>—</span>
+            : subs.slice(0, 3).map((s, i) => (
+                <span key={i} style={{ fontSize: 10, padding: '2px 6px', background: '#ede9fe',
+                                       color: '#5b21b6', borderRadius: 4, whiteSpace: 'nowrap',
+                                       overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 80,
+                                       fontFamily: "'JetBrains Mono', monospace" }}>
+                  {s.name || `s${i+1}`}
+                </span>
+              ))
+          }
+          {subs.length > 3 && <span style={{ fontSize: 10, color: '#64748b' }}>+{subs.length - 3}</span>}
         </div>
       </div>
     );
@@ -1802,6 +1840,365 @@ function ChipEditor({ value, onChange, action, actionContext }) {
   );
 }
 
+// Subagent list editor for the 'subagents-editor' slot kind.
+// Value is a JSON-serialized array of subagent definitions matching the shape
+// subagent_factory.py / workflow_config.extract_subagents_config() expect:
+// { name, description?, role_prompt?, capabilities?, tools?, model?, output_schema? }.
+const SUBAGENT_NAME_RE = /[^a-z0-9]+/g; // mirrors subagent_factory.py:277 slugification
+
+function _slugifySubagentName(name) {
+  return String(name || '').trim().toLowerCase().replace(SUBAGENT_NAME_RE, '_').replace(/^_+|_+$/g, '');
+}
+
+function SubagentsEditor({ value, onChange, llmOptions, toolCatalog, profileCatalog }) {
+  const [parseError, setParseError] = useState(false);
+  const [expanded, setExpanded] = useState(() => new Set());
+  const [toolFilter, setToolFilter] = useState('');
+
+  const subs = useMemo(() => {
+    if (!value) { setParseError(false); return []; }
+    if (Array.isArray(value)) { setParseError(false); return value; }
+    try {
+      const parsed = JSON.parse(value);
+      setParseError(false);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      setParseError(true);
+      return [];
+    }
+  }, [value]);
+
+  const capabilityOptions = profileCatalog?.capabilities || [];
+  const outputSchemaOptions = profileCatalog?.output_schemas || ['generic'];
+  const tools = toolCatalog || [];
+  const filteredTools = toolFilter.trim()
+    ? tools.filter(t => t.name.toLowerCase().includes(toolFilter.trim().toLowerCase()))
+    : tools;
+  const builtinTools = filteredTools.filter(t => t.source !== 'mcp');
+  const mcpTools = filteredTools.filter(t => t.source === 'mcp');
+
+  const commit = (next) => onChange?.(JSON.stringify(next));
+
+  const addSub = () => {
+    const idx = subs.length + 1;
+    commit([...subs, { name: `subagent_${idx}`, description: '', role_prompt: '', capabilities: [], tools: [], model: '', output_schema: 'generic' }]);
+    setExpanded(prev => new Set(prev).add(idx - 1));
+  };
+  const removeSub = (i) => commit(subs.filter((_, idx) => idx !== i));
+  const updateSub = (i, field, val) => commit(subs.map((s, idx) => idx === i ? { ...s, [field]: val } : s));
+
+  const toggleExpanded = (i) => setExpanded(prev => {
+    const next = new Set(prev);
+    if (next.has(i)) next.delete(i); else next.add(i);
+    return next;
+  });
+
+  const nameCounts = useMemo(() => {
+    const counts = {};
+    subs.forEach(s => {
+      const slug = _slugifySubagentName(s.name);
+      if (!slug) return;
+      counts[slug] = (counts[slug] || 0) + 1;
+    });
+    return counts;
+  }, [subs]);
+
+  const labelStyle = { fontSize: 9.5, fontWeight: 700, color: '#64748b',
+    letterSpacing: '0.04em', textTransform: 'uppercase', marginBottom: 3 };
+  const inputStyle = { width: '100%', boxSizing: 'border-box', padding: '4px 8px',
+    background: '#f5f3ff', border: '1px solid #ddd6fe', borderRadius: 5,
+    fontSize: 11.5, outline: 'none', fontFamily: "'JetBrains Mono', monospace", color: '#3730a3' };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8,
+                  background: '#faf5ff', padding: 10, borderRadius: 8,
+                  border: '1px solid #ede9fe' }}>
+      {parseError && (
+        <div style={{ fontSize: 10.5, color: '#dc2626', background: '#fee2e2',
+                       border: '1px solid #fecaca', borderRadius: 5, padding: '5px 8px' }}>
+          Couldn't read the saved subagents — the stored value isn't valid JSON. Check
+          the raw workflow data; editing here will overwrite it with an empty list.
+        </div>
+      )}
+      {subs.length === 0 && !parseError && (
+        <div style={{ fontSize: 11, color: '#a78bfa', textAlign: 'center', padding: '4px 0' }}>
+          No subagents — add one below
+        </div>
+      )}
+      {subs.map((sub, i) => {
+        const slug = _slugifySubagentName(sub.name);
+        const nameError = !sub.name?.trim()
+          ? 'Name is required'
+          : !slug
+          ? 'Name must contain at least one letter or digit'
+          : nameCounts[slug] > 1
+          ? `Duplicate subagent name (resolves to "${slug}")`
+          : null;
+        const selectedCaps = Array.isArray(sub.capabilities) ? sub.capabilities : [];
+        const selectedTools = Array.isArray(sub.tools) ? sub.tools
+          : (typeof sub.tools === 'string' && sub.tools.trim() ? sub.tools.split(',').map(s => s.trim()).filter(Boolean) : []);
+        const isOpen = expanded.has(i);
+        const toggleCap = (cap) => updateSub(i, 'capabilities',
+          selectedCaps.includes(cap) ? selectedCaps.filter(c => c !== cap) : [...selectedCaps, cap]);
+        const toggleTool = (name) => updateSub(i, 'tools',
+          selectedTools.includes(name) ? selectedTools.filter(t => t !== name) : [...selectedTools, name]);
+
+        return (
+          <div key={i} style={{ background: '#fff', border: `1px solid ${nameError ? '#fecaca' : '#ede9fe'}`,
+                                 borderRadius: 6, padding: '8px 10px',
+                                 display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <button onClick={() => toggleExpanded(i)}
+                style={{ background: 'transparent', border: 'none', cursor: 'pointer',
+                         color: '#7c3aed', display: 'flex', alignItems: 'center', padding: 0 }}>
+                <Icon name={isOpen ? 'chevronDown' : 'chevronRight'} size={12} color="#7c3aed" />
+              </button>
+              <div style={{ flex: 1, minWidth: 0, fontSize: 12, fontWeight: 700, color: '#3730a3',
+                             fontFamily: "'JetBrains Mono', monospace", overflow: 'hidden',
+                             textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {sub.name?.trim() || `subagent_${i + 1}`}
+              </div>
+              {!isOpen && (
+                <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+                  {selectedCaps.length > 0 && (
+                    <span style={{ fontSize: 9.5, color: '#7c3aed', background: '#f5f3ff',
+                                   borderRadius: 999, padding: '1px 6px' }}>{selectedCaps.length} cap</span>
+                  )}
+                  {selectedTools.length > 0 && (
+                    <span style={{ fontSize: 9.5, color: '#0891b2', background: '#ecfeff',
+                                   borderRadius: 999, padding: '1px 6px' }}>{selectedTools.length} tools</span>
+                  )}
+                </div>
+              )}
+              <button onClick={() => removeSub(i)}
+                style={{ background: 'transparent', border: 'none', color: '#94a3b8', cursor: 'pointer',
+                         fontSize: 14, width: 18, height: 18, borderRadius: 4, flexShrink: 0,
+                         display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                onMouseEnter={e => { e.currentTarget.style.color='#ef4444'; e.currentTarget.style.background='#fee2e2'; }}
+                onMouseLeave={e => { e.currentTarget.style.color='#94a3b8'; e.currentTarget.style.background='transparent'; }}>
+                ×
+              </button>
+            </div>
+
+            {isOpen && (
+              <>
+                <div>
+                  <div style={labelStyle}>Name</div>
+                  <input value={sub.name || ''}
+                    onChange={e => updateSub(i, 'name', e.target.value)}
+                    placeholder="e.g. database_subagent"
+                    style={inputStyle} />
+                  {nameError && (
+                    <div style={{ fontSize: 10, color: '#dc2626', marginTop: 3 }}>{nameError}</div>
+                  )}
+                </div>
+
+                <div>
+                  <div style={labelStyle}>Description <span style={{ fontWeight: 400, textTransform: 'none', color: '#94a3b8' }}>(shown to the orchestrator when choosing a subagent)</span></div>
+                  <input value={sub.description || ''}
+                    onChange={e => updateSub(i, 'description', e.target.value)}
+                    placeholder="e.g. Diagnoses database performance issues"
+                    style={inputStyle} />
+                </div>
+
+                <div>
+                  <div style={labelStyle}>Role prompt</div>
+                  <textarea value={sub.role_prompt ?? sub.system ?? ''}
+                    onChange={e => updateSub(i, 'role_prompt', e.target.value)}
+                    rows={3}
+                    placeholder="You are a subagent focused on…"
+                    style={{ width: '100%', boxSizing: 'border-box', padding: '5px 8px',
+                             background: '#0f172a', border: '1px solid #1e293b', borderRadius: 5,
+                             fontSize: 11, color: '#a5f3fc', outline: 'none', resize: 'vertical',
+                             fontFamily: "'JetBrains Mono', monospace", lineHeight: 1.4 }} />
+                </div>
+
+                <div>
+                  <div style={labelStyle}>Capabilities <span style={{ fontWeight: 400, textTransform: 'none', color: '#94a3b8' }}>(optional)</span></div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                    {capabilityOptions.length === 0 && (
+                      <span style={{ fontSize: 10, color: '#94a3b8' }}>No registered capabilities</span>
+                    )}
+                    {capabilityOptions.map(cap => {
+                      const active = selectedCaps.includes(cap);
+                      return (
+                        <span key={cap} onClick={() => toggleCap(cap)}
+                          style={{ display: 'inline-flex', alignItems: 'center', gap: 4,
+                                   padding: '3px 8px', borderRadius: 999, cursor: 'pointer',
+                                   fontSize: 10.5, fontWeight: 600,
+                                   border: `1px solid ${active ? '#7c3aed' : '#e2e8f0'}`,
+                                   background: active ? '#7c3aed15' : '#f8fafc',
+                                   color: active ? '#7c3aed' : '#94a3b8', userSelect: 'none' }}>
+                          {cap}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div>
+                  <div style={labelStyle}>Tool access <span style={{ fontWeight: 400, textTransform: 'none', color: '#94a3b8' }}>(optional — all if none selected)</span></div>
+                  {tools.length > 6 && (
+                    <input value={toolFilter} onChange={e => setToolFilter(e.target.value)}
+                      placeholder="Filter tools…"
+                      style={{ ...inputStyle, marginBottom: 4, background: '#fff', color: '#334155' }} />
+                  )}
+                  {builtinTools.length > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: mcpTools.length ? 4 : 0 }}>
+                      {builtinTools.map(t => {
+                        const active = selectedTools.includes(t.name);
+                        return (
+                          <span key={t.name} onClick={() => toggleTool(t.name)} title={t.description || t.name}
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: 4,
+                                     padding: '3px 8px', borderRadius: 999, cursor: 'pointer',
+                                     fontSize: 10.5, fontWeight: 600,
+                                     border: `1px solid ${active ? '#f59e0b' : '#e2e8f0'}`,
+                                     background: active ? '#f59e0b15' : '#f8fafc',
+                                     color: active ? '#f59e0b' : '#94a3b8', userSelect: 'none' }}>
+                            {t.name}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {mcpTools.length > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                      {mcpTools.map(t => {
+                        const active = selectedTools.includes(t.name);
+                        return (
+                          <span key={t.name} onClick={() => toggleTool(t.name)} title={t.description || t.name}
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: 4,
+                                     padding: '3px 8px', borderRadius: 999, cursor: 'pointer',
+                                     fontSize: 10.5, fontWeight: 600,
+                                     border: `1px solid ${active ? '#0891b2' : '#e2e8f0'}`,
+                                     background: active ? '#0891b215' : '#f8fafc',
+                                     color: active ? '#0891b2' : '#94a3b8', userSelect: 'none' }}>
+                            {t.name}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {tools.length === 0 && (
+                    <span style={{ fontSize: 10, color: '#94a3b8' }}>No tools discovered yet</span>
+                  )}
+                </div>
+
+                <div>
+                  <div style={labelStyle}>Disallowed tools <span style={{ fontWeight: 400, textTransform: 'none', color: '#94a3b8' }}>(optional — fnmatch, subtracts from the access above)</span></div>
+                  <input value={Array.isArray(sub.disallowedTools) ? sub.disallowedTools.join(', ') : (sub.disallowedTools || '')}
+                    onChange={e => updateSub(i, 'disallowedTools', e.target.value)}
+                    placeholder="e.g. fs_write*, run_command"
+                    style={inputStyle} />
+                </div>
+
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={labelStyle}>Model <span style={{ fontWeight: 400, textTransform: 'none', color: '#94a3b8' }}>(optional)</span></div>
+                    <select value={sub.model || ''} onChange={e => updateSub(i, 'model', e.target.value)}
+                      style={{ ...inputStyle, fontFamily: 'inherit' }}>
+                      <option value="">— inherit parent —</option>
+                      {(llmOptions || []).map(name => <option key={name} value={name}>{name}</option>)}
+                    </select>
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={labelStyle}>Output schema</div>
+                    <select value={sub.output_schema || 'generic'} onChange={e => updateSub(i, 'output_schema', e.target.value)}
+                      style={{ ...inputStyle, fontFamily: 'inherit' }}>
+                      {outputSchemaOptions.map(name => <option key={name} value={name}>{name}</option>)}
+                    </select>
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={labelStyle}>Max turns <span style={{ fontWeight: 400, textTransform: 'none', color: '#94a3b8' }}>(optional — recursion cap)</span></div>
+                    <input type="number" min="1" value={sub.max_turns ?? ''}
+                      onChange={e => updateSub(i, 'max_turns', e.target.value ? parseInt(e.target.value, 10) : undefined)}
+                      placeholder="default"
+                      style={inputStyle} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={labelStyle}>Permission mode</div>
+                    <select value={sub.permission_mode || 'auto_allow'} onChange={e => updateSub(i, 'permission_mode', e.target.value)}
+                      style={{ ...inputStyle, fontFamily: 'inherit' }}>
+                      <option value="auto_allow">Auto-allow (default — parent's delegate call is already gated)</option>
+                      <option value="default">Default (ask per policy)</option>
+                    </select>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        );
+      })}
+      <button onClick={addSub}
+        style={{ width: '100%', padding: '6px 12px', background: '#7c3aed', color: '#fff',
+                 border: 'none', borderRadius: 6, fontSize: 11.5, fontWeight: 600,
+                 cursor: 'pointer', display: 'flex', alignItems: 'center',
+                 justifyContent: 'center', gap: 4 }}
+        onMouseEnter={e => { e.currentTarget.style.background = '#6d28d9'; }}
+        onMouseLeave={e => { e.currentTarget.style.background = '#7c3aed'; }}>
+        <Icon name="plus" size={12} color="#fff" />
+        Add Subagent
+      </button>
+    </div>
+  );
+}
+
+// Toggle-chip picker for the Agent node's 'skills' slot. Value is a
+// comma-separated string of skill names (matches ChipEditor's storage shape /
+// backend _as_str_list parsing). Empty selection = no scoping — the agent
+// auto-selects from the global skill library (see build_recall_query).
+function SkillsPicker({ value, onChange, skillCatalog }) {
+  const selected = React.useMemo(
+    () => (value ? String(value).split(',').map(s => s.trim()).filter(Boolean) : []),
+    [value],
+  );
+  const dbSkills = skillCatalog?.db || [];
+  const fsSkills = skillCatalog?.filesystem || [];
+  const toggle = (name) => {
+    const next = selected.includes(name) ? selected.filter(n => n !== name) : [...selected, name];
+    onChange(next.join(', '));
+  };
+  const labelStyle = { fontSize: 9.5, fontWeight: 700, color: '#64748b',
+    letterSpacing: '0.04em', textTransform: 'uppercase', marginBottom: 3 };
+
+  const renderGroup = (skills, activeColor) => (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+      {skills.map(s => {
+        const active = selected.includes(s.name);
+        return (
+          <span key={s.name} onClick={() => toggle(s.name)} title={s.description || s.name}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 4,
+                     padding: '3px 8px', borderRadius: 999, cursor: 'pointer',
+                     fontSize: 10.5, fontWeight: 600,
+                     border: `1px solid ${active ? activeColor : '#e2e8f0'}`,
+                     background: active ? `${activeColor}15` : '#f8fafc',
+                     color: active ? activeColor : '#94a3b8', userSelect: 'none' }}>
+            {s.name}
+          </span>
+        );
+      })}
+    </div>
+  );
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '6px 12px' }}>
+      <div style={labelStyle}>
+        Skills <span style={{ fontWeight: 400, textTransform: 'none', color: '#94a3b8' }}>
+          (optional — none selected = auto-select from the global library)
+        </span>
+      </div>
+      {fsSkills.length > 0 && renderGroup(fsSkills, '#7c3aed')}
+      {dbSkills.length > 0 && renderGroup(dbSkills, '#0891b2')}
+      {fsSkills.length === 0 && dbSkills.length === 0 && (
+        <span style={{ fontSize: 10, color: '#94a3b8' }}>No skills available yet</span>
+      )}
+    </div>
+  );
+}
+
 // Multi-select dropdown for db-select slots
 // Uses position:fixed so the dropdown escapes overflowY:auto panel clipping
 function MultiDbSelect({ value, options, onChange }) {
@@ -2069,7 +2466,8 @@ function MultiRepoSelect({ value, onChange }) {
   );
 }
             function ParamRow({ k, label, v, slotKind, onChange, selectOptions, slotAccept, onFileChange,
-                    slotAction, allParams, nodes, updateMultipleParams, slotPlaceholder }) {
+                    slotAction, allParams, nodes, updateMultipleParams, slotPlaceholder,
+                    llmOptions, toolCatalog, profileCatalog, skillCatalog }) {
   const [customKeys, setCustomKeys] = React.useState(() => new Set());
   const isCode      = slotKind === 'textarea';
   const isWeekday   = slotKind === 'weekday-select';
@@ -2081,8 +2479,10 @@ function MultiRepoSelect({ value, onChange }) {
   const isSelect    = slotKind === 'select';
   const isToggle    = slotKind === 'toggle';
   const isSegment   = slotKind === 'segment';
-  const isChips     = slotKind === 'chips';
-  const isMono      = isCode || k === 'cron' || k === 'url';
+  const isChips        = slotKind === 'chips';
+  const isSubagentsEd  = slotKind === 'subagents-editor';
+  const isSkillsPicker = slotKind === 'skills-picker';
+  const isMono         = isCode || k === 'cron' || k === 'url';
   const displayLabel = label || humanize(k);
   const baseStyle = {
     width: '100%', boxSizing: 'border-box', border: 'none', outline: 'none',
@@ -2096,12 +2496,12 @@ function MultiRepoSelect({ value, onChange }) {
                        letterSpacing: '0.04em', textTransform: 'uppercase' }}>{displayLabel}</span>
       </div>
       <div style={{ padding: isCode ? '9px 11px'
-                          : (isWeekday || isFilePick || isToggle || isChips || isSegment) ? '0'
+                          : (isWeekday || isFilePick || isToggle || isChips || isSegment || isSubagentsEd || isSkillsPicker) ? '0'
                           : '7px 11px',
                     background: isCode ? '#0f172a'
-                                : (isWeekday || isFilePick || isToggle || isChips || isSegment) ? 'transparent'
+                                : (isWeekday || isFilePick || isToggle || isChips || isSegment || isSubagentsEd || isSkillsPicker) ? 'transparent'
                                 : '#fafbfc',
-                    border: (isWeekday || isFilePick || isToggle || isChips || isSegment) ? 'none'
+                    border: (isWeekday || isFilePick || isToggle || isChips || isSegment || isSubagentsEd || isSkillsPicker) ? 'none'
                             : `1px solid ${isCode ? '#1e293b' : '#e2e8f0'}`,
                     borderRadius: 7 }}>
         {slotKind === 'routes-editor'
@@ -2340,6 +2740,11 @@ function MultiRepoSelect({ value, onChange }) {
               onChange={val => onChange?.(k, val)}
               action={slotAction}
               actionContext={allParams || {}} />
+          : isSubagentsEd
+          ? <SubagentsEditor value={v} onChange={val => onChange?.(k, val)}
+              llmOptions={llmOptions} toolCatalog={toolCatalog} profileCatalog={profileCatalog} />
+          : isSkillsPicker
+          ? <SkillsPicker value={v} onChange={val => onChange?.(k, val)} skillCatalog={skillCatalog} />
           : isFilePick
           ? <FileSelect value={String(v ?? '')} accept={slotAccept}
               onChange={(name, content) => onFileChange?.(name, content)} />
@@ -2401,7 +2806,7 @@ function PortRowR({ slot }) {
   );
 }
 
-function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpServers, workflowName, edges, nodes, latestExecution }) {
+function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpServers, toolCatalog, profileCatalog, skillCatalog, workflowName, edges, nodes, latestExecution }) {
   const def = NODE_TYPES[node.type];
   if (!def) return null;
   const tint = CAT_TINT[def.category] || CAT_TINT.Tools;
@@ -2520,7 +2925,7 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpS
         <SHdr>{def.desc}</SHdr>
 
         {(() => {
-          const EDITABLE_KINDS = new Set(['field', 'select', 'segment', 'textarea', 'llm-select', 'db-select', 'mcp-select', 'repo-select', 'weekday-select', 'file-select', 'toggle', 'chips', 'routes-editor']);
+          const EDITABLE_KINDS = new Set(['field', 'select', 'segment', 'textarea', 'llm-select', 'db-select', 'mcp-select', 'repo-select', 'weekday-select', 'file-select', 'toggle', 'chips', 'routes-editor', 'subagents-editor', 'skills-picker']);
           const currentParams = node.params || {};
           const editableSlots = (def.slots || []).filter(s => {
             if (!EDITABLE_KINDS.has(s.kind)) return false;
@@ -2560,6 +2965,10 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpS
                       nodes={nodes}
                       updateMultipleParams={updateMultipleParams}
                       slotPlaceholder={slot.placeholder}
+                      llmOptions={llmOptions}
+                      toolCatalog={toolCatalog}
+                      profileCatalog={profileCatalog}
+                      skillCatalog={skillCatalog}
                       onFileChange={slot.kind === 'file-select'
                         ? (name, content) => onUpdateNode?.(node.id, {
                             params: { ...(node.params || {}), [slot.id]: name, sqlContent: content },
@@ -2692,7 +3101,7 @@ function ExecutionList({ workflowName, onCount, executions = [], loading = false
   );
 }
 
-function RPanel({ tab, setTab, node, onUpdateNode, onDelete, llms, dbServers, allMcpServers, workflowName, edges, nodes, latestExecution, executions, execLoading, execError }) {
+function RPanel({ tab, setTab, node, onUpdateNode, onDelete, llms, dbServers, allMcpServers, toolCatalog, profileCatalog, skillCatalog, workflowName, edges, nodes, latestExecution, executions, execLoading, execError }) {
   const [execCount, setExecCount] = useState(null);
 
   return (
@@ -2706,7 +3115,7 @@ function RPanel({ tab, setTab, node, onUpdateNode, onDelete, llms, dbServers, al
               label="Executions" icon="history" badge={execCount ?? undefined} />
       </div>
       {tab === 'node' && (node
-        ? <NodeProperties node={node} onUpdateNode={onUpdateNode} onDelete={onDelete} llms={llms} dbServers={dbServers} allMcpServers={allMcpServers} workflowName={workflowName} edges={edges} nodes={nodes} latestExecution={latestExecution} />
+        ? <NodeProperties node={node} onUpdateNode={onUpdateNode} onDelete={onDelete} llms={llms} dbServers={dbServers} allMcpServers={allMcpServers} toolCatalog={toolCatalog} profileCatalog={profileCatalog} skillCatalog={skillCatalog} workflowName={workflowName} edges={edges} nodes={nodes} latestExecution={latestExecution} />
         : <EmptyProps />)}
       {tab === 'executions' && (
         <ExecutionList workflowName={workflowName} onCount={setExecCount} executions={executions} loading={execLoading} error={execError} />
@@ -2740,7 +3149,7 @@ function injectKF() {
 // 11. MAIN EXPORT
 // ─────────────────────────────────────────────────────────────────
 
-function WorkflowSwitcher({ title, workflows, onSwitchWorkflow, onClearCanvas }) {
+function WorkflowSwitcher({ title, workflows, onSwitchWorkflow }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
 
@@ -2816,23 +3225,6 @@ function WorkflowSwitcher({ title, workflows, onSwitchWorkflow, onClearCanvas })
               No other workflows
             </div>
           )}
-
-          {/* Clear canvas */}
-          {onClearCanvas && (
-            <div style={{ borderTop: '1px solid #f1f5f9', padding: '6px 8px 8px' }}>
-              <button
-                onClick={() => { setOpen(false); onClearCanvas(); }}
-                style={{ display: 'flex', alignItems: 'center', gap: 7, width: '100%',
-                         padding: '7px 8px', borderRadius: 6, fontSize: 13,
-                         fontWeight: 500, color: '#dc2626', background: 'transparent',
-                         border: 'none', cursor: 'pointer', textAlign: 'left' }}
-                onMouseEnter={e => e.currentTarget.style.background = '#fef2f2'}
-                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                <Icon name="trash" size={12} color="#dc2626" strokeWidth={2} />
-                Clear canvas
-              </button>
-            </div>
-          )}
         </div>
       )}
     </div>
@@ -2877,6 +3269,12 @@ const LangflowEditor = forwardRef(function LangflowEditor(
   const [dbServers, setDbServers]     = useState({});
   const [allMcpServers, setAllMcpServers] = useState({});
   const [gtz, setGtz]             = useState(GLOBAL_TZ);
+  // Tool catalog (builtin + MCP-discovered) and profile catalog (output schemas +
+  // capability ids) — used by the Subagents node's per-subagent editor.
+  const [toolCatalog, setToolCatalog]     = useState([]);
+  const [profileCatalog, setProfileCatalog] = useState({ output_schemas: [], capabilities: [] });
+  // DB-backed + filesystem (SKILL.md) skills, for the Agent node's Skills picker.
+  const [skillCatalog, setSkillCatalog] = useState({ db: [], filesystem: [] });
   const loadMcpServers = useCallback(() => {
     getMCPServers().then(all => {
       if (!all || !Object.keys(all).length) return; // don't overwrite good data with empty
@@ -2892,6 +3290,18 @@ const LangflowEditor = forwardRef(function LangflowEditor(
     getAppSettings().then(s => {
       const tz = s?.global_timezone;
       if (tz) { _setGlobalTzCache(tz); setGtz(tz); }
+    }).catch(() => {});
+    listTools().then(data => setToolCatalog(data?.tools || [])).catch(() => {});
+    agentApiClient.getAgentProfileCatalog().then(data => {
+      if (!data) return;
+      setProfileCatalog({
+        output_schemas: data.output_schemas || [],
+        capabilities: data.capabilities || [],
+      });
+    }).catch(() => {});
+    agentApiClient.listSkills().then(data => {
+      if (!data) return;
+      setSkillCatalog({ db: data.db || [], filesystem: data.filesystem || [] });
     }).catch(() => {});
   }, [loadMcpServers]);
 
@@ -2961,13 +3371,23 @@ const LangflowEditor = forwardRef(function LangflowEditor(
         {onCancel && <div style={{ width: 1, height: 20, background: '#e2e8f0' }} />}
 
         {/* Workflow switcher chip */}
-        <WorkflowSwitcher title={title} workflows={workflows} onSwitchWorkflow={onSwitchWorkflow}
-                          onClearCanvas={() => { setNodes([]); setEdges([]); setSelectedId(null); }} />
+        <WorkflowSwitcher title={title} workflows={workflows} onSwitchWorkflow={onSwitchWorkflow} />
 
         <div style={{ flex: 1 }} />
 
         {/* Actions */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <button
+            onClick={() => { setNodes([]); setEdges([]); setSelectedId(null); }}
+            title="Remove all nodes and edges"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 34,
+                     padding: '0 12px', fontSize: 13, fontWeight: 600, borderRadius: 8,
+                     cursor: 'pointer', background: '#fff', color: '#dc2626',
+                     border: '1px solid #fecaca' }}
+            onMouseEnter={e => { e.currentTarget.style.background = '#fef2f2'; e.currentTarget.style.borderColor = '#fca5a5'; }}
+            onMouseLeave={e => { e.currentTarget.style.background = '#fff'; e.currentTarget.style.borderColor = '#fecaca'; }}>
+            <Icon name="trash" size={13} color="#dc2626" /> Clear canvas
+          </button>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px 0 4px',
                         border: '1px solid #e2e8f0', borderRadius: 8, height: 34 }}>
             <ToggleSwitch on={active} onChange={setActive} />
@@ -3040,7 +3460,8 @@ const LangflowEditor = forwardRef(function LangflowEditor(
         </div>
         {selectedNode && (
           <RPanel tab={rightTab} setTab={setRightTab} node={selectedNode} onUpdateNode={handleUpdateNode}
-                  onDelete={handleDeleteNode} llms={llms} dbServers={dbServers} allMcpServers={allMcpServers} workflowName={workflowName} edges={edges} nodes={nodes}
+                  onDelete={handleDeleteNode} llms={llms} dbServers={dbServers} allMcpServers={allMcpServers}
+                  toolCatalog={toolCatalog} profileCatalog={profileCatalog} skillCatalog={skillCatalog} workflowName={workflowName} edges={edges} nodes={nodes}
                   latestExecution={latestExecution} executions={workflowExecutions} execLoading={execLoading} execError={execError} />
         )}
       </div>

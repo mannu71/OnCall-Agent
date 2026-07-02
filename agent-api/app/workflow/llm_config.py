@@ -568,6 +568,24 @@ async def resolve_llm_config_for_consumer_port(
     return resolved.to_dict()
 
 
+async def resolve_llm_config_by_name(config_name: str) -> Dict[str, Any]:
+    """Resolve a specific DB-registered LLM config by name.
+
+    Used by named subagent definitions that declare a ``"model"`` field.
+
+    Raises:
+        ValueError: if the name does not match a registered config.
+    """
+    cfg = LLMNodeConfig(config_name=config_name)
+    resolved = await _resolve_named(cfg)
+    if not resolved:
+        raise ValueError(
+            f"LLM config '{config_name}' not found. Register it in Settings → Language Models."
+        )
+    await _enrich_credentials(resolved)
+    return resolved.to_dict()
+
+
 async def resolve_llm_config_for_role(role: str) -> Dict[str, Any]:
     """Resolve the LLM config assigned to a gateway *role*, with fallback.
 

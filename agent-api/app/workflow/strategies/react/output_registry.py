@@ -1,11 +1,13 @@
-"""Registry of structured-output schemas for "Data Query Mode".
+"""Registry of structured-output schemas for the agent final-synthesis step.
 
-The investigation agent has always bound its final synthesis to
-:class:`InvestigationReport`. To let a *profile* return a use-case-appropriate
-shape (a support resolution, a data-analysis result, …) instead of forcing an RCA
-schema onto every agent, structured output now resolves a named schema from this
-registry. ``investigation`` remains the default, so existing workflows are
-unchanged.
+Agents resolve a named schema from this registry so each use case can return a
+shape that fits its domain: an RCA agent uses ``investigation``, a support agent
+uses ``support_resolution``, and a generic agent uses ``generic``. The default
+is ``generic`` — a neutral shape (summary / findings / next_steps / confidence)
+that works for any task. Profiles and agent-node configs can pin a different schema.
+
+The ``incident-rca`` builtin profile explicitly pins ``investigation``, so existing
+RCA workflows are unaffected by the default change.
 
 All models stay flat, optional-heavy, and provider-agnostic (Bedrock / Anthropic /
 OpenAI ``with_structured_output`` over a Pydantic model) and serialize to JSON for
@@ -92,7 +94,7 @@ _REGISTRY: Dict[str, Type[BaseModel]] = {
     "data_analysis": DataAnalysis,
 }
 
-_DEFAULT = "investigation"
+_DEFAULT = "generic"
 
 
 def register_schema(name: str, model: Type[BaseModel]) -> None:

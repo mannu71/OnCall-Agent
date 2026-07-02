@@ -103,6 +103,44 @@ class ExecutionRepository(BaseAsyncRepository):
             await session.commit()
             return True
 
+    async def mark_failed(
+        self,
+        execution_id: str,
+        *,
+        error: Optional[str] = None,
+    ) -> bool:
+        """Minimal, low-surface-area write that just flips status -> 'failed'
+        and sets completed_at/error, without touching trajectory/token
+        fields. Used as the fallback when the rich ``save()`` write (which
+        also serializes trajectory + token usage) raises — that richer path
+        has more that can go wrong, and a failure partway through it must
+        never leave the row stuck at status='running' (the "already
+        running" lock is derived directly from this column; a stuck row
+        blocks every future execution of the workflow until manually
+        cleared)."""
+        try:
+            eid = int(execution_id)
+        except (TypeError, ValueError):
+            return False
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(ExecutionModel).where(ExecutionModel.id == eid)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return False
+            row.status = "failed"
+            row.completed_at = datetime.now(timezone.utc)
+            if error:
+                row.error = error
+            if row.started_at and row.completed_at:
+                row.duration_ms = int(
+                    (row.completed_at - row.started_at).total_seconds() * 1000
+                )
+            await session.commit()
+            return True
+
     async def cancel_all_active(
         self,
         *,
@@ -210,6 +248,9 @@ class ExecutionRepository(BaseAsyncRepository):
             output_tokens=execution_data.get("output_tokens", 0) or 0,
             total_tokens=execution_data.get("total_tokens", 0) or 0,
             trajectory=execution_data.get("trajectory"),
+            # Set only for chat-triggered executions (migration 028) — lets the
+            # Dashboard exclude ad-hoc chat turns from real workflow-run stats.
+            chat_session_id=execution_data.get("chat_session_id"),
         )
 
         async with AsyncSessionLocal() as session:
@@ -455,4 +496,6 @@ class ExecutionRepository(BaseAsyncRepository):
             "input_tokens": getattr(execution, "input_tokens", 0) or 0,
             "output_tokens": getattr(execution, "output_tokens", 0) or 0,
             "total_tokens": getattr(execution, "total_tokens", 0) or 0,
+            # Non-None only for chat-triggered executions (migration 028).
+            "chat_session_id": getattr(execution, "chat_session_id", None),
         }
