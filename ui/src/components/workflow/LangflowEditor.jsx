@@ -146,6 +146,186 @@ function normalizeEdge(e) {
   return { ...e, sourceSlot, targetSlot };
 }
 
+// ── Subagent windows — a Tool-category node dragged inside a
+// `subagent_window` box becomes a member of it (n.parentId), scoping it to
+// that subagent instead of the main agent's tools port. Membership is
+// geometric (checked against the box's x/y/w/h), not a graph edge. ────────
+const DEFAULT_SUBAGENT_WIN_W = 300;
+const DEFAULT_SUBAGENT_WIN_H = 360;
+
+function isToolNodeType(nodeType) {
+  const def = NODE_TYPES[nodeType];
+  return !!def?.slots?.some(s => s.kind === 'port-out' && s.portType === 'tool');
+}
+
+function subagentWindowRect(win) {
+  return {
+    x: win.x, y: win.y,
+    w: Number(win.params?.w) || DEFAULT_SUBAGENT_WIN_W,
+    h: Number(win.params?.h) || DEFAULT_SUBAGENT_WIN_H,
+  };
+}
+
+function pointInRect(px, py, rect) {
+  return px >= rect.x && px <= rect.x + rect.w && py >= rect.y && py <= rect.y + rect.h;
+}
+
+const SUBAGENT_WIN_PADDING = 14;
+const SUBAGENT_WIN_HEADER  = 26; // clears the name pill drawn above the box
+const SUBAGENT_WIN_PORT_Y  = 20; // fixed y for both the lm-in and specialists-out ports
+// Target column height for the grid flow below — roughly a full-size Tool
+// card's height (CloudWatch ~646), so a tall tool still gets its own column
+// while several short ones (MCP ~196-226, Code Search ~252-282) keep
+// stacking into the same column together instead of each claiming a new one.
+const SUBAGENT_WIN_MAX_COL_H = 650;
+
+// Auto-arrange a subagent_window's members into a grid (wraps into a new
+// column once a column reaches SUBAGENT_WIN_MAX_COL_H, rather than one long
+// vertical strip), and fit the window to fully enclose them — so the dashed
+// border never shows a gap or an overflowing node. Run after a node newly
+// joins (drag-in or palette-drop) and after a manual resize (grow-only:
+// shrinking below what the contents need snaps back to the fitting size).
+// Pass `shrink: true` when a member was just REMOVED (e.g. deleted) — there
+// the box should shrink back down to the smaller remaining content instead
+// of keeping its old, now-oversized footprint with a stale gap.
+function layoutSubagentMembers(nodes, winId, { shrink = false } = {}) {
+  const win = nodes.find(n => n.id === winId);
+  if (!win) return nodes;
+  const rect = subagentWindowRect(win);
+  const members = nodes.filter(n => n.parentId === winId);
+  if (!members.length) return nodes;
+
+  const positions = new Map();
+  let colX = rect.x + SUBAGENT_WIN_PADDING;
+  let curY = rect.y + SUBAGENT_WIN_HEADER;
+  let colWidth = 0;
+  let maxRight = colX;
+  let maxBottom = curY;
+  for (const m of members) {
+    const def = NODE_TYPES[m.type];
+    const w = def?.width || NODE_W;
+    const h = totalHeight(visibleSlotsFor(m));
+    // Wrap to a new column once the current one has at least one item and
+    // this one would push it past the target column height.
+    if (curY > rect.y + SUBAGENT_WIN_HEADER && (curY - rect.y) + h > SUBAGENT_WIN_MAX_COL_H) {
+      colX += colWidth + SUBAGENT_WIN_PADDING;
+      curY = rect.y + SUBAGENT_WIN_HEADER;
+      colWidth = 0;
+    }
+    positions.set(m.id, { x: colX, y: curY });
+    curY += h + SUBAGENT_WIN_PADDING;
+    colWidth = Math.max(colWidth, w);
+    maxRight = Math.max(maxRight, colX + w);
+    maxBottom = Math.max(maxBottom, curY - SUBAGENT_WIN_PADDING);
+  }
+  const fitW = (maxRight - rect.x) + SUBAGENT_WIN_PADDING;
+  const fitH = maxBottom - rect.y; // header + tallest column + trailing padding
+  const newW = shrink ? fitW : Math.max(rect.w, fitW);
+  const newH = shrink ? fitH : Math.max(rect.h, fitH);
+
+  return nodes.map(n => {
+    if (positions.has(n.id)) return { ...n, ...positions.get(n.id) };
+    if (n.id === winId && (newW !== rect.w || newH !== rect.h)) {
+      return { ...n, params: { ...n.params, w: String(newW), h: String(newH) } };
+    }
+    return n;
+  });
+}
+
+// Best-effort node-type → runtime tool-name glob, for the auto-generated
+// A subagent definition's `tools` allow-list (fnmatch, see subagent_factory.py)
+// is derived from the tool nodes inside its window. The globs must match the
+// tool names the backend actually binds:
+//   • cloudwatch_tool  → cloudwatch_*
+//   • code_search_tool → crawler_* (Code Crawler) OR codegraph__* (codegraph
+//     backend — tools are MCP-composite named codegraph__<tool>)
+//   • mcp_server       → <serverName>__* per selected server (MCP composite
+//     naming {server_id}__{tool}; params.servers is a comma-joined list)
+// Unknown node types fall back to '*' (full inherit) until their exact tool-name
+// prefixes are confirmed — narrower than that would silently break them.
+function toolGlobsForNode(node) {
+  const t = node?.type;
+  if (t === 'cloudwatch_tool') return ['cloudwatch_*'];
+  if (t === 'code_search_tool') {
+    return [node?.params?.backend === 'codegraph' ? 'codegraph__*' : 'crawler_*'];
+  }
+  if (t === 'mcp_server') {
+    const servers = String(node?.params?.servers || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    return servers.length ? servers.map(s => `${s}__*`) : ['*'];
+  }
+  return ['*'];
+}
+
+// Slots actually rendered for a node — once a tool joins a subagent_window,
+// its `tool` output is dangling (containment already scopes it; the edge to
+// the main agent was stripped on join), so drop it everywhere at once (row,
+// footer, port dot) rather than leaving a half-shown, non-functional port.
+// Used by both WfNode (rendering) and layoutSubagentMembers (height/stacking)
+// so the two never disagree about how tall a contained node's card is.
+function visibleSlotsFor(node) {
+  const slots = slotsForNode(NODE_TYPES, node);
+  if (!node.parentId) return slots;
+  return slots.filter(s => !(s.kind === 'port-out' && s.portType === 'tool'));
+}
+
+// Derive the backend `agent_config["subagents"]` list (see
+// subagent_factory.py) from the canvas's subagent_window boxes + their
+// contained tool nodes, and write it onto the main Agent node's own params
+// — the same field the legacy JSON "Subagents" node used, and the same
+// params→agent_config path already proven for supervisor_enabled/engine
+// (app/harness/spec_factory.py / app/harness/engine). Called only at
+// export time (getWorkflowData) so the live canvas state never carries this
+// derived value — it's always freshly recomputed from the boxes.
+// Model choice is per-TOOL, not per-window (a subagent can mix tools that
+// each use a different model) — each Tool node has its own optional `lm`
+// port. The backend's subagent def only carries one `model` field though,
+// so best-effort: use the first contained tool that has one wired, the
+// same way the Agent/code_search_tool `lm` ports resolve a wired
+// multi-model edge (sourceSlot `lm::<model name>`) down to one model name.
+function resolveModelForNode(nodeId, nodes, edges) {
+  const edge = edges.find(e => e.target === nodeId && e.targetSlot === 'lm');
+  if (!edge) return undefined;
+  const srcSlot = edge.sourceSlot || '';
+  if (srcSlot.startsWith('lm::')) return srcSlot.slice(4).trim() || undefined;
+  const srcNode = nodes.find(n => n.id === edge.source);
+  const raw = srcNode?.params?.llm || srcNode?.params?.model;
+  return raw ? String(raw).split(',')[0].trim() || undefined : undefined;
+}
+
+function buildExportedWorkflow(nodes, edges, enabled) {
+  const windows = nodes.filter(n => n.type === 'subagent_window');
+  if (!windows.length) return { nodes, edges, enabled };
+
+  const defs = windows
+    .map(win => {
+      const members = nodes.filter(n => n.parentId === win.id);
+      const tools = Array.from(new Set(members.flatMap(m => toolGlobsForNode(m))));
+      let model;
+      for (const m of members) {
+        model = resolveModelForNode(m.id, nodes, edges);
+        if (model) break;
+      }
+      return {
+        name: (win.params?.name || win.name || '').trim(),
+        description: win.params?.description || '',
+        tools: tools.length ? tools : ['*'],
+        ...(model ? { model } : {}),
+      };
+    })
+    .filter(d => d.name);
+  if (!defs.length) return { nodes, edges, enabled };
+
+  const agentNode = nodes.find(n => n.type === 'agent');
+  if (!agentNode) return { nodes, edges, enabled };
+
+  const subagentsJson = JSON.stringify(defs);
+  const outNodes = nodes.map(n => n.id === agentNode.id
+    ? { ...n, params: { ...n.params, subagents: subagentsJson } }
+    : n);
+  return { nodes: outNodes, edges, enabled };
+}
+
 // ─────────────────────────────────────────────────────────────────
 // 4. SAMPLE WORKFLOW  (from workflow-data.js)
 // ─────────────────────────────────────────────────────────────────
@@ -224,7 +404,16 @@ function totalHeight(slots) {
 function handlePosition(node, slotId) {
   const def = NODE_TYPES[node.type];
   if (!def) return { x: node.x, y: node.y };
-  const slots = slotsForNode(NODE_TYPES, node);
+  // subagent_window is a bespoke frame, not a slot-stacked WfNode card — its
+  // port sits at a fixed y (see SubagentWindowFrame), not one derived from
+  // row offsets.
+  if (node.type === 'subagent_window') {
+    const rect = subagentWindowRect(node);
+    const y = node.y + SUBAGENT_WIN_PORT_Y;
+    if (slotId === 'specialists') return { x: node.x + rect.w, y };
+    return { x: node.x, y: node.y };
+  }
+  const slots = visibleSlotsFor(node);
   const idx = slots.findIndex(s => s.id === slotId);
   if (idx < 0) return { x: node.x, y: node.y };
   const slot = slots[idx];
@@ -684,7 +873,7 @@ const WfNode = memo(function WfNode({ node, selected, dragging, drawingSourceSlo
   if (!def) return null;
   const tint = CAT_TINT[def.category] || CAT_TINT.Tools;
   const w = def.width || NODE_W;
-  const slots = slotsForNode(NODE_TYPES, node);
+  const slots = visibleSlotsFor(node);
   const h = totalHeight(slots);
   // liveStatus: 'running' | 'success' | 'failed' | null (null = idle/unknown)
   const effectiveStatus = liveStatus ?? node.status ?? 'idle';
@@ -870,6 +1059,66 @@ function PortTypeLegend() {
   );
 }
 
+// Dashed grouping frame for a `subagent_window` node — dragging tools onto
+// it (see onDrop/startDrag in WorkflowCanvas) scopes them to this subagent.
+// Deliberately NOT a WfNode: it has no ports, and its body is an empty
+// drop-zone rather than a slot-driven form (name/description are edited via
+// the normal right-side Properties panel once selected, same as any node).
+function SubagentWindowFrame({ node, selected, drawingSourceSlot, onClick, onPointerDown, onPortPointerDown, onResize }) {
+  const { w, h } = subagentWindowRect(node);
+  const name = node.params?.name || node.name || 'Subagent';
+  const resizeRef = useRef(null);
+  const startResize = useCallback((e) => {
+    e.stopPropagation();
+    const sx = e.clientX, sy = e.clientY, ow = w, oh = h;
+    const onMove = (ev) => {
+      onResize(Math.max(200, ow + (ev.clientX - sx)), Math.max(160, oh + (ev.clientY - sy)));
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }, [w, h, onResize]);
+
+  return (
+    <div
+      onClick={(e) => { e.stopPropagation(); onClick(node.id); }}
+      onPointerDown={(e) => onPointerDown(node.id, e)}
+      style={{ position: 'absolute', left: node.x, top: node.y, width: w, height: h,
+               border: `1.5px dashed ${selected ? '#7c3aed' : '#c4b5fd'}`,
+               borderRadius: 10, background: 'rgba(124, 58, 237, 0.03)',
+               cursor: 'grab', boxSizing: 'border-box' }}>
+      <div style={{ position: 'absolute', top: -11, left: 10, padding: '1px 8px',
+                    background: '#f5f3ff', border: '1px solid #ddd6fe', borderRadius: 999,
+                    fontSize: 10.5, fontWeight: 700, color: '#5b21b6',
+                    letterSpacing: '0.02em', whiteSpace: 'nowrap' }}>
+        {name}
+      </div>
+
+      {/* specialists (out) — wire to the Agent node's own "Subagents" input,
+          same port the legacy Subagents node used. Model choice lives on
+          each contained Tool node's own `lm` port instead of here. */}
+      <PortHandle side="right" y={SUBAGENT_WIN_PORT_Y} color={PORT_TYPE.data.color}
+        drawing={drawingSourceSlot === 'specialists'}
+        onPointerDown={onPortPointerDown
+          ? e => { e.stopPropagation(); onPortPointerDown(node, { id: 'specialists' }, SUBAGENT_WIN_PORT_Y, e); }
+          : undefined}
+      />
+
+      <div
+        ref={resizeRef}
+        onPointerDown={startResize}
+        title="Resize"
+        style={{ position: 'absolute', right: -6, bottom: -6, width: 14, height: 14,
+                 borderRadius: 4, background: '#fff', border: '1.5px solid #c4b5fd',
+                 cursor: 'nwse-resize' }}
+      />
+    </div>
+  );
+}
+
 function CanvasBtn({ onClick, icon, title }) {
   const [h, setH] = useState(false);
   return (
@@ -956,7 +1205,9 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
     e.stopPropagation();
     const v = viewRef.current;
     const rect = ref.current.getBoundingClientRect();
-    const w = srcNode.width || (NODE_TYPES[srcNode.type]?.width) || NODE_W;
+    const w = srcNode.type === 'subagent_window'
+      ? subagentWindowRect(srcNode).w
+      : srcNode.width || (NODE_TYPES[srcNode.type]?.width) || NODE_W;
     const fx = srcNode.x + w;   // right edge of node (port-out is on the right)
     const fy = srcNode.y + portY;
     const mx = (e.clientX - rect.left - v.x) / v.zoom;
@@ -1065,28 +1316,68 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
     nodeDraggedRef.current = false;
     const sx = e.clientX, sy = e.clientY;
     const ox = n.x, oy = n.y, id = n.id;
+    const isWindow = n.type === 'subagent_window';
+    // Snapshot member starting positions up front — a subagent_window drag
+    // moves its members by the same delta, so they stay visually contained.
+    const memberStarts = isWindow
+      ? nodesRef.current.filter(m => m.parentId === id).map(m => ({ id: m.id, x: m.x, y: m.y }))
+      : null;
+    let lastDx = 0, lastDy = 0;
     let dragRaf = null;
     const onMove = ev => {
       const dx = ev.clientX - sx, dy = ev.clientY - sy;
       if (!nodeDraggedRef.current && Math.sqrt(dx*dx + dy*dy) < 4) return;
       nodeDraggedRef.current = true;
+      lastDx = dx; lastDy = dy;
       if (dragRaf) return;
       dragRaf = requestAnimationFrame(() => {
         dragRaf = null;
         const v = viewRef.current;
-        setNodes(ns => ns.map(m =>
-          m.id === id ? { ...m, x: ox + dx/v.zoom, y: oy + dy/v.zoom } : m
-        ));
+        const wdx = dx/v.zoom, wdy = dy/v.zoom;
+        setNodes(ns => ns.map(m => {
+          if (m.id === id) return { ...m, x: ox + wdx, y: oy + wdy };
+          if (isWindow) {
+            const start = memberStarts.find(s => s.id === m.id);
+            if (start) return { ...m, x: start.x + wdx, y: start.y + wdy };
+          }
+          return m;
+        }));
       });
     };
     const onUp = () => {
       if (dragRaf) cancelAnimationFrame(dragRaf);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      if (!nodeDraggedRef.current || isWindow) return;
+      // Drag-end containment check for a plain (non-window) node: entering a
+      // subagent_window's bounds assigns it as a member (exclusive — clears
+      // any prior window, and strips its direct tool→agent edge since it's
+      // now subagent-scoped); leaving all windows clears membership.
+      const v = viewRef.current;
+      const finalX = ox + lastDx/v.zoom, finalY = oy + lastDy/v.zoom;
+      const centerX = finalX + (NODE_TYPES[n.type]?.width || NODE_W) / 2;
+      const centerY = finalY + 40;
+      const isTool = isToolNodeType(n.type);
+      const win = isTool
+        ? nodesRef.current.find(m => m.type === 'subagent_window'
+            && pointInRect(centerX, centerY, subagentWindowRect(m)))
+        : null;
+      const newParentId = win ? win.id : undefined;
+      if (n.parentId !== newParentId) {
+        setNodes(ns => {
+          const withParent = ns.map(m => m.id === id ? { ...m, parentId: newParentId } : m);
+          // Snap into a tidy slot inside its new window rather than sitting
+          // wherever the cursor happened to drop it.
+          return newParentId ? layoutSubagentMembers(withParent, newParentId) : withParent;
+        });
+        if (newParentId) {
+          setEdges(es => es.filter(ed => !(ed.source === id && ed.sourceSlot === 'tool' && ed.targetSlot === 'tools')));
+        }
+      }
     };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
-  }, [setNodes]);
+  }, [setNodes, setEdges]);
 
   const handleNodeClick = useCallback((id) => {
     if (nodeDraggedRef.current) return;
@@ -1118,12 +1409,26 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
       params.tz = getDisplayTimezone();
     }
     try { if (nodeParams) Object.assign(params, JSON.parse(nodeParams)); } catch {}
-    setNodes(ns => [...ns, {
-      id, type: nodeType,
-      x: Math.round(wx - (def.width || NODE_W) / 2),
-      y: Math.round(wy - 40),
-      name: nodeLabel || def.label, status: 'idle', params,
-    }]);
+    const nx = Math.round(wx - (def.width || NODE_W) / 2);
+    const ny = Math.round(wy - 40);
+    // Dropping a Tool node inside a subagent_window's bounds scopes it to
+    // that subagent immediately (membership is exclusive by construction —
+    // a brand-new node has no prior owner to strip).
+    let parentId;
+    if (isToolNodeType(nodeType)) {
+      const win = nodesRef.current.find(m => m.type === 'subagent_window'
+        && pointInRect(wx, wy, subagentWindowRect(m)));
+      if (win) parentId = win.id;
+    }
+    setNodes(ns => {
+      const withNew = [...ns, {
+        id, type: nodeType, x: nx, y: ny, parentId,
+        name: nodeLabel || def.label, status: 'idle', params,
+      }];
+      // Snap into a tidy slot inside its window rather than sitting wherever
+      // the palette drop happened to land.
+      return parentId ? layoutSubagentMembers(withNew, parentId) : withNew;
+    });
     onSelect?.(id);
   }, [view, onSelect, setNodes]);
 
@@ -1177,6 +1482,23 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
       <div ref={transformLayerRef} data-canvas-bg style={{ position: 'absolute', left: 0, top: 0, width: '100%', height: '100%',
                                     transformOrigin: '0 0',
                                     transform: `translate(${view.x}px,${view.y}px) scale(${view.zoom})` }}>
+        {/* Subagent window frames — rendered first so members drawn later
+            (both the port-in hit-targets and the WfNode pass below) sit
+            visually on top of the dashed box they're grouped into. */}
+        {nodes.filter(n => n.type === 'subagent_window').map(n => (
+          <SubagentWindowFrame key={n.id} node={n}
+            selected={selectedId === n.id}
+            drawingSourceSlot={drawEdge?.sourceNodeId === n.id ? drawEdge.sourceSlotId : null}
+            onClick={handleNodeClick}
+            onPointerDown={handleNodePointerDown}
+            onPortPointerDown={startPortDrag}
+            onResize={(w, h) => setNodes(ns => layoutSubagentMembers(
+              ns.map(m => m.id === n.id ? { ...m, params: { ...m.params, w: String(w), h: String(h) } } : m),
+              n.id,
+            ))}
+          />
+        ))}
+
         {/* SVG layer: real edges + ghost edge */}
         {/* SVG is always pointer-events:none so it never blocks canvas pan/drag.
             Individual edge <g> elements opt back in with pointerEvents:'auto'. */}
@@ -1194,10 +1516,10 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
         </svg>
 
         {/* Port-in hit targets (invisible, used for edge-drop detection) */}
-        {nodes.map(n => {
+        {nodes.filter(n => n.type !== 'subagent_window').map(n => {
           const def = NODE_TYPES[n.type];
           if (!def) return null;
-          const slots = slotsForNode(NODE_TYPES, n);
+          const slots = visibleSlotsFor(n);
           const w = n.width || def.width || NODE_W;
           return slots.filter(s => s.kind === 'port-in').map((s, i) => {
             const portY = rowOffset(slots, slots.indexOf(s)) + ROW_H / 2;
@@ -1220,7 +1542,7 @@ function WorkflowCanvas({ nodes, setNodes, edges, setEdges, selectedId, selected
           });
         })}
 
-        {nodes.map(n => (
+        {nodes.filter(n => n.type !== 'subagent_window').map(n => (
           <WfNode key={n.id} node={n}
             selected={selectedId === n.id}
             dragging={false}
@@ -3241,11 +3563,19 @@ const LangflowEditor = forwardRef(function LangflowEditor(
     injectKF();
   }, []);
 
-  const [nodes, setNodes] = useState(() =>
-    initialNodes?.length > 0
+  const [nodes, setNodes] = useState(() => {
+    const loaded = initialNodes?.length > 0
       ? initialNodes.map(normalizeNode)
-      : SAMPLE_WORKFLOW.nodes
-  );
+      : SAMPLE_WORKFLOW.nodes;
+    // Self-healing on open: re-stack every subagent_window's members fresh
+    // against its saved bounds, rather than trusting whatever x/y happened
+    // to be saved. Guarantees a contained tool never renders outside its
+    // window after a reopen, regardless of what state it was saved in.
+    return loaded.reduce(
+      (ns, n) => n.type === 'subagent_window' ? layoutSubagentMembers(ns, n.id) : ns,
+      loaded,
+    );
+  });
   const [edges, setEdges] = useState(() =>
     initialEdges?.length > 0
       ? initialEdges.map(normalizeEdge)
@@ -3340,13 +3670,23 @@ const LangflowEditor = forwardRef(function LangflowEditor(
 
   // Delete a node and its connected edges
   const handleDeleteNode = useCallback((id) => {
-    setNodes(ns => ns.filter(n => n.id !== id));
+    setNodes(ns => {
+      const deleted = ns.find(n => n.id === id);
+      // Deleting a subagent_window releases its members back to being free
+      // (non-scoped) nodes rather than leaving a dangling parentId reference.
+      const remaining = ns.filter(n => n.id !== id)
+        .map(n => n.parentId === id ? { ...n, parentId: undefined } : n);
+      // Deleting a MEMBER node leaves a gap and a now-oversized box unless
+      // the window's remaining members are re-stacked and the box shrunk
+      // back down to fit them.
+      return deleted?.parentId ? layoutSubagentMembers(remaining, deleted.parentId, { shrink: true }) : remaining;
+    });
     setEdges(es => es.filter(e => e.source !== id && e.target !== id));
     setSelectedId(prev => prev === id ? null : prev);
   }, []);
 
   useImperativeHandle(ref, () => ({
-    getWorkflowData: () => ({ nodes, edges, enabled: active }),
+    getWorkflowData: () => buildExportedWorkflow(nodes, edges, active),
   }), [nodes, edges, active]);
 
   const title = workflowName || SAMPLE_WORKFLOW.title;

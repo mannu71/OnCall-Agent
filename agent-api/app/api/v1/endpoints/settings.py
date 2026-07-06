@@ -129,6 +129,36 @@ async def update_general_settings(payload: GeneralSettingsUpdate) -> Dict[str, A
     return {"success": True, "global_timezone": tz}
 
 
+class FeatureFlagsUpdate(BaseModel):
+    """Batch of feature-flag overrides. A null value resets to the env default."""
+
+    updates: Dict[str, Any] = Field(
+        description="Map of flag key → new value (bool/int/str), or null to reset.",
+    )
+
+
+@router.get("/settings/features")
+async def get_feature_flags() -> Dict[str, Any]:
+    """Return the runtime feature-flag catalog with current + default values."""
+    from app.core import feature_flags
+
+    return {"flags": feature_flags.effective()}
+
+
+@router.put("/settings/features")
+async def update_feature_flags(payload: FeatureFlagsUpdate) -> Dict[str, Any]:
+    """Persist and live-apply feature-flag overrides (no restart required)."""
+    from app.core import feature_flags
+
+    try:
+        flags = await feature_flags.set_flags(payload.updates)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return {"success": True, "flags": flags}
+
+
 @router.get("/settings/embedding/models")
 async def get_embedding_models() -> Dict[str, Any]:
     """Get available embedding models by provider.

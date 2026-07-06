@@ -14,6 +14,11 @@
     "postinstall": "cd ../agent-api && pip install -r requirements.txt"
   },
   "dependencies": {
+    "@react-three/drei": "^10.7.0",
+    "@react-three/fiber": "^9.5.0",
+    "@react-three/postprocessing": "^3.0.4",
+    "postprocessing": "^6.38.3",
+    "three": "~0.183.0",
     "@radix-ui/react-checkbox": "^1.3.3",
     "@radix-ui/react-collapsible": "^1.1.12",
     "@radix-ui/react-dialog": "^1.1.15",

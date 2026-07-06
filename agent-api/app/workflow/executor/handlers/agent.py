@@ -60,6 +60,13 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
     mcp_manager = executor.mcp_managers[execution_id]
 
     stream_callback = _AgentStreamCallback(executor, execution_id, node_id)
+    # Capture the parent run's callback so delegated subagents can surface their
+    # tool activity on this same chat stream, tagged with the subagent name.
+    try:
+        from app.harness.subagent_factory import set_parent_stream_callback
+        set_parent_stream_callback(stream_callback)
+    except Exception:  # noqa: BLE001 — attribution must never break a run
+        pass
 
     strategy_context = {
         'execution_id': execution_id,

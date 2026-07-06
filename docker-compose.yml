@@ -55,7 +55,9 @@ services:
       - PROVIDER_TRANSPORT=bedrock
       - COMPRESSION_ENABLED=true
       - COMPRESSION_ENDPOINT=http://headroom:8787
-      - COMPRESSION_MIN_CHARS=500
+      # Sub-2KB outputs gain little from compression but pay sidecar latency
+      # on every call, so only compress meaningfully large results.
+      - COMPRESSION_MIN_CHARS=2000
       - COMPRESSION_TIMEOUT_MS=2000
     depends_on:
       postgres:
@@ -65,7 +67,9 @@ services:
       - oncall-agent
 
   headroom:
-    image: ghcr.io/chopratejas/headroom:latest
+    # Pinned by digest (was :latest) so the compression sidecar can't drift
+    # under us. Bump deliberately after re-verifying the A/B token savings.
+    image: ghcr.io/chopratejas/headroom@sha256:50b85d8e320cfcdf1b38919bb7ae067b93ff7a8de0a93f05b2c1246370200d1c
     container_name: kyc-agent-headroom
     command: ["--port", "8787"]
     ports:

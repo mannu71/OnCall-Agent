@@ -3,10 +3,8 @@ import { useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
-import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import { cn } from '@/lib/utils';
@@ -14,7 +12,6 @@ import {
   Loader2,
   Bot,
   User,
-  RefreshCw,
   XCircle,
   Construction,
   Brain,
@@ -23,7 +20,6 @@ import {
   Activity,
   Database,
   AlertCircle,
-  Search,
   Cpu,
   CornerDownLeft,
   Info,
@@ -42,7 +38,7 @@ import { isAgentWorkflowValid } from '../utils/workflowValidation.js';
 import agentApiClient, { isAbortError } from '../services/agentApiClient.js';
 import ChatMessage, { MESSAGE_TYPES } from '../components/chat/ChatMessage.jsx';
 import SendButton from '../components/chat/SendButton.jsx';
-import DensityToggle, { DENSITIES } from '../components/chat/DensityToggle.jsx';
+import ContextRing from '../components/chat/ContextRing.jsx';
 import TraceTimeline from '../components/chat/TraceTimeline.jsx';
 import { formatClock } from '../lib/formatTime.js';
 import { useChatSessionsQuery } from '../hooks/queries/useChatSessionsQuery.js';
@@ -63,21 +59,6 @@ function persistSessionId(id) {
 // Client-side mirror of the backend trace_ids detector (cosmetic badge only —
 // the backend remains the source of truth for the correlation fast-path).
 const CORRELATION_ID_RE = /\b(1-[0-9a-f]{8}-[0-9a-f]{24}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9A-Z]{10,}:[0-9A-Fa-f]{8})\b/;
-const TIME_RANGE_HINT_RE = /\b(last|over|past|\d+\s*(m|min|mins|h|hr|hour|hours|d|day|days))\b/i;
-
-// Mirror of the backend conversational-intent heuristic (app/core/intent.py):
-// don't scope a greeting/thanks with a CloudWatch time range. Biased to False so
-// a real query is never mistaken for small talk.
-const SMALL_TALK_RE = /^\s*(hi|hii+|hey|hello|hiya|yo|sup|good\s*(morning|afternoon|evening)|greetings|thanks(\s*you)?|thank\s*you|thx|ty|cheers|ok(ay)?|cool|nice|great|got\s*it|bye|goodbye|see\s*ya|who\s*are\s*you|what\s*are\s*you|what\s*can\s*you\s*do|what\s*do\s*you\s*do|help|how\s*are\s*you)[\s!.,?]*$/i;
-const INVESTIGATION_HINT_RE = /\b(error|errors|fail|failed|failing|failure|exception|log|logs|trace|stack|crash|timeout|latency|slow|alarm|alert|5xx|4xx|500|503|throttl|outage|down|spike|spiking|anomaly|why|debug|investigate|root\s*cause|rca|repo|deploy|rollback|metric|cpu|memory|leak|query|database|sql|endpoint|api|status\s*code)\b/i;
-
-/** True only for clearly conversational messages (no investigation signal). */
-function isSmallTalk(text) {
-  const t = (text || '').trim();
-  if (!t || t.length > 64) return false;
-  if (INVESTIGATION_HINT_RE.test(t)) return false;
-  return SMALL_TALK_RE.test(t);
-}
 
 /** True when an agent workflow contains a CloudWatch node (so it can trace logs). */
 function agentHasCloudWatch(agent) {
@@ -101,7 +82,7 @@ const DEV_MODE = import.meta.env.DEV;
 const welcomeMessage = () => ({
   id: 'init-1',
   type: MESSAGE_TYPES.SYSTEM,
-  content: 'Welcome! Select an agent from the sidebar, then ask it anything to get started.',
+  content: 'Welcome! Pick an agent from the dropdown below, then ask it anything to get started.',
   timestamp: new Date().toISOString(),
 });
 
@@ -133,8 +114,21 @@ function Chat() {
   const [selectedAgent, setSelectedAgent] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showToolsList, setShowToolsList] = useState(false);
-  const [timeRange, setTimeRange] = useState('24h');
   const [agentSheetOpen, setAgentSheetOpen] = useState(false);
+
+  // Agent turn-loop engine for this chat — langgraph (ReAct, default) or the
+  // native hand-rolled turn loop (app.harness.engine). Overrides whatever the
+  // agent's own workflow node is configured with for just this session,
+  // persisted locally so a refresh keeps the last choice.
+  const [engineMode, setEngineMode] = useState(() => {
+    if (typeof localStorage === 'undefined') return 'langgraph';
+    const v = localStorage.getItem('chatEngineMode');
+    return v === 'native' ? 'native' : 'langgraph';
+  });
+  const changeEngineMode = (m) => {
+    setEngineMode(m);
+    try { localStorage.setItem('chatEngineMode', m); } catch { /* ignore */ }
+  };
 
   // Persistent chat sessions (migration 022). `sessionId` is created lazily on
   // the first message of a fresh chat; resuming hydrates messages from the API.
@@ -151,17 +145,6 @@ function Chat() {
   const [sessionId, setSessionId] = useState(null);
   const [sessionSheetOpen, setSessionSheetOpen] = useState(false);
   const [traceDrawerOpen, setTraceDrawerOpen] = useState(false);
-
-  // Conversation density (compact | comfortable | spacious), persisted locally.
-  const [density, setDensity] = useState(() => {
-    if (typeof localStorage === 'undefined') return 'comfortable';
-    const v = localStorage.getItem('chatDensity');
-    return DENSITIES.includes(v) ? v : 'comfortable';
-  });
-  const changeDensity = (d) => {
-    setDensity(d);
-    try { localStorage.setItem('chatDensity', d); } catch { /* ignore */ }
-  };
 
   // Composer send-button launch animation (transient).
   const [sendLaunching, setSendLaunching] = useState(false);
@@ -454,13 +437,7 @@ function Chat() {
 
     addMessage(MESSAGE_TYPES.USER, userMessage, { hasTraceId: CORRELATION_ID_RE.test(userMessage) });
 
-    // Append the selected time range hint ONLY for CloudWatch agents (and only
-    // when the user didn't already give one). Generic workflows get the raw text.
-    const effectiveAgent = selectedAgent || agents[0];
-    const scopeForCw = effectiveAgent && agentHasCloudWatch(effectiveAgent);
-    const question = (scopeForCw && !TIME_RANGE_HINT_RE.test(userMessage) && !isSmallTalk(userMessage))
-      ? `${userMessage} (over the last ${timeRange})`
-      : userMessage;
+    const question = userMessage;
 
     // If no agent selected, prompt user to select one
     if (!selectedAgent) {
@@ -554,18 +531,36 @@ function Chat() {
       const steps = [];
       const syncSteps = () => setMessages(prev => prev.map(m =>
         m.id === thinkingId ? { ...m, steps: [...steps] } : m));
-      const onStepCall = (name, args) => {
+      const onStepCall = (name, args, agent, model) => {
         lastActivityRef.current = Date.now();
-        steps.push({ id: `${name}-${steps.length}`, name, args, status: 'running', startedAt: Date.now() });
+        // `agent` attributes the call to its origin: 'agent' (main agent) or a
+        // subagent/squad name. `model` is the LLM that ran it. Both kept verbatim
+        // so the timeline can badge every row (main vs named subagent + model).
+        steps.push({ id: `${name}-${steps.length}`, name, args, agent: agent || 'agent', model: model || '', status: 'running', startedAt: Date.now() });
         syncSteps();
       };
-      const onStepResult = (name, result) => {
+      const onStepResult = (name, result, failed = false, agent, model) => {
         lastActivityRef.current = Date.now();
+        const who = agent || 'agent';
+        // Prefer the running step matching BOTH tool name and origin (so a main
+        // agent and a subagent calling the same tool don't cross-match); fall
+        // back to name-only if the origins somehow differ.
+        let idx = -1;
         for (let i = steps.length - 1; i >= 0; i--) {
-          if (steps[i].status === 'running' && steps[i].name === name) {
-            steps[i] = { ...steps[i], status: 'done', result, durationMs: Date.now() - steps[i].startedAt };
-            break;
+          const s = steps[i];
+          if (s.status === 'running' && s.name === name && (s.agent || 'agent') === who) { idx = i; break; }
+        }
+        if (idx < 0) {
+          for (let i = steps.length - 1; i >= 0; i--) {
+            if (steps[i].status === 'running' && steps[i].name === name) { idx = i; break; }
           }
+        }
+        if (idx >= 0) {
+          steps[idx] = {
+            ...steps[idx], status: failed ? 'error' : 'done', result,
+            model: steps[idx].model || model || '',
+            durationMs: Date.now() - steps[idx].startedAt,
+          };
         }
         syncSteps();
       };
@@ -599,10 +594,19 @@ function Chat() {
       const result = await agentApiClient.runAgentStream(agent.name, question, {
         history,
         sessionId: sid,
+        engine: engineMode,
         signal: controller.signal,
         onToken,
-        onToolCall: (name, args) => { onStepCall(name, args); pushTrace('tool', `Calling ${name}…`); pushStatus(`Calling ${name}…`); },
-        onToolResult: (name, res) => { onStepResult(name, res); pushTrace('tool', `${name} returned`); },
+        onToolCall: (name, args, agent) => {
+          onStepCall(name, args, agent);
+          const who = agent && agent !== 'agent' ? `[${agent}] ` : '';
+          pushTrace('tool', `${who}Calling ${name}…`); pushStatus(`${who}Calling ${name}…`);
+        },
+        onToolResult: (name, res, failed, agent) => {
+          onStepResult(name, res, failed, agent);
+          const who = agent && agent !== 'agent' ? `[${agent}] ` : '';
+          pushTrace('tool', failed ? `${who}${name} failed` : `${who}${name} returned`);
+        },
         onNode: (nodeId, status) => pushTrace('think', `${nodeId} ${status}`),
         onStatus: (msg) => pushStatus(msg),
         onTokens: (t) => {
@@ -796,110 +800,14 @@ function Chat() {
   return (
     <div className={`${sysDark ? 'dark ' : ''}flex h-screen bg-[#f5f5f7] dark:bg-[#161618] text-slate-800 dark:text-slate-100 select-none overflow-hidden w-full max-w-full`}>
 
-      {/* Sub-Sidebar: Left - Agent List */}
-      <aside className="hidden md:flex w-[240px] lg:w-[280px] border-r border-black/[0.06] dark:border-white/10 flex-col h-full bg-white/70 dark:bg-[#1c1c1e]/70 backdrop-blur-xl flex-shrink-0">
-        <div className="p-4 border-b border-slate-100 h-20 flex flex-col justify-center gap-0.5">
-          <div className="flex items-center justify-between">
-            <h2 className="font-bold text-slate-800 dark:text-slate-100 text-sm tracking-wide">Agents</h2>
-            <Button 
-              size="icon" 
-              variant="ghost" 
-              onClick={loadAgents} 
-              disabled={isLoading}
-              title="Refresh Agents List"
-              className="size-8 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-50"
-            >
-              <RefreshCw className={isLoading ? 'animate-spin' : ''} data-icon="inline-start" />
-            </Button>
-          </div>
-          <p className="text-[11px] text-slate-400 font-medium">
-            Select an agent to start chatting
-          </p>
-        </div>
-
-        {/* Sub-Sidebar Search */}
-        <div className="px-4 py-2.5 border-b border-slate-100">
-          <div className="relative">
-            <Search className="absolute left-2.5 top-2.5 size-3.5 text-slate-400" />
-            <Input 
-              placeholder="Search agents..." 
-              value={searchQuery}
-              onChange={e => setSearchQuery(e.target.value)}
-              className="pl-8 h-8 text-xs bg-slate-50/50 border-slate-200 focus-visible:bg-white focus:border-primary focus:ring-0 hover:bg-slate-50/80 transition-all rounded-lg"
-            />
-          </div>
-        </div>
-
-        {/* Agent list items */}
-        <div className="flex-grow overflow-auto py-2">
-          {filteredAgents.length === 0 ? (
-            <div className="px-4 py-3">
-              <Alert className="bg-slate-50 border-slate-200 rounded-xl p-3">
-                <AlertDescription className="text-xs text-slate-500 leading-normal">
-                  No agents found. Go to <span className="font-semibold text-slate-700">Workflow</span> to build an agent workflow with an LLM and Tool attached.
-                </AlertDescription>
-              </Alert>
-            </div>
-          ) : (
-            filteredAgents.map((agent) => {
-              const isSelected = selectedAgent?.id === agent.id;
-              return (
-                <div key={agent.id} className="px-2 mb-1 relative group">
-                  <div
-                    onClick={() => !isLoading && handleSelectAgent(agent)}
-                    className={cn(
-                      "w-full flex items-center px-3 py-3 rounded-xl transition-all duration-300 cursor-pointer border",
-                      isSelected
-                        ? 'bg-primary/10 text-slate-800 dark:text-slate-100 border-primary/30'
-                        : 'text-slate-600 dark:text-slate-300 border-transparent hover:bg-black/[0.03] dark:hover:bg-white/[0.05]',
-                      isLoading && 'opacity-65 cursor-not-allowed'
-                    )}
-                  >
-                    <div className="flex items-center gap-3 flex-1 min-w-0">
-                      <div className={cn(
-                        "size-8 rounded-lg flex items-center justify-center flex-shrink-0 transition-colors",
-                        isSelected
-                          ? 'bg-primary text-primary-foreground shadow-sm shadow-primary/30'
-                          : 'bg-slate-100 dark:bg-white/[0.06] text-slate-500 dark:text-slate-400'
-                      )}>
-                        <Bot className="size-4" />
-                      </div>
-                      <div className="flex-1 text-left min-w-0">
-                        <div className="font-semibold text-xs text-slate-700 dark:text-slate-200 truncate flex items-center gap-1.5">
-                          <span className="truncate">{agent.name}</span>
-                          {agentHasCloudWatch(agent) && (
-                            <span className="shrink-0 text-[9px] font-semibold text-sky-700 bg-sky-50 border border-sky-100 rounded px-1 leading-4">CloudWatch</span>
-                          )}
-                        </div>
-                        <div className="text-[10px] text-slate-400 flex items-center gap-1.5 mt-0.5">
-                          <span className="relative flex h-1.5 w-1.5">
-                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                            <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500"></span>
-                          </span>
-                          {isSelected ? 'Active' : 'Ready'}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                  
-                  {/* Sidebar indicator bar */}
-                  {isSelected && (
-                    <div className="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-7 bg-primary rounded-r-full shadow-md" />
-                  )}
-                </div>
-              )
-            })
-          )}
-        </div>
-      </aside>
-
       {/* Main Column: Chat Panel */}
       <div className="flex-grow flex flex-col h-full bg-[#f5f5f7] dark:bg-[#161618] min-w-0 relative">
 
         {/* Top Header Bar */}
         <header className="min-h-16 sm:h-20 px-3 sm:px-4 md:px-8 py-2.5 sm:py-0 border-b border-black/[0.06] dark:border-white/10 bg-white/70 dark:bg-[#1c1c1e]/70 backdrop-blur-xl flex items-center gap-2 sm:gap-4 flex-shrink-0 z-10 overflow-hidden">
           <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1 overflow-hidden">
-            {/* Mobile agent picker (sidebar is hidden < md) */}
+            {/* Mobile agent picker — quick access on narrow screens, in
+                addition to the composer's own agent dropdown. */}
             <Sheet open={agentSheetOpen} onOpenChange={setAgentSheetOpen}>
               <SheetTrigger asChild>
                 <Button variant="outline" size="icon" className="md:hidden size-9 shrink-0 rounded-lg" title="Choose agent">
@@ -939,56 +847,10 @@ function Chat() {
               <h1 className="font-bold text-sm text-slate-800 dark:text-slate-100 tracking-wide truncate leading-tight">
                 {selectedAgent ? selectedAgent.name : 'Select an agent'}
               </h1>
-              <div className="text-[11px] text-slate-400 font-medium flex items-center gap-1.5 mt-0.5 font-sans min-w-0">
-                <span
-                  className="min-w-0 truncate max-w-[min(100%,12rem)] sm:max-w-[min(100%,18rem)] bg-slate-50 dark:bg-white/[0.06] border border-slate-100 dark:border-white/10 px-1.5 py-0.5 rounded font-mono text-[10px] text-slate-500 dark:text-slate-400 font-semibold leading-none"
-                  title={modelName}
-                >
-                  {modelName}
-                </span>
-                <span className="text-slate-200 dark:text-slate-600 shrink-0">·</span>
-                <span className="shrink-0 whitespace-nowrap">{toolsCount} tool{toolsCount === 1 ? '' : 's'}</span>
-              </div>
             </div>
           </div>
 
-          {/* Context-window fullness (this turn) + session-cumulative tokens.
-              Context bar mirrors claude-code-main's status line: current-turn
-              fullness, color-coded, NOT the session total (tracked separately
-              below — finalized on the session, not per-workflow-run). */}
-          {contextUsage.window > 0 && (
-            <div className="hidden md:flex items-center gap-3 shrink-0 px-2" title={`${contextUsage.used.toLocaleString()} / ${contextUsage.window.toLocaleString()} tokens this turn`}>
-              <div className="flex items-center gap-1.5">
-                <div className="w-16 h-1.5 rounded-full bg-slate-100 dark:bg-white/10 overflow-hidden">
-                  <div
-                    className={cn(
-                      'h-full rounded-full transition-all duration-500',
-                      contextUsage.pct >= 90 ? 'bg-red-500' : contextUsage.pct >= 70 ? 'bg-amber-500' : 'bg-emerald-500'
-                    )}
-                    style={{ width: `${Math.max(4, contextUsage.pct)}%` }}
-                  />
-                </div>
-                <span className={cn(
-                  'text-[10px] font-semibold tabular-nums',
-                  contextUsage.pct >= 90 ? 'text-red-600' : contextUsage.pct >= 70 ? 'text-amber-600' : 'text-slate-400'
-                )}>
-                  {contextUsage.pct}%
-                </span>
-              </div>
-              {(sessionTokens.input + sessionTokens.output) > 0 && (
-                <span
-                  className="text-[10px] text-slate-400 font-medium whitespace-nowrap"
-                  title={`Session total — in: ${sessionTokens.input.toLocaleString()}, out: ${sessionTokens.output.toLocaleString()}, cache-read: ${sessionTokens.cacheRead.toLocaleString()}`}
-                >
-                  {(sessionTokens.input + sessionTokens.output).toLocaleString()} session tok
-                </span>
-              )}
-            </div>
-          )}
-
           <div className="flex items-center gap-1 sm:gap-2 shrink-0">
-            <DensityToggle value={density} onChange={changeDensity} />
-
             <Button
               variant="outline"
               size="sm"
@@ -1066,23 +928,12 @@ function Chat() {
                 </div>
               </SheetContent>
             </Sheet>
-
-            <Badge
-              variant="success"
-              className="hidden sm:flex px-2.5 py-0.5 rounded-full items-center gap-1.5 text-[11px] font-semibold transition-all duration-300 shrink-0"
-            >
-              <span className="relative flex size-1.5">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full size-1.5 bg-emerald-500"></span>
-              </span>
-              Online
-            </Badge>
           </div>
         </header>
 
         {/* Scrollable Conversation Stream — centered single-column rail */}
         <div className="flex-grow overflow-auto px-4 md:px-8 py-6 select-text">
-          <div className={cn('mx-auto w-full max-w-[var(--chat-max)] flex flex-col', `chat-density-${density}`)}>
+          <div className={cn('mx-auto w-full max-w-[var(--chat-max)] flex flex-col')}>
             {messages.map((message) => (
               <ChatMessage
                 key={message.id}
@@ -1098,9 +949,9 @@ function Chat() {
           </div>
         </div>
 
-        {/* Dynamic Tools Floating Drawer */}
+        {/* Dynamic Tools Floating Drawer — anchored above its composer trigger */}
         {showToolsList && (
-          <div className="absolute bottom-28 left-8 z-20 w-80 bg-white border border-slate-200 rounded-2xl shadow-xl p-4 animate-in fade-in slide-in-from-bottom-3 duration-300">
+          <div className="absolute bottom-32 right-4 md:right-8 z-20 w-80 bg-white border border-slate-200 rounded-2xl shadow-xl p-4 animate-in fade-in slide-in-from-bottom-3 duration-300">
             <div className="flex items-center justify-between border-b pb-2 mb-2">
               <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
                 <Wrench className="size-3.5 text-primary" />
@@ -1182,7 +1033,68 @@ function Chat() {
         {/* Input tray panel — same max width as the message rail */}
         <div className="p-4 md:p-8 pt-0 md:pt-0 bg-transparent flex-shrink-0 z-10">
           <div className="mx-auto w-full max-w-[var(--chat-max)] bg-white/80 dark:bg-[#1c1c1e]/80 backdrop-blur-xl border border-black/[0.08] dark:border-white/10 rounded-2xl p-3 flex flex-col gap-3 shadow-[0_4px_24px_rgb(0_0_0/0.06)] transition-colors focus-within:border-primary/60 focus-within:ring-2 focus-within:ring-primary/20">
-            
+
+            {/* Composer top strip — agent switcher (so you can change agents
+                without leaving the chat box) + tools trigger, top-right. */}
+            <div className="flex items-center justify-between gap-2">
+              <Select
+                value={selectedAgent?.id ? String(selectedAgent.id) : ''}
+                onValueChange={(id) => {
+                  const agent = agents.find((a) => String(a.id) === id);
+                  if (agent) handleSelectAgent(agent);
+                }}
+                disabled={isLoading || agents.length === 0}
+              >
+                <SelectTrigger
+                  size="sm"
+                  title={selectedAgent ? selectedAgent.name : 'Select an agent'}
+                  className="h-7 w-auto border-none shadow-none bg-transparent px-1.5 gap-1 text-slate-500 dark:text-slate-300 hover:bg-black/[0.04] dark:hover:bg-white/[0.06] rounded-md focus:ring-0 [&>span]:hidden"
+                >
+                  <Bot className="size-4 shrink-0" />
+                  <SelectValue placeholder="Select an agent" />
+                </SelectTrigger>
+                <SelectContent>
+                  {agents.length === 0 ? (
+                    <div className="px-3 py-2 text-xs text-slate-500">No agents available</div>
+                  ) : agents.map((agent) => (
+                    <SelectItem key={agent.id} value={String(agent.id)}>
+                      <span className="flex items-center gap-1.5">
+                        <span className="truncate">{agent.name}</span>
+                        {agentHasCloudWatch(agent) && (
+                          <span className="shrink-0 text-[9px] font-semibold text-sky-700 bg-sky-50 border border-sky-100 rounded px-1 leading-4">CloudWatch</span>
+                        )}
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+
+              <div className="flex items-center gap-1.5 shrink-0">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => setShowToolsList(!showToolsList)}
+                  title={`Connected tools (${toolsCount})`}
+                  className={cn('size-7 shrink-0 rounded-lg relative text-slate-400 hover:text-slate-600 hover:bg-slate-50', showToolsList && 'bg-red-50 text-primary hover:bg-red-50 hover:text-primary')}
+                >
+                  <Wrench className="size-3.5" />
+                  {toolsCount > 0 && (
+                    <span className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-0.5 rounded-full bg-primary text-white text-[9px] font-bold flex items-center justify-center leading-none">
+                      {toolsCount}
+                    </span>
+                  )}
+                </Button>
+
+                {/* Context-window fullness (this turn) + session-cumulative
+                    tokens. Mirrors claude-code-main's status line: current-turn
+                    fullness, color-coded, NOT the session total (tracked
+                    separately — finalized on the session, not per-workflow-run). */}
+                {contextUsage.window > 0 && (
+                  <ContextRing contextUsage={contextUsage} sessionTokens={sessionTokens} />
+                )}
+              </div>
+            </div>
+
             {/* Multi-line chat Textarea */}
             <Textarea 
               ref={inputRef}
@@ -1198,75 +1110,35 @@ function Chat() {
             {/* Input Footer row — tools wrap; actions stay grouped on the right */}
             <div className="flex flex-col gap-2 border-t border-slate-50 dark:border-white/[0.06] pt-2.5 sm:flex-row sm:items-center">
               <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 sm:gap-2">
-                <Button 
-                  variant="ghost" 
-                  size="sm" 
-                  onClick={() => setShowToolsList(!showToolsList)}
-                  className={cn(
-                    "h-8 shrink-0 rounded-lg text-xs font-semibold text-muted-foreground",
-                    showToolsList && "bg-red-50 text-primary hover:bg-red-50"
-                  )}
+                {/* Agent turn-loop engine — ReAct (langgraph, default) vs the
+                    native hand-rolled loop. Per-session override, sent as the
+                    `engine` param on each turn (see resolve_engine). */}
+                <div
+                  className="flex items-center h-7 shrink-0 rounded-lg bg-slate-100 dark:bg-white/[0.06] p-0.5 gap-0.5"
+                  title="Agent turn-loop engine for this chat"
                 >
-                  @ tools
-                </Button>
-                
-                {/* CloudWatch-specific quick actions — only for agents that
-                    actually have a CloudWatch tool. Other workflows stay generic. */}
-                {selectedAgent && agentHasCloudWatch(selectedAgent) && (
-                  <>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => {
-                        setInputValue('Trace correlation id <paste id here> ');
-                        setTimeout(() => inputRef.current?.focus(), 0);
-                      }}
-                      className="h-8 shrink-0 rounded-lg text-xs font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-700"
-                      title="Insert a correlation/trace ID lookup template"
+                  {[
+                    { value: 'langgraph', label: 'ReAct' },
+                    { value: 'native', label: 'Native' },
+                  ].map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => changeEngineMode(opt.value)}
+                      className={cn(
+                        'h-6 px-2 rounded-md text-[10.5px] font-semibold transition-colors',
+                        engineMode === opt.value
+                          ? 'bg-white dark:bg-[#2c2c2e] text-primary shadow-sm'
+                          : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-300'
+                      )}
                     >
-                      <Search className="size-3.5 shrink-0" data-icon="inline-start" />
-                      <span className="max-[420px]:hidden">Trace ID</span>
-                    </Button>
-
-                    {/* Time range scoping for CloudWatch lookups */}
-                    <Select value={timeRange} onValueChange={setTimeRange}>
-                      <SelectTrigger
-                        size="sm"
-                        className="h-8 w-[74px] shrink-0 rounded-lg text-xs font-semibold text-slate-600"
-                        title="Time range for CloudWatch lookups"
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="15m">15m</SelectItem>
-                        <SelectItem value="1h">1h</SelectItem>
-                        <SelectItem value="6h">6h</SelectItem>
-                        <SelectItem value="24h">24h</SelectItem>
-                        <SelectItem value="7d">7d</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </>
-                )}
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               <div className="flex shrink-0 items-center justify-end gap-2 sm:ml-2">
-                {/* Model + status cluster, like the Claude Code composer's
-                    "Sonnet 5 · High ⟳" indicator. modelName can be a long
-                    multi-model list ("Claude Sonnet 4.6, Claude Haiku 4.5"),
-                    and this row's available width depends on the sidebar
-                    panels, not the viewport — so it must truncate rather than
-                    rely on a viewport breakpoint (which caused it to overlap
-                    "Trace ID" whenever the chat column was narrow but the
-                    browser itself was wide). */}
-                {modelName && modelName !== '—' && (
-                  <span
-                    className="hidden sm:flex items-center gap-1.5 min-w-0 max-w-[7rem] shrink text-[10px] font-semibold text-slate-400"
-                    title={modelName}
-                  >
-                    <span className="truncate">{modelName.split(',')[0].trim()}</span>
-                    {isLoading && <Loader2 className="size-3 shrink-0 animate-spin text-primary" />}
-                  </span>
-                )}
                 {isLoading && watchdogStale && !isStopping && (
                   // Watchdog: no SSE activity for WATCHDOG_SILENCE_MS. Most
                   // stuck runs would otherwise leave the user staring at a

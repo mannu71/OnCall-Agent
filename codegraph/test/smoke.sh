@@ -114,4 +114,10 @@ acc=$(docker run --rm -v "$here/test:/test:ro" codegraph:builder \
         python3 /test/accuracy/eval.py 2>&1) || true
 echo "$acc" >&2
 
+# ── RETRIEVAL (informational): hybrid search_graph vs legacy BM25-only ──────
+echo "=== RETRIEVAL (informational) ===" >&2
+ret=$(docker run --rm -v "$here/test:/test:ro" codegraph:builder \
+        python3 /test/retrieval/eval.py 2>&1) || true
+echo "$ret" >&2
+
 echo "PASS: all functional smoke checks (M0-M7)" >&2

@@ -196,6 +196,38 @@ class ExecutionRepository(BaseAsyncRepository):
         )
         return [self._execution_to_dict(e) for e in executions]
 
+    async def list_completed_by_chat_session(
+        self, session_id: str, limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """List trajectory-bearing executions for a chat session, oldest first.
+
+        Backs tool-inclusive chat history replay (app.harness.chat_history) —
+        the caller segments each trajectory into its own turn's tool_calls/
+        tool_results. ``chat_session_id`` is stamped only when an execution
+        row is saved (see result.py), so the in-flight run for THIS turn is
+        never included. Fast-path/HITL/failed runs save ``trajectory=None``
+        and are excluded by the WHERE clause, not filtered client-side.
+        """
+        rows = await self._all(
+            select(ExecutionModel)
+            .where(
+                ExecutionModel.chat_session_id == session_id,
+                ExecutionModel.trajectory.isnot(None),
+            )
+            .order_by(ExecutionModel.started_at.asc())
+            .limit(limit)
+        )
+        return [
+            {
+                "id": row.id,
+                "status": row.status,
+                "started_at": row.started_at.isoformat() if row.started_at else None,
+                "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+                "trajectory": row.trajectory,
+            }
+            for row in rows
+        ]
+
     async def list_all(self, limit: int = 100) -> List[Dict[str, Any]]:
         """List all executions (newest first)."""
         executions = await self._all(

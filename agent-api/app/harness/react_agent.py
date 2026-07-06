@@ -16,8 +16,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from app.workflow.strategies.react.agent_builder import compose_system_prompt
-from app.workflow.strategies.react.tool_setup import build_playbook_tools
+from app.harness.agent_builder import compose_system_prompt
+from app.harness.tool_setup import build_playbook_tools
 
 logger = logging.getLogger(__name__)
 
@@ -212,11 +212,22 @@ def _finish_build_agent(
                 session_id=_compaction_session,
                 model=_compaction_model,
             )
-            out = await mgr.compact_if_needed(list(msgs))
+            out = None
+            if session_id:
+                from app.harness.engine.compression import maybe_metamemory_summary
+                out = await maybe_metamemory_summary(
+                    list(msgs),
+                    vfs_session_id=session_id,
+                    compaction_threshold_tokens=mgr.compaction_threshold_tokens,
+                    keep_recent_tokens=mgr.keep_recent_tokens,
+                    estimate_tokens=mgr.estimate_tokens,
+                )
+            if out is None:
+                out = await mgr.compact_if_needed(list(msgs))
         except Exception:  # noqa: BLE001 — compaction must never break a run
             out = msgs
         try:
-            from app.workflow.strategies.react.agent_runner import sanitize_messages_for_model
+            from app.harness.agent_runner import sanitize_messages_for_model
             out = sanitize_messages_for_model(out)
         except Exception:  # noqa: BLE001 — a guard must never break a run
             pass

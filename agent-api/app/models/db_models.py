@@ -541,3 +541,63 @@ class MCPRoleAssignmentModel(Base):
     __table_args__ = (
         UniqueConstraint("role", "server_name", name="uq_mcp_role_assignments_role_server"),
     )
+
+
+class ExecutionScratchModel(Base):
+    """Optional Postgres-backed deep-agent session scratch (todos + VFS).
+
+    One row per (execution_id, store) holding the whole store's content as a
+    JSON blob — used only when ``settings.scratch_store_backend == "postgres"``;
+    the default "memory" backend never touches this table. See migration
+    ``029_execution_scratch_store.sql`` and
+    ``app/infrastructure/persistence/execution_scratch_repository.py``.
+    """
+    __tablename__ = "execution_scratch_store"
+
+    execution_id = Column(String(128), primary_key=True)
+    store = Column(String(32), primary_key=True)   # 'todos' | 'vfs'
+    value = Column(JSON, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
+class FailureLedgerModel(Base):
+    """Recurring tool/run failure fingerprints for governance conversion.
+
+    A fingerprint recurring ``count >= settings.governance_convert_threshold``
+    times is eligible for conversion into a durable control (eval fixture,
+    policy rule, selftest check) — see
+    ``app.core.improvement.analyzer.GovernanceConverter`` and migration
+    ``030_governance_and_trajectory.sql``. Inert until that feature is used;
+    off by default has zero rows.
+    """
+    __tablename__ = "failure_ledger"
+
+    fingerprint = Column(String(80), primary_key=True)
+    first_seen = Column(DateTime(timezone=True), default=_utcnow)
+    last_seen = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+    count = Column(Integer, default=1)
+    sample_execution_ids = Column(JSON, default=list)
+    status = Column(String(16), default="open")  # open | converted | dismissed
+    control_ref = Column(Text, nullable=True)
+
+
+class TrajectoryEventModel(Base):
+    """Typed, step-granular trajectory event (one per model turn / tool call).
+
+    Recorded alongside the existing flat ``executions.trajectory`` JSON blob
+    by ``app.harness.step_recorder`` when ``settings.step_events_enabled`` is
+    on. See migration ``030_governance_and_trajectory.sql``.
+    """
+    __tablename__ = "trajectory_events"
+
+    event_id = Column(String(32), primary_key=True)
+    trace_id = Column(String(128), nullable=False)   # execution_id or subagent span
+    span_id = Column(String(64), nullable=True)       # NULL = root run
+    step_index = Column(Integer, nullable=False)
+    ts = Column(DateTime(timezone=True), default=_utcnow)
+    type = Column(String(24), nullable=False)         # model_turn | tool_call | lifecycle | ...
+    payload = Column(JSON, nullable=False)
+
+    __table_args__ = (
+        Index("idx_trajectory_events_trace", "trace_id", "step_index"),
+    )

@@ -47,6 +47,7 @@ _ALWAYS_KEEP_NAMES = {
     "delegate_investigation", "edit_file", "apply_edit",
     "write_todos", "update_todo", "run_command",
     "fs_write", "fs_read", "fs_ls", "fs_grep",
+    "fs_append", "fs_upsert", "fs_prune",
 }
 # char/4 token heuristic for schema size estimation. This is intentionally
 # approximate — the gate activates on a soft cliff (20K tokens), not a hard

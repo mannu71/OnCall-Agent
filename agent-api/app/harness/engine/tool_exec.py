@@ -35,6 +35,27 @@ async def _invoke_one(
         return f"Error: {exc}\n Please fix your mistakes."
 
 
+async def _record_failure_fingerprint(
+    tool_name: str, output_str: str, execution_id: Optional[str],
+) -> None:
+    """Live failure->governance hook (3.2): upsert this failure's fingerprint
+    into failure_ledger in real time. Gated by
+    settings.governance_conversion_enabled (default False) — the flag check
+    is the first thing done so the common (flag-off) path costs one
+    attribute read, no DB round-trip. Best-effort — never breaks a run.
+    """
+    try:
+        from app.config import settings
+        if not getattr(settings, "governance_conversion_enabled", False):
+            return
+        from app.core.improvement.analyzer import fingerprint_error
+        from app.infrastructure.persistence import failure_ledger_repository
+        fp = fingerprint_error(f"{tool_name}: {output_str}")
+        await failure_ledger_repository.record(fp, execution_id)
+    except Exception:  # noqa: BLE001 — governance must never break a run
+        pass
+
+
 async def execute_tool_calls(
     ai_message: Any,
     tools_by_name: Dict[str, Any],
@@ -44,6 +65,8 @@ async def execute_tool_calls(
     execution_port: Any = None,
     stream_callback: Any = None,
     tool_call_count_before: int = 0,
+    recorder: Any = None,
+    step_index: int = 0,
 ) -> ToolExecResult:
     """Run every ``tool_calls`` entry on ``ai_message`` concurrently.
 
@@ -109,13 +132,27 @@ async def execute_tool_calls(
             except Exception:  # noqa: BLE001
                 pass
 
+        _t0 = asyncio.get_event_loop().time()
         tool = tools_by_name.get(tc_name)
         if tool is None:
             output_str = f"Error: tool '{tc_name}' is not available."
         else:
             output_str = await _invoke_one(tool, tc_name, tc_args)
+        _latency_ms = (asyncio.get_event_loop().time() - _t0) * 1000.0
 
         is_failed, _reason = classify_tool_failure(tc_name, output_str)
+        if is_failed:
+            await _record_failure_fingerprint(tc_name, output_str, execution_id)
+        if recorder is not None:
+            try:
+                recorder.record_tool_call(
+                    step_index, tool_name=tc_name,
+                    status="error" if is_failed else "ok",
+                    latency_ms=_latency_ms,
+                    error_class=_reason if is_failed else None,
+                )
+            except Exception:  # noqa: BLE001 — recording must never break a run
+                pass
         gc_post = guardrail.after_call(tc_name, tc_args, output_str, failed=is_failed)
         if gc_post.action in ("warn", "block", "halt"):
             output_str = append_toolguard_guidance(output_str, gc_post)
@@ -138,7 +175,9 @@ async def execute_tool_calls(
 
         if stream_callback is not None:
             try:
-                await stream_callback.on_tool_result(tc_name, output_str[:2000])
+                await stream_callback.on_tool_result(
+                    tc_name, output_str[:2000], failed=is_failed,
+                )
             except Exception:  # noqa: BLE001
                 pass
 

@@ -475,6 +475,114 @@ class SkillService:
             for s, score in matched[:limit]
         ]
 
+    async def recall_two_stage(
+        self,
+        query: str,
+        limit: int = 3,
+        allowed: Optional[set] = None,
+        use_llm: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Two-stage skill retrieval (4.4).
+
+        Stage 1: BM25-rank active skills (reusing
+        ``app.core.tools.router.rank_tools`` — the same ranker
+        ``ToolExposureManager`` uses) over a doc built from
+        name/tags/applicability/category_path/trigger_patterns — a richer
+        signal than ``recall()``'s trigger_patterns-only regex match. Stage 2
+        (when ``use_llm`` and ``settings.skill_two_stage_recall`` are both
+        on): the DB-configured LLM reviews the shortlist and may select a
+        SUBSET — including zero, when nothing genuinely fits — instead of
+        deterministically keeping the top-K regardless of fit.
+
+        Falls back to the existing keyword-based :meth:`recall` when the
+        flag is off, so behavior is unchanged unless explicitly opted into.
+        Never raises — any failure degrades to :meth:`recall`.
+        """
+        if not getattr(settings, "skill_two_stage_recall", False):
+            return await self.recall(query, limit=limit, allowed=allowed)
+
+        try:
+            await _ensure_store()
+            from app.core.tools.router import rank_tools
+
+            candidates = [
+                s for s in _CACHE.values()
+                if s.get("status") == "active" and (not allowed or s.get("name") in allowed)
+            ]
+            if not candidates:
+                return []
+
+            schemas = []
+            for s in candidates:
+                words = (s.get("name") or "").replace("-", " ").replace("_", " ")
+                doc = " ".join(p for p in [
+                    words, s.get("title") or "", s.get("applicability") or "",
+                    s.get("category_path") or "", " ".join(s.get("tags") or []),
+                    " ".join(s.get("trigger_patterns") or []),
+                ] if p)
+                schemas.append({"name": s["name"], "description": doc})
+
+            ranked = rank_tools(schemas, query)
+            shortlist_k = int(getattr(settings, "skill_shortlist_k", 6))
+            by_name = {s["name"]: s for s in candidates}
+            shortlist = [
+                by_name[sc["name"]] for sc, score in ranked[:shortlist_k]
+                if score > 0 and sc.get("name") in by_name
+            ]
+            if not shortlist:
+                return []
+
+            selected = shortlist
+            if use_llm:
+                try:
+                    selected = await self._llm_select_skills(query, shortlist) or []
+                except Exception as exc:  # noqa: BLE001 — LLM stage is best-effort
+                    logger.debug("SkillService.recall_two_stage: LLM select skipped (%s)", exc)
+                    selected = shortlist
+
+            return [
+                {
+                    "id": s["name"], "name": s["name"], "title": s.get("title"),
+                    "description": s.get("description"), "trigger_patterns": s.get("trigger_patterns"),
+                    "steps": s.get("steps"), "score": None,
+                }
+                for s in selected[:limit]
+            ]
+        except Exception as exc:  # noqa: BLE001 — two-stage recall must never break a run
+            logger.debug("SkillService.recall_two_stage: failed, falling back to recall() — %s", exc)
+            return await self.recall(query, limit=limit, allowed=allowed)
+
+    async def _llm_select_skills(
+        self, query: str, shortlist: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Ask the DB-configured LLM to pick a subset of the shortlist (may
+        be empty). No hardcoded model — reuses the same call_llm() path
+        app.core.improvement.analyzer's proposal step uses."""
+        from app.crawler.call_llm import call_llm
+
+        options = "\n".join(
+            f"- {s['name']}: {s.get('title')} — "
+            f"{(s.get('applicability') or s.get('description') or '')[:150]}"
+            for s in shortlist
+        )
+        prompt = (
+            "Given this user request and a shortlist of candidate skills, return a JSON "
+            "array of the skill NAMES that genuinely apply. Return an EMPTY array if none "
+            "clearly apply — do not guess.\n\n"
+            f"Request: {query}\n\nCandidates:\n{options}\n\n"
+            "Respond with a JSON array of names ONLY, no prose."
+        )
+        text, _tin, _tout, _cached = await call_llm(prompt, tier="search", max_tokens=300)
+        m = re.search(r"\[.*\]", text or "", re.DOTALL)
+        if not m:
+            return shortlist
+        try:
+            names = json.loads(m.group(0))
+        except Exception:  # noqa: BLE001
+            return shortlist
+        by_name = {s["name"]: s for s in shortlist}
+        return [by_name[n] for n in names if isinstance(n, str) and n in by_name]
+
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
@@ -976,6 +1084,12 @@ def _normalize_record(d: Dict[str, Any], name: Optional[str] = None) -> Dict[str
         "promoted_from_id": d.get("promoted_from_id"),
         "created_at":       d.get("created_at"),
         "updated_at":       d.get("updated_at"),
+        # 4.4 hierarchical two-stage retrieval (all optional, backward-compatible
+        # — a skill written before this field existed just gets the defaults).
+        "category_path":    d.get("category_path") or "",
+        "tags":             d.get("tags") or [],
+        "applicability":    d.get("applicability") or "",
+        "provenance":       d.get("provenance") or {"source": d.get("source") or "manual"},
     }
 
 

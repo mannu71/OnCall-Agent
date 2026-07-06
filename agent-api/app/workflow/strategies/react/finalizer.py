@@ -201,14 +201,22 @@ async def finalize(
     # plan for the UI, then drop both stores so nothing outlives the run.
     _todos = []
     try:
-        from app.workflow.strategies.react import planning_tools as _pl
-        _todos = _pl.get_todos(execution_id)
-        _pl.drop_session(execution_id)
+        from app.harness import planning_tools as _pl
+        _todos = await _pl.get_todos(execution_id)
+        await _pl.drop_session(execution_id)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # Metamemory session persistence: sync BEFORE the drop below removes
+        # this execution's VFS row — otherwise there's nothing left to sync.
+        from app.harness import metamemory as _metamemory
+        _chat_session_id = (context.get("inputs") or {}).get("_chat_session_id")
+        await _metamemory.sync_session_persistence_out(execution_id, _chat_session_id)
     except Exception:  # noqa: BLE001
         pass
     try:
         from app.core import vfs as _vfs
-        _vfs.drop_session(execution_id)
+        await _vfs.vfs_drop_session(execution_id)
     except Exception:  # noqa: BLE001
         pass
 
@@ -226,9 +234,23 @@ async def finalize(
         if _context_window_size else 0
     )
 
+    # Terminal state (app.harness.terminal_state): "was this run actually a
+    # success" — never trust a self-reported answer alone. Best-effort; a
+    # derivation failure must never block the result from returning.
+    terminal_state = None
+    try:
+        from app.core.intent import is_conversational
+        from app.harness.terminal_state import terminal_state_for_result
+        terminal_state = terminal_state_for_result(
+            result, is_conversational=is_conversational(user_query),
+        )
+    except Exception as _ts_err:  # noqa: BLE001
+        logger_instance.debug("ReactStrategy: terminal_state derivation skipped (%s)", _ts_err)
+
     return {
         "type": "react",
         "user_query": user_query,
+        "terminal_state": terminal_state,
         "final_answer": final_answer,
         "structured_output": structured_output,
         "output_mode": _output_mode,
@@ -269,10 +291,10 @@ async def cleanup_on_error(execution_id: Optional[str], mcp_manager: Any) -> Non
     except Exception:  # noqa: BLE001
         pass
     try:
-        from app.workflow.strategies.react import planning_tools as _pl
-        _pl.drop_session(execution_id)
+        from app.harness import planning_tools as _pl
+        await _pl.drop_session(execution_id)
         from app.core import vfs as _vfs
-        _vfs.drop_session(execution_id)
+        await _vfs.vfs_drop_session(execution_id)
     except Exception:  # noqa: BLE001
         pass
 

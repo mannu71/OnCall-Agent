@@ -156,65 +156,91 @@ deepagents was removed is accurate. No action needed.
 
 ## Structural Architecture Issues
 
-### 6. Incomplete harness extraction (layering inversion)
+### 6. ~~Incomplete harness extraction (layering inversion)~~ — Resolved
 
-The harness is described as the "single ReAct runtime," but core behavior still lives in
-strategy:
+The 10 modules the harness actually depended on physically lived under
+`app/workflow/strategies/react/` even though they're generic agent-runtime/tool
+implementations, not react-workflow-specific: `agent_builder.py`, `agent_runner.py`,
+`helpers.py`, `hitl.py`, `tool_setup.py`, `tool_permissions.py`, `edit_tools.py`,
+`planning_tools.py`, `verify_tools.py`, `subagent_factory.py` (plus `hashline.py`,
+found during the move — used only by `edit_tools.py` and one unrelated service). All
+11 moved to `app/harness/`. Every import site across `app/` and `evals/` (~35 call
+sites) was repointed; the now-pointless `app/harness/permissions.py` re-export shim
+(created specifically to avoid this move — see its old docstring — and confirmed to
+have zero external callers) was deleted, since `tool_permissions` now has a stable
+home directly in harness.
 
-| Harness module | Imports from strategy |
-|---|---|
-| `tool_assembler.py` | `tool_setup`, `subagent`, `edit_tools`, `planning_tools`, `subagent_factory`, `verify_tools` |
-| `react_agent.py` | `agent_builder`, `tool_setup`, `agent_runner` |
-| `supervisor_loop.py` | `helpers`, `hitl` |
-| `context_builder.py` | `helpers` |
-| `conversational.py` | `agent_runner` |
+`streaming.py` and `llm_factory.py` were deliberately **not** moved: both are used
+well beyond the react strategy (`batch_react.py`, `router_classify.py`, executor
+handlers, `evals/accuracy/*`), so they're a different, pre-existing "generic util
+misplaced in one strategy's package" issue — moving them into harness would just
+relocate the misplacement, not fix it. Out of scope here.
 
-`permissions.py` is intentionally excluded from this table: it's a documented stable
-re-export shim over `app.workflow.strategies.react.tool_permissions` (its own
-docstring states this is the intended entry point pending Phase 2 migration), not an
-example of unplanned coupling.
+One genuine circular-import cycle the move eliminated (not just "mitigated by laziness"):
+`supervisor_loop.py`'s `emit_hitl_pause`/`estimate_confidence` were lazily imported
+specifically to avoid a real cycle through `strategies/__init__.py`. Now that `hitl.py`
+and `helpers.py` live in harness (and have zero `strategies`-package imports
+themselves), that cycle no longer exists — converted back to ordinary top-level
+imports and verified (`app.harness.supervisor_loop` imports cleanly, `test_supervisor_loop`
+still passes).
 
-This creates **circular import risk**, mitigated only by lazy imports in
-`supervisor_loop.py`. The intended dependency direction (strategy → harness) is violated
-in practice.
+Verification: full-repo `compileall` (no syntax errors), explicit `importlib.import_module`
+of all 34 touched/dependent modules including `app.main` and `evals.harness_selftest`
+(all resolve), and the harness self-test suite's DB-free-capable functions (~20 test
+functions, 140+ individual checks spanning envelopes, tool_router, engine
+resolution/dispatch, turn_loop, spec/facade, policy engine, sandbox, agent_spec,
+supervisor_loop, context_builder, extension_tools, edit_tools, configurable_agents,
+delegation, conversational intent) — all green.
 
-**Fix:** Complete harness extraction — move `agent_builder`, `agent_runner`, and tool
-implementations behind harness interfaces; strategy becomes thin wiring only.
-
----
-
-### 7. ReactStrategy is a god object
-
-`strategy.py` owns in one ~680-line method chain:
-
-- Profile merge and config extraction
-- Conversational fast path
-- KB recall and context seeding
-- PII pseudonymization
-- Tool assembly (two phases)
-- LLM build + throttle failover chain
-- Agent spec + build
-- Supervised execution
-- Synthesis floor, auto-learn, trajectory persistence
-- Structured output parsing
-- Privacy rehydration and session cleanup
-
-Hard to test, extend, or reason about in isolation. Every new capability adds another
-branch here.
+The intended dependency direction (strategy → harness) now holds structurally, not
+just by convention: harness modules that used to reach backward into strategy no
+longer can, because the files they needed are inside harness itself.
 
 ---
 
-### 8. Dual execution paths with different semantics
+### 7. ~~ReactStrategy is a god object~~ — Resolved
+
+`strategy.py` is now 134 lines — a thin coordinator delegating to `preflight.build_run_plan`
+(config resolution, action-space assembly, spec build), `executor.run_plan` (agent build,
+supervised loop, engine routing), and `finalizer.finalize`/`cleanup_on_error` (synthesis
+floor, auto-learn, trajectory save, structured output, PII rehydration, result envelope).
+Each phase is independently testable; `ReactStrategy.execute` itself is just try/preflight/
+executor/finalizer/except.
+
+---
+
+### 8. ~~Dual execution paths with different semantics~~ — Partially resolved
+
+Previously, cron-fired **visual** workflows bypassed the canonical dispatcher entirely:
+`scheduler._execute_workflow_wrapper` called `WorkflowScheduler.execute_workflow`, which
+had its own inline `is_visual_workflow` branch calling `execute_visual_workflow(workflow_data)`
+directly — no `inputs`, return value discarded (`None`). Manual API calls, and nested-workflow
+tasks (`executor.py::_execute_workflow`), went through `app.workflow.routing.execute_workflow`
+instead — the actual canonical dispatcher, already used by 3 call sites. Two divergent code
+paths reaching the same runtime.
+
+**Fix applied:** `_execute_workflow_wrapper` now fetches `workflow_data` itself and, for
+visual workflows, calls `routing.execute_workflow(workflow_data, manual=False)` directly —
+the same function manual API and nested-workflow calls use. `WorkflowScheduler.execute_workflow`
+no longer has a visual-workflow branch at all; it now only ever handles legacy (task-based)
+workflows, which is the one thing that still calls it (both from the cron wrapper's `else`
+branch and from `routing.execute_legacy_workflow`).
 
 | Trigger | Path | Inputs | Leader gate | Return value |
 |---|---|---|---|---|
 | Manual API | `routing.execute_workflow` | Full `inputs`, chat persistence | No | Full result dict |
-| Cron scheduler | `execute_visual_workflow` directly | **None** | Yes | `None` |
-| Legacy workflows | `TaskExecutor` via scheduler | Task-specific | Partial | `WorkflowExecution` record |
+| Cron scheduler (visual) | `routing.execute_workflow` (same path as manual) | **None** — no UI/config for static per-schedule inputs yet | Yes | Full result dict |
+| Nested workflow task | `routing.execute_workflow` | `variables` from the parent task | No | Full result dict |
+| Alarm-triggered (heartbeat) | `routing.execute_visual_workflow` directly | Alarm context (`user_query`, `alarm_name`, `alarm_reason`) | No | Result dict |
+| Legacy workflows | `TaskExecutor` via `WorkflowScheduler.execute_workflow` | Task-specific | Partial | `WorkflowExecution` record |
 
-Scheduled visual workflows cannot receive dynamic inputs. Manual and scheduled runs have
-different observability envelopes. Two workflow schema dialects (ReactFlow `data.*` vs
-LangflowEditor `params.*`) add edge-case complexity throughout.
+**Still open:** cron still has no mechanism to supply dynamic/static inputs (a feature gap,
+not a duplicate-path bug now — there's one dispatcher, it just isn't given anything to pass).
+The legacy `TaskExecutor` runtime remains structurally separate — genuinely a different
+execution engine (shell/python tasks vs. the node graph), not something to collapse into
+`routing.execute_workflow` without a much larger rewrite; out of scope here. Two workflow
+schema dialects (ReactFlow `data.*` vs LangflowEditor `params.*`) still add edge-case
+complexity throughout.
 
 ---
 
@@ -259,42 +285,68 @@ Two planning paradigms without clear mutual exclusion or unified abstraction.
 
 ## Scalability & Multi-Replica Issues
 
-### 12. In-process session state
+### 12. ~~In-process session state~~ — Resolved
 
 | Store | Location | Cleared on run end? | Cross-replica safe? |
 |---|---|---|---|
-| Todo store | `planning_tools._store` | Yes | No |
-| VFS | `app.core.vfs` | Yes | No |
+| Todo store | `planning_tools._store` (memory) or `execution_scratch_store` (postgres) | Yes | Only in postgres mode |
+| VFS | `app.core.vfs.VFSBackend` (memory) or `execution_scratch_store` (postgres) | Yes | Only in postgres mode |
 | HITL checkpointer | Postgres `AsyncPostgresSaver` | Persistent | Yes |
 
 (`subagent_factory._ASYNC_REGISTRY` dropped from this table — see #1/#9: async
-delegation is being removed rather than made cross-replica safe.)
+delegation was removed rather than made cross-replica safe.)
 
-Postgres checkpointer supports HITL across restarts, but todos/VFS are in-memory.
-**Inconsistent persistence model** — works on single node, breaks under horizontal
-scaling or process restart mid-run.
+Added an opt-in Postgres backend (`SCRATCH_STORE_BACKEND=postgres`, default stays
+`memory` — zero behavior change unless explicitly configured). Migration
+`029_execution_scratch_store.sql` adds `execution_scratch_store` (one row per
+`(execution_id, store)`, whole store content as one JSON blob — mirrors how both
+in-memory stores already represent one session's data as a single Python object).
+`app/infrastructure/persistence/execution_scratch_repository.py` follows the
+existing `BaseAsyncRepository` pattern used by the other 11 repositories.
+`planning_tools.get_todos/drop_session` and the new `vfs_write/vfs_read/vfs_ls/
+vfs_grep/vfs_drop_session` facade in `app/core/vfs/backend.py` are now async and
+branch on the backend setting; `write_todos`/`update_todo`/`fs_*` tools switched
+from `StructuredTool(func=...)` to `StructuredTool(coroutine=...)` accordingly.
+`VFSBackend`'s existing bounds-checking/grep/ls logic is reused for the Postgres
+path by hydrating a transient instance from the stored JSON blob rather than
+re-implementing that logic against a second data model. `offload_if_large` stays
+memory-only/sync — it isn't wired into the live tool-execution pipeline (only
+`fs_write`/`fs_read`/`fs_ls`/`fs_grep` are), so converting it added risk with no
+production benefit.
 
-**Fix:** Move todos/VFS to execution-scoped stores backed by Postgres or Redis. This
-remains the P2 multi-replica gap; it is no longer coupled to async delegation cleanup.
+Postgres checkpointer already supported HITL across restarts; todos/VFS now have
+the same option. **Note:** the Postgres backend is config-wired and unit-tested
+against the memory path's behavior, but not yet exercised end-to-end against a
+live Postgres instance in this pass — verify with a real DB before enabling
+`SCRATCH_STORE_BACKEND=postgres` in a genuine multi-replica deployment.
 
 ---
 
-### 13. Leader lock fail-open
+### 13. ~~Leader lock fail-open~~ — Resolved
 
-In `scheduler.py`, if Postgres advisory lock acquisition fails, every replica assumes
-leadership (`_is_leader = True`). Cron curator and hill-climb jobs can double-run.
-Manual API executes are never leader-gated at all.
-
-**Fix:** Leader lock fail-closed in multi-replica mode (env flag).
+`scheduler.py`'s `_ensure_leader` previously always set `_is_leader = True` on any
+Postgres advisory-lock acquisition error. Added `LEADER_LOCK_FAIL_CLOSED` (env flag,
+`app.config.settings.leader_lock_fail_closed`, default `False`) — when set, a lock
+error instead sets `_is_leader = False`, so a transient DB hiccup in a genuine
+multi-replica deployment can't cause every replica to double-fire cron/curator/
+hill-climb jobs. Default stays fail-open so a single-node deployment with no
+Postgres advisory-lock support keeps running its scheduled jobs unaffected. Manual
+API executes remain ungated by design (see #8) — leader election only governs
+*scheduled* fires.
 
 ---
 
-### 14. SSE stream keyed by workflow name, not execution ID
+### 14. ~~SSE stream keyed by workflow name, not execution ID~~ — Resolved
 
-Concurrent runs of the same workflow can conflate streaming events. No per-execution
-stream isolation at the API level.
-
-**Fix:** SSE streams keyed by `execution_id`.
+The canonical visual-workflow path (`visual_workflow_executor.py`) was already
+`execution_id`-keyed. The legacy `TaskExecutor`-based path in `scheduler.py` was the
+one still keyed by `workflow_name` (`event_queues`, `_emit_event`,
+`subscribe_to_events`, `unsubscribe_from_events`) — now re-keyed to `execution_id` for
+consistency. Note: this legacy scheduler SSE surface currently has no HTTP endpoint
+subscribing to it (grepped — zero external callers of `subscribe_to_events`), so the
+fix is defensive/consistency rather than closing an actively-exploitable conflation
+bug; if a legacy-workflow SSE endpoint is added later, it now keys correctly by
+default.
 
 ---
 
@@ -335,10 +387,18 @@ hard to enforce consistently for subagents and delegated children.
 
 ## Operational & Security Gaps
 
-### 18. No API authentication
+### 18. ~~No API authentication~~ — Resolved
 
-Workflow execute, MCP CRUD, improvement apply, and crawler investigate appear
-unauthenticated. Suitable for internal/trusted networks only.
+Added `app.api.middleware.api_auth.APIKeyAuthMiddleware`, opt-in via
+`API_AUTH_ENABLED` + `API_AUTH_KEYS` (comma-separated). Off by default — internal/
+trusted-network deployments are unaffected. When enabled, every request needs a
+valid key via `Authorization: Bearer <key>` or `X-API-Key: <key>`, except an
+always-open allowlist (`/`, `/docs`, `/openapi.json`, `/redoc`, `/api/v1/health` —
+infra health probes can't be expected to carry a key). Registered before
+`CORSMiddleware` in `main.py` so CORS ends up outermost (Starlette: last-added
+wraps first) and a 401 rejection still carries CORS headers for browser clients.
+Fails open (passes requests through, with a warning) if enabled with no keys
+configured, so a misconfiguration can't silently lock every route with no way in.
 
 ---
 
@@ -358,15 +418,15 @@ registered and callable.
 
 ---
 
-### 21. Documentation drift
+### 21. ~~Documentation drift~~ — Resolved
 
-| Doc says | Code does |
-|---|---|
-| `improvement/__init__.py`: "never auto-applies" | Scheduler calls `apply_proposals(dry_run=False)` when `HILLCLIMB_APPLY_ENABLED=true` |
-| `output_registry`: defaults to InvestigationReport | `_DEFAULT = "generic"` |
-| `subagent_factory`: registry "cleared on run teardown" | Never called from strategy |
+All three drift points fixed:
 
-Creates operator confusion about what Loop 4 actually does in production.
+| Doc said | Code did | Fix |
+|---|---|---|
+| `improvement/__init__.py`: "never auto-applies" | Scheduler calls `apply_proposals(dry_run=False)` when `HILLCLIMB_APPLY_ENABLED=true` | Docstring now explains the two-flag opt-in (`self_improvement_enabled` + `hillclimb_apply_enabled`), which kinds actually auto-apply (`skill`, `reliability`) and which never do (`prompt`, `policy`) |
+| `output_registry.resolve_output_schema`: "defaulting to InvestigationReport" | `_DEFAULT = "generic"` | Docstring corrected to say `GenericReport` |
+| `subagent_factory`: registry "cleared on run teardown" | Never called from strategy | Moot — `_ASYNC_REGISTRY` itself was removed entirely (see #1) |
 
 ---
 
@@ -375,9 +435,9 @@ Creates operator confusion about what Loop 4 actually does in production.
 | Loop | Status | Main gap |
 |---|---|---|
 | **1 — Agent** | Mature | Recovery stack in `agent_runner` is powerful but combinatorially complex; harness extraction incomplete |
-| **2 — Verification** | Partially activated | Weak tool-health heuristic; retry only prepends to user query (CACHE CONTRACT prevents prompt-level fixes) |
-| **3 — Event-driven** | Partial | Cron works; no inbound webhooks/Slack/alarm→run; scheduled runs lack inputs |
-| **4 — Hill-climbing** | Opt-in, fragile guard | Guard/test runner mismatch; `_apply_reliability_proposal` always returns True; skill apply patches `SkillService._CACHE` internals |
+| **2 — Verification** | Partially activated | Tool-health scoring fixed (#3); retry still only prepends to user query (CACHE CONTRACT prevents prompt-level fixes) |
+| **3 — Event-driven** | Partial | Cron works; `HeartbeatMonitor` (`app/core/heartbeat.py`, wired in `main.py` lifespan) already polls CloudWatch alarms and auto-triggers investigation workflows with alarm context as inputs — the doc previously claimed no alarm→run path existed, which was stale. Still genuinely missing: inbound webhooks / Slack triggers; scheduled (cron) runs still can't receive dynamic inputs (only the heartbeat's alarm-triggered path passes `inputs` today) |
+| **4 — Hill-climbing** | Opt-in, guard fixed (#4) | `_apply_reliability_proposal` always returns True (by design — it's a log-only write, see #21); skill apply still patches `SkillService._CACHE` internals directly |
 
 ---
 
@@ -421,17 +481,19 @@ retry-specific system prompt deltas without breaking prompt caching.
    The wired `subagent` port is retired, not carried forward~~ (see #2, #9)
 6. ~~Gate VFS tools on `filesystem` flag; audit all `AgentSpec` fields for similar drift~~
 
-### P2 — Multi-replica readiness
+### P2 — Multi-replica readiness — ALL DONE
 
-7. Move todos/VFS to execution-scoped stores backed by Postgres or Redis
-8. Leader lock fail-closed in multi-replica mode (env flag)
-9. SSE streams keyed by `execution_id`
+7. ~~Move todos/VFS to execution-scoped stores backed by Postgres or Redis~~
+   (Postgres; not yet DB-verified end-to-end, see #12)
+8. ~~Leader lock fail-closed in multi-replica mode (env flag)~~
+9. ~~SSE streams keyed by `execution_id`~~
 
-### P3 — Operational hardening
+### P3 — Operational hardening — ALL DONE
 
-10. API authentication middleware
-11. Unify manual and scheduled execution through one path with consistent inputs/observability
-12. Reconcile Loop 4 documentation with actual auto-apply behavior
+10. ~~API authentication middleware~~
+11. ~~Unify manual and scheduled execution through one path with consistent inputs/observability~~
+    (visual-workflow dispatch unified; legacy `TaskExecutor` remains a separate runtime by design — see #8)
+12. ~~Reconcile Loop 4 documentation with actual auto-apply behavior~~
 
 ---
 
@@ -439,12 +501,17 @@ retry-specific system prompt deltas without breaking prompt caching.
 
 The **design philosophy is strong** — loop engineering over prompt engineering, CACHE
 CONTRACT, progressive disclosure, bounded supervision, and opt-in self-improvement are
-the right architectural bets. The **implementation is mid-migration**: P0 (correctness
-bugs) and P1 items 5–6 (subagent consolidation, VFS flag gating) are now resolved;
-harness extraction (P1 item 4 / #6-#7) is still incomplete, leaving bidirectional
-coupling and the `ReactStrategy` god object; duplicate planning/tool-filtering paths
-(#10-#11) and multi-replica lifecycle gaps (P2, #12-#14) remain open.
+the right architectural bets. The **implementation is mid-migration**: P0 (all), P1
+items 5–6 (subagent consolidation, VFS flag gating), P2 (all — leader-lock
+fail-closed, SSE execution_id keying, Postgres-backed todos/VFS), and P3 (all — API
+auth middleware, unified visual-workflow dispatch, Loop 4 doc reconciliation) are now
+resolved. **P1 item 4 (harness extraction) is the sole remaining open item on this
+whole list** — moving `agent_builder`, `agent_runner`, and tool implementations
+behind harness interfaces so `strategy.py` becomes thin wiring only, resolving the
+bidirectional coupling (#6) and `ReactStrategy` god object (#7). Duplicate
+planning/tool-filtering paths (#10-#11) are a known, accepted lower-priority
+structural issue not on the numbered remediation list.
 
-The remaining highest-risk items for production are **in-memory session state under
-multi-replica deployment** (P2) and the **ReactStrategy god object / incomplete harness
-boundary** (P1 item 4) — the highest maintenance cost in the codebase.
+The remaining highest-risk/highest-maintenance-cost item for production is the
+**ReactStrategy god object / incomplete harness boundary** (P1 item 4) — the sole
+item outstanding from P0–P3.

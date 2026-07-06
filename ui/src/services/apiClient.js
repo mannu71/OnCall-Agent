@@ -106,6 +106,17 @@ export async function updateGeneralSettings(generalSettings) {
     });
 }
 
+export async function getFeatureFlags() {
+    return apiRequest('/settings/features');
+}
+
+export async function updateFeatureFlags(updates) {
+    return apiRequest('/settings/features', {
+        method: 'PUT',
+        body: JSON.stringify({ updates }),
+    });
+}
+
 // ============================================
 // Workflow APIs
 // ============================================

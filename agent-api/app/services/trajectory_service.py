@@ -185,6 +185,29 @@ class TrajectoryService:
 
         return {"execution_id": execution_id, "turns": turns}
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Step-level trajectory events (offline-RL export)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def export_step_events(self, execution_id: str) -> List[Dict[str, Any]]:
+        """Return this run's step-level ``trajectory_events`` rows, ordered
+        by ``step_index``, as JSONL-able dicts.
+
+        These are the typed step-level events written by
+        ``app.harness.step_recorder`` (see migration 030) when
+        ``settings.step_events_enabled`` is on — a finer-grained sibling of
+        :meth:`get_atropos_format`'s flat message-role view, carrying
+        per-step observation/action/outcome/reward. Returns an empty list
+        (never raises) when step events are off or the trace has none —
+        callers don't need to guard.
+        """
+        try:
+            from app.infrastructure.persistence import trajectory_event_repository
+            return await trajectory_event_repository.list_for_trace(execution_id)
+        except Exception as exc:  # noqa: BLE001 — export must never raise
+            logger.debug("trajectory_service.export_step_events: %s", exc)
+            return []
+
 
 # Singleton instance
 trajectory_service = TrajectoryService()

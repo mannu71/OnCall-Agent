@@ -1,4 +1,4 @@
-import { Cpu, Server, Shield, Sliders } from 'lucide-react';
+import { Cpu, Server, Shield, Sliders, ToggleRight } from 'lucide-react';
 import { version } from '../../../package.json';
 
 export const LS_WORKSPACE = 'oncall.workspaceName';
@@ -113,6 +113,14 @@ export function buildSections({ serverCount, llmCount, certCount }) {
             icon: Shield,
             count: certCount,
             desc: 'Trusted CAs for secure database and service connections.',
+        },
+        {
+            id: 'features',
+            title: 'Feature flags',
+            sub: 'Runtime toggles',
+            icon: ToggleRight,
+            count: null,
+            desc: 'Turn optional agent capabilities on or off. Changes apply on the next run — no restart.',
         },
     ];
 }

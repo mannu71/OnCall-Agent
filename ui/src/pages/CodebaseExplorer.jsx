@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { Suspense, lazy, useState, useEffect, useCallback, useMemo } from 'react';
 import ReactFlow, {
   MiniMap,
   Controls,
@@ -30,6 +30,10 @@ import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { agentApiClient } from '../services/agentApiClient';
 import DiffImpactPanel from '../components/explorer/DiffImpactPanel';
+
+// three.js + r3f are heavy (~600KB+) and only needed for the codegraph
+// backend's 3D graph — defer loading until that view actually mounts.
+const CodegraphGraphView = lazy(() => import('../components/explorer/graph3d/CodegraphGraphView'));
 
 // Curated colors for node types to wow the user (Premium details badge styles)
 const KIND_COLORS = {
@@ -328,6 +332,9 @@ export default function CodebaseExplorer() {
   const [isLoading, setIsLoading] = useState(false);
   const [isMutating, setIsMutating] = useState(false); // reindex / delete in flight
   const [actionError, setActionError] = useState('');
+  // Portal target for the codegraph 3D view's filters + file tree, so they fill
+  // this otherwise-empty left panel instead of overlaying the graph.
+  const [cgSidebarEl, setCgSidebarEl] = useState(null);
 
   // Graph state
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
@@ -765,7 +772,7 @@ export default function CodebaseExplorer() {
   return (
     <div className="flex h-screen max-h-screen bg-background text-foreground overflow-hidden font-sans">
       {/* 1. LEFT SIDEBAR: Codebase Explorer & Domain Groupings */}
-      <div className="w-80 border-r border-border bg-card flex flex-col flex-shrink-0">
+      <div className={`${backend === 'codegraph' ? 'w-64' : 'w-80'} border-r border-border bg-card flex flex-col flex-shrink-0`}>
         <div className="p-4 border-b border-border">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
@@ -845,7 +852,13 @@ export default function CodebaseExplorer() {
           )}
         </div>
 
-        {/* Tab Headers */}
+        {/* Codegraph hosts its filters + file tree here (portaled from the 3D
+            view) so the graph itself gets the full central width. Crawler keeps
+            its own tabbed file-tree/domain/impact panel. */}
+        {backend === 'codegraph' ? (
+          <div ref={setCgSidebarEl} className="flex-1 min-h-0 flex flex-col overflow-hidden" />
+        ) : (
+        <>
         <div className="flex border-b border-border text-xs">
           <button
             onClick={() => setActiveTab('structure')}
@@ -955,9 +968,24 @@ export default function CodebaseExplorer() {
             />
           )}
         </div>
+        </>
+        )}
       </div>
 
-      {/* 2. CENTRAL PANEL: Interactive visual graph canvas (0 LLM cost) */}
+      {/* 2. CENTRAL PANEL: codegraph gets its native 3D force-directed graph
+          (real physics layout, own sidebar/filter/detail panel); the crawler
+          backend keeps the 2D file-containment ReactFlow canvas. */}
+      {backend === 'codegraph' ? (
+        <div className="flex-1 min-w-0 h-full relative bg-background">
+          <Suspense fallback={
+            <div className="flex items-center justify-center h-full">
+              <Loader2 className="w-8 h-8 text-primary animate-spin" />
+            </div>
+          }>
+            <CodegraphGraphView repo={selectedRepo} sidebarContainer={cgSidebarEl} />
+          </Suspense>
+        </div>
+      ) : (
       <div className="flex-1 min-w-0 h-full relative bg-background border-r border-border">
         <div className="absolute top-4 left-4 z-10 flex gap-2">
           <div className="bg-card/90 border border-border px-3 py-1.5 rounded-md text-xs flex items-center gap-2 backdrop-blur shadow-lg">
@@ -981,15 +1009,18 @@ export default function CodebaseExplorer() {
         >
           <Background color="currentColor" className="text-muted-foreground/15" gap={16} />
           <Controls className="bg-card border border-border text-foreground" />
-          <MiniMap 
-            nodeColor={() => 'var(--primary)'} 
-            maskColor="rgba(0,0,0,0.15)" 
+          <MiniMap
+            nodeColor={() => 'var(--primary)'}
+            maskColor="rgba(0,0,0,0.15)"
             className="bg-card border border-border"
           />
         </ReactFlow>
       </div>
+      )}
 
-      {/* 3. RIGHT SIDEBAR: Code entity details & Guided Code Tours */}
+      {/* 3. RIGHT SIDEBAR: Code entity details & Guided Code Tours (crawler only —
+          codegraph's 3D view renders its own node-detail panel inline). */}
+      {backend !== 'codegraph' && (
       <div className="w-96 border-l border-border bg-card flex flex-col flex-shrink-0 overflow-y-auto custom-scrollbar">
         {selectedNode ? (
           <div className="p-5 space-y-6">
@@ -1135,6 +1166,7 @@ export default function CodebaseExplorer() {
           </div>
         )}
       </div>
+      )}
     </div>
   );
 }

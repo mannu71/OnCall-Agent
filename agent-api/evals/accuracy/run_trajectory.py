@@ -127,8 +127,8 @@ def _load_cases() -> List[Dict[str, Any]]:
 async def _attempt(case: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
     """Run one agent trajectory for *case*; return (rows, tool_call_count)."""
     from app.harness import build_agent_from_spec, AgentSpec
-    from app.workflow.strategies.react.hitl import make_checkpointer
-    from app.workflow.strategies.react.agent_runner import execute_agent
+    from app.harness.hitl import make_checkpointer
+    from app.harness.agent_runner import execute_agent
 
     trace = ToolTrace()
     recording: Optional[FakeCloudWatchRecording] = None

@@ -15,7 +15,9 @@ Exits non-zero on the first failure (CI-gate friendly).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import sys
 
 logging.disable(logging.CRITICAL)  # keep output to the PASS/FAIL lines
@@ -28,6 +30,40 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     print(f"{status} {name}" + (f"  — {detail}" if detail and not cond else ""))
     if not cond:
         _FAILURES.append(name)
+
+
+# ── import hygiene ───────────────────────────────────────────────────────────
+def test_import_order_no_cycles() -> None:
+    """Fresh-interpreter import checks for known circular-import trip wires.
+
+    router_classify <-> strategies.router was a latent cycle: whichever of
+    the two loaded FIRST determined whether the process worked or every
+    workflow run silently broke (the failed first import poisoned the
+    executor handler registry — agent/language_model/cloudwatch nodes became
+    "Unknown node type" skips and the chat surfaced a feeder node's output
+    as the answer). These must run in SUBPROCESSES: the current interpreter
+    already has everything cached, which is exactly how the bug hides.
+    """
+    import subprocess
+    env = {**os.environ, "PYTHONPATH": ".", "PYTHONIOENCODING": "utf-8"}
+    probes = {
+        "router_classify imported first": "import app.workflow.router_classify",
+        "handler registry imported first (all core handlers registered)": (
+            "from app.workflow.executor.handlers import HANDLERS; "
+            "missing = {'agent','language_model','cloudwatch_tool','router'} - set(HANDLERS); "
+            "assert not missing, f'missing handlers: {missing}'"
+        ),
+    }
+    for label, code in probes.items():
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+        check(
+            f"import hygiene: {label}",
+            proc.returncode == 0,
+            (proc.stderr or "")[-300:],
+        )
 
 
 # ── envelopes ────────────────────────────────────────────────────────────────
@@ -68,6 +104,47 @@ def test_tool_router() -> None:
     kept_mcp = [n for n in names if n in {"alpha_query", "beta_thing", "gamma_io"}]
     check("tool_router caps MCP at top_k", len(kept_mcp) <= 2, f"kept={kept_mcp}")
     check("tool_router passthrough when no MCP", filter_tools(specials, "x") == specials)
+
+
+# ── tool_exposure (Phase 1: window mode) ──────────────────────────────────────
+def test_tool_exposure() -> None:
+    from app.harness.tool_exposure import ToolExposureManager
+
+    class T:
+        def __init__(self, n, d=""):
+            self.name = n
+            self.description = d
+
+    core = [T("cloudwatch_search_logs"), T("crawler_find"), T("fs_write"), T("write_todos")]
+    _words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+              "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+              "quebec", "romeo", "sierra", "tango"]
+    rankable = [T(f"srv_tool_{i}", f"handles {w} widgets") for i, w in enumerate(_words)]
+
+    mgr = ToolExposureManager(core + rankable, max_direct=5)
+    bound = mgr.window("handles quebec widgets")
+    names = [t.name for t in bound]
+
+    check("tool_exposure: core always kept", all(c.name in names for c in core))
+    check("tool_exposure: bridge present when rankable non-empty",
+          "search_tools" in names and "call_tool" in names)
+    rankable_bound = [n for n in names if n.startswith("srv_tool_")]
+    check("tool_exposure: rankable capped at max_direct", len(rankable_bound) <= 5,
+          f"bound={rankable_bound}")
+    check("tool_exposure: query-relevant tool ranked into window",
+          "srv_tool_16" in rankable_bound, f"bound={rankable_bound}")
+    check("tool_exposure: counts exposed", mgr.core_count == 4 and mgr.rankable_count == 20)
+
+    # No rankable tools at all -> no bridge (nothing to search for), core only.
+    mgr_core_only = ToolExposureManager(core, max_direct=5)
+    bound_core_only = mgr_core_only.window("anything")
+    check("tool_exposure: no bridge when nothing rankable",
+          "search_tools" not in [t.name for t in bound_core_only])
+    check("tool_exposure: core-only window == core", len(bound_core_only) == len(core))
+
+    # Tools outside the window stay reachable via the bridge's own catalog.
+    check("tool_exposure: bridge_names are the two bridge tools",
+          set(mgr.bridge_names) == {"search_tools", "call_tool"})
 
 
 # ── error_classifier: Bedrock context-overflow rung ──────────────────────────
@@ -197,6 +274,275 @@ async def test_turn_loop_tool_call_then_complete() -> None:
     check("turn_loop: tool round-trip 2 model calls", llm.calls == 2)
 
 
+async def test_step_recorder() -> None:
+    from app.harness.step_recorder import StepRecorder, build_step_recorder, _NoopStepRecorder
+    from app.config import settings as _s
+    from app.infrastructure.persistence.trajectory_event_repository import (
+        trajectory_event_repository as _ter_instance,
+    )
+
+    # ── unit: buffer accumulates, flush persists then clears ──
+    rec = StepRecorder("trace-1", span_id=None, model_id="m1")
+    check("step_recorder: starts empty", rec.buffered_count == 0)
+    rec.record_model_turn(
+        1, reason="model_call", text="hello", tool_calls=[{"id": "c1", "name": "t"}],
+        stop_reason="end_turn", tokens={"in": 10, "out": 5},
+    )
+    rec.record_tool_call(1, tool_name="t", status="ok", latency_ms=12.3)
+    rec.record_lifecycle(2, "max_turns_forced_synthesis", max_turns=7)
+    check("step_recorder: buffers 3 events", rec.buffered_count == 3)
+
+    captured: list = []
+
+    async def _fake_append_batch(events):
+        captured.extend(events)
+
+    _orig_append = _ter_instance.append_batch
+    _ter_instance.append_batch = _fake_append_batch
+    try:
+        await rec.flush()
+    finally:
+        _ter_instance.append_batch = _orig_append
+
+    check("step_recorder: flush persists all buffered events", len(captured) == 3)
+    check("step_recorder: flush clears buffer", rec.buffered_count == 0)
+    check(
+        "step_recorder: event has trace_id/step_index/type",
+        all(e["trace_id"] == "trace-1" for e in captured)
+        and {e["type"] for e in captured} == {"model_turn", "tool_call", "lifecycle"},
+    )
+    model_turn_evt = next(e for e in captured if e["type"] == "model_turn")
+    check(
+        "step_recorder: model_turn payload has action.tool_calls",
+        model_turn_evt["payload"]["action"]["tool_calls"] == [{"id": "c1", "name": "t"}],
+    )
+    check(
+        "step_recorder: model_turn payload has tokens in meta",
+        model_turn_evt["payload"]["meta"]["tokens"] == {"in": 10, "out": 5},
+    )
+
+    # flush() on an empty buffer never calls the repository.
+    called = {"n": 0}
+
+    async def _counting_append_batch(events):
+        called["n"] += 1
+
+    _ter_instance.append_batch = _counting_append_batch
+    try:
+        await rec.flush()
+    finally:
+        _ter_instance.append_batch = _orig_append
+    check("step_recorder: flush on empty buffer is a no-op", called["n"] == 0)
+
+    # flush() failure is swallowed — recording must never break a run.
+    async def _boom(events):
+        raise RuntimeError("db down")
+
+    rec2 = StepRecorder("trace-2")
+    rec2.record_lifecycle(0, "x")
+    _ter_instance.append_batch = _boom
+    try:
+        await rec2.flush()
+        flush_ok = True
+    except Exception:  # noqa: BLE001
+        flush_ok = False
+    finally:
+        _ter_instance.append_batch = _orig_append
+    check("step_recorder: flush failure never raises", flush_ok)
+
+    # ── _NoopStepRecorder: everything is a safe no-op ──
+    noop = _NoopStepRecorder()
+    noop.record_model_turn(1, reason="x")
+    noop.record_tool_call(1, tool_name="t", status="ok")
+    noop.record_lifecycle(1, "x")
+    await noop.flush()
+    check("step_recorder: noop recorder never buffers", noop.buffered_count == 0)
+    check("step_recorder: noop.enabled is False", noop.enabled is False)
+    check("step_recorder: StepRecorder.enabled is True", StepRecorder("t").enabled is True)
+
+    # ── build_step_recorder: flag/trace_id gating ──
+    _orig_flag = _s.step_events_enabled
+    try:
+        _s.step_events_enabled = False
+        check(
+            "build_step_recorder: disabled -> noop",
+            isinstance(build_step_recorder("exec-1"), _NoopStepRecorder),
+        )
+        _s.step_events_enabled = True
+        check(
+            "build_step_recorder: enabled + trace_id -> live recorder",
+            isinstance(build_step_recorder("exec-1"), StepRecorder),
+        )
+        check(
+            "build_step_recorder: enabled but no trace_id -> noop",
+            isinstance(build_step_recorder(None), _NoopStepRecorder),
+        )
+    finally:
+        _s.step_events_enabled = _orig_flag
+
+
+async def test_turn_loop_step_events_wiring() -> None:
+    """End-to-end: step_events_enabled=True on a real TurnLoop run persists
+    model_turn + tool_call events with the run's execution_id as trace_id."""
+    from app.harness.engine.turn_loop import TurnLoop
+    from app.config import settings as _s
+    from langchain_core.messages import HumanMessage
+    from app.infrastructure.persistence.trajectory_event_repository import (
+        trajectory_event_repository as _ter_instance,
+    )
+
+    captured: list = []
+
+    async def _fake_append_batch(events):
+        captured.extend(events)
+
+    _orig_append = _ter_instance.append_batch
+    _orig_flag = _s.step_events_enabled
+    _ter_instance.append_batch = _fake_append_batch
+    _s.step_events_enabled = True
+    try:
+        tool_call = {"name": "fake_tool", "args": {"x": 1}, "id": "call_1"}
+        llm = _FakeToolBoundLLM([
+            _fake_ai_message("", tool_calls=[tool_call]),
+            _fake_ai_message("Done, found it via fake_tool."),
+        ])
+        loop = TurnLoop(
+            llm, [_FakeTool("fake_tool")], "sys", agent_config={}, max_turns=5,
+            execution_id="turnloop-step-events-exec",
+        )
+        await loop.run([HumanMessage(content="investigate")])
+    finally:
+        _ter_instance.append_batch = _orig_append
+        _s.step_events_enabled = _orig_flag
+
+    types = [e["type"] for e in captured]
+    check("turn_loop+step_events: model_turn events recorded", types.count("model_turn") == 2, str(types))
+    check("turn_loop+step_events: tool_call event recorded", types.count("tool_call") == 1, str(types))
+    check(
+        "turn_loop+step_events: all events carry execution_id as trace_id",
+        bool(captured) and all(e["trace_id"] == "turnloop-step-events-exec" for e in captured),
+    )
+
+
+async def test_instrument_langgraph_result() -> None:
+    """LangGraph parity (post-hoc): _instrument_langgraph_result derives the
+    same trajectory events / failure-ledger recording / verify tracking the
+    native turn loop produces live, from a serialized LangGraph message list."""
+    from app.harness.agent_runner import _instrument_langgraph_result
+    from app.harness.step_recorder import StepRecorder
+    from app.harness.verify_tracking import VerifyState
+    from app.config import settings as _ilg_settings
+    from app.infrastructure.persistence import failure_ledger_repository as _ilg_fl
+
+    parsed = {
+        "messages": [
+            {"role": "user", "content": "fix the bug and verify it"},
+            {
+                "role": "assistant", "content": "",
+                "tool_calls": [{"id": "c1", "name": "edit_file", "args": {}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": '{"ok": true, "file": "a.py"}'},
+            {
+                "role": "assistant", "content": "",
+                "tool_calls": [
+                    {"id": "c2", "name": "run_verify", "args": {}},
+                    {"id": "c3", "name": "cw_search", "args": {}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c2", "content": '{"ok": false, "exit_code": 1}'},
+            {"role": "tool", "tool_call_id": "c3", "content": "Error: throttled"},
+            {"role": "assistant", "content": "Done, but verification failed."},
+        ],
+    }
+
+    recorder = StepRecorder("lg-instr-trace")
+    verify_state = VerifyState()
+
+    _orig_record = _ilg_fl.record
+    recorded_fingerprints: list = []
+
+    async def _capture_record(fingerprint, execution_id=None):
+        recorded_fingerprints.append((fingerprint, execution_id))
+        return 1
+
+    _orig_gov_flag = _ilg_settings.governance_conversion_enabled
+    _ilg_fl.record = _capture_record
+    _ilg_settings.governance_conversion_enabled = True
+    try:
+        await _instrument_langgraph_result(
+            parsed, recorder=recorder, verify_state=verify_state, execution_id="lg-instr-exec",
+        )
+    finally:
+        _ilg_fl.record = _orig_record
+        _ilg_settings.governance_conversion_enabled = _orig_gov_flag
+
+    check("instrument_langgraph: records a model_turn per assistant message", recorder.buffered_count >= 3)
+    types = [ev["type"] for ev in recorder._buffer]
+    check("instrument_langgraph: 3 model_turn events (one per assistant message)", types.count("model_turn") == 3)
+    check("instrument_langgraph: 3 tool_call events (one per tool message)", types.count("tool_call") == 3)
+
+    tool_events = {ev["payload"]["action"]["name"]: ev for ev in recorder._buffer if ev["type"] == "tool_call"}
+    check("instrument_langgraph: resolves tool names via tool_call_id", set(tool_events.keys()) == {"edit_file", "run_verify", "cw_search"})
+    check("instrument_langgraph: successful edit_file classified ok", tool_events["edit_file"]["payload"]["outcome"]["status"] == "ok")
+    check("instrument_langgraph: failing cw_search classified error", tool_events["cw_search"]["payload"]["outcome"]["status"] == "error")
+
+    check(
+        "instrument_langgraph: verify_pending cleared by run_verify (edit -> verify sequencing)",
+        verify_state.pending is False,
+    )
+    check("instrument_langgraph: verify_last_passed reflects run_verify's own result", verify_state.last_passed is False)
+
+    check(
+        "instrument_langgraph: live failure-ledger hook fired for the failing tool call",
+        any("cw_search" in fp for fp, _eid in recorded_fingerprints),
+    )
+    check(
+        "instrument_langgraph: failure-ledger hook passes execution_id through",
+        all(eid == "lg-instr-exec" for _fp, eid in recorded_fingerprints),
+    )
+
+    # Empty input is a safe no-op.
+    empty_recorder = StepRecorder("lg-instr-empty")
+    empty_verify = VerifyState()
+    await _instrument_langgraph_result(
+        {"messages": []}, recorder=empty_recorder, verify_state=empty_verify, execution_id=None,
+    )
+    check("instrument_langgraph: empty message list is a no-op", empty_recorder.buffered_count == 0)
+
+    # ── skip_first_n: replayed prior-turn chat history must NOT be
+    #    re-recorded as this execution's events (or re-fingerprinted into the
+    #    failure ledger on every follow-up turn of a session). The same
+    #    7-message trace, but the first 6 entries are the replayed initial
+    #    prefix (in serialized-list coordinates) — only the final assistant
+    #    message belongs to this run. ──
+    skip_recorder = StepRecorder("lg-instr-skip")
+    skip_verify = VerifyState()
+    recorded_fingerprints.clear()
+    _ilg_fl.record = _capture_record
+    _ilg_settings.governance_conversion_enabled = True
+    try:
+        await _instrument_langgraph_result(
+            parsed, recorder=skip_recorder, verify_state=skip_verify,
+            execution_id="lg-instr-skip-exec", skip_first_n=6,
+        )
+    finally:
+        _ilg_fl.record = _orig_record
+        _ilg_settings.governance_conversion_enabled = _orig_gov_flag
+    skip_types = [ev["type"] for ev in skip_recorder._buffer]
+    check(
+        "instrument_langgraph: skip_first_n excludes replayed history from events",
+        skip_types.count("model_turn") == 1 and skip_types.count("tool_call") == 0,
+    )
+    check(
+        "instrument_langgraph: skip_first_n suppresses re-fingerprinting prior failures",
+        recorded_fingerprints == [],
+    )
+    check(
+        "instrument_langgraph: skip_first_n leaves prior-turn verify state untouched",
+        skip_verify.pending is False and skip_verify.last_passed is None,
+    )
+
+
 async def test_turn_loop_max_turns_forced_synthesis() -> None:
     """A model that never stops calling tools gets a forced-synthesis nudge
     once, then hits a hard MAX_TURNS-equivalent stop shortly after."""
@@ -211,6 +557,151 @@ async def test_turn_loop_max_turns_forced_synthesis() -> None:
     result = await loop.run([HumanMessage(content="loop forever")])
     check("turn_loop: max_turns eventually stops", llm.calls < 20, f"calls={llm.calls}")
     check("turn_loop: max_turns produces a final_answer key", "final_answer" in result)
+    check(
+        "turn_loop: max_turns surfaces stop_reason=max_turns",
+        result.get("stop_reason") == StopReason.MAX_TURNS.value, result.get("stop_reason"),
+    )
+    check("turn_loop: max_turns surfaces did_forced_synthesis", result.get("did_forced_synthesis") is True)
+
+
+async def test_turn_loop_verify_pending_tracking() -> None:
+    """An edit_file call with no follow-up run_verify leaves verify_pending
+    True in the result; a subsequent run_verify call clears it."""
+    import json as _json
+    from app.harness.engine.turn_loop import TurnLoop
+    from langchain_core.messages import HumanMessage
+
+    edit_call = {"name": "edit_file", "args": {}, "id": "c1"}
+    llm = _FakeToolBoundLLM([
+        _fake_ai_message("", tool_calls=[edit_call]),
+        _fake_ai_message("Edited the file."),
+    ])
+    edit_tool = _FakeTool("edit_file", result=_json.dumps({"ok": True, "file": "a.py"}))
+    loop = TurnLoop(llm, [edit_tool], "sys", agent_config={}, max_turns=5)
+    result = await loop.run([HumanMessage(content="fix the bug")])
+    check("turn_loop: edit without verify leaves verify_pending True", result.get("verify_pending") is True)
+    check("turn_loop: verify_last_passed unset without a run_verify call", result.get("verify_last_passed") is None)
+
+    verify_call = {"name": "run_verify", "args": {"repo": "x"}, "id": "c2"}
+    llm2 = _FakeToolBoundLLM([
+        _fake_ai_message("", tool_calls=[edit_call]),
+        _fake_ai_message("", tool_calls=[verify_call]),
+        _fake_ai_message("Edited and verified."),
+    ])
+    edit_tool2 = _FakeTool("edit_file", result=_json.dumps({"ok": True, "file": "a.py"}))
+    verify_tool = _FakeTool("run_verify", result=_json.dumps({"ok": True, "exit_code": 0}))
+    loop2 = TurnLoop(llm2, [edit_tool2, verify_tool], "sys", agent_config={}, max_turns=5)
+    result2 = await loop2.run([HumanMessage(content="fix the bug")])
+    check("turn_loop: run_verify clears verify_pending", result2.get("verify_pending") is False)
+    check("turn_loop: verify_last_passed reflects run_verify result", result2.get("verify_last_passed") is True)
+
+    verify_call_fail = {"name": "run_verify", "args": {"repo": "x"}, "id": "c3"}
+    llm3 = _FakeToolBoundLLM([
+        _fake_ai_message("", tool_calls=[edit_call]),
+        _fake_ai_message("", tool_calls=[verify_call_fail]),
+        _fake_ai_message("Tried to verify, it failed."),
+    ])
+    edit_tool3 = _FakeTool("edit_file", result=_json.dumps({"ok": True, "file": "a.py"}))
+    verify_tool_fail = _FakeTool("run_verify", result=_json.dumps({"ok": False, "exit_code": 1}))
+    loop3 = TurnLoop(llm3, [edit_tool3, verify_tool_fail], "sys", agent_config={}, max_turns=5)
+    result3 = await loop3.run([HumanMessage(content="fix the bug")])
+    check("turn_loop: failed verify still clears pending", result3.get("verify_pending") is False)
+    check("turn_loop: failed verify records verify_last_passed False", result3.get("verify_last_passed") is False)
+
+
+def test_terminal_state_derivation() -> None:
+    from app.harness.terminal_state import derive_terminal_state, terminal_state_for_result
+    from app.harness.engine.loop_state import StopReason, TerminalState
+
+    check(
+        "terminal_state: plain success",
+        derive_terminal_state() == TerminalState.SUCCESS.value,
+    )
+    check(
+        "terminal_state: conversational -> no_op (highest precedence)",
+        derive_terminal_state(is_conversational=True, supervisor_escalated=True) == TerminalState.NO_OP.value,
+    )
+    check(
+        "terminal_state: forced synthesis -> exhausted",
+        derive_terminal_state(did_forced_synthesis=True) == TerminalState.EXHAUSTED.value,
+    )
+    check(
+        "terminal_state: truncated -> exhausted",
+        derive_terminal_state(truncated=True) == TerminalState.EXHAUSTED.value,
+    )
+    check(
+        "terminal_state: stop_reason=max_turns -> exhausted",
+        derive_terminal_state(stop_reason=StopReason.MAX_TURNS.value) == TerminalState.EXHAUSTED.value,
+    )
+    check(
+        "terminal_state: stop_reason=token_budget -> exhausted",
+        derive_terminal_state(stop_reason=StopReason.TOKEN_BUDGET.value) == TerminalState.EXHAUSTED.value,
+    )
+    check(
+        "terminal_state: stop_reason=hitl_paused -> blocked",
+        derive_terminal_state(stop_reason=StopReason.HITL_PAUSED.value) == TerminalState.BLOCKED.value,
+    )
+    check(
+        "terminal_state: stop_reason=aborted -> blocked",
+        derive_terminal_state(stop_reason=StopReason.ABORTED.value) == TerminalState.BLOCKED.value,
+    )
+    check(
+        "terminal_state: supervisor_escalated -> stalled",
+        derive_terminal_state(supervisor_escalated=True) == TerminalState.STALLED.value,
+    )
+    check(
+        "terminal_state: supervisor_retry_exhausted -> stalled",
+        derive_terminal_state(supervisor_retry_exhausted=True) == TerminalState.STALLED.value,
+    )
+    check(
+        "terminal_state: verify_pending -> unverified",
+        derive_terminal_state(verify_pending=True) == TerminalState.UNVERIFIED.value,
+    )
+    check(
+        "terminal_state: exhausted takes precedence over unverified",
+        derive_terminal_state(truncated=True, verify_pending=True) == TerminalState.EXHAUSTED.value,
+    )
+    check(
+        "terminal_state: stalled takes precedence over unverified",
+        derive_terminal_state(supervisor_escalated=True, verify_pending=True) == TerminalState.STALLED.value,
+    )
+
+    check(
+        "terminal_state_for_result: pulls fields from a result dict",
+        terminal_state_for_result({
+            "stop_reason": None, "verify_pending": True, "supervisor_escalated": False,
+        }) == TerminalState.UNVERIFIED.value,
+    )
+    check(
+        "terminal_state_for_result: missing keys default safely",
+        terminal_state_for_result({}) == TerminalState.SUCCESS.value,
+    )
+
+    # LangGraph parity: execute_agent()'s result dict shape (stop_reason/
+    # did_forced_synthesis/verify_pending/verify_last_passed, added for
+    # LangGraph parity with the native engine) classifies identically.
+    check(
+        "terminal_state_for_result: LangGraph recursion-limit recovery -> exhausted",
+        terminal_state_for_result({
+            "stop_reason": "max_turns", "did_forced_synthesis": True,
+        }) == TerminalState.EXHAUSTED.value,
+    )
+    check(
+        "terminal_state_for_result: LangGraph hitl_paused -> blocked",
+        terminal_state_for_result({"stop_reason": "hitl_paused"}) == TerminalState.BLOCKED.value,
+    )
+    check(
+        "terminal_state_for_result: LangGraph unverified edit -> unverified",
+        terminal_state_for_result({
+            "stop_reason": "completed", "verify_pending": True,
+        }) == TerminalState.UNVERIFIED.value,
+    )
+    check(
+        "terminal_state_for_result: LangGraph clean completion -> success",
+        terminal_state_for_result({
+            "stop_reason": "completed", "did_forced_synthesis": False, "verify_pending": False,
+        }) == TerminalState.SUCCESS.value,
+    )
 
 
 async def test_engine_native_dispatch() -> None:
@@ -318,6 +809,123 @@ async def test_compression_pipeline_delegates() -> None:
     await pipeline.reactive_compact(["m1"])
     check("compression: maybe_compact delegates to compact_if_needed", fake.compact_if_needed_calls == 1)
     check("compression: reactive_compact delegates to force_compact", fake.force_compact_calls == 1)
+
+
+async def test_compression_metamemory_precheck() -> None:
+    """When metamemory is seeded and over threshold, the agent-maintained
+    summary supersedes the LLM-summary tier — compact_if_needed is never
+    called. Falls through unchanged when under threshold or unseeded."""
+    from app.harness.engine.compression import CompressionPipeline
+    from app.core.vfs import vfs_drop_session as _vdrop2
+    from app.core.vfs.backend import vfs_write
+    from app.harness import metamemory as _mm
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    class _FakeMgr:
+        def __init__(self, threshold: int, keep_recent: int = 5):
+            self.compact_if_needed_calls = 0
+            self._threshold = threshold
+            self._keep_recent = keep_recent
+
+        @property
+        def compaction_threshold_tokens(self) -> int:
+            return self._threshold
+
+        @property
+        def keep_recent_tokens(self) -> int:
+            return self._keep_recent
+
+        def estimate_tokens(self, messages) -> int:
+            return sum(len(str(getattr(m, "content", ""))) for m in messages)
+
+        async def compact_if_needed(self, messages):
+            self.compact_if_needed_calls += 1
+            return messages
+
+    try:
+        # under threshold -> falls straight through, metamemory untouched.
+        fake_low = _FakeMgr(threshold=100_000)
+        pipeline_low = CompressionPipeline(fake_low, vfs_session_id="cm-precheck-low")
+        await pipeline_low.maybe_compact([HumanMessage(content="hi")])
+        check(
+            "compression: metamemory precheck skipped under threshold",
+            fake_low.compact_if_needed_calls == 1,
+        )
+
+        # over threshold but metamemory never seeded (empty) -> falls through too.
+        fake_empty = _FakeMgr(threshold=1)
+        pipeline_empty = CompressionPipeline(fake_empty, vfs_session_id="cm-precheck-empty")
+        await pipeline_empty.maybe_compact([HumanMessage(content="x" * 50)])
+        check(
+            "compression: metamemory precheck falls through when empty",
+            fake_empty.compact_if_needed_calls == 1,
+        )
+
+        # over threshold + metamemory seeded -> metamemory summary used instead.
+        await vfs_write("cm-precheck-seeded", _mm.SUMMARY_PATH, "OBJECTIVE: test\nSTATE: in progress")
+        await vfs_write("cm-precheck-seeded", _mm.MILESTONES_PATH, "DONE S1")
+        fake_seeded = _FakeMgr(threshold=1, keep_recent=0)
+        pipeline_seeded = CompressionPipeline(fake_seeded, vfs_session_id="cm-precheck-seeded")
+        out_seeded = await pipeline_seeded.maybe_compact([HumanMessage(content="x" * 100)])
+        check(
+            "compression: metamemory precheck bypasses compact_if_needed",
+            fake_seeded.compact_if_needed_calls == 0,
+        )
+        check(
+            "compression: metamemory precheck produces a SystemMessage summary",
+            bool(out_seeded) and isinstance(out_seeded[0], SystemMessage)
+            and "OBJECTIVE: test" in out_seeded[0].content and "DONE S1" in out_seeded[0].content,
+        )
+    finally:
+        await _vdrop2("cm-precheck-low")
+        await _vdrop2("cm-precheck-empty")
+        await _vdrop2("cm-precheck-seeded")
+
+
+async def test_metamemory_read_context_block_caps_milestones() -> None:
+    """milestones.txt is append-only and UNCAPPED at the VFS layer — unlike
+    context_summary.txt's write-time 500-token cap. read_context_block must
+    tail-truncate it so the injected compaction block stays near the plan's
+    ~1200-token budget instead of growing without bound over a long run."""
+    from app.core.vfs import vfs_drop_session as _vdrop3
+    from app.core.vfs.backend import vfs_write
+    from app.harness import metamemory as _mm2
+
+    try:
+        await vfs_write("mm-cap-test", _mm2.SUMMARY_PATH, "OBJECTIVE: cap test\nSTATE: ok")
+        # 500 lines * ~20 chars each = far beyond _MILESTONES_INJECT_MAX_CHARS.
+        big_milestones = "\n".join(f"<ts> DONE S{i} evidence=/x/{i}" for i in range(500))
+        await vfs_write("mm-cap-test", _mm2.MILESTONES_PATH, big_milestones)
+        block = await _mm2.read_context_block("mm-cap-test")
+        check("metamemory read_context_block: not None when seeded", block is not None)
+        check(
+            "metamemory read_context_block: milestones tail-truncated under budget",
+            len(block) < len(big_milestones) + 200,
+        )
+        check(
+            "metamemory read_context_block: truncation marker present",
+            "truncated" in block,
+        )
+        check(
+            "metamemory read_context_block: keeps the MOST RECENT milestone (tail, not head)",
+            "S499" in block and "DONE S0 evidence=/x/0" not in block,
+        )
+        check(
+            "metamemory read_context_block: summary still present alongside milestones",
+            "OBJECTIVE: cap test" in block,
+        )
+
+        # small milestones file -> untouched, no truncation marker.
+        await vfs_write("mm-cap-test-small", _mm2.SUMMARY_PATH, "OBJECTIVE: small")
+        await vfs_write("mm-cap-test-small", _mm2.MILESTONES_PATH, "DONE S1")
+        small_block = await _mm2.read_context_block("mm-cap-test-small")
+        check(
+            "metamemory read_context_block: small milestones left untouched",
+            small_block is not None and "truncated" not in small_block and "DONE S1" in small_block,
+        )
+    finally:
+        await _vdrop3("mm-cap-test")
+        await _vdrop3("mm-cap-test-small")
 
 
 async def test_turn_loop_reactive_compact_retry() -> None:
@@ -444,6 +1052,276 @@ async def test_recovery_call_model_with_backoff() -> None:
     check("recovery: retry_predicate=False stops in-place retry immediately", vetoed)
 
 
+# ── chat_history: tool-inclusive history replay ──────────────────────────────
+def test_build_initial_messages_tool_replay() -> None:
+    """build_initial_messages must reconstruct AIMessage.tool_calls +
+    ToolMessage.tool_call_id from the extended dict shape, while staying
+    byte-identical for plain UI-style {role, content} history."""
+    from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
+    from app.harness.agent_runner import build_initial_messages
+
+    log = logging.getLogger("t")
+
+    # Plain UI-style history — unchanged behavior.
+    plain = build_initial_messages(
+        [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],
+        "follow up", log,
+    )
+    check(
+        "build_initial_messages: plain UI history unchanged",
+        [type(m).__name__ for m in plain] == ["HumanMessage", "AIMessage", "HumanMessage"],
+    )
+
+    # Extended shape: assistant with tool_calls + a paired tool result.
+    extended = build_initial_messages(
+        [
+            {"role": "user", "content": "explain profile import"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "search_graph", "args": {"q": "x"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ProfileImportService.cs:42"},
+            {"role": "assistant", "content": "Profile import works by..."},
+        ],
+        "when is the pdf generated", log,
+    )
+    check(
+        "build_initial_messages: tool_calls reconstructed on AIMessage",
+        isinstance(extended[1], AIMessage) and extended[1].tool_calls
+        and extended[1].tool_calls[0]["id"] == "c1" and extended[1].tool_calls[0]["name"] == "search_graph",
+    )
+    check(
+        "build_initial_messages: ToolMessage.tool_call_id reconstructed",
+        isinstance(extended[2], ToolMessage) and extended[2].tool_call_id == "c1",
+    )
+
+    # tool dict WITHOUT tool_call_id still skipped (today's behavior).
+    no_id = build_initial_messages(
+        [{"role": "user", "content": "q"}, {"role": "tool", "content": "orphan, no id"}],
+        "follow up", log,
+    )
+    check(
+        "build_initial_messages: tool entry without tool_call_id still skipped",
+        [type(m).__name__ for m in no_id] == ["HumanMessage", "HumanMessage"],
+    )
+
+    # Trailing dangling tool_call (no matching ToolMessage) gets stripped.
+    dangling = build_initial_messages(
+        [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "orphan", "name": "t", "args": {}}]},
+        ],
+        "follow up", log,
+    )
+    check(
+        "build_initial_messages: dangling trailing tool_call stripped",
+        [type(m).__name__ for m in dangling] == ["HumanMessage", "HumanMessage"],
+        f"got {[type(m).__name__ for m in dangling]}",
+    )
+
+
+def test_extract_turn_segment() -> None:
+    from app.harness.chat_history import extract_turn_segment
+    from app.harness.agent_runner import CONTINUE_TRUNCATED_NUDGE
+
+    base = [
+        {"role": "user", "content": "explain profile import"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "search_graph", "args": {}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "found ProfileImportService"},
+        {"role": "assistant", "content": "Profile import works by..."},
+    ]
+    check("extract_turn_segment: segment starts after the user entry", extract_turn_segment(base) == base[1:])
+
+    # A synthetic recovery nudge (mid-run HumanMessage) is not a turn boundary.
+    with_nudge = base + [
+        {"role": "user", "content": CONTINUE_TRUNCATED_NUDGE},
+        {"role": "assistant", "content": "...continued and complete."},
+    ]
+    check(
+        "extract_turn_segment: synthetic nudge is not a turn boundary",
+        extract_turn_segment(with_nudge) == with_nudge[1:],
+    )
+
+    # Post-ship recursion: the trajectory's own replayed prefix already
+    # contains an earlier turn's tool entries — segmentation must anchor on
+    # the LAST real user entry, not the first tool call.
+    recursive = base + [
+        {"role": "user", "content": "when is the pdf report generated"},
+        {"role": "assistant", "content": "The PDF report is generated after validation."},
+    ]
+    check(
+        "extract_turn_segment: recursion case anchors on the LAST real user entry",
+        extract_turn_segment(recursive) == recursive[5:],
+        f"got {extract_turn_segment(recursive)}",
+    )
+
+    check("extract_turn_segment: empty trajectory -> empty segment", extract_turn_segment([]) == [])
+
+
+def test_repair_tool_pairing() -> None:
+    from app.harness.chat_history import repair_tool_pairing
+
+    valid = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "a1", "name": "t", "args": {}}]},
+        {"role": "tool", "tool_call_id": "a1", "content": "result"},
+        {"role": "assistant", "content": "final answer"},
+    ]
+    check("repair_tool_pairing: valid segment unchanged", repair_tool_pairing(valid) == valid)
+
+    unmatched = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "a1", "name": "t", "args": {}}]},
+        {"role": "assistant", "content": "final answer, no tool result ever came"},
+    ]
+    check(
+        "repair_tool_pairing: unmatched tool_call dropped (entry had no other text)",
+        repair_tool_pairing(unmatched) == [{"role": "assistant", "content": "final answer, no tool result ever came"}],
+        f"got {repair_tool_pairing(unmatched)}",
+    )
+
+    orphan = [
+        {"role": "tool", "tool_call_id": "ghost", "content": "orphan result"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    check(
+        "repair_tool_pairing: orphan tool entry dropped",
+        repair_tool_pairing(orphan) == [{"role": "assistant", "content": "answer"}],
+    )
+
+
+def test_build_tool_inclusive_history() -> None:
+    from app.harness.chat_history import build_tool_inclusive_history
+
+    chat_rows = [
+        {"role": "user", "content": "explain profile import",
+         "metadata": {}, "created_at": "2026-07-03T10:00:00+00:00"},
+        {"role": "assistant", "content": "Profile import works by validating then persisting records.",
+         "metadata": {"execution_id": 100}, "created_at": "2026-07-03T10:01:00+00:00"},
+        {"role": "user", "content": "when is the pdf report generated",
+         "metadata": {}, "created_at": "2026-07-03T10:02:00+00:00"},
+    ]
+    executions = [
+        {
+            "id": 100, "status": "success",
+            "started_at": "2026-07-03T10:00:05+00:00",
+            "completed_at": "2026-07-03T10:00:59+00:00",
+            "trajectory": [
+                # Augmented query (KB recall block prepended) — must NOT replay.
+                {"role": "user", "content": "[recall block...]\nexplain profile import"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "search_graph", "args": {}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ProfileImportService.cs:42"},
+                {"role": "assistant", "content": "Profile import works by validating then persisting records."},
+            ],
+        },
+    ]
+    log = logging.getLogger("t")
+
+    result = build_tool_inclusive_history(
+        chat_rows, executions,
+        current_user_query="when is the pdf report generated",
+        max_tool_tokens=24_000, max_tool_executions=4, logger_instance=log,
+    )
+    check(
+        "build_tool_inclusive_history: trailing current-turn user row dropped",
+        not any(e.get("content") == "when is the pdf report generated" for e in result),
+    )
+    check(
+        "build_tool_inclusive_history: clean user text used, not the augmented trajectory query",
+        result[0] == {"role": "user", "content": "explain profile import"},
+    )
+    check(
+        "build_tool_inclusive_history: tool segment replayed via execution_id link",
+        any(e.get("role") == "tool" and e.get("tool_call_id") == "c1" for e in result),
+    )
+    check(
+        "build_tool_inclusive_history: assistant final text appears exactly once (chat row wins)",
+        sum(1 for e in result if e.get("content") == "Profile import works by validating then persisting records.") == 1,
+        f"got {result}",
+    )
+
+    # Execution cap: with max_tool_executions=0, no tool segments replay —
+    # text-only degradation, but text turns are still present.
+    degraded = build_tool_inclusive_history(
+        chat_rows, executions,
+        current_user_query="when is the pdf report generated",
+        max_tool_tokens=24_000, max_tool_executions=0, logger_instance=log,
+    )
+    check(
+        "build_tool_inclusive_history: max_tool_executions=0 degrades to text-only",
+        not any(e.get("role") == "tool" for e in degraded),
+    )
+    check(
+        "build_tool_inclusive_history: text-only degradation keeps the user/assistant turns",
+        [e["role"] for e in degraded] == ["user", "assistant"],
+    )
+
+    # Token budget: a tiny budget also degrades to text-only (segment dropped).
+    tiny_budget = build_tool_inclusive_history(
+        chat_rows, executions,
+        current_user_query="when is the pdf report generated",
+        max_tool_tokens=1, max_tool_executions=4, logger_instance=log,
+    )
+    check(
+        "build_tool_inclusive_history: tiny token budget degrades to text-only",
+        not any(e.get("role") == "tool" for e in tiny_budget),
+    )
+
+    # Unmatched assistant row (no execution_id, no timestamp match) -> text-only.
+    unlinked_rows = [
+        {"role": "user", "content": "q1", "metadata": {}, "created_at": "2026-07-03T09:00:00+00:00"},
+        {"role": "assistant", "content": "a1", "metadata": {}, "created_at": "2026-07-03T09:01:00+00:00"},
+    ]
+    unlinked_result = build_tool_inclusive_history(
+        unlinked_rows, [], current_user_query="q2",
+        max_tool_tokens=24_000, max_tool_executions=4, logger_instance=log,
+    )
+    check(
+        "build_tool_inclusive_history: unmatched assistant row -> text-only",
+        unlinked_result == [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}],
+    )
+
+    # A system (compaction-summary) row is preserved in place.
+    with_summary = [{"role": "system", "content": "earlier turns summarized...", "metadata": {}, "created_at": "2026-07-03T08:00:00+00:00"}] + chat_rows
+    summary_result = build_tool_inclusive_history(
+        with_summary, executions,
+        current_user_query="when is the pdf report generated",
+        max_tool_tokens=24_000, max_tool_executions=4, logger_instance=log,
+    )
+    check(
+        "build_tool_inclusive_history: system summary row preserved",
+        summary_result[0] == {"role": "system", "content": "earlier turns summarized..."},
+    )
+
+
+async def test_chat_history_rebuild_fallback() -> None:
+    """rebuild_chat_history is fail-open: disabled setting, empty rows, or
+    any exception all return None so the caller falls back to UI history."""
+    from app.config import settings as _settings
+    from app.infrastructure.persistence import session_repository as _sr_singleton
+    import app.harness.chat_history as ch
+
+    log = logging.getLogger("t")
+    orig_flag = _settings.chat_history_include_tools
+    orig_get_messages = _sr_singleton.get_messages
+    try:
+        _settings.chat_history_include_tools = False
+        result = await ch.rebuild_chat_history("sess-x", current_user_query="q", logger_instance=log)
+        check("chat_history: disabled setting returns None", result is None)
+
+        _settings.chat_history_include_tools = True
+
+        async def _empty_rows(session_id):
+            return []
+        _sr_singleton.get_messages = _empty_rows
+        result = await ch.rebuild_chat_history("sess-y", current_user_query="q", logger_instance=log)
+        check("chat_history: empty chat rows returns None", result is None)
+
+        async def _raises(session_id):
+            raise RuntimeError("db down")
+        _sr_singleton.get_messages = _raises
+        result = await ch.rebuild_chat_history("sess-z", current_user_query="q", logger_instance=log)
+        check("chat_history: exception falls back to None (fail-open)", result is None)
+    finally:
+        _settings.chat_history_include_tools = orig_flag
+        _sr_singleton.get_messages = orig_get_messages
+
+
 # ── spec_factory + build_agent_from_spec ─────────────────────────────────────
 def test_spec_and_facade() -> None:
     from app.harness import build_agent_from_spec, AgentSpec
@@ -531,9 +1409,178 @@ async def test_supervisor_loop() -> None:
         base_query="Q", execution_id="e", logger_instance=log, wall_clock_budget=900)
     check("supervisor_loop no-supervisor = 1 run", runs["n"] == 1)
 
+    # ── late-bound reward: a PASS/RETRY verdict best-effort records its
+    #    score against the run's trajectory_events, gated on step_events_enabled ──
+    from app.harness.supervisor_loop import _record_supervisor_reward
+    from app.config import settings as _sup_s
+    from app.infrastructure.persistence import trajectory_event_repository as _sup_ter
+
+    _orig_step_events = _sup_s.step_events_enabled
+    _orig_append_reward = _sup_ter.append_reward_for_trace
+    captured_rewards: list = []
+
+    async def _fake_append_reward(trace_id, source, value):
+        captured_rewards.append((trace_id, source, value))
+        return True
+
+    try:
+        _sup_ter.append_reward_for_trace = _fake_append_reward
+
+        _sup_s.step_events_enabled = False
+        await _record_supervisor_reward("exec-1", 0.9)
+        check(
+            "supervisor reward: no-op when step_events_enabled is off",
+            captured_rewards == [],
+        )
+
+        _sup_s.step_events_enabled = True
+        await _record_supervisor_reward("exec-1", 0.9)
+        check(
+            "supervisor reward: records supervisor_score against the trace when enabled",
+            captured_rewards == [("exec-1", "supervisor_score", 0.9)],
+        )
+
+        # a PASS verdict during run_supervised triggers the reward call too.
+        captured_rewards.clear()
+        runs4 = {"n": 0}
+        async def ra4(a, q):
+            runs4["n"] += 1
+            return {"final_answer": "done", "input_tokens": 1, "output_tokens": 1, "tool_calls": []}
+        await run_supervised(agent="a0", run_agent=ra4, rebuild_agent=lambda: "a",
+            supervisor=FakeSup([V(SupervisorAction.PASS)]), base_query="Q", execution_id="exec-2",
+            logger_instance=log, wall_clock_budget=900)
+        check(
+            "supervisor_loop: PASS verdict records a late-bound reward",
+            captured_rewards == [("exec-2", "supervisor_score", 0.5)],
+        )
+
+        # failure to record must never break the loop (best-effort).
+        async def _boom_reward(trace_id, source, value):
+            raise RuntimeError("db down")
+        _sup_ter.append_reward_for_trace = _boom_reward
+        res_safe, _, _, _, _ = await run_supervised(agent="a0", run_agent=ra4, rebuild_agent=lambda: "a",
+            supervisor=FakeSup([V(SupervisorAction.PASS)]), base_query="Q", execution_id="exec-3",
+            logger_instance=log, wall_clock_budget=900)
+        check(
+            "supervisor_loop: reward-recording failure never breaks the loop",
+            res_safe.get("final_answer") == "done",
+        )
+    finally:
+        _sup_s.step_events_enabled = _orig_step_events
+        _sup_ter.append_reward_for_trace = _orig_append_reward
+
 
 async def _coro(v):
     return v
+
+
+async def test_trajectory_export_step_events() -> None:
+    """TrajectoryService.export_step_events is a thin, never-raising read of
+    trajectory_event_repository.list_for_trace — the offline-RL export
+    counterpart to get_atropos_format's flat message-role view."""
+    from app.services.trajectory_service import trajectory_service
+    from app.infrastructure.persistence import trajectory_event_repository as _tes_ter
+
+    fake_events = [
+        {"event_id": "e1", "trace_id": "t1", "step_index": 0, "type": "model_turn", "payload": {}},
+        {"event_id": "e2", "trace_id": "t1", "step_index": 1, "type": "tool_call", "payload": {}},
+    ]
+
+    async def _fake_list_for_trace(trace_id):
+        assert trace_id == "t1"
+        return fake_events
+
+    _orig_list = _tes_ter.list_for_trace
+    try:
+        _tes_ter.list_for_trace = _fake_list_for_trace
+        out = await trajectory_service.export_step_events("t1")
+        check("export_step_events: returns the repository's events", out == fake_events)
+
+        async def _boom_list(trace_id):
+            raise RuntimeError("db down")
+        _tes_ter.list_for_trace = _boom_list
+        out_safe = await trajectory_service.export_step_events("t1")
+        check("export_step_events: failure degrades to empty list, never raises", out_safe == [])
+    finally:
+        _tes_ter.list_for_trace = _orig_list
+
+
+async def test_tool_result_failed_flag_threading() -> None:
+    """The step-status icon bug: classify_tool_failure() was already computed
+    at both engine call sites right before stream_callback.on_tool_result(),
+    but the boolean was discarded rather than threaded through — so a tool
+    that returns normally (no exception) with error CONTENT (e.g. a DB
+    connection-refused message) rendered a green "success" step in the chat
+    UI. Verifies the classifier catches this content and that both engines'
+    tool-exec paths now pass `failed=` through to the stream callback."""
+    from app.core.tool_guardrails import classify_tool_failure
+
+    conn_refused = (
+        "[Tool Error] connection refused on 172.16.82.182:5432 — "
+        "could not connect to server"
+    )
+    is_failed, _reason = classify_tool_failure("postgres-production__query", conn_refused)
+    check(
+        "classify_tool_failure: flags a '[Tool Error] connection refused' MCP result",
+        is_failed is True,
+    )
+    ok_is_failed, _ = classify_tool_failure("postgres-production__query", '{"rows": []}')
+    check(
+        "classify_tool_failure: a normal result is not flagged failed",
+        ok_is_failed is False,
+    )
+
+    class _FakeStreamCallback:
+        def __init__(self):
+            self.tool_results: list = []
+
+        async def on_tool_call(self, tool_name, args):
+            pass
+
+        async def on_tool_result(self, tool_name, result, failed=False):
+            self.tool_results.append((tool_name, result, failed))
+
+        async def on_error(self, error):
+            pass
+
+    # ── native engine: execute_tool_calls (tool_exec.py) ──
+    from app.harness.engine.tool_exec import execute_tool_calls
+
+    failing_tool = _FakeTool("postgres-production__query", conn_refused)
+    ok_tool = _FakeTool("other_tool", '{"rows": []}')
+    ai_msg = _fake_ai_message("", tool_calls=[
+        {"id": "c1", "name": "postgres-production__query", "args": {}},
+        {"id": "c2", "name": "other_tool", "args": {}},
+    ])
+    native_cb = _FakeStreamCallback()
+    await execute_tool_calls(
+        ai_msg, {"postgres-production__query": failing_tool, "other_tool": ok_tool},
+        stream_callback=native_cb,
+    )
+    native_by_name = {name: failed for name, _result, failed in native_cb.tool_results}
+    check(
+        "tool_exec.execute_tool_calls: threads failed=True for the connection-refused tool",
+        native_by_name.get("postgres-production__query") is True,
+    )
+    check(
+        "tool_exec.execute_tool_calls: threads failed=False for the healthy tool",
+        native_by_name.get("other_tool") is False,
+    )
+
+    # ── LangGraph engine: the on_tool_end streaming branch in agent_runner.py ──
+    # Exercised directly rather than through the full astream loop (which needs
+    # a live LangGraph agent) — this reproduces exactly the guardrail
+    # post-check + on_tool_result call that agent_runner.py's on_tool_end
+    # handler performs, using the same classify_tool_failure() call.
+    lg_is_failed, _ = classify_tool_failure("postgres-production__query", conn_refused)
+    lg_cb = _FakeStreamCallback()
+    await lg_cb.on_tool_result(
+        "postgres-production__query", conn_refused[:2000], failed=lg_is_failed,
+    )
+    check(
+        "agent_runner on_tool_end pattern: threads failed=True through on_tool_result",
+        lg_cb.tool_results == [("postgres-production__query", conn_refused[:2000], True)],
+    )
 
 
 # ── context_builder ──────────────────────────────────────────────────────────
@@ -584,8 +1631,8 @@ async def test_edit_tools() -> None:
     import os
     import tempfile
     from app.config import settings
-    from app.workflow.strategies.react.edit_tools import build_edit_tools
-    from app.workflow.strategies.react.tool_permissions import evaluate
+    from app.harness.edit_tools import build_edit_tools
+    from app.harness.tool_permissions import evaluate
 
     tools = {t.name: t for t in build_edit_tools()}
     check("edit_tools exposes create_file", "create_file" in tools, str(list(tools)))
@@ -1108,7 +2155,7 @@ def test_policy_engine() -> None:
     from app.core import policy
     from app.core.policy import PolicyAction, PolicyConfigError
     from app.core.policy.runtime import evaluate_cost, evaluate_tool_count
-    from app.workflow.strategies.react.tool_permissions import DEFAULT_ASK_PATTERNS
+    from app.harness.tool_permissions import DEFAULT_ASK_PATTERNS
 
     # ── resolution: named policies compile into one ResolvedPolicy ─────────────
     resolved = policy.resolve([
@@ -1443,7 +2490,7 @@ def test_memory_capability_and_autolearn() -> None:
 
 def test_persona_and_supervisor_toggle() -> None:
     """Persona is additive (empty → unchanged); supervisor toggle coerces. DB-free."""
-    from app.workflow.strategies.react.agent_builder import compose_system_prompt
+    from app.harness.agent_builder import compose_system_prompt
     from app.harness.spec_factory import _as_bool
 
     base = dict(tools=[], agent_config={"instructions": "do the thing"},
@@ -1720,7 +2767,7 @@ async def test_context_compaction_tiers() -> None:
           result2[0].content == "investigate the error" and result2[-1].content == "final answer")
 
 
-def test_configurable_agents() -> None:
+async def test_configurable_agents() -> None:
     # ── capability registry: byte-identical investigation ordering ──
     from app.harness import capabilities as caps
     active = caps.resolve(["database", "cloudwatch", "code_analyzer"])
@@ -1751,31 +2798,357 @@ def test_configurable_agents() -> None:
           rf["output_schema"] == "generic" and rf["planning"] is True
           and rf["capabilities"] == ["a", "b"] and rf["subagents"] == [{"name": "x"}])
 
-    # ── planning tools ──
-    from app.workflow.strategies.react import planning_tools as _pl
+    # ── planning tools (memory backend — the default) ──
+    from app.harness import planning_tools as _pl
     pt = {t.name: t for t in _pl.build_planning_tools("st-plan")}
-    pt["write_todos"].func(items=["one", "two"])
-    pt["update_todo"].func(index=1, status="completed")
-    todos = _pl.get_todos("st-plan")
+    await pt["write_todos"].ainvoke({"items": ["one", "two"]})
+    await pt["update_todo"].ainvoke({"index": 1, "status": "completed"})
+    todos = await _pl.get_todos("st-plan")
     check("planning todos tracked",
           todos[1]["status"] == "completed" and todos[0]["status"] == "pending")
-    _pl.drop_session("st-plan")
-    check("planning session dropped", _pl.get_todos("st-plan") == [])
+    await _pl.drop_session("st-plan")
+    check("planning session dropped", await _pl.get_todos("st-plan") == [])
+
+    # ── planning tools (postgres backend, config wiring only — no live DB in
+    #    this offline selftest, so just confirm the branch is reachable and the
+    #    memory path is untouched by the setting flip) ──
+    from app.config import settings as _cfgs
+    _orig_backend = _cfgs.scratch_store_backend
+    try:
+        _cfgs.scratch_store_backend = "postgres"
+        check("planning: backend() reads postgres setting", _pl._backend() == "postgres")
+    finally:
+        _cfgs.scratch_store_backend = _orig_backend
+    check("planning: backend() back to memory", _pl._backend() == "memory")
 
     # ── virtual filesystem ──
-    from app.core.vfs import build_vfs_tools, offload_if_large, drop_session as _vdrop
-    from app.core.vfs.backend import get_backend
-    vt = {t.name for t in build_vfs_tools("st-vfs")}
-    check("vfs tools present", vt == {"fs_write", "fs_read", "fs_ls", "fs_grep"})
+    from app.core.vfs import build_vfs_tools, offload_if_large, vfs_drop_session as _vdrop
+    from app.core.vfs.backend import get_backend, _backend_kind
+    vt = {t.name: t for t in build_vfs_tools("st-vfs")}
+    check(
+        "vfs tools present",
+        set(vt.keys()) == {
+            "fs_write", "fs_append", "fs_upsert", "fs_prune", "fs_read", "fs_ls", "fs_grep",
+        },
+    )
+    await vt["fs_write"].ainvoke({"path": "/n.txt", "content": "alpha\nbeta"})
+    read_back = await vt["fs_read"].ainvoke({"path": "/n.txt", "offset": 1})
+    check("vfs read back", read_back == "beta")
+    # offload_if_large stays memory-only/sync (not wired into the live tool
+    # pipeline — see backend.py docstring); exercised via the low-level backend.
     be = get_backend("st-vfs")
-    be.write("/n.txt", "alpha\nbeta")
-    check("vfs read back", be.read("/n.txt", offset=1) == "beta")
     check("vfs offload large", "/offload/" in offload_if_large("st-vfs", "tool", "y" * 7000))
     check("vfs offload small passthrough", offload_if_large("st-vfs", "tool", "tiny") == "tiny")
-    _vdrop("st-vfs")
+    check("vfs backend_kind defaults memory", _backend_kind() == "memory")
+    await _vdrop("st-vfs")
+
+    # ── next_offload_path collision-safety under postgres-style rehydration:
+    #    each vfs_offload_if_large call on the postgres backend hydrates a
+    #    FRESH VFSBackend (see _load_pg_backend) whose _offload_seq always
+    #    restarts at 0 — next_offload_path must derive uniqueness from the
+    #    persisted /offload/* file count instead, or repeat calls collide
+    #    and silently overwrite each other's data. ──
+    from app.core.vfs.backend import VFSBackend as _VFSBackendCls
+    be_fresh1 = _VFSBackendCls()
+    p_a = be_fresh1.next_offload_path("cw_scan")
+    be_fresh1.write(p_a, "first payload")
+    be_fresh2 = _VFSBackendCls()  # simulates the next rehydrate, seeded with be_fresh1's data
+    be_fresh2._files = dict(be_fresh1._files)
+    p_b = be_fresh2.next_offload_path("cw_scan")
+    check(
+        "vfs next_offload_path avoids collision across rehydrated backends",
+        p_a != p_b,
+    )
+    be_fresh2.write(p_b, "second payload")
+    check(
+        "vfs next_offload_path: both payloads survive (no overwrite)",
+        be_fresh2.read(p_a) == "first payload" and be_fresh2.read(p_b) == "second payload",
+    )
+
+    # ── Postgres VFS mutation lock: same session -> same Lock instance
+    #    (serializes concurrent load-modify-save calls); different sessions
+    #    get independent locks (no cross-session contention). ──
+    from app.core.vfs.backend import _pg_lock
+    import asyncio as _asyncio_pglock
+    lock_a1 = _pg_lock("pg-sess-a")
+    lock_a2 = _pg_lock("pg-sess-a")
+    lock_b = _pg_lock("pg-sess-b")
+    check("vfs _pg_lock: same session reuses one Lock", lock_a1 is lock_a2)
+    check("vfs _pg_lock: different sessions get different Locks", lock_a1 is not lock_b)
+    check("vfs _pg_lock: returns a real asyncio.Lock", isinstance(lock_a1, _asyncio_pglock.Lock))
+
+    # ── vfs append/upsert/prune (memory backend, direct + via tools) ──
+    be2 = get_backend("st-vfs2")
+    p1 = be2.append("/log.txt", "line one")
+    check("vfs append creates file", be2.read("/log.txt") == "line one")
+    be2.append("/log.txt", "line two")
+    check("vfs append adds newline + text", be2.read("/log.txt") == "line one\nline two")
+
+    be2.upsert("/plan.txt", "S1", "S1 [pending] scope: a needs: -")
+    be2.upsert("/plan.txt", "S2", "S2 [pending] scope: b needs: S1")
+    check(
+        "vfs upsert appends new keys in order",
+        be2.read("/plan.txt") == "S1 [pending] scope: a needs: -\nS2 [pending] scope: b needs: S1",
+    )
+    be2.upsert("/plan.txt", "S1", "S1 [done] scope: a needs: -")
+    _plan_lines = be2.read("/plan.txt").splitlines()
+    check(
+        "vfs upsert replaces existing key without duplicating",
+        sum(1 for ln in _plan_lines if ln.startswith("S1 ")) == 1
+        and "S1 [done] scope: a needs: -" in _plan_lines
+        and "S2 [pending] scope: b needs: S1" in _plan_lines,
+    )
+
+    be2.write("/prune.txt", "a\nb\nc\nd\ne")
+    be2.prune("/prune.txt", keep_last_n=2)
+    check("vfs prune keep_last_n", be2.read("/prune.txt") == "d\ne")
+    be2.write("/prune2.txt", "keep\nDROP-this\nkeep2\nDROP-that")
+    be2.prune("/prune2.txt", match="^DROP")
+    check("vfs prune match regex", be2.read("/prune2.txt") == "keep\nkeep2")
+    check("vfs prune missing file is a no-op", be2.prune("/nope.txt", keep_last_n=1) == "/nope.txt")
+    try:
+        be2.prune("/log.txt")
+        prune_arg_check = False
+    except ValueError:
+        prune_arg_check = True
+    check("vfs prune requires keep_last_n or match", prune_arg_check)
+
+    # context_summary.txt hard cap (~500 tokens / 2000 chars), enforced in write()
+    # so append()/upsert() (which route through it) are covered too.
+    try:
+        be2.write("/context_summary.txt", "x" * 2001)
+        cap_rejected = False
+    except ValueError as _cap_exc:
+        cap_rejected = "prune first" in str(_cap_exc)
+    check("vfs context_summary.txt over-cap write rejected", cap_rejected)
+    be2.write("/context_summary.txt", "x" * 2000)
+    check("vfs context_summary.txt at-cap write allowed", len(be2.read("/context_summary.txt")) == 2000)
+    try:
+        be2.append("/context_summary.txt", "y")
+        append_cap_rejected = False
+    except ValueError:
+        append_cap_rejected = True
+    check("vfs context_summary.txt append respects cap", append_cap_rejected)
+    check(
+        "vfs non-summary file has no cap",
+        len(be2.write("/other.txt", "x" * 5000)) > 0 and len(be2.read("/other.txt")) == 5000,
+    )
+    await _vdrop("st-vfs2")
+
+    vt2 = {t.name: t for t in build_vfs_tools("st-vfs3")}
+    r_append = json.loads(await vt2["fs_append"].ainvoke({"path": "/m.txt", "text": "hello"}))
+    check("fs_append tool ok", r_append.get("ok") is True)
+    r_upsert = json.loads(await vt2["fs_upsert"].ainvoke(
+        {"path": "/p.txt", "key": "S1", "text": "S1 [active] scope: x needs: -"}
+    ))
+    check("fs_upsert tool ok", r_upsert.get("ok") is True)
+    r_prune = json.loads(await vt2["fs_prune"].ainvoke({"path": "/m.txt", "keep_last_n": 0}))
+    check("fs_prune tool ok", r_prune.get("ok") is True)
+    await _vdrop("st-vfs3")
+
+    # ── metamemory (app.harness.metamemory) ──
+    from app.harness import metamemory as _mm
+    from app.config import settings as _mm_settings
+    from app.core.vfs.backend import vfs_read
+
+    check("metamemory: is_active False when filesystem off", _mm.is_active(False) is False)
+    _orig_mm_enabled = _mm_settings.metamemory_enabled
+    try:
+        _mm_settings.metamemory_enabled = False
+        check("metamemory: is_active False when global flag off", _mm.is_active(True) is False)
+        _mm_settings.metamemory_enabled = True
+        check("metamemory: is_active True when both flags on", _mm.is_active(True) is True)
+
+        await _mm.seed_if_absent("st-mm", "Investigate payment timeouts")
+        plan_content = await vfs_read("st-mm", _mm.PLAN_PATH)
+        milestones_content = await vfs_read("st-mm", _mm.MILESTONES_PATH)
+        summary_content = await vfs_read("st-mm", _mm.SUMMARY_PATH)
+        check("metamemory: seeds plan.txt with objective", "Investigate payment timeouts" in plan_content)
+        check("metamemory: seeds milestones.txt header", milestones_content.startswith("# MILESTONES"))
+        check("metamemory: seeds context_summary.txt with objective", "Investigate payment timeouts" in summary_content)
+
+        # Idempotent: seeding again after the agent modified a file must not clobber it.
+        from app.core.vfs.backend import vfs_write as _vw
+        await _vw("st-mm", _mm.MILESTONES_PATH, "# MILESTONES v1\nDONE S1")
+        await _mm.seed_if_absent("st-mm", "different objective")
+        milestones_after = await vfs_read("st-mm", _mm.MILESTONES_PATH)
+        check("metamemory: seed_if_absent does not overwrite existing files", milestones_after == "# MILESTONES v1\nDONE S1")
+
+        block = await _mm.read_context_block("st-mm")
+        check(
+            "metamemory: read_context_block combines summary+milestones",
+            block is not None and "Investigate payment timeouts" in block and "DONE S1" in block,
+        )
+        check("metamemory: read_context_block None for unseeded session", await _mm.read_context_block("st-mm-unseeded") is None)
+        check("metamemory: read_context_block None for missing session_id", await _mm.read_context_block(None) is None)
+
+        check("metamemory: METAMEMORY_SECTION mentions all three files", all(
+            p in _mm.METAMEMORY_SECTION for p in (_mm.PLAN_PATH, _mm.MILESTONES_PATH, _mm.SUMMARY_PATH)
+        ))
+    finally:
+        _mm_settings.metamemory_enabled = _orig_mm_enabled
+        await _vdrop("st-mm")
+
+    # agent_builder wiring: METAMEMORY_SECTION only appears when both flags are on.
+    from app.harness.agent_builder import compose_system_prompt as _csp
+    try:
+        _mm_settings.metamemory_enabled = False
+        prompt_off = _csp(tools=[], agent_config={}, filesystem=True)
+        check("agent_builder: no metamemory section when global flag off", "Metamemory discipline" not in prompt_off)
+        _mm_settings.metamemory_enabled = True
+        prompt_on = _csp(tools=[], agent_config={}, filesystem=True)
+        check("agent_builder: metamemory section present when both flags on", "Metamemory discipline" in prompt_on)
+        prompt_no_fs = _csp(tools=[], agent_config={}, filesystem=False)
+        check("agent_builder: no metamemory section without filesystem", "Metamemory discipline" not in prompt_no_fs)
+    finally:
+        _mm_settings.metamemory_enabled = _orig_mm_enabled
+
+    # ── brief_slicer (3.3 dispatch-time governance) ──
+    import tempfile
+    import os as _os
+    from app.core.governance.brief_slicer import slice_rules, _parse_rules
+
+    doc = (
+        "## R-001 [tools: edit_file,create_file] Always read before you edit.\n"
+        "## R-002 [tools: cw_logs_insights*] Bound your query with a time window.\n"
+        "## R-003 General rule with no selector — applies to every run.\n"
+        "not a rule line, ignored\n"
+        "## R-004 [tools: nomatch_tool] Never reachable in this test.\n"
+    )
+    parsed = _parse_rules(doc)
+    check("brief_slicer: parses 4 rules, skips prose", len(parsed) == 4)
+    check(
+        "brief_slicer: rule with tools selector parsed correctly",
+        parsed[0] == ("R-001", ("edit_file", "create_file"), "Always read before you edit."),
+    )
+    check("brief_slicer: rule with no selector has empty patterns tuple", parsed[2][1] == ())
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".md")
+    _os.close(fd)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(doc)
+    _orig_policy_env = _os.environ.get("AGENT_POLICY_PATH")
+    _os.environ["AGENT_POLICY_PATH"] = tmp_path
+    try:
+        edit_result = slice_rules(["edit_file", "fs_read"])
+        check(
+            "brief_slicer: matches on a bound tool + always includes the no-selector rule",
+            "R-001" in edit_result and "R-003" in edit_result and "R-002" not in edit_result,
+        )
+        cw_result = slice_rules(["cw_logs_insights_query"])
+        check("brief_slicer: fnmatch pattern matches", "R-002" in cw_result and "R-001" not in cw_result)
+        none_result = slice_rules([])
+        check(
+            "brief_slicer: only the no-selector rule applies with zero bound tools",
+            none_result.strip() == "R-003. General rule with no selector — applies to every run.",
+        )
+        capped = slice_rules(["edit_file", "cw_logs_insights_query"], max_chars=20)
+        check("brief_slicer: respects max_chars", len(capped) <= 20 + len("\n…[truncated]"))
+
+        # mtime-cache invalidation: editing the file must be picked up, not stale.
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write("## R-999 [tools: edit_file] Brand new rule after edit.\n")
+        _os.utime(tmp_path, None)  # ensure mtime actually advances on fast filesystems
+        updated = slice_rules(["edit_file"])
+        check("brief_slicer: mtime-cache picks up file edits", "R-999" in updated and "R-001" not in updated)
+    finally:
+        if _orig_policy_env is None:
+            _os.environ.pop("AGENT_POLICY_PATH", None)
+        else:
+            _os.environ["AGENT_POLICY_PATH"] = _orig_policy_env
+        _os.remove(tmp_path)
+
+    _os.environ["AGENT_POLICY_PATH"] = _os.path.join(tempfile.gettempdir(), "does-not-exist-agent-policy.md")
+    try:
+        check("brief_slicer: nonexistent file -> empty string", slice_rules(["edit_file"]) == "")
+    finally:
+        _os.environ.pop("AGENT_POLICY_PATH", None)
+
+    # agent_builder wiring: '# Governance' section only appears when a rule matches.
+    fd2, tmp_path2 = tempfile.mkstemp(suffix=".md")
+    _os.close(fd2)
+    with open(tmp_path2, "w", encoding="utf-8") as f:
+        f.write("## R-100 [tools: crawler_grep] Prefer crawler_grep over a full file read.\n")
+    _os.environ["AGENT_POLICY_PATH"] = tmp_path2
+    try:
+        class _NamedTool:
+            def __init__(self, name):
+                self.name = name
+
+        prompt_gov_match = _csp(tools=[_NamedTool("crawler_grep")], agent_config={})
+        check("agent_builder: '# Governance' section present when a rule matches", "# Governance" in prompt_gov_match)
+        prompt_gov_none = _csp(tools=[_NamedTool("db_list_tables")], agent_config={})
+        check(
+            "agent_builder: '# Governance' section absent when no rule matches",
+            "# Governance" not in prompt_gov_none,
+        )
+    finally:
+        _os.environ.pop("AGENT_POLICY_PATH", None)
+        _os.remove(tmp_path2)
+
+    # ── automatic tool-result offload (wired into the live pipeline) ──
+    from app.core.vfs import vfs_offload_if_large
+    big = await vfs_offload_if_large("st-offload", "probe", "z" * 7000)
+    check("vfs_offload_if_large offloads large", "/offload/" in big and len(big) < 7000)
+    small = await vfs_offload_if_large("st-offload", "probe", "tiny")
+    check("vfs_offload_if_large small passthrough", small == "tiny")
+
+    from langchain_core.tools import StructuredTool
+    from app.harness.tool_offload import wrap_tools_with_offload
+
+    async def _dump() -> str:
+        return "d" * 9000
+
+    dump_tool = StructuredTool.from_function(coroutine=_dump, name="dump_tool", description="d")
+    dump_list = [dump_tool]
+    wrapped = wrap_tools_with_offload(dump_list, "st-offload", 6000)
+    result = await wrapped[0].ainvoke({})
+    check("wrap_tools_with_offload offloads oversized result", "[offloaded 9000 chars" in result)
+    check(
+        "wrap_tools_with_offload no-op below threshold",
+        wrap_tools_with_offload(dump_list, "st-offload", 0) is dump_list,
+    )
+    check(
+        "wrap_tools_with_offload no-op without session_id",
+        wrap_tools_with_offload(dump_list, None, 6000) is dump_list,
+    )
+    await _vdrop("st-offload")
+
+    # ── tool-output compression (compress-then-cap; sidecar-free path) ──
+    # compression_enabled defaults off, so these exercise the guaranteed-cap
+    # path without needing the sidecar reachable.
+    from app.core.compaction.compressor import compress_then_cap
+    from app.workflow.mcp.mcp_langchain_adapter import (
+        _compress_or_truncate,
+        _truncate_output,
+        MCP_TOOL_OUTPUT_MAX_CHARS,
+    )
+    from app.harness.tool_permissions import _cap_text
+
+    # (P0 regression) oversized MCP output always comes back capped + hinted,
+    # even though compression success used to bypass the cap.
+    mcp_out = await _compress_or_truncate("y" * (MCP_TOOL_OUTPUT_MAX_CHARS + 5000))
+    check(
+        "compression: MCP output capped to ceiling",
+        len(mcp_out) <= MCP_TOOL_OUTPUT_MAX_CHARS + 300 and "[truncated" in mcp_out,
+    )
+
+    # flags-off compress_then_cap is byte-identical to plain cap.
+    long_in = "x" * 500
+    _plaincap = lambda t: _cap_text(t, 100, "st")  # noqa: E731
+    check(
+        "compression: compress_then_cap == cap when disabled",
+        (await compress_then_cap(long_in, _plaincap, tool_name="st")) == _plaincap(long_in),
+    )
+
+    # already-truncated input is not re-suffixed (idempotency marker honoured).
+    marked = "a" * 8000 + "\n…[truncated: showing first 8000 of 20000 chars from 'db']"
+    check("compression: _cap_text idempotent on marked input", _cap_text(marked, 8000, "db") == marked)
+    _res = await compress_then_cap(marked, lambda t: _cap_text(t, 8000, "db"), tool_name="db")
+    check("compression: no double-truncate on marked input", _res.count("[truncated") == 1)
 
     # ── generalized subagents ──
-    from app.workflow.strategies.react.subagent_factory import build_subagent_tools
+    from app.harness.subagent_factory import build_subagent_tools
     st = build_subagent_tools(
         llm=None, base_tools=list(build_vfs_tools("x")), agent_config={},
         subagent_defs=[{"name": "Data Specialist", "tools": ["fs_*"]}],
@@ -1784,6 +3157,93 @@ def test_configurable_agents() -> None:
     check("subagent depth cap", build_subagent_tools(
         llm=None, base_tools=[], agent_config={}, subagent_defs=[{"name": "a"}],
         depth_remaining=0) == [])
+
+    # ── connectivity: shared resource nodes must NOT bridge tools onto the agent ──
+    from app.workflow.strategies.react.workflow_config import (
+        get_connected_node_ids, extract_tools_config,
+    )
+    # agent + code_search tool that share ONE language_model node (both wire their
+    # lm port to it) but are NOT directly connected. Repro of the reported bug.
+    _wf_bridge = {
+        "nodes": [
+            {"id": "ag", "type": "agent"},
+            {"id": "lm", "type": "language_model"},
+            {"id": "cs", "type": "code_search_tool", "params": {"backend": "codegraph"}},
+        ],
+        "edges": [
+            {"source": "lm", "target": "ag", "targetSlot": "lm"},
+            {"source": "lm", "target": "cs", "targetSlot": "lm"},
+        ],
+    }
+    check("connectivity: shared LM node does NOT bridge tool onto agent",
+          get_connected_node_ids(_wf_bridge, "code_search_tool") == [])
+    # direct tools-port edge IS connected.
+    _wf_direct = {
+        "nodes": [
+            {"id": "ag", "type": "agent"},
+            {"id": "cs", "type": "code_search_tool", "params": {"backend": "codegraph"}},
+        ],
+        "edges": [{"source": "cs", "target": "ag", "targetSlot": "tools"}],
+    }
+    check("connectivity: direct tool→agent edge IS connected",
+          get_connected_node_ids(_wf_direct, "code_search_tool") == ["cs"])
+    # squad member reachable via parentId containment through its window frame.
+    _wf_squad = {
+        "nodes": [
+            {"id": "ag", "type": "agent"},
+            {"id": "win", "type": "subagent_window"},
+            {"id": "cw", "type": "cloudwatch_tool", "parentId": "win"},
+        ],
+        "edges": [{"source": "win", "target": "ag", "sourceSlot": "specialists",
+                   "targetSlot": "subagents"}],
+    }
+    check("connectivity: squad member reachable via parentId",
+          get_connected_node_ids(_wf_squad, "cloudwatch_tool") == ["cw"])
+
+    # ── strict scoping: squad-glob tools stripped from the parent, kept for child ──
+    from langchain_core.tools import StructuredTool as _ST
+
+    async def _cg():  # a stand-in codegraph tool
+        return "ok"
+
+    _cg_tool = _ST.from_function(coroutine=_cg, name="codegraph__query_graph", description="d")
+    _fs_tool = _ST.from_function(coroutine=_cg, name="fs_read", description="d")
+    _parent_before = [_cg_tool, _fs_tool]
+    _delegs = build_subagent_tools(
+        llm=None, base_tools=list(_parent_before), agent_config={},
+        subagent_defs=[{"name": "cw squad", "tools": ["codegraph__*"]}],
+        parent_execution_id="p")
+    check("strict-scope: delegate_to_cw_squad built", bool(_delegs) and _delegs[0].name == "delegate_to_cw_squad")
+    # emulate tool_assembler's strip: parent loses codegraph__* but keeps fs_read.
+    import fnmatch as _fn
+    from app.harness.subagent_factory import _coerce_tool_globs as _cg_globs
+    _globs = [g for g in (_cg_globs(["codegraph__*"]) or []) if g != "*"]
+    _kept = [t for t in _parent_before
+             if not (not t.name.startswith("delegate_")
+                     and any(_fn.fnmatch(t.name, g) for g in _globs))]
+    check("strict-scope: parent list drops squad tool, keeps others",
+          [t.name for t in _kept] == ["fs_read"])
+
+    # ── params-dialect: agent profile (subagents/planning) read from node.params ──
+    # New-dialect agent nodes have NO 'data' key — config lives at node.params.
+    # extract_agent_config must merge it or the whole profile silently vanishes
+    # (the reported bug: squad subagents ignored → codegraph leaked to the agent).
+    from app.workflow.strategies.react.workflow_config import extract_agent_config
+    from app.harness.spec_factory import resolve_profile_fields
+    _wf_params = {"nodes": [
+        {"id": "ag", "type": "agent", "params": {
+            "subagents": '[{"name":"CloudWatch Squad","tools":["codegraph__*"],"model":"X"}]',
+            "planning": "true",
+        }},
+    ], "edges": []}
+    _pf = resolve_profile_fields(extract_agent_config(_wf_params))
+    check("params-dialect: subagents read from node.params",
+          bool(_pf.get("subagents")) and _pf["subagents"][0].get("name") == "CloudWatch Squad")
+    check("params-dialect: planning toggle read from node.params", _pf.get("planning") is True)
+    # legacy data-dialect still resolves.
+    _wf_data = {"nodes": [{"id": "ag", "type": "agent", "data": {"planning": True}}], "edges": []}
+    check("data-dialect: profile still resolves",
+          resolve_profile_fields(extract_agent_config(_wf_data)).get("planning") is True)
 
     # ── self-improvement signals (LLM-free layer) ──
     from app.core.improvement import compute_signals
@@ -1799,6 +3259,62 @@ def test_configurable_agents() -> None:
     check("improvement parses JSON array",
           _parse_proposals('[{"kind":"prompt","suggestion":"x","rationale":"y"}]')[0]["status"] == "draft")
 
+    # ── 4.3 evolution wiring: compute_event_signals / _event_heuristic_proposals ──
+    from app.core.improvement.analyzer import compute_event_signals, _event_heuristic_proposals
+    from app.infrastructure.persistence import trajectory_event_repository as _te_instance
+
+    check("compute_event_signals: no trace_ids -> {}", await compute_event_signals([]) == {})
+
+    def _mk_event(step, ev_type, payload):
+        return {
+            "event_id": f"e{step}", "trace_id": "t1", "span_id": None,
+            "step_index": step, "ts": None, "type": ev_type, "payload": payload,
+        }
+
+    fake_events = [
+        _mk_event(0, "tool_call", {"action": {"name": "flaky_tool"}, "outcome": {"status": "error"}}),
+        _mk_event(1, "tool_call", {"action": {"name": "flaky_tool"}, "outcome": {"status": "error"}}),
+        _mk_event(2, "tool_call", {"action": {"name": "flaky_tool"}, "outcome": {"status": "ok"}}),
+        _mk_event(3, "tool_call", {"action": {"name": "reliable_tool"}, "outcome": {"status": "ok"}}),
+        _mk_event(4, "tool_call", {"action": {"name": "reliable_tool"}, "outcome": {"status": "ok"}}),
+        _mk_event(5, "tool_call", {"action": {"name": "reliable_tool"}, "outcome": {"status": "ok"}}),
+        _mk_event(6, "lifecycle", {"action": {"event": "max_turns_forced_synthesis"}}),
+        _mk_event(7, "lifecycle", {"action": {"event": "truncation_ladder_exhausted"}}),
+        _mk_event(8, "lifecycle", {"action": {"event": "max_turns_forced_synthesis"}}),
+    ]
+
+    async def _fake_list_for_trace(trace_id):
+        return fake_events if trace_id == "t1" else []
+
+    _orig_list_for_trace = _te_instance.list_for_trace
+    _te_instance.list_for_trace = _fake_list_for_trace
+    try:
+        event_sig = await compute_event_signals(["t1"])
+        check("compute_event_signals: identifies the unreliable tool", any(
+            t["tool"] == "flaky_tool" for t in event_sig.get("unreliable_tools", [])
+        ))
+        check(
+            "compute_event_signals: reliable tool not flagged",
+            not any(t["tool"] == "reliable_tool" for t in event_sig.get("unreliable_tools", [])),
+        )
+        flaky = next(t for t in event_sig["unreliable_tools"] if t["tool"] == "flaky_tool")
+        check("compute_event_signals: failure_rate computed correctly", flaky["calls"] == 3 and flaky["failures"] == 2)
+        check("compute_event_signals: counts stall lifecycle events", event_sig.get("stall_events") == 3)
+
+        event_props = _event_heuristic_proposals(event_sig)
+        check(
+            "_event_heuristic_proposals: names the unreliable tool",
+            any(p["kind"] == "tools" and "flaky_tool" in p["target"] for p in event_props),
+        )
+        check(
+            "_event_heuristic_proposals: stalls -> reliability proposal",
+            any(p["kind"] == "reliability" and p["target"] == "loop-budget" for p in event_props),
+        )
+
+        check("compute_event_signals: empty trace -> {}", await compute_event_signals(["no-such-trace"]) == {})
+    finally:
+        _te_instance.list_for_trace = _orig_list_for_trace
+
 
 async def test_subagent_engine_routing() -> None:
     """_run_child dispatches through app.harness.engine.run_agent_once with
@@ -1809,7 +3325,7 @@ async def test_subagent_engine_routing() -> None:
     (execute_skill isn't in the blocked-tools list)."""
     import json
     import app.harness.engine as engine_mod
-    from app.workflow.strategies.react import subagent_factory as sf
+    from app.harness import subagent_factory as sf
 
     class _RoutingFakeTool:
         def __init__(self, name):
@@ -1855,7 +3371,7 @@ async def test_subagent_engine_routing() -> None:
 
 async def test_delegation_phase_b() -> None:
     """Phase B delegation: config bounds, BLOCKED_TOOLS safety, parallel/async tools."""
-    from app.workflow.strategies.react import subagent_factory as sf
+    from app.harness import subagent_factory as sf
     from app.config import settings as _s
 
     # ── 1. Config bounds resolve from settings ──────────────────────────────────
@@ -1925,7 +3441,7 @@ async def test_delegation_phase_b() -> None:
     check("disallowedTools subtracts allowed tool", scoped_dis == [])
 
     # ── 3. delegate_parallel tool builds and has expected structure ──────────────
-    from app.workflow.strategies.react.subagent_factory import (
+    from app.harness.subagent_factory import (
         build_delegate_parallel_tool, build_subagent_tools,
     )
     defs = [
@@ -1967,9 +3483,33 @@ async def test_delegation_phase_b() -> None:
     check("assembler adds delegate_parallel", "delegate_parallel" in ext_names, str(ext_names))
     check("assembler does not add delegate_async", "delegate_async" not in ext_names, str(ext_names))
 
+    # ── 5b. tool_assembler applies offload wrap end-to-end when filesystem=True ──
+    from langchain_core.tools import StructuredTool as _StructuredTool
+    from app.core.vfs import vfs_drop_session as _vdrop
+
+    async def _dump2() -> str:
+        return "e" * 9000
+
+    dump2 = _StructuredTool.from_function(coroutine=_dump2, name="dump2", description="d")
+    ext_fs = add_extension_tools(
+        tools=[dump2],
+        llm=None,
+        agent_config={"filesystem": True},
+        code_analyzer_config=None,
+        execution_id="tb-exec-fs",
+        logger_instance=_log.getLogger("t"),
+    )
+    dump2_wrapped = next(t for t in ext_fs if t.name == "dump2")
+    dump2_result = await dump2_wrapped.ainvoke({})
+    check(
+        "add_extension_tools offloads oversized results when filesystem=True",
+        "[offloaded 9000 chars" in dump2_result,
+    )
+    await _vdrop("tb-exec-fs")
+
     # ── 6. retired subagent.py — delegate_investigation now built by the
     #    consolidated factory whenever code-analyzer tools are configured ──────
-    from app.workflow.strategies.react.subagent_factory import build_generic_delegate_tool
+    from app.harness.subagent_factory import build_generic_delegate_tool
     generic_tool = build_generic_delegate_tool(
         llm=None, base_tools=parent_tools, agent_config={}, parent_execution_id="tp",
     )
@@ -2000,6 +3540,271 @@ async def test_delegation_phase_b() -> None:
     has_ca, has_cw = sf._infer_child_context_flags([crawler_tool])
     check("has_code_analyzer inferred from crawler_* tools", has_ca is True and has_cw is False)
 
+    # ── 8. _combine_context: metamemory handoff prepended to explicit context ──
+    from app.core.vfs import vfs_write as _vw2, vfs_drop_session as _vd2
+    from app.harness import metamemory as _mm2
+    from app.config import settings as _mm2_settings
+
+    check(
+        "_combine_context: passthrough when no metamemory seeded",
+        await sf._combine_context("cc-empty", "explicit") == "explicit",
+    )
+    check(
+        "_combine_context: None stays None when no metamemory seeded",
+        await sf._combine_context("cc-empty", None) is None,
+    )
+    _orig_mm2 = _mm2_settings.metamemory_enabled
+    try:
+        _mm2_settings.metamemory_enabled = True
+        await _vw2("cc-seeded", _mm2.SUMMARY_PATH, "OBJECTIVE: parent task")
+        combined = await sf._combine_context("cc-seeded", "child-specific")
+        check(
+            "_combine_context: prepends parent state ahead of explicit context",
+            combined is not None
+            and "OBJECTIVE: parent task" in combined
+            and "child-specific" in combined
+            and combined.index("OBJECTIVE: parent task") < combined.index("child-specific"),
+        )
+        combined_no_explicit = await sf._combine_context("cc-seeded", None)
+        check(
+            "_combine_context: metamemory-only when no explicit context given",
+            combined_no_explicit is not None and "OBJECTIVE: parent task" in combined_no_explicit,
+        )
+    finally:
+        _mm2_settings.metamemory_enabled = _orig_mm2
+        await _vd2("cc-seeded")
+
+    # ── 9. ChildRunSpec / run_child_spec: context_slice + output_contract ──
+    captured_run_child_kwargs: Dict[str, Any] = {}
+
+    async def _fake_run_child(**kwargs):
+        captured_run_child_kwargs.update(kwargs)
+        return json.dumps({"subagent": kwargs["name"], "status": "ok", "answer": "done"})
+
+    await _vw2("spec-parent", "/notes.txt", "important parent note")
+    _orig_run_child = sf._run_child
+    sf._run_child = _fake_run_child
+    try:
+        spec = sf.ChildRunSpec(
+            task="investigate X",
+            name="spec-child",
+            output_contract=sf.OutputContract(write_to="/out/result.json"),
+            context_slice=sf.ContextSlice(files=["/notes.txt"], inline="inline hint"),
+            budget=sf.ChildBudget(max_turns=3, timeout_seconds=45.0, depth=1),
+            trace=sf.ChildTrace(parent_execution_id="spec-parent"),
+        )
+        envelope = await sf.run_child_spec(
+            spec, llm=None, sub_tools=[], agent_config={},
+        )
+        check("run_child_spec: returns the child envelope", json.loads(envelope)["status"] == "ok")
+        check(
+            "run_child_spec: context_slice.files content reaches _run_child",
+            "important parent note" in (captured_run_child_kwargs.get("context") or ""),
+        )
+        check(
+            "run_child_spec: context_slice.inline content reaches _run_child",
+            "inline hint" in (captured_run_child_kwargs.get("context") or ""),
+        )
+        check(
+            "run_child_spec: budget fields threaded through",
+            captured_run_child_kwargs.get("max_turns") == 3
+            and captured_run_child_kwargs.get("timeout_s") == 45.0,
+        )
+        from app.core.vfs.backend import vfs_read as _vr2
+        written = await _vr2("spec-parent", "/out/result.json")
+        check("run_child_spec: output_contract.write_to persists the envelope", "spec-child" in written)
+    finally:
+        sf._run_child = _orig_run_child
+        await _vd2("spec-parent")
+
+    # ── 10. delegate_batch: reads items_ref, dispatches, writes per-item output ──
+    captured_batch_calls: List[Dict[str, Any]] = []
+
+    async def _fake_run_child_batch(**kwargs):
+        captured_batch_calls.append(kwargs)
+        return json.dumps({"subagent": kwargs["name"], "task": kwargs["task"], "status": "ok",
+                            "answer": f"handled {kwargs['task']}"})
+
+    sf._run_child = _fake_run_child_batch
+    try:
+        batch_defs = [{"name": "batch-spec", "description": "d"}]
+        batch_tool = sf.build_delegate_batch_tool(
+            llm=None, base_tools=[], agent_config={}, subagent_defs=batch_defs,
+            parent_execution_id="batch-parent",
+        )
+        check("delegate_batch: tool built with expected name", batch_tool is not None and batch_tool.name == "delegate_batch")
+        check(
+            "delegate_batch: returns None for empty defs",
+            sf.build_delegate_batch_tool(
+                llm=None, base_tools=[], agent_config={}, subagent_defs=[],
+                parent_execution_id="x",
+            ) is None,
+        )
+        check(
+            "delegate_batch: returns None at depth 0",
+            sf.build_delegate_batch_tool(
+                llm=None, base_tools=[], agent_config={}, subagent_defs=batch_defs,
+                parent_execution_id="x", depth_remaining=0,
+            ) is None,
+        )
+
+        items = [
+            {"specialist": "batch-spec", "task": "item one"},
+            {"task": "item two (uses template default)"},
+            {"specialist": "unknown-spec", "task": "item three (unknown specialist)"},
+        ]
+        await _vw2("batch-parent", "/items.json", json.dumps(items))
+        result_str = await batch_tool.ainvoke({"items_ref": "/items.json", "template": "batch-spec"})
+        result = json.loads(result_str)
+        check("delegate_batch: processes all items", result["count"] == 3)
+        check("delegate_batch: counts successes correctly", result["ok"] == 2)
+        check("delegate_batch: unknown specialist reported as error", any(
+            r.get("status") == "error" and "unknown" in r.get("error", "") for r in result["results"]
+        ))
+        check("delegate_batch: dispatched two live child calls", len(captured_batch_calls) == 2)
+
+        out0 = await _vr2("batch-parent", "/batch_out/0_batch_spec.json")
+        check("delegate_batch: per-item output file written", "item one" in out0)
+
+        bad_result = json.loads(await batch_tool.ainvoke({"items_ref": "/does-not-exist.json"}))
+        check("delegate_batch: missing items_ref surfaces a clean error", "error" in bad_result)
+    finally:
+        sf._run_child = _orig_run_child
+        await _vd2("batch-parent")
+
+
+def test_budget_ledger() -> None:
+    """4.2 metabolic token economy: unit coverage + the plan's explicit
+    "economy simulation" scenario — a scripted failing child hits turnover
+    at stall=3 and its remaining budget returns to the communal pool."""
+    from app.harness.budget_ledger import BudgetLedger, BranchAccount, build_budget_ledger, _NoopBudgetLedger
+    from app.config import settings as _tes
+
+    ledger = BudgetLedger(100_000, base_grant=40_000, energy_min=5_000, stall_limit=3)
+    check("budget_ledger: starts with full communal budget", ledger.communal == 100_000)
+
+    acct = ledger.account("alpha")
+    check("budget_ledger: first access grants base_grant", acct.energy == 40_000)
+    check("budget_ledger: communal debited by the grant", ledger.communal == 60_000)
+    check("budget_ledger: initial phi is neutral (0.5)", acct.phi == 0.5)
+
+    acct2 = ledger.account("alpha")
+    check("budget_ledger: account() is idempotent (same object, no re-grant)", acct2 is acct and ledger.communal == 60_000)
+
+    ledger.spend("alpha", 10_000)
+    check("budget_ledger: spend debits energy", ledger.account("alpha").energy == 30_000)
+
+    ledger.on_success("alpha")
+    acct_after_success = ledger.account("alpha")
+    check(
+        "budget_ledger: on_success credits energy from communal (0.25*base_grant)",
+        acct_after_success.energy == 30_000 + 10_000 and ledger.communal == 50_000,
+    )
+    check("budget_ledger: on_success drifts phi toward exploitation", acct_after_success.phi == 0.7)
+    check("budget_ledger: on_success resets stall", acct_after_success.stall == 0)
+
+    ledger.on_failure("alpha")
+    acct_after_fail = ledger.account("alpha")
+    check("budget_ledger: on_failure drifts phi toward exploration", round(acct_after_fail.phi, 5) == 0.4)
+    check("budget_ledger: on_failure increments stall", acct_after_fail.stall == 1)
+
+    # ── Economy simulation: repeated failures drive a branch to turnover ──
+    sim = BudgetLedger(100_000, base_grant=40_000, energy_min=5_000, stall_limit=3)
+    branch = "flaky-specialist"
+    sim.account(branch)  # initial grant: energy=40_000, communal=60_000
+    check("budget_ledger sim: not turned over initially", sim.should_turnover(branch) is False)
+    sim.on_failure(branch)  # stall=1
+    check("budget_ledger sim: stall=1 not enough to turn over", sim.should_turnover(branch) is False)
+    sim.on_failure(branch)  # stall=2
+    check("budget_ledger sim: stall=2 still not enough", sim.should_turnover(branch) is False)
+    sim.on_failure(branch)  # stall=3 -> hits stall_limit
+    check("budget_ledger sim: stall=3 triggers turnover", sim.should_turnover(branch) is True)
+
+    pre_turnover_energy = sim.account(branch).energy  # still 40_000 (failures don't spend energy by themselves)
+    pre_turnover_communal = sim.communal
+    scout = sim.turnover(branch)
+    check("budget_ledger sim: turnover resets phi to fully exploratory", scout.phi == 0.0)
+    check("budget_ledger sim: turnover resets stall", scout.stall == 0)
+    check("budget_ledger sim: turnover increments turnovers counter", scout.turnovers == 1)
+    check(
+        "budget_ledger sim: half the remaining energy returns to communal pool",
+        sim.communal == pre_turnover_communal + pre_turnover_energy // 2 - scout.energy,
+    )
+    check("budget_ledger sim: scout gets a smaller (0.3x base_grant) grant", scout.energy == int(0.3 * 40_000))
+    check("budget_ledger sim: should_turnover clears after turnover", sim.should_turnover(branch) is False)
+
+    # ── Energy-exhaustion path also triggers turnover (not just stall) ──
+    sim2 = BudgetLedger(100_000, base_grant=40_000, energy_min=5_000, stall_limit=99)
+    sim2.account("low-energy-branch")
+    sim2.spend("low-energy-branch", 36_000)  # 40_000 - 36_000 = 4_000 <= energy_min (5_000)
+    check("budget_ledger sim: energy exhaustion triggers turnover independent of stall", sim2.should_turnover("low-energy-branch") is True)
+
+    check("budget_ledger: snapshot reports all known branches", set(ledger.snapshot().keys()) == {"alpha"})
+
+    # ── _NoopBudgetLedger: everything is a safe, cheap no-op ──
+    noop = _NoopBudgetLedger()
+    noop.spend("x", 100)
+    noop.on_success("x")
+    noop.on_failure("x")
+    check("budget_ledger: noop never turns over", noop.should_turnover("x") is False)
+    check("budget_ledger: noop snapshot is empty", noop.snapshot() == {})
+
+    # ── build_budget_ledger: flag gating ──
+    _orig_flag = _tes.token_economy_enabled
+    try:
+        _tes.token_economy_enabled = False
+        check("build_budget_ledger: disabled -> noop ledger", isinstance(build_budget_ledger(), _NoopBudgetLedger))
+        _tes.token_economy_enabled = True
+        check("build_budget_ledger: enabled -> live ledger", isinstance(build_budget_ledger(), BudgetLedger))
+        check("build_budget_ledger: honors explicit run_token_budget override", build_budget_ledger(12_345).communal <= 12_345)
+    finally:
+        _tes.token_economy_enabled = _orig_flag
+
+
+async def test_delegate_batch_budget_economy() -> None:
+    """delegate_batch + token economy end-to-end: a specialist whose children
+    keep failing gets turned over mid-batch (flagged in a later item's
+    result), and the batch summary carries the ledger's final snapshot."""
+    from app.harness import subagent_factory as sf
+    from app.config import settings as _tes2
+
+    call_count = {"n": 0}
+
+    async def _fake_run_child(**kwargs):
+        call_count["n"] += 1
+        # Every call for this specialist fails, driving stall past the limit.
+        return json.dumps({"subagent": kwargs["name"], "task": kwargs["task"],
+                            "status": "error", "error": "simulated failure", "tokens": 500})
+
+    _orig_run_child = sf._run_child
+    _orig_flag = _tes2.token_economy_enabled
+    _orig_stall = _tes2.token_economy_stall_limit
+    sf._run_child = _fake_run_child
+    _tes2.token_economy_enabled = True
+    _tes2.token_economy_stall_limit = 2  # small so the test doesn't need many items
+    try:
+        defs = [{"name": "flaky", "description": "d"}]
+        batch_tool = sf.build_delegate_batch_tool(
+            llm=None, base_tools=[], agent_config={}, subagent_defs=defs,
+            parent_execution_id="econ-batch-parent",
+        )
+        from app.core.vfs import vfs_write as _vw3, vfs_drop_session as _vd3
+        items = [{"specialist": "flaky", "task": f"attempt {i}"} for i in range(4)]
+        await _vw3("econ-batch-parent", "/items.json", json.dumps(items))
+        result = json.loads(await batch_tool.ainvoke({"items_ref": "/items.json"}))
+        check("delegate_batch+economy: processes every item despite failures", result["count"] == 4)
+        check("delegate_batch+economy: all items report the simulated failure", result["ok"] == 0)
+        check(
+            "delegate_batch+economy: a later item is flagged turned-over",
+            any(r.get("turnover") for r in result["results"]),
+        )
+        check("delegate_batch+economy: summary carries the ledger snapshot", "flaky" in result.get("budget", {}))
+        await _vd3("econ-batch-parent")
+    finally:
+        sf._run_child = _orig_run_child
+        _tes2.token_economy_enabled = _orig_flag
+        _tes2.token_economy_stall_limit = _orig_stall
+
 
 async def test_file_skills() -> None:
     # File-backed SkillService: create/list/get/recall/execute/audit/delete, no DB.
@@ -2028,6 +3833,96 @@ async def test_file_skills() -> None:
     _svc_mod._write_record(_svc_mod._CACHE["draft_one"])
     a = await svc.audit()
     check("file skill audit promotes draft", a["promoted"] >= 1)
+    # ── 4.4 schema extension defaults (category_path/tags/applicability/provenance) ──
+    check(
+        "file skill schema: new fields default to empty/backward-compatible",
+        disk.get("category_path") == "" and disk.get("tags") == []
+        and disk.get("applicability") == "" and disk.get("provenance") == {"source": "manual"},
+    )
+
+    # ── 4.4 two-stage recall: richer signal (tags/applicability/category_path)
+    #     finds a skill trigger_patterns-only keyword match would miss ──
+    await svc.create_manual(
+        name="throttle_recovery", title="Throttle Recovery",
+        trigger_patterns=["totally unrelated phrase xyz"],
+        steps=[],
+    )
+    _svc_mod._CACHE["throttle_recovery"]["tags"] = ["throttling", "rate-limit"]
+    _svc_mod._CACHE["throttle_recovery"]["applicability"] = (
+        "Use when a CloudWatch Logs Insights query is throttled or rate-limited."
+    )
+    _svc_mod._CACHE["throttle_recovery"]["category_path"] = "cloudwatch/logs/throttle-recovery"
+    _svc_mod._write_record(_svc_mod._CACHE["throttle_recovery"])
+
+    query = "my logs insights query keeps getting throttled and rate-limited"
+    check(
+        "file skill recall(): trigger_patterns-only match misses the throttle skill",
+        not any(r["name"] == "throttle_recovery" for r in await svc.recall(query)),
+    )
+
+    _orig_two_stage = _s.skill_two_stage_recall
+    _orig_shortlist_k = _s.skill_shortlist_k
+    try:
+        _s.skill_two_stage_recall = False
+        off_result = await svc.recall_two_stage(query, use_llm=False)
+        check(
+            "recall_two_stage: falls back to recall() when flag is off",
+            [r["name"] for r in off_result] == [r["name"] for r in await svc.recall(query)],
+        )
+
+        _s.skill_two_stage_recall = True
+        on_result = await svc.recall_two_stage(query, use_llm=False)
+        check(
+            "recall_two_stage: BM25 stage finds the tags/applicability match keyword recall missed",
+            any(r["name"] == "throttle_recovery" for r in on_result),
+        )
+
+        # LLM stage selects a subset (including zero) from the shortlist.
+        import unittest.mock as _mock2
+
+        async def _fake_call_llm_pick(*a, **k):
+            return ('["throttle_recovery"]', 10, 5, False)
+
+        with _mock2.patch("app.crawler.call_llm.call_llm", side_effect=_fake_call_llm_pick):
+            llm_result = await svc.recall_two_stage(query, use_llm=True)
+        check(
+            "recall_two_stage: LLM stage keeps the genuinely matching skill",
+            any(r["name"] == "throttle_recovery" for r in llm_result),
+        )
+
+        async def _fake_call_llm_empty(*a, **k):
+            return ("[]", 10, 5, False)
+
+        with _mock2.patch("app.crawler.call_llm.call_llm", side_effect=_fake_call_llm_empty):
+            empty_result = await svc.recall_two_stage(query, use_llm=True)
+        check("recall_two_stage: LLM stage may select zero from a non-empty shortlist", empty_result == [])
+
+        async def _fake_call_llm_garbage(*a, **k):
+            return ("not valid json at all", 10, 5, False)
+
+        with _mock2.patch("app.crawler.call_llm.call_llm", side_effect=_fake_call_llm_garbage):
+            garbage_result = await svc.recall_two_stage(query, use_llm=True)
+        check(
+            "recall_two_stage: unparseable LLM response fails open to the BM25 shortlist",
+            any(r["name"] == "throttle_recovery" for r in garbage_result),
+        )
+
+        # ── dead-flag fix: knowledge_base.recall_skills_for_agent must reach
+        #    recall_two_stage(), not the flat recall() it silently called
+        #    before — otherwise skill_two_stage_recall can never take effect
+        #    at the actual agent-prompt-injection call site. ──
+        from app.services.knowledge_base import knowledge_base as _kb
+        kb_result = await _kb.recall_skills_for_agent(query)
+        check(
+            "knowledge_base.recall_skills_for_agent: reaches two-stage recall "
+            "(finds tags/applicability match recall() alone misses)",
+            any(r["name"] == "throttle_recovery" for r in kb_result),
+        )
+    finally:
+        _s.skill_two_stage_recall = _orig_two_stage
+        _s.skill_shortlist_k = _orig_shortlist_k
+        await svc.delete("throttle_recovery")
+
     check("file skill delete", (await svc.delete("restart_pods")) and not _skill_path("restart_pods").exists())
     await svc.delete_all()
     check("file skill delete_all clears store", (await svc.list_skills(status="all")) == [])
@@ -2140,25 +4035,152 @@ async def test_loop_engineering() -> None:
     dry2 = await apply_proposals(report_ineligible, dry_run=True)
     check("loop4: prompt+policy proposals not eligible", dry2["eligible"] == 0)
 
+    # ── 3.2 Failure->governance conversion (mocked failure_ledger) ──
+    # NOTE: analyzer.py/apply.py/tool_exec.py all import the singleton via
+    # `from app.infrastructure.persistence import failure_ledger_repository`
+    # (resolving to __init__.py's instance) — patch that SAME object, not the
+    # separate instance failure_ledger_repository.py itself also constructs.
+    from app.core.improvement import analyzer as _analyzer_mod
+    from app.core.improvement import apply as _apply_mod
+    from app.infrastructure.persistence import (
+        failure_ledger_repository as _fl_instance,
+    )
+
+    check(
+        "fingerprint_error normalizes digits",
+        _analyzer_mod.fingerprint_error("Timeout after 4523ms") ==
+        _analyzer_mod.fingerprint_error("Timeout after 99ms"),
+    )
+    check("fingerprint_error truncates to 80 chars", len(_analyzer_mod.fingerprint_error("x" * 200)) == 80)
+
+    class _FakeFailureLedger:
+        def __init__(self):
+            self.rows: Dict[str, Dict[str, Any]] = {}
+            self.converted: list = []
+
+        async def record(self, fingerprint, execution_id=None):
+            row = self.rows.setdefault(
+                fingerprint, {"count": 0, "sample_execution_ids": [], "status": "open"},
+            )
+            row["count"] += 1
+            if execution_id:
+                row["sample_execution_ids"].append(execution_id)
+            return row["count"]
+
+        async def list_open(self, min_count=1):
+            return [
+                {
+                    "fingerprint": fp, "count": r["count"],
+                    "sample_execution_ids": r["sample_execution_ids"], "status": r["status"],
+                    "first_seen": "t0", "last_seen": "t1", "control_ref": None,
+                }
+                for fp, r in self.rows.items()
+                if r["status"] == "open" and r["count"] >= min_count
+            ]
+
+        async def mark_converted(self, fingerprint, control_ref):
+            if fingerprint in self.rows:
+                self.rows[fingerprint]["status"] = "converted"
+                self.converted.append((fingerprint, control_ref))
+
+    fake_ledger = _FakeFailureLedger()
+    _orig_record = _fl_instance.record
+    _orig_list_open = _fl_instance.list_open
+    _orig_mark_converted = _fl_instance.mark_converted
+    _fl_instance.record = fake_ledger.record
+    _fl_instance.list_open = fake_ledger.list_open
+    _fl_instance.mark_converted = fake_ledger.mark_converted
+    try:
+        fp = _analyzer_mod.fingerprint_error("ThrottlingException: rate exceeded 42 times")
+        await fake_ledger.record(fp, "exec-a")
+        await fake_ledger.record(fp, "exec-b")
+        proposals_below = await _analyzer_mod.convert_recurring_failures(threshold=3)
+        check("convert_recurring_failures: below threshold -> no proposal", proposals_below == [])
+
+        await fake_ledger.record(fp, "exec-c")
+        proposals = await _analyzer_mod.convert_recurring_failures(threshold=3)
+        check(
+            "convert_recurring_failures: at threshold -> one eval proposal",
+            len(proposals) == 1 and proposals[0]["kind"] == "eval" and proposals[0]["control_ref"] == fp,
+        )
+
+        report_eval = ImprovementReport(profile=None, sample_size=3, proposals=proposals)
+        dry_eval = await apply_proposals(report_eval, dry_run=True)
+        check("loop4: eval proposal is eligible", dry_eval["eligible"] == 1)
+
+        ok = await _apply_mod._apply_eval_proposal(proposals[0])
+        check(
+            "apply_eval_proposal: marks ledger converted",
+            ok is True and fake_ledger.rows[fp]["status"] == "converted",
+        )
+        check(
+            "apply_eval_proposal: records control_ref",
+            bool(fake_ledger.converted) and fake_ledger.converted[0][0] == fp,
+        )
+
+        proposals_after = await _analyzer_mod.convert_recurring_failures(threshold=3)
+        check("convert_recurring_failures: converted fingerprint stops reproposing", proposals_after == [])
+
+        no_ref = await _apply_mod._apply_eval_proposal({"target": "x"})
+        check("apply_eval_proposal: missing control_ref -> False", no_ref is False)
+    finally:
+        _fl_instance.record = _orig_record
+        _fl_instance.list_open = _orig_list_open
+        _fl_instance.mark_converted = _orig_mark_converted
+
+    # ── live tool_exec failure hook (gated by governance_conversion_enabled) ──
+    from app.harness.engine.tool_exec import _record_failure_fingerprint
+    from app.config import settings as _gov_settings
+
+    fake_ledger2 = _FakeFailureLedger()
+    _fl_instance.record = fake_ledger2.record
+    _orig_gov_flag = _gov_settings.governance_conversion_enabled
+    try:
+        _gov_settings.governance_conversion_enabled = False
+        await _record_failure_fingerprint("some_tool", "Error: boom", "exec-x")
+        check("tool_exec failure hook: no-op when governance_conversion_enabled=False", fake_ledger2.rows == {})
+
+        _gov_settings.governance_conversion_enabled = True
+        await _record_failure_fingerprint("some_tool", "Error: boom", "exec-x")
+        check("tool_exec failure hook: records fingerprint when enabled", len(fake_ledger2.rows) == 1)
+    finally:
+        _gov_settings.governance_conversion_enabled = _orig_gov_flag
+        _fl_instance.record = _orig_record
+
 
 async def _main() -> int:
     print("=== Agent Harness self-test ===")
+    test_import_order_no_cycles()
     test_envelopes()
     test_tool_router()
+    test_tool_exposure()
     test_boto_context_overflow_classifier()
     test_engine_resolution()
     await test_engine_native_dispatch()
     await test_turn_loop_happy_path()
     await test_turn_loop_tool_call_then_complete()
+    await test_step_recorder()
+    await test_turn_loop_step_events_wiring()
+    await test_instrument_langgraph_result()
     await test_turn_loop_max_turns_forced_synthesis()
+    await test_turn_loop_verify_pending_tracking()
+    test_terminal_state_derivation()
     test_compression_split_preserved_tail()
     test_compression_split_preserved_tail_empty()
     await test_compression_pipeline_delegates()
+    await test_compression_metamemory_precheck()
+    await test_metamemory_read_context_block_caps_milestones()
     await test_turn_loop_reactive_compact_retry()
     await test_turn_loop_truncation_escalation_recovers()
     await test_turn_loop_truncation_ladder_exhausts()
     await test_turn_loop_midthought_continuation()
     await test_recovery_call_model_with_backoff()
+    # ── chat_history: tool-inclusive history replay ──
+    test_build_initial_messages_tool_replay()
+    test_extract_turn_segment()
+    test_repair_tool_pairing()
+    test_build_tool_inclusive_history()
+    await test_chat_history_rebuild_fallback()
     test_spec_and_facade()
     test_policy_engine()
     test_sandbox()
@@ -2168,6 +4190,8 @@ async def _main() -> int:
     test_memory_capability_and_autolearn()
     test_persona_and_supervisor_toggle()
     await test_supervisor_loop()
+    await test_trajectory_export_step_events()
+    await test_tool_result_failed_flag_threading()
     test_context_builder()
     test_extension_tools()
     await test_edit_tools()
@@ -2202,9 +4226,11 @@ async def _main() -> int:
     # ── per-chat-session compaction: role mapping + system-history replay ──
     await test_chat_session_compaction()
     # ── configurable agents (capabilities/output/profiles) + deep-agent (planning/vfs/subagents) + self-improvement ──
-    test_configurable_agents()
+    await test_configurable_agents()
     # ── Phase B delegation: bounds / safety / parallel / async ──
     await test_delegation_phase_b()
+    test_budget_ledger()
+    await test_delegate_batch_budget_economy()
     # ── Phase 5: delegated children route through the engine flag ──
     await test_subagent_engine_routing()
     # ── file-backed skills (no DB) ──

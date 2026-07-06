@@ -127,7 +127,29 @@ class Settings(BaseSettings):
         default=["*"],
         description="Allowed CORS origins. Set to specific domains in production."
     )
-    
+
+    # ── API-key authentication (opt-in) ──────────────────────────────────────
+    # OFF by default — workflow execute, MCP CRUD, improvement apply, and
+    # crawler investigate are otherwise unauthenticated, suitable only for an
+    # internal/trusted network. Set both to require a key on every route
+    # except health/docs/root (see app.api.middleware.api_auth).
+    api_auth_enabled: bool = Field(
+        default=False, validation_alias="API_AUTH_ENABLED"
+    )
+    api_auth_keys: str = Field(
+        default="", validation_alias="API_AUTH_KEYS",
+        description="Comma-separated list of valid API keys.",
+    )
+
+    # ── Deep-agent scratch store backend (todos + VFS) ───────────────────────
+    # "memory" (default): process-local dict, same behavior as before this
+    # setting existed. "postgres": execution_scratch_store table (migration
+    # 029) — needed for horizontal scaling, where a run's tool calls can land
+    # on a different replica than the one that wrote earlier scratch state.
+    scratch_store_backend: str = Field(
+        default="memory", validation_alias="SCRATCH_STORE_BACKEND",
+    )
+
     # Storage paths (kept for backward compatibility, but database is preferred)
     storage_path: str = "data/storage"
     workflow_dir: str = "data/workflows"
@@ -314,6 +336,46 @@ class Settings(BaseSettings):
     # caps so it only catches truly unbounded outputs; matches claude-code's
     # DEFAULT_MAX_RESULT_SIZE_CHARS. Set to 0 to disable. Override via env.
     tool_output_max_chars: int = Field(default=50000, validation_alias="TOOL_OUTPUT_MAX_CHARS")
+    # When AgentSpec.filesystem is on, a StructuredTool result longer than this
+    # is offloaded to the session VFS (app.harness.tool_offload) and replaced
+    # with a short handle+preview instead of bloating every subsequent turn's
+    # context. Applied BEFORE tool_output_max_chars so an offloaded handle is
+    # never itself truncated. Matches the VFS backend's own _OFFLOAD_THRESHOLD
+    # default so behavior is identical whether offload happens via this live
+    # wrapper or the lower-level vfs_offload_if_large() helper. Set to 0 to
+    # disable. Override via env.
+    tool_result_offload_chars: int = Field(default=6000, validation_alias="TOOL_RESULT_OFFLOAD_CHARS")
+    # Tool exposure: "legacy" keeps today's apply_tool_disclosure behavior
+    # (all-or-nothing defer at a count/token threshold) byte-for-byte.
+    # "window" switches to app.harness.tool_exposure.ToolExposureManager,
+    # which caps the number of non-core tools bound directly on any one
+    # assembly to tool_exposure_max — MCP tool-density research reports
+    # bound-tool selection accuracy drops below 90% once the active tool
+    # count exceeds roughly this range. Core/family tools (CloudWatch,
+    # crawler, DB, playbook, delegate, edit, planning, filesystem) are
+    # exempt from the cap in both modes; tools outside the window stay
+    # reachable via the same search_tools/call_tool bridge. Override via env.
+    tool_exposure_mode: str = Field(default="legacy", validation_alias="TOOL_EXPOSURE_MODE")
+    tool_exposure_max: int = Field(default=12, validation_alias="TOOL_EXPOSURE_MAX")
+    # Step-level trajectory events (app.harness.step_recorder, migration 030's
+    # trajectory_events table). Off by default: a no-op recorder is used, zero
+    # extra DB writes. When on, the native turn loop records one event per
+    # model turn / tool call, buffered in memory and flushed as a single batch
+    # insert at the end of the run — never a per-step DB round-trip. LangGraph
+    # engine runs are not yet instrumented (native-engine-only for now).
+    step_events_enabled: bool = Field(default=False, validation_alias="STEP_EVENTS_ENABLED")
+    # Metamemory (app.harness.metamemory): seeds /plan.txt, /milestones.txt,
+    # /context_summary.txt in the session VFS at run start and steers compaction
+    # to inject them instead of re-summarizing raw history. Off by default;
+    # requires AgentSpec.filesystem (a no-op otherwise — nowhere to seed files).
+    metamemory_enabled: bool = Field(default=False, validation_alias="METAMEMORY_ENABLED")
+    # Persist metamemory files across chat turns (migration 029's
+    # execution_scratch_store, keyed "session:<chat_session_id>") instead of the
+    # per-run-only default. Off by default; requires scratch_store_backend to
+    # reach the same table set persistence for todos/offload scratch does.
+    vfs_session_persistence_enabled: bool = Field(
+        default=False, validation_alias="VFS_SESSION_PERSISTENCE_ENABLED",
+    )
     skill_min_tool_calls: int = 3
     # Confidence-gated distillation: a distilled skill scoring
     # below this is saved as 'draft' (hidden from recall) until audited/proven.
@@ -381,8 +443,13 @@ class Settings(BaseSettings):
 
     # ── Tool-output compression ──────────────────────────────────────────────
     # Replaces lossy char-truncation with type-aware reversible compression for
-    # large MCP tool outputs. Compression runs in a local sidecar (no LLM call).
+    # large tool outputs. Compression runs in a local sidecar (no LLM call).
     # Opt-in (default off); on timeout/error falls back to existing truncation.
+    # Compression is applied at the tool-output source and ALWAYS re-capped, so
+    # conversation-history compaction is intentionally left to the existing
+    # structure-aware ladder (it preserves Bedrock tool_use/tool_result pairing,
+    # which a message-array compressor cannot guarantee). Reversible retrieval
+    # (recover originals) is covered by the VFS offload + fs_read path.
     compression_enabled: bool = Field(
         default=False, validation_alias="COMPRESSION_ENABLED"
     )
@@ -395,7 +462,25 @@ class Settings(BaseSettings):
     )
     # Hard timeout for a single compress call (ms). On expiry, fall back to truncation.
     compression_timeout_ms: int = Field(
-        default=250, validation_alias="COMPRESSION_TIMEOUT_MS"
+        default=2000, validation_alias="COMPRESSION_TIMEOUT_MS"
+    )
+    # Retries on transient sidecar errors. Compression is opportunistic (the
+    # truncation fallback is always correct), so keep this low to bound the
+    # latency added to the hot tool-call path.
+    compression_max_retries: int = Field(
+        default=1, validation_alias="COMPRESSION_MAX_RETRIES"
+    )
+    # Model id sent to the sidecar so it selects the matching tokenizer. Empty
+    # falls back to a neutral placeholder. Never hardcoded — operators set the
+    # deployed Bedrock model id here (models are DB-resolved elsewhere).
+    compression_model_hint: str = Field(
+        default="", validation_alias="COMPRESSION_MODEL_HINT"
+    )
+    # Extend compression from MCP tool outputs to every other tool family
+    # (db, cloudwatch, crawler, code analyzer) via the universal output cap.
+    # Default off → non-MCP tool behaviour is byte-identical until enabled.
+    compression_all_tools: bool = Field(
+        default=False, validation_alias="COMPRESSION_ALL_TOOLS"
     )
 
     # ── Per-turn durable-fact extraction + audit loop ────────────────────────
@@ -452,6 +537,15 @@ class Settings(BaseSettings):
         default=True, validation_alias="SKILL_RAG_SELECTION_ENABLED"
     )
     skill_rag_k: int = Field(default=2, validation_alias="SKILL_RAG_K")
+    # 4.4 two-stage skill retrieval (app.core.skills.service.SkillService.
+    # recall_two_stage). OFF by default — recall() (trigger_patterns-only
+    # keyword match) is unchanged unless explicitly opted into. When on:
+    # BM25 shortlist over name/tags/applicability/category_path, then an
+    # LLM pass that may select zero from the shortlist.
+    skill_two_stage_recall: bool = Field(
+        default=False, validation_alias="SKILL_TWO_STAGE_RECALL"
+    )
+    skill_shortlist_k: int = Field(default=6, validation_alias="SKILL_SHORTLIST_K")
 
     # ── Skill storage (file-based; no DB) ────────────────────────────────────
     # Executable skills (distilled + user-created) are stored as one JSON file
@@ -478,9 +572,38 @@ class Settings(BaseSettings):
     )
     # CSV of fnmatch patterns always stripped from child tool sets.
     # Children are investigate/read-only by default; orchestrator owns mutations.
+    # fs_write*/fs_append/fs_upsert/fs_prune together cover every VFS mutation
+    # (metamemory files included) — children keep fs_read/fs_ls/fs_grep only.
     delegation_blocked_tools: str = Field(
-        default="delegate_*,apply_fix,edit_file,fs_write*,run_command,write_todos,send_*,wiki_*",
+        default=(
+            "delegate_*,apply_fix,edit_file,fs_write*,fs_append,fs_upsert,fs_prune,"
+            "run_command,write_todos,send_*,wiki_*"
+        ),
         validation_alias="DELEGATION_BLOCKED_TOOLS",
+    )
+
+    # ── Metabolic token economy (app.harness.budget_ledger) ─────────────────
+    # OFF by default — a no-op ledger is used, zero behavior change. Applied at
+    # the granularity delegate_batch actually supports (between children, not
+    # mid-run): each specialist branch gets an initial energy grant, spends it
+    # as its children run, earns more on success, drifts its role state (phi)
+    # explore<->exploit, and triggers lifecycle turnover (half its remaining
+    # energy returns to the communal pool; a fresh scout profile replaces it)
+    # once energy is exhausted or it stalls repeatedly.
+    token_economy_enabled: bool = Field(
+        default=False, validation_alias="TOKEN_ECONOMY_ENABLED"
+    )
+    token_economy_run_budget: int = Field(
+        default=200_000, validation_alias="TOKEN_ECONOMY_RUN_BUDGET",
+    )
+    token_economy_base_grant: int = Field(
+        default=40_000, validation_alias="TOKEN_ECONOMY_BASE_GRANT",
+    )
+    token_economy_energy_min: int = Field(
+        default=5_000, validation_alias="TOKEN_ECONOMY_ENERGY_MIN",
+    )
+    token_economy_stall_limit: int = Field(
+        default=3, validation_alias="TOKEN_ECONOMY_STALL_LIMIT",
     )
 
     # ── Self-improvement (hill-climbing) loop ────────────────────────────────
@@ -500,6 +623,20 @@ class Settings(BaseSettings):
     # 'prompt' / 'policy' proposals are always left as human-reviewed drafts.
     hillclimb_apply_enabled: bool = Field(
         default=False, validation_alias="HILLCLIMB_APPLY_ENABLED"
+    )
+
+    # ── Failure->governance conversion (app.core.improvement.analyzer) ──────
+    # OFF by default. When True: (1) analyze_recent() upserts its batch's
+    # error fingerprints into failure_ledger (migration 030); (2) a fingerprint
+    # recurring >= governance_convert_threshold times becomes an 'eval'-kind
+    # draft proposal (convert_recurring_failures) that apply.py can
+    # auto-apply — bookkeeping only (marks the ledger row 'converted'), never
+    # fabricates eval assertions.
+    governance_conversion_enabled: bool = Field(
+        default=False, validation_alias="GOVERNANCE_CONVERSION_ENABLED"
+    )
+    governance_convert_threshold: int = Field(
+        default=3, validation_alias="GOVERNANCE_CONVERT_THRESHOLD"
     )
 
     # ── Pinned-facts memory tier ─────────────────────────────────────────────
@@ -530,11 +667,40 @@ class Settings(BaseSettings):
     chat_session_keep_recent_tokens: int = Field(
         default=1_500, validation_alias="CHAT_SESSION_KEEP_RECENT_TOKENS"
     )
+    # ── Tool-inclusive chat history replay ───────────────────────────────────
+    # A follow-up question re-runs every tool from scratch unless prior turns'
+    # tool_calls/tool_results are replayed alongside the plain text history
+    # (app.harness.chat_history). Fail-open by design: any error in the
+    # rebuild path falls back to the UI's text-only history, so this defaults
+    # on. The token/execution caps bound how much prior tool activity gets
+    # replayed — per-turn context compaction handles overall window pressure
+    # on top of this.
+    chat_history_include_tools: bool = Field(
+        default=True, validation_alias="CHAT_HISTORY_INCLUDE_TOOLS"
+    )
+    chat_tool_history_max_tokens: int = Field(
+        default=12_000, validation_alias="CHAT_TOOL_HISTORY_MAX_TOKENS"
+    )
+    chat_tool_history_max_executions: int = Field(
+        default=2, validation_alias="CHAT_TOOL_HISTORY_MAX_EXECUTIONS"
+    )
     # How often the scheduler runs the self-improvement curator (hours). The
     # cheap promotions run every cycle; LLM consolidation stays gated by
     # ``memory_audit_enabled``.
     curator_interval_hours: int = Field(
         default=6, validation_alias="CURATOR_INTERVAL_HOURS"
+    )
+
+    # ── Multi-replica leader election ────────────────────────────────────────
+    # WorkflowScheduler._ensure_leader acquires a Postgres advisory lock so only
+    # one replica fires cron/curator/hill-climb jobs. Default is fail-OPEN
+    # (lock-acquisition error → assume leader) so a single-node deployment with
+    # no Postgres advisory-lock support still runs its scheduled jobs. Set this
+    # True in a genuine multi-replica deployment to fail-CLOSED instead — a lock
+    # error then means "assume NOT leader" so a transient DB hiccup can't cause
+    # every replica to double-fire the same cron/curator/hill-climb run.
+    leader_lock_fail_closed: bool = Field(
+        default=False, validation_alias="LEADER_LOCK_FAIL_CLOSED"
     )
 
     # ── Context references (@file / @folder / @url / @git in the query) ──────

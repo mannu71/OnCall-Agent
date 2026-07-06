@@ -84,7 +84,7 @@ async def conversational_reply(
     strategy result envelope. Raises on model failure so the caller can fall back.
     """
     from langchain_core.messages import SystemMessage, HumanMessage
-    from app.workflow.strategies.react.agent_runner import extract_text_content
+    from app.harness.agent_runner import extract_text_content
 
     system_prompt = _build_system_prompt(
         has_cloudwatch=has_cloudwatch,

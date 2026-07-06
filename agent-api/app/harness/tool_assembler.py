@@ -108,7 +108,7 @@ async def assemble_base_tools(
     too: without it, a dead LLM credential surfaces at the first model call
     instead of pre-flight, same as before this generic-degrade fix existed.
     """
-    from app.workflow.strategies.react.tool_setup import setup_tools
+    from app.harness.tool_setup import setup_tools
 
     tools = await setup_tools(tools_config, mcp_manager, execution_id)
     degraded: List[str] = []
@@ -261,11 +261,31 @@ async def assemble_base_tools(
     # silently dropped tools the agent needed). Core families + operator-pinned
     # tools stay directly bound; small toolsets pass through unchanged. This
     # supersedes the old tool_router.filter_tools prune.
+    #
+    # tool_exposure_mode="window" (opt-in) replaces the binary defer-everything-
+    # or-nothing threshold gate with a per-assembly budget on the non-core tail
+    # (see app.harness.tool_exposure.ToolExposureManager) — the accuracy-safe
+    # "10-15 active tools" range MCP tool-density research reports. Default
+    # "legacy" keeps apply_tool_disclosure's behavior unchanged.
     if tools:
         try:
-            from app.harness.tool_disclosure import apply_tool_disclosure
+            from app.config import settings as _settings
+            if getattr(_settings, "tool_exposure_mode", "legacy") == "window":
+                from app.harness.tool_exposure import ToolExposureManager
 
-            tools = apply_tool_disclosure(tools, logger_instance=logger_instance)
+                mgr = ToolExposureManager(tools, max_direct=_settings.tool_exposure_max)
+                tools = mgr.window(user_query)
+                logger_instance.info(
+                    "ReactStrategy: tool exposure window — %d core, %d/%d "
+                    "rankable tool(s) bound (+bridge=%d)",
+                    mgr.core_count, min(mgr.rankable_count, mgr.max_direct),
+                    mgr.rankable_count, len(mgr.bridge_names),
+                    extra={"execution_id": execution_id},
+                )
+            else:
+                from app.harness.tool_disclosure import apply_tool_disclosure
+
+                tools = apply_tool_disclosure(tools, logger_instance=logger_instance)
         except Exception as _td_err:
             logger_instance.warning(
                 "ReactStrategy: tool disclosure skipped (non-fatal): %s",
@@ -307,7 +327,7 @@ def add_extension_tools(
         # snapshot WITHOUT this tool, so it cannot fan out further. Built on the
         # same subagent_factory engine as the named delegate_to_<name> tools.
         try:
-            from app.workflow.strategies.react.subagent_factory import build_generic_delegate_tool
+            from app.harness.subagent_factory import build_generic_delegate_tool
             _generic = build_generic_delegate_tool(
                 llm, list(tools), agent_config, parent_execution_id=execution_id,
             )
@@ -319,7 +339,7 @@ def add_extension_tools(
         # Code-edit tool (apply fixes). Gated as 'ask' by the permission layer, so
         # every edit needs operator approval.
         try:
-            from app.workflow.strategies.react.edit_tools import build_edit_tools
+            from app.harness.edit_tools import build_edit_tools
             tools.extend(build_edit_tools())
         except Exception as _ee:  # noqa: BLE001
             logger_instance.warning("ReactStrategy: edit tool skipped (%s)", _ee)
@@ -333,7 +353,7 @@ def add_extension_tools(
 
     if _flags.get("planning"):
         try:
-            from app.workflow.strategies.react.planning_tools import build_planning_tools
+            from app.harness.planning_tools import build_planning_tools
             tools.extend(build_planning_tools(execution_id))
         except Exception as _pe:  # noqa: BLE001
             logger_instance.warning("ReactStrategy: planning tools skipped (%s)", _pe)
@@ -351,9 +371,10 @@ def add_extension_tools(
 
     if _flags.get("subagents"):
         try:
-            from app.workflow.strategies.react.subagent_factory import (
+            from app.harness.subagent_factory import (
                 build_subagent_tools,
                 build_delegate_parallel_tool,
+                build_delegate_batch_tool,
             )
             _sub_defs = _flags["subagents"]
             _base_snapshot = list(tools)  # snapshot before appending delegation tools
@@ -369,6 +390,47 @@ def add_extension_tools(
             )
             if _parallel is not None:
                 tools.append(_parallel)
+            # RAH-style batch fan-out (>5 items via a VFS file). Reads its
+            # items_ref through fs_read, so it's only genuinely usable
+            # alongside filesystem:true — degrades to a clear error string
+            # (not a crash) if called without it.
+            _batch_tool = build_delegate_batch_tool(
+                llm, _base_snapshot, agent_config, _sub_defs,
+                parent_execution_id=execution_id,
+            )
+            if _batch_tool is not None:
+                tools.append(_batch_tool)
+
+            # Strict scoping: a tool that belongs to a squad is reachable ONLY
+            # through its delegate_to_<name> child (which captured _base_snapshot
+            # above, so it keeps them), never directly by the parent. Strip the
+            # squad-glob tools from the parent's own list. Wildcard ('*') defs are
+            # skipped — they'd strip everything — and delegate_* tools are never
+            # stripped.
+            import fnmatch as _fnmatch
+            from app.harness.subagent_factory import _coerce_tool_globs as _globs_of
+            _squad_globs: List[str] = []
+            for _d in _sub_defs:
+                if not isinstance(_d, dict):
+                    continue
+                for _g in (_globs_of(_d.get("tools")) or []):
+                    if _g and _g != "*":
+                        _squad_globs.append(_g)
+            if _squad_globs:
+                def _is_squad_tool(_t: Any) -> bool:
+                    _nm = getattr(_t, "name", "") or ""
+                    if _nm.startswith("delegate_"):
+                        return False
+                    return any(_fnmatch.fnmatch(_nm, _g) for _g in _squad_globs)
+
+                _stripped = [getattr(_t, "name", "") for _t in tools if _is_squad_tool(_t)]
+                if _stripped:
+                    tools[:] = [_t for _t in tools if not _is_squad_tool(_t)]
+                    logger_instance.info(
+                        "ReactStrategy: strict squad scoping removed %d tool(s) from "
+                        "the main agent (reachable only via delegate_to_<name>): %s",
+                        len(_stripped), _stripped,
+                    )
         except Exception as _se:  # noqa: BLE001
             logger_instance.warning("ReactStrategy: subagent tools skipped (%s)", _se)
 
@@ -405,7 +467,7 @@ def add_extension_tools(
         try:
             from app.core import sandbox as _sandbox
             if _sandbox.is_enabled():
-                from app.workflow.strategies.react.verify_tools import build_verify_tool
+                from app.harness.verify_tools import build_verify_tool
                 _verify_tool = build_verify_tool(
                     _verify_cmd,
                     image=_flags.get("verify_image"),
@@ -423,5 +485,19 @@ def add_extension_tools(
                 )
         except Exception as _vte:  # noqa: BLE001
             logger_instance.warning("ReactStrategy: verify tool skipped (%s)", _vte)
+
+    # Automatic result offload (profile-gated on filesystem, off by default).
+    # Applied LAST so it wraps every tool assembled above (base + code/edit +
+    # planning + vfs + subagents + sandbox + verify) in one pass. Requires a
+    # bound VFS session — already bound above when filesystem is on.
+    if _flags.get("filesystem"):
+        try:
+            from app.config import settings
+            from app.harness.tool_offload import wrap_tools_with_offload
+            tools[:] = wrap_tools_with_offload(
+                tools, execution_id, settings.tool_result_offload_chars,
+            )
+        except Exception as _oe:  # noqa: BLE001
+            logger_instance.warning("ReactStrategy: tool offload skipped (%s)", _oe)
 
     return tools

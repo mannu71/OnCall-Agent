@@ -55,6 +55,15 @@ export default defineConfig(({ mode }) => ({
             '@radix-ui/react-checkbox',
           ],
           'tanstack': ['@tanstack/react-query'],
+          // three.js + r3f only load when the codegraph 3D graph view is opened,
+          // but keep them off the main bundle regardless (~600KB+ combined).
+          'three-vendor': [
+            'three',
+            '@react-three/fiber',
+            '@react-three/drei',
+            '@react-three/postprocessing',
+            'postprocessing',
+          ],
         },
       },
     },

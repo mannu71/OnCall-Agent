@@ -22,12 +22,19 @@ ENGINE_NATIVE = "native"
 _VALID_ENGINES = (ENGINE_LANGGRAPH, ENGINE_NATIVE)
 
 
-def resolve_engine(agent_config: Optional[Dict[str, Any]] = None) -> str:
+def resolve_engine(
+    agent_config: Optional[Dict[str, Any]] = None,
+    context: Optional[Dict[str, Any]] = None,
+) -> str:
     """Resolve which engine should drive this run.
 
-    Precedence: per-workflow ``agent_config["engine"]`` (or its ``params``
-    mirror, same coercion pattern as ``supervisor_enabled``) beats the global
-    ``AGENT_ENGINE`` setting.
+    Precedence (highest first): an explicit per-request override — passed as
+    ``context["engine"]`` or ``context["inputs"]["engine"]``, same pattern as
+    :func:`app.harness.spec_factory.resolve_permission_mode` — lets a single
+    chat turn pick ReAct/Native without touching the saved workflow. Falling
+    back from there: per-workflow ``agent_config["engine"]`` (or its
+    ``params`` mirror, same coercion pattern as ``supervisor_enabled``), then
+    the global ``AGENT_ENGINE`` setting.
 
     HITL runs are clamped to ``langgraph`` until the native engine grows its
     own pause/resume + durable persistence story — resuming a HITL-paused run
@@ -35,11 +42,15 @@ def resolve_engine(agent_config: Optional[Dict[str, Any]] = None) -> str:
     loop does not yet have.
     """
     agent_config = agent_config or {}
+    ctx = context or {}
     params = agent_config.get("params") if isinstance(agent_config.get("params"), dict) else {}
 
-    raw = agent_config.get("engine")
-    if raw is None:
-        raw = params.get("engine")
+    raw = (
+        ctx.get("engine")
+        or (ctx.get("inputs") or {}).get("engine")
+        or agent_config.get("engine")
+        or params.get("engine")
+    )
     engine = str(raw).strip().lower() if raw else settings.agent_engine
 
     if engine not in _VALID_ENGINES:
@@ -81,7 +92,7 @@ async def run_agent_once(
 
     ``engine`` defaults to ``resolve_engine(spec.agent_config)`` when omitted.
     Both branches return the same result-dict contract as
-    ``app.workflow.strategies.react.agent_runner.execute_agent``
+    ``app.harness.agent_runner.execute_agent``
     (``final_answer``, ``messages``, ``tool_calls``, token counts, ...).
     """
     agent_config = getattr(spec, "agent_config", None) or {}
@@ -101,7 +112,7 @@ async def run_agent_once(
         )
 
     from app.harness import build_agent_from_spec
-    from app.workflow.strategies.react.agent_runner import execute_agent
+    from app.harness.agent_runner import execute_agent
 
     agent = build_agent_from_spec(
         spec, llm, tools, checkpointer=checkpointer, execution_port=execution_port,
@@ -137,8 +148,8 @@ async def _run_native(
     model_name: Optional[str],
 ) -> Dict[str, Any]:
     from app.harness.engine.turn_loop import TurnLoop
-    from app.workflow.strategies.react.agent_builder import compose_system_prompt
-    from app.workflow.strategies.react.agent_runner import build_initial_messages
+    from app.harness.agent_builder import compose_system_prompt
+    from app.harness.agent_runner import build_initial_messages
 
     agent_config = spec.agent_config or {}
     system_prompt = compose_system_prompt(

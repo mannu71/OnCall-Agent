@@ -205,6 +205,7 @@ export const agentApiClient = {
         if (o.userQuery) params.query = o.userQuery;
         if (o.outputMode) params.output_mode = o.outputMode;
         if (o.permissionMode) params.permission_mode = o.permissionMode;
+        if (o.engine) params.engine = o.engine;
         // When a persisted chat session is active, the backend records the user
         // and assistant turns against it so the conversation survives a refresh.
         if (o.sessionId) params.session_id = o.sessionId;
@@ -271,9 +272,9 @@ export const agentApiClient = {
             };
             es.onmessage = (evt) => { const d = parse(evt); if (d && d.message) h.onStatus && h.onStatus(d.message); };
             const on = (type, cb) => es.addEventListener(type, cb);
-            on('tool_call',    (e) => { const d = parse(e); const nm = d.tool || d.name; if (nm) h.onToolCall && h.onToolCall(nm, d.args || {}); });
-            on('tool_started', (e) => { const d = parse(e); const nm = d.tool || d.name; if (nm) h.onToolCall && h.onToolCall(nm, d.args || {}); });
-            on('tool_result',  (e) => { const d = parse(e); const nm = d.tool || d.name; if (nm) h.onToolResult && h.onToolResult(nm, d.result || d.output); });
+            on('tool_call',    (e) => { const d = parse(e); const nm = d.tool || d.name; if (nm) h.onToolCall && h.onToolCall(nm, d.args || {}, d.agent, d.model); });
+            on('tool_started', (e) => { const d = parse(e); const nm = d.tool || d.name; if (nm) h.onToolCall && h.onToolCall(nm, d.args || {}, d.agent, d.model); });
+            on('tool_result',  (e) => { const d = parse(e); const nm = d.tool || d.name; if (nm) h.onToolResult && h.onToolResult(nm, d.result || d.output, !!d.failed, d.agent, d.model); });
             on('llm_token',    (e) => { const d = parse(e); h.onToken && h.onToken(d.token || d.text || ''); });
             on('node_started',   (e) => { const d = parse(e); h.onNode && h.onNode(d.node_id || d.nodeId, 'started'); });
             on('node_completed', (e) => { const d = parse(e); h.onNode && h.onNode(d.node_id || d.nodeId, 'completed'); });
@@ -315,7 +316,7 @@ export const agentApiClient = {
         try {
             const data = await this.executeWorkflow(workflowName, {
                 background: false, userQuery, history: h.history, sessionId: h.sessionId,
-                signal: h.signal,
+                engine: h.engine, signal: h.signal,
             });
             if (data && data.status === 'already_running') {
                 throw new Error(`Agent "${workflowName}" is already running. Wait for it to finish.`);
@@ -859,6 +860,27 @@ export const agentApiClient = {
             `/api/v1/codegraph/index/${encodeURIComponent(repo)}`
         );
         return response.data;
+    },
+
+    /**
+     * 3D force-directed graph layout (node positions/colors + edges) computed
+     * by the codegraph engine's layout3d.c. Can take a while on large repos —
+     * disable the timeout.
+     */
+    async getCodegraphLayout(repo, { level = 'overview', centerNode, radius, maxNodes } = {}) {
+        const response = await client.get(
+            `/api/v1/codegraph/repos/${encodeURIComponent(repo)}/layout`,
+            {
+                params: {
+                    level,
+                    center_node: centerNode,
+                    radius,
+                    max_nodes: maxNodes,
+                },
+                timeout: 0,
+            }
+        );
+        return response.data; // { nodes: [...], edges: [...], total_nodes }
     },
 
     // ==================== Project Intelligence (read-only) ====================

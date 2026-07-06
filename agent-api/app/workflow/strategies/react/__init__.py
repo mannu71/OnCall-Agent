@@ -1,5 +1,5 @@
 """ReAct agent strategy package."""
-from app.workflow.strategies.react.helpers import (
+from app.harness.helpers import (
     build_recall_context,
     cap_context_block,
     collect_failed_tools,

@@ -6088,15 +6088,36 @@ static int vs_build_keyword_vectors(cg_store_t *s, const char *project, const ch
     return actual_kw;
 }
 
-/* Compute the per-keyword min cosine score between a node's int8 vector and
- * each of the query vectors.  Returns 0.0 if the node vector is unavailable
- * or mis-sized. */
+/* Weight given to the strict per-keyword MIN when blending with the MEAN
+ * (see vs_min_cosine_score below). 1.0 reproduces the old all-keywords-AND
+ * behavior; lower values let a node with one so-so keyword match and other
+ * strong matches still surface instead of being zeroed by the weak one. */
+#define CG_VS_MIN_WEIGHT_DEFAULT 0.7
+
+static double vs_min_weight(void) {
+    const char *v = getenv("CG_VS_MIN_WEIGHT");
+    if (!v) {
+        return CG_VS_MIN_WEIGHT_DEFAULT;
+    }
+    char *end = NULL;
+    double parsed = strtod(v, &end);
+    if (end == v || parsed < 0.0 || parsed > CG_STORE_UNIT_POS_D) {
+        return CG_VS_MIN_WEIGHT_DEFAULT;
+    }
+    return parsed;
+}
+
+/* Compute a blended per-keyword cosine score between a node's int8 vector and
+ * each of the query vectors: w*min + (1-w)*mean across keywords, so one weak
+ * keyword no longer zeroes out an otherwise strong multi-keyword match.
+ * Returns 0.0 if the node vector is unavailable or mis-sized. */
 static double vs_min_cosine_score(const int8_t *node_vec, int node_vec_len,
                                   const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw) {
     if (!node_vec || node_vec_len != VS_VEC_DIM) {
         return 0.0;
     }
     double min_score = CG_STORE_UNIT_POS_D;
+    double sum_score = 0.0;
     for (int k = 0; k < actual_kw; k++) {
         int32_t dot = 0;
         int32_t ma = 0;
@@ -6111,8 +6132,14 @@ static double vs_min_cosine_score(const int8_t *node_vec, int node_vec_len,
         if (cos_k < min_score) {
             min_score = cos_k;
         }
+        sum_score += cos_k;
     }
-    return min_score;
+    if (actual_kw <= 0) {
+        return 0.0;
+    }
+    double mean_score = sum_score / (double)actual_kw;
+    double w = vs_min_weight();
+    return w * min_score + (CG_STORE_UNIT_POS_D - w) * mean_score;
 }
 
 /* Append one candidate row read from the scan statement into the result

@@ -8,7 +8,17 @@ from typing import Any, Dict, Optional, Tuple
 from app.config import settings
 from app.core.model_router import NodeRole, explain, model_for
 from app.workflow.llm_config import find_llm_node_for_consumer, resolve_llm_config_for_node
-from app.workflow.strategies.react.llm_factory import build_llm
+
+# NOTE: build_llm is imported lazily inside classify_route(), NOT here.
+# A module-level `from app.workflow.strategies.react.llm_factory import ...`
+# initializes the app.workflow.strategies package, whose __init__ imports
+# strategies.router, which imports THIS module back for ROUTER_SYSTEM_PROMPT —
+# a circular import that blows up whenever router_classify is the first of
+# the two to load (e.g. via executor/handlers/router.py on the first workflow
+# run). Worse, the failed import used to poison the handler registry for the
+# process lifetime: already-cached handler submodules never re-ran their
+# @register side effects, so agent/language_model/cloudwatch nodes silently
+# became "Unknown node type" skips on every subsequent run.
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +157,8 @@ async def classify_route(
         ),
         HumanMessage(content=f"Query to classify: {classify_query}"),
     ]
+
+    from app.workflow.strategies.react.llm_factory import build_llm  # lazy — see module docstring note
 
     llm = build_llm(llm_config)
     response = await llm.ainvoke(messages)

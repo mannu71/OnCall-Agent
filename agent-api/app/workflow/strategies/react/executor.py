@@ -106,12 +106,17 @@ async def run_plan(
         if len(_fallback_chain) > 1 else None
     )
 
-    _engine = resolve_engine(agent_config)
+    _engine = resolve_engine(agent_config, context)
 
     async def _run_agent(_agent, _query):
+        # plan.conversation_history is the tool-inclusive replay built in
+        # preflight (app.harness.chat_history) — None for non-chat runs or
+        # when the rebuild failed/was skipped, in which case this falls back
+        # to the UI's text-only history exactly as before.
         _history = (
-            (context.get("inputs") or {}).get("history")
-            if isinstance(context, dict) else None
+            plan.conversation_history
+            if plan.conversation_history is not None
+            else ((context.get("inputs") or {}).get("history") if isinstance(context, dict) else None)
         )
         last_exc: Optional[Exception] = None
         for _idx, _candidate in enumerate(_fallback_chain):

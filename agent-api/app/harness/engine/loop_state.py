@@ -37,6 +37,23 @@ class StopReason(str, enum.Enum):
     HITL_PAUSED = "hitl_paused"
 
 
+class TerminalState(str, enum.Enum):
+    """User/dashboard-facing outcome, derived from StopReason + supervisor
+    verdict + verify status (see app.harness.terminal_state). Distinct from
+    StopReason: StopReason is "why the loop stopped" (engine-internal);
+    TerminalState is "was this actually a success" (what a caller/dashboard
+    should trust). An exhausted or unverified run never self-reports
+    ``success`` — see the loop-engineering discipline this maps to:
+    "an error or an exhausted budget never counts as success"."""
+
+    SUCCESS = "success"
+    NO_OP = "no_op"
+    BLOCKED = "blocked"
+    STALLED = "stalled"
+    EXHAUSTED = "exhausted"
+    UNVERIFIED = "unverified"
+
+
 @dataclass
 class TokenLedger:
     """Wraps a single ``TokenUsageCallback`` — the one source of truth for
@@ -86,6 +103,15 @@ class TurnLoopState:
     withheld_errors: List[Any] = field(default_factory=list)
     ledger: TokenLedger = field(default_factory=TokenLedger)
     truncated: bool = False
+    # Environment-first verification (3.1): True from the turn an edit_file/
+    # create_file call succeeds until run_verify is subsequently called (pass
+    # or fail — being called at all clears "pending"). Only meaningful when
+    # run_verify is actually bound (AgentSpec.verify_command configured);
+    # stays False for runs that never touch an edit tool.
+    verify_pending: bool = False
+    verify_last_passed: Optional[bool] = None
 
 
-__all__ = ["ContinueReason", "StopReason", "TokenLedger", "TurnLoopState"]
+__all__ = [
+    "ContinueReason", "StopReason", "TerminalState", "TokenLedger", "TurnLoopState",
+]

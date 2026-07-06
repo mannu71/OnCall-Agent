@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 from app.config import settings
 from app.core.redact import redact
@@ -41,10 +41,24 @@ if TYPE_CHECKING:  # pragma: no cover
 class _AgentStreamCallback:
     """Adapts StreamCallback protocol events to VisualWorkflowExecutor._publish_event."""
 
-    def __init__(self, executor: "VisualWorkflowExecutor", execution_id: str, node_id: str):
+    def __init__(
+        self,
+        executor: "VisualWorkflowExecutor",
+        execution_id: str,
+        node_id: str,
+        agent_name: str = "agent",
+    ):
         self._executor = executor
         self._execution_id = execution_id
         self._node_id = node_id
+        # Default attribution for tool events emitted directly by the main agent.
+        # A delegated child overrides it per-event via the ``agent`` kwarg (see
+        # subagent_factory._ChildStreamCallback) so the chat can badge who ran a
+        # tool (main agent vs. a named squad/subagent).
+        self._agent_name = agent_name
+        # The main agent's resolved model id, set by preflight once known, so the
+        # chat can show which model ran each call. Subagents override per-event.
+        self.model_name = ""
 
     async def on_llm_token(self, token: str) -> None:
         await self._executor._publish_event(
@@ -52,16 +66,27 @@ class _AgentStreamCallback:
             {"token": token, "node_id": self._node_id},
         )
 
-    async def on_tool_call(self, tool_name: str, args: dict) -> None:
+    async def on_tool_call(
+        self, tool_name: str, args: dict, agent: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> None:
         await self._executor._publish_event(
             self._execution_id, "tool_call",
-            {"tool": tool_name, "args": args, "node_id": self._node_id},
+            {"tool": tool_name, "args": args, "node_id": self._node_id,
+             "agent": agent or self._agent_name, "model": model or self.model_name},
         )
 
-    async def on_tool_result(self, tool_name: str, result: str) -> None:
+    async def on_tool_result(
+        self, tool_name: str, result: str, failed: bool = False, agent: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> None:
         await self._executor._publish_event(
             self._execution_id, "tool_result",
-            {"tool": tool_name, "result": redact(result)[:2000], "node_id": self._node_id},
+            {
+                "tool": tool_name, "result": redact(result)[:2000], "node_id": self._node_id,
+                "failed": failed, "agent": agent or self._agent_name,
+                "model": model or self.model_name,
+            },
         )
 
     async def on_error(self, error: str) -> None:

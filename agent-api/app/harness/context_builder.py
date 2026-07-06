@@ -75,9 +75,10 @@ async def build_recall_query(
 
     if has_history:
         blocks.append(
-            "[Follow-up turn — the prior conversation is in the message history "
-            "above. Answer from it when possible; only call tools for genuinely "
-            "NEW information the user is now asking for.]"
+            "[Follow-up turn — the prior conversation, including any tool results "
+            "already gathered, is in the message history above. Answer from it "
+            "when possible; only call tools for genuinely NEW information the "
+            "user is now asking for.]"
         )
 
     # ── (a) Pinned facts — always injected, NOT similarity-gated ─────────────
@@ -117,7 +118,7 @@ async def build_recall_query(
 
     try:
         from app.services.knowledge_base import knowledge_base as _kb
-        from app.workflow.strategies.react.helpers import build_recall_context
+        from app.harness.helpers import build_recall_context
 
         _issues = await _kb.search_known_issues(user_query, limit=3, threshold=0.65)
         _patterns = await _kb.search_similar_patterns(user_query, limit=3, threshold=0.65)
@@ -212,7 +213,7 @@ def seed_context_blocks(
     uncapped so the strategy can fall back to it if the agent's own answer comes
     back empty or truncated.
     """
-    from app.workflow.strategies.react.helpers import cap_context_block
+    from app.harness.helpers import cap_context_block
 
     cw_context = context.get("cloudwatch_context")
     cw_synthesis: str = ""
@@ -260,7 +261,7 @@ def apply_synthesis_floor(
     pre-computed synthesis rather than returning a half-finished investigation. A
     long, substantial narrative is never clobbered. Mutates and returns *result*.
     """
-    from app.workflow.strategies.react.helpers import looks_like_midthought
+    from app.harness.helpers import looks_like_midthought
 
     _final_text = (result.get("final_answer") or "").strip()
     # Treat provider refusals ("…cannot answer this question") as non-answers too.

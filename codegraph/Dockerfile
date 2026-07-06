@@ -11,14 +11,6 @@
 #   docker build -t codegraph:latest ./codegraph
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── UI stage — build the graph-ui React/Three.js bundle ─────────────────────
-FROM node:20 AS uibuilder
-WORKDIR /ui
-COPY graph-ui/ ./
-RUN npm config set strict-ssl false \
-    && (npm ci || npm install) \
-    && ./node_modules/.bin/vite build
-
 FROM debian:bookworm-slim AS builder
 # All third-party libraries are bundled under lib/ and src/parser/lib/, so the
 # only system build deps are a C/C++ toolchain + zlib.
@@ -38,11 +30,6 @@ WORKDIR /build
 COPY CMakeLists.txt .
 COPY src/ ./src/
 COPY lib/ ./lib/
-COPY scripts/ ./scripts/
-# Embed the built UI bundle (generates src/webui/embedded_assets.c; CMake then
-# drops the empty embedded_stub.c automatically).
-COPY --from=uibuilder /ui/dist ./graph-ui/dist
-RUN python3 scripts/gen_embedded_assets.py graph-ui/dist src/webui/embedded_assets.c
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build --target codegraph_engine --parallel \
     && strip build/codegraph
@@ -57,7 +44,9 @@ COPY --from=builder /languages.so /opt/codegraph/languages.so
 # CG_TS_SO is the grammar-bundle path the dlopen bridge resolves at runtime.
 ENV CG_TS_SO=/opt/codegraph/languages.so
 ENV CODEGRAPH_TS_SO=/opt/codegraph/languages.so
-# 3D graph visualization UI (codegraph serve --ui=true --port=9749).
+# JSON/HTTP API (layout, index, browse — no bundled frontend; the 3D graph
+# view lives in the main app's Codebase Explorer instead, via the get_layout
+# MCP tool). `codegraph serve --port=9749` exposes it standalone.
 EXPOSE 9749
 # Smoke test at build time: the binary must report its version.
 RUN /usr/local/bin/codegraph --version

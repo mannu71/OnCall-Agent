@@ -15,13 +15,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── codegraph pre-build (inlined so `docker compose up --build` works standalone) ─
+# cg-uibuilder has no UI to build anymore (the 3D graph view lives in the main
+# app's Codebase Explorer, via the get_layout MCP tool) — kept only as the
+# source of the node:20 image's node/npm binaries for runtime-full below.
 FROM node:20 AS cg-uibuilder
-WORKDIR /ui
-COPY codegraph/graph-ui/ ./
-RUN --mount=type=cache,target=/root/.npm \
-    npm config set strict-ssl false \
-    && (npm ci || npm install) \
-    && ./node_modules/.bin/vite build
 
 FROM debian:bookworm-slim AS cg-builder
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -38,9 +35,6 @@ WORKDIR /build
 COPY codegraph/CMakeLists.txt .
 COPY codegraph/src/ ./src/
 COPY codegraph/lib/ ./lib/
-COPY codegraph/scripts/ ./scripts/
-COPY --from=cg-uibuilder /ui/dist ./graph-ui/dist
-RUN python3 scripts/gen_embedded_assets.py graph-ui/dist src/webui/embedded_assets.c
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build --target codegraph_engine --parallel \
     && strip build/codegraph

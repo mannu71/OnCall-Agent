@@ -1,0 +1,45 @@
+[
+  {"query": "process_payment", "relevant": ["payments.process_payment"]},
+  {"query": "cancel_order", "relevant": ["orders.cancel_order"]},
+  {"query": "register_user", "relevant": ["users.register_user"]},
+  {"query": "send_sms", "relevant": ["notifications.send_sms"]},
+  {"query": "calculate_total", "relevant": ["orders.calculate_total"]},
+  {"query": "validate_card", "relevant": ["payments.validate_card"]},
+  {"query": "verify_email", "relevant": ["users.verify_email"]},
+  {"query": "reset_password", "relevant": ["users.reset_password"]},
+  {"query": "ship_order", "relevant": ["orders.ship_order"]},
+  {"query": "queue_notification", "relevant": ["notifications.queue_notification"]},
+  {"query": "retry notification", "relevant": ["notifications.retry_notification"]},
+  {"query": "cancel subscription", "relevant": ["payments.cancel_subscription"]},
+  {"query": "void transaction", "relevant": ["payments.void_transaction"]},
+  {"query": "track order", "relevant": ["orders.track_order"]},
+  {"query": "create order", "relevant": ["orders.create_order"]},
+  {"query": "deactivate user", "relevant": ["users.deactivate_user"]},
+  {"query": "update profile", "relevant": ["users.update_profile"]},
+  {"query": "settle batch", "relevant": ["payments.settle_batch"]},
+  {"query": "send email", "relevant": ["notifications.send_email"]},
+  {
+    "query": "process payment",
+    "relevant": [
+      "payments.process_payment",
+      "payments.authorize_payment",
+      "payments.capture_payment",
+      "payments.refund_payment",
+      "payments.retry_payment"
+    ],
+    "note": "multi-keyword: production payment functions should outrank test_process_payment despite its exact 2-word name match (test-path penalty)"
+  },
+  {
+    "query": "payment",
+    "relevant": [
+      "payments.process_payment",
+      "payments.validate_card",
+      "payments.charge_card",
+      "payments.authorize_payment",
+      "payments.capture_payment",
+      "payments.refund_payment",
+      "payments.retry_payment"
+    ],
+    "note": "broad query into a single large file — exercises the per-file diversity cap"
+  }
+]

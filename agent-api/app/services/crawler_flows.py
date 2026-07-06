@@ -99,7 +99,7 @@ async def crawler_read_file(
     if e - s + 1 > max_lines:
         e = s + max_lines - 1
     if with_anchors:
-        from app.workflow.strategies.react.hashline import line_hash
+        from app.harness.hashline import line_hash
         body = "\n".join(
             f"L{i}#{line_hash(lines[i - 1])}: {lines[i - 1]}" for i in range(s, e + 1)
         )

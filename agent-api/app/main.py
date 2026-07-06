@@ -57,7 +57,7 @@ if not settings.aws_ssl_verify:
 
 from app.config import settings
 from app.api.v1.api import api_router
-from app.api.middleware import register_exception_handlers
+from app.api.middleware import register_exception_handlers, APIKeyAuthMiddleware
 from app.core.scheduler import workflow_scheduler
 from app.core.heartbeat import heartbeat_monitor
 from app.core.database import init_db
@@ -138,6 +138,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"LangGraph persistence init skipped: {e}")
 
+    # Apply any runtime feature-flag overrides saved from the Settings UI on top
+    # of the environment defaults (best-effort; never blocks startup).
+    try:
+        from app.core import feature_flags
+
+        await feature_flags.load_overlay()
+    except Exception as e:  # noqa: BLE001 — never fail startup on the overlay
+        logger.warning(f"Feature-flag overlay load skipped: {e}")
+
     # Surface the isolated-sandbox posture once at startup so a mis-set backend
     # (e.g. SANDBOX_BACKEND=container with no Docker) is visible before any run.
     try:
@@ -180,6 +189,13 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# API-key auth - opt-in (see app.api.middleware.api_auth). Added before CORS
+# so CORS ends up as the outermost middleware (Starlette: last-added wraps
+# first) — that way a 401 rejection still carries CORS headers, so a
+# browser-based client can read the response instead of hitting an opaque
+# CORS network error.
+app.add_middleware(APIKeyAuthMiddleware)
 
 # CORS middleware - configurable via settings
 app.add_middleware(

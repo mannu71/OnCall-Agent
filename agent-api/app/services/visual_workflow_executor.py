@@ -334,9 +334,18 @@ class VisualWorkflowExecutor:
             if node_type in HANDLERS:
                 result = await HANDLERS[node_type](self, node, context)
             else:
+                # Loud, not silent: a core type (agent/language_model/...)
+                # landing here means the handler registry is broken (e.g. a
+                # module-import failure poisoned registration) — the run would
+                # otherwise "succeed" with the wrong node's output as the
+                # visible answer.
+                logger.warning(
+                    "Unknown node type '%s' (node=%s) — skipping; registered "
+                    "handlers: %s", node_type, node_id, sorted(HANDLERS.keys()),
+                )
                 result = {
                     "status": "skipped",
-                    "message": f"Unknown node type: {node_type}",
+                    "output": f"Unknown node type: {node_type}",
                 }
             
             end_time = datetime.now(timezone.utc)

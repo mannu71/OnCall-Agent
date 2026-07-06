@@ -6,7 +6,7 @@ so the Codebase Explorer can manage either backend. Thin HTTP layer over
 """
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -36,6 +36,22 @@ async def get_node(repo: str, qualified_name: str = Query(...)) -> Dict[str, Any
     if node is None:
         raise HTTPException(status_code=404, detail="node not found")
     return node
+
+
+@router.get("/repos/{repo}/layout", summary="3D force-directed graph layout for a codegraph repo")
+async def get_layout(
+    repo: str,
+    level: str = Query("overview", description="'overview' (cluster centroids) or 'detail'"),
+    center_node: Optional[str] = Query(None, description="Qualified name to center detail layout on"),
+    radius: int = Query(2),
+    max_nodes: int = Query(2000),
+) -> Dict[str, Any]:
+    result = await codegraph_admin.get_layout(
+        repo, level=level, center_node=center_node, radius=radius, max_nodes=max_nodes
+    )
+    if result.get("error"):
+        raise HTTPException(status_code=500, detail=result["error"])
+    return result
 
 
 @router.post("/index/{repo}", summary="Reindex a codegraph repo (fast mode)")

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from app.core.redact import redact
-from app.workflow.strategies.react.helpers import collect_failed_tools, estimate_confidence
+from app.harness.helpers import collect_failed_tools, estimate_confidence
 
 logger = logging.getLogger(__name__)
 

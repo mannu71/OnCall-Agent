@@ -100,7 +100,7 @@ def _register_introspected_builtins() -> int:
     """Register built-in tools we can introspect with no config (playbook tools)."""
     count = 0
     try:
-        from app.workflow.strategies.react.tool_setup import build_playbook_tools
+        from app.harness.tool_setup import build_playbook_tools
         for tool in build_playbook_tools():
             name = getattr(tool, "name", None)
             if not name:

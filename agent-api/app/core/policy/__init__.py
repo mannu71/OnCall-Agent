@@ -88,7 +88,7 @@ def resolve_with_platform_defaults(config: Optional[List[dict]]) -> ResolvedPoli
     used before the policy engine existed.
     """
     from app.config import settings
-    from app.workflow.strategies.react.tool_permissions import DEFAULT_ASK_PATTERNS
+    from app.harness.tool_permissions import DEFAULT_ASK_PATTERNS
 
     return resolve(config).with_defaults(
         default_ask_patterns=DEFAULT_ASK_PATTERNS,
@@ -110,7 +110,7 @@ def apply_to_tools(
     ``agent_builder``: permission gate first (so the model-facing schema and the
     prompt-cache prefix are unchanged), then the universal output cap.
     """
-    from app.workflow.strategies.react.tool_permissions import (
+    from app.harness.tool_permissions import (
         wrap_tools_with_output_cap,
         wrap_tools_with_permissions,
     )

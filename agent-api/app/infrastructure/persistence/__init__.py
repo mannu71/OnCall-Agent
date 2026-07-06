@@ -14,6 +14,9 @@ from app.infrastructure.persistence.model_role_repository import ModelRoleReposi
 from app.infrastructure.persistence.mcp_role_repository import MCPRoleRepository
 from app.infrastructure.persistence.session_repository import SessionRepository
 from app.infrastructure.persistence.agent_profile_repository import AgentProfileRepository
+from app.infrastructure.persistence.execution_scratch_repository import ExecutionScratchRepository
+from app.infrastructure.persistence.failure_ledger_repository import FailureLedgerRepository
+from app.infrastructure.persistence.trajectory_event_repository import TrajectoryEventRepository
 
 # Shared singletons — prefer injecting ``Repository()`` in tests.
 workflow_repository = WorkflowRepository()
@@ -27,6 +30,9 @@ model_role_repository = ModelRoleRepository()
 mcp_role_repository = MCPRoleRepository()
 session_repository = SessionRepository()
 agent_profile_repository = AgentProfileRepository()
+execution_scratch_repository = ExecutionScratchRepository()
+failure_ledger_repository = FailureLedgerRepository()
+trajectory_event_repository = TrajectoryEventRepository()
 
 __all__ = [
     "WorkflowRepository",
@@ -40,6 +46,9 @@ __all__ = [
     "MCPRoleRepository",
     "SessionRepository",
     "AgentProfileRepository",
+    "ExecutionScratchRepository",
+    "FailureLedgerRepository",
+    "TrajectoryEventRepository",
     "workflow_repository",
     "execution_repository",
     "llm_config_repository",
@@ -50,4 +59,7 @@ __all__ = [
     "model_role_repository",
     "mcp_role_repository",
     "session_repository",
+    "execution_scratch_repository",
+    "failure_ledger_repository",
+    "trajectory_event_repository",
 ]

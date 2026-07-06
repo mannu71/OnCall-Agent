@@ -296,6 +296,87 @@ def delete_project(project: str) -> Dict[str, Any]:
         return {"error": str(exc), "deleted": False}
 
 
+async def get_layout(
+    project: str,
+    level: str = "overview",
+    center_node: Optional[str] = None,
+    radius: int = 2,
+    max_nodes: int = 2000,
+) -> Dict[str, Any]:
+    """Compute a 3D force-directed graph layout for *project* via the engine.
+
+    Unlike the read paths above, layout requires the engine's compiled
+    Barnes-Hut layout algorithm (``layout3d.c``), so this goes through the
+    same ephemeral MCP subprocess connect/execute/disconnect as reindex.
+    """
+    from app.services.mcp_client_manager import MCPClientManager
+    from app.workflow.tools.codegraph_tools import (
+        CODEGRAPH_SERVER_ID,
+        codegraph_inline_config,
+    )
+
+    # The engine's own project identifier (derived from the indexed repo_path,
+    # e.g. "app-data-indexed_repos-compliance-acuris-api") is not the same as
+    # the friendly repo_name (root_path basename) used everywhere else in this
+    # module — get_layout is the one read path that goes through the live
+    # engine, so it needs the internal name, not the display name.
+    found = _find_project(project)
+    if not found:
+        return {"error": f"project '{project}' not indexed"}
+    _db_path, internal_name = found
+
+    manager = MCPClientManager()
+    connected = False
+    try:
+        connected = await manager.connect_server(
+            CODEGRAPH_SERVER_ID, codegraph_inline_config()
+        )
+        if not connected:
+            return {"error": "could not start codegraph engine"}
+
+        args: Dict[str, Any] = {
+            "project": internal_name,
+            "level": level,
+            "radius": radius,
+            "max_nodes": max_nodes,
+        }
+        if center_node:
+            args["center_node"] = center_node
+
+        result = await manager.execute_tool(
+            server_id=CODEGRAPH_SERVER_ID,
+            tool_name="get_layout",
+            arguments=args,
+            tool_timeout=60,
+        )
+        if result.get("isError"):
+            from app.crawler.background_indexer import _content_text
+            return {"error": _content_text(result)}
+
+        # NOTE: _content_text truncates to 500 chars (fine for short error
+        # messages, not for a full layout payload) — extract the raw text here.
+        content = result.get("content")
+        text = None
+        if isinstance(content, list) and content:
+            item = content[0]
+            text = item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
+        if not text:
+            return {"error": "empty layout response"}
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {"error": f"malformed layout response: {text[:200]}"}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("codegraph_admin: get_layout failed for project=%s", project)
+        return {"error": str(exc)}
+    finally:
+        if connected:
+            try:
+                await manager.disconnect_all()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 async def reindex_project(project: str) -> Dict[str, Any]:
     """Re-run codegraph indexing for *project* (fast mode) via the engine."""
     from app.services.mcp_client_manager import MCPClientManager

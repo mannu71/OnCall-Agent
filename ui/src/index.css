@@ -190,17 +190,13 @@
     background: rgba(148, 163, 184, 0.6); 
   }
 }
-/* ── Chat redesign: scoped tokens, density + keyframes ──────────────────────
+/* ── Chat redesign: scoped tokens + keyframes ────────────────────────────────
    Additive only. Derived from existing brand/slate tokens; no palette change. */
 :root {
-  --chat-max: 820px;
-  /* density defaults (comfortable) — overridden by .chat-density-* below */
+  --chat-max: none;
   --msg-pad: 1rem;
   --msg-gap: 1.25rem;
 }
-.chat-density-compact    { --msg-pad: 0.625rem; --msg-gap: 0.6rem; }
-.chat-density-comfortable{ --msg-pad: 1rem;     --msg-gap: 1.25rem; }
-.chat-density-spacious   { --msg-pad: 1.25rem;  --msg-gap: 1.75rem; }
 
 @keyframes chat-msg-enter {
   from { opacity: 0; transform: translateY(6px); }

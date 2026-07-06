@@ -33,12 +33,6 @@ logger = logging.getLogger(__name__)
 #: steps ~= 5 ReAct iterations) in native turn-count terms.
 _CONTINUATION_TURN_BUDGET = 5
 
-_FORCED_SYNTHESIS_NUDGE = (
-    "You have gathered enough information and may NOT call any more tools. "
-    "Give your FINAL answer now, citing concrete file:line evidence. If you "
-    "could not fully determine something, say so plainly."
-)
-
 
 def _default_max_turns() -> int:
     # LangGraph counts a "step" as one node transition (~2 per ReAct
@@ -62,6 +56,18 @@ def _continue_site(state: TurnLoopState, reason: ContinueReason, log: Any) -> No
     """The single place another loop iteration gets scheduled."""
     state.continue_reason = reason
     log.debug("engine: continue reason=%s turn=%d", reason.value, state.turn_count)
+
+
+# Environment-first verification (3.1): shared with the LangGraph path via
+# app.harness.verify_tracking, so both engines derive identical signals.
+def _update_verify_state(state: TurnLoopState, tool_calls: List[Any], tool_messages: List[Any]) -> None:
+    """Track edit_file/create_file -> run_verify sequencing on TurnLoopState."""
+    from app.harness.verify_tracking import VerifyState, scan_tool_calls
+
+    vs = VerifyState(pending=state.verify_pending, last_passed=state.verify_last_passed)
+    scan_tool_calls(vs, tool_calls, tool_messages)
+    state.verify_pending = vs.pending
+    state.verify_last_passed = vs.last_passed
 
 
 def _extract_stream_text(content: Any) -> str:
@@ -132,6 +138,8 @@ class TurnLoop:
             getattr(llm, "model_id", None) or getattr(llm, "model", None) or model_name
         )
         self._compression = self._build_compression_pipeline()
+        from app.harness.step_recorder import build_step_recorder
+        self._recorder = build_step_recorder(execution_id, model_id=self._compaction_model)
 
     def _build_compression_pipeline(self) -> Any:
         # Construction must never break a run — mirrors _maybe_compact's own
@@ -146,7 +154,7 @@ class TurnLoop:
                 session_id=self._compaction_session,
                 model=self._compaction_model,
             )
-            return CompressionPipeline(mgr)
+            return CompressionPipeline(mgr, vfs_session_id=self.execution_id)
         except Exception as exc:  # noqa: BLE001
             self.log.warning("engine: compression pipeline setup skipped (%s)", exc)
             return _NoopCompressionPipeline()
@@ -195,13 +203,17 @@ class TurnLoop:
 
     async def run(self, initial_messages: List[Any]) -> Dict[str, Any]:
         from langchain_core.messages import HumanMessage, SystemMessage
-        from app.workflow.strategies.react.agent_runner import (
+        from app.harness.agent_runner import (
             sanitize_messages_for_model,
             _serialize_agent_result,
             _stop_reason_of,
             _strip_dangling_tool_calls,
             _TRUNCATED_STOP_REASONS,
+            FORCED_SYNTHESIS_NUDGE,
         )
+
+        from app.core.compaction.compressor import start_stats
+        start_stats()  # fresh per-run compression-savings accumulator
 
         state = TurnLoopState(messages=list(initial_messages))
         system_message = (
@@ -222,10 +234,13 @@ class TurnLoop:
                     )
                     state.did_forced_synthesis = True
                     state.messages = _strip_dangling_tool_calls(state.messages)
-                    state.messages.append(HumanMessage(content=_FORCED_SYNTHESIS_NUDGE))
+                    state.messages.append(HumanMessage(content=FORCED_SYNTHESIS_NUDGE))
                     # Give the recovery a small extra budget in case the model
                     # still tries to call a tool despite the nudge.
                     self.max_turns = state.turn_count - 1 + _CONTINUATION_TURN_BUDGET
+                    self._recorder.record_lifecycle(
+                        state.turn_count, "max_turns_forced_synthesis", max_turns=self.max_turns,
+                    )
                     _continue_site(state, ContinueReason.TOKEN_BUDGET_CONTINUATION, self.log)
                     continue
                 state.stop_reason = StopReason.MAX_TURNS
@@ -272,6 +287,18 @@ class TurnLoop:
             stop_reason = _stop_reason_of(ai_msg)
             is_truncated = stop_reason in _TRUNCATED_STOP_REASONS
 
+            if self._recorder.enabled:
+                from app.harness.agent_runner import extract_text_content
+                _turn_text = extract_text_content(ai_msg.content) if ai_msg.content else ""
+                self._recorder.record_model_turn(
+                    state.turn_count, reason="model_call", text=_turn_text,
+                    tool_calls=tool_calls, stop_reason=stop_reason,
+                    tokens={
+                        "in": state.ledger.input_tokens, "out": state.ledger.output_tokens,
+                        "cache_read": state.ledger.cache_read_tokens,
+                    },
+                )
+
             if tool_calls and not is_truncated:
                 exec_result = await tool_exec.execute_tool_calls(
                     ai_msg, self.tools_by_name,
@@ -279,9 +306,11 @@ class TurnLoop:
                     execution_port=self.execution_port,
                     stream_callback=self.stream_callback,
                     tool_call_count_before=tool_call_running_count,
+                    recorder=self._recorder, step_index=state.turn_count,
                 )
                 tool_call_running_count += len(tool_calls)
                 state.messages.extend(exec_result.tool_messages)
+                _update_verify_state(state, tool_calls, exec_result.tool_messages)
                 if exec_result.steer_messages:
                     state.messages.extend(exec_result.steer_messages)
                     _continue_site(state, ContinueReason.COLLAPSE_DRAIN_RETRY, self.log)
@@ -327,14 +356,15 @@ class TurnLoop:
                     "engine: truncation recovery ladder exhausted — returning "
                     "partial answer (execution_id=%s)", self.execution_id,
                 )
+                self._recorder.record_lifecycle(state.turn_count, "truncation_ladder_exhausted")
                 state.stop_reason = StopReason.COMPLETED
                 break
 
             # ── Mid-thought preamble: the model narrated its next action
             # ("Let me search for…") instead of acting or concluding. Give it
             # one more turn to actually act/synthesize. ─────────────────────
-            from app.workflow.strategies.react.agent_runner import extract_text_content
-            from app.workflow.strategies.react.helpers import looks_like_midthought
+            from app.harness.agent_runner import extract_text_content
+            from app.harness.helpers import looks_like_midthought
             current_text = extract_text_content(ai_msg.content) if ai_msg.content else ""
             if (
                 not state.did_midthought_continuation
@@ -379,6 +409,24 @@ class TurnLoop:
             " [truncated]" if state.truncated else "",
         )
 
+        from app.core.compaction.compressor import get_stats
+        _cstats = get_stats()
+        compression_stats = None
+        if _cstats is not None and _cstats.calls:
+            compression_stats = {
+                "calls": _cstats.calls,
+                "chars_before": _cstats.chars_before,
+                "chars_after": _cstats.chars_after,
+                "tokens_before": _cstats.tokens_before,
+                "tokens_after": _cstats.tokens_after,
+            }
+            self.log.info(
+                "engine: compression saved %d→%d chars (%.0f%%) over %d calls",
+                _cstats.chars_before, _cstats.chars_after,
+                (1 - _cstats.chars_after / max(_cstats.chars_before, 1)) * 100,
+                _cstats.calls,
+            )
+
         if self.execution_port is not None and self.execution_id is not None:
             try:
                 await self.execution_port.publish_token_usage(self.execution_id, {
@@ -400,6 +448,15 @@ class TurnLoop:
             "total_tokens": total_input_tokens + total_output_tokens,
             "cache_read_tokens": cache_read_tokens,
             "cache_creation_tokens": cache_creation_tokens,
+            # Context chars/tokens the compression sidecar removed this run
+            # (absent when compression was disabled or made no changes).
+            "compression_stats": compression_stats,
+            # Terminal-state inputs (app.harness.terminal_state) — native
+            # engine only; the LangGraph path leaves these absent.
+            "stop_reason": state.stop_reason.value if state.stop_reason else None,
+            "did_forced_synthesis": state.did_forced_synthesis,
+            "verify_pending": state.verify_pending,
+            "verify_last_passed": state.verify_last_passed,
         }
         if parsed.get("truncated"):
             result["truncated"] = True
@@ -414,6 +471,8 @@ class TurnLoop:
                 result["ungrounded_ids"] = flagged
         except Exception:  # noqa: BLE001 — a telemetry guard must never break a run
             pass
+
+        await self._recorder.flush()
 
         return result
 

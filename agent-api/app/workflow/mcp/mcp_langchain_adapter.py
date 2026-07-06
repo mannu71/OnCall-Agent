@@ -16,7 +16,7 @@ import logging
 from typing import Any, Dict, List, Optional, Type
 
 from app.config import settings
-from app.core.compaction.compressor import compress_text
+from app.core.compaction.compressor import compress_then_cap
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field, create_model
@@ -62,39 +62,15 @@ def _truncate_output(text: str, max_chars: int = MCP_TOOL_OUTPUT_MAX_CHARS) -> s
 
 
 async def _compress_or_truncate(text: str) -> str:
-    """Compress large tool output when enabled; fall back to lossy truncation.
+    """Compress large tool output when enabled, then ALWAYS apply the char cap.
 
-    Compression is type-aware and reversible (no data loss); truncation is the
-    existing lossy char-cap kept as the safety net when compression is disabled
-    or the sidecar is unreachable.
+    Compression raises information density under the ``mcp_tool_output_max_chars``
+    ceiling; it never lifts it. A tool result is replayed in the message history
+    on every subsequent ReAct iteration, so an uncapped (even compressed) result
+    silently inflates input cost across the whole loop. ``compress_then_cap``
+    guarantees the returned text is capped whether compression ran or not.
     """
-    chars = len(text)
-    if settings.compression_enabled and chars > settings.compression_min_chars:
-        logger.info(
-            "Compression: attempting %d-char tool output (min_chars=%d)",
-            chars,
-            settings.compression_min_chars,
-        )
-        result = await compress_text(
-            text,
-            endpoint=settings.compression_endpoint,
-            timeout_ms=settings.compression_timeout_ms,
-        )
-        if result.compressed:
-            logger.info(
-                "Compression: %d → %d chars (%.0f%% saved, %d → %d tokens)",
-                chars,
-                len(result.text),
-                (1 - len(result.text) / max(chars, 1)) * 100,
-                result.tokens_before,
-                result.tokens_after,
-            )
-            return result.text
-        logger.info(
-            "Compression: sidecar returned unchanged text for %d-char output; falling back to truncate",
-            chars,
-        )
-    return _truncate_output(text)
+    return await compress_then_cap(text, _truncate_output, tool_name="mcp")
 
 
 def _build_input_schema(tool_schema: Optional[Dict[str, Any]]) -> Type[BaseModel]:

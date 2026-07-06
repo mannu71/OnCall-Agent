@@ -57,6 +57,7 @@ enum {
 #include "base/dump_verify.h"
 #include "base/compat_regex.h"
 #include "indexer/artifact.h"
+#include "webui/layout3d.h"
 
 #ifdef _WIN32
 #include <process.h>
@@ -479,6 +480,16 @@ static const tool_def_t TOOLS[] = {
     {"symbol_history", "Report git churn/authorship history captured for a symbol",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"symbol\":{\"type\":"
      "\"string\"}},\"required\":[\"project\",\"symbol\"]}"},
+
+    {"get_layout",
+     "Compute a 3D force-directed graph layout for visualization (node positions, sizes, colors "
+     "and edges). 'overview' level returns cluster centroids for the whole project; 'detail' "
+     "level returns individual nodes within radius hops of center_node.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"level\":{\"type\":"
+     "\"string\",\"enum\":[\"overview\",\"detail\"],\"default\":\"overview\"},\"center_node\":{"
+     "\"type\":\"string\",\"description\":\"Qualified name to center the layout on (detail level "
+     "only)\"},\"radius\":{\"type\":\"integer\",\"default\":2},\"max_nodes\":{\"type\":\"integer\","
+     "\"default\":2000}},\"required\":[\"project\"]}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -1174,6 +1185,42 @@ static char *handle_get_graph_schema(cg_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+static char *handle_get_layout(cg_mcp_server_t *srv, const char *args) {
+    char *project = cg_mcp_get_string_arg(args, "project");
+    cg_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        return not_indexed;
+    }
+
+    char *level_str = cg_mcp_get_string_arg(args, "level");
+    cg_layout_level_t level =
+        (level_str && strcmp(level_str, "detail") == 0) ? CG_LAYOUT_DETAIL : CG_LAYOUT_OVERVIEW;
+    free(level_str);
+    char *center_node = cg_mcp_get_string_arg(args, "center_node");
+    int radius = cg_mcp_get_int_arg(args, "radius", 2);
+    int max_nodes = cg_mcp_get_int_arg(args, "max_nodes", 2000);
+
+    cg_layout_result_t *layout =
+        cg_layout_compute(store, project, level, center_node, radius, max_nodes);
+    free(center_node);
+    if (!layout) {
+        free(project);
+        return cg_mcp_text_result("{\"error\":\"layout computation failed\"}", true);
+    }
+
+    char *json = cg_layout_to_json(layout);
+    cg_layout_free(layout);
+    free(project);
+
+    char *result = cg_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 /* Validate edge type: uppercase letters + underscore only, max 64 chars. */
 static bool validate_edge_type(const char *s) {
     if (!s || strlen(s) > CG_SZ_64) {
@@ -1322,11 +1369,56 @@ static char *bm25_file_pattern_like(const char *file_pattern) {
     return like;
 }
 
-/* Run the BM25 full-text search path and return the JSON result string.
- * Returns NULL if FTS5 is unavailable or the query produced no usable tokens,
- * in which case the caller falls back to the regex-based search path. */
-static char *bm25_search(cg_store_t *store, const char *project, const char *query,
-                         const char *file_pattern, int limit, int offset) {
+/* Check if a file path looks like a test file. Used both by BFS traversal
+ * output (below) and by the hybrid search re-rank to down-weight test/spec
+ * files under production code. */
+static bool is_test_file(const char *path) {
+    if (!path) {
+        return false;
+    }
+    return strstr(path, "/test") != NULL || strstr(path, "test_") != NULL ||
+           strstr(path, "_test.") != NULL || strstr(path, "/tests/") != NULL ||
+           strstr(path, "/spec/") != NULL || strstr(path, ".test.") != NULL;
+}
+
+/* One BM25 (or fused) search hit, kept in memory instead of serialized JSON
+ * so hybrid_search() below can fuse it with vector-search candidates. */
+typedef struct {
+    int64_t node_id;
+    char *label;
+    char *name;
+    char *qualified_name;
+    char *file_path;
+    int start_line;
+    int end_line;
+    double score;
+} bm25_candidate_t;
+
+static void bm25_candidates_free(bm25_candidate_t *c, int n) {
+    if (!c) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        free(c[i].label);
+        free(c[i].name);
+        free(c[i].qualified_name);
+        free(c[i].file_path);
+    }
+    free(c);
+}
+
+/* Runs the same two-step FTS5 BM25 query as the original bm25_search() but
+ * returns an in-memory candidate array instead of serialized JSON, so both
+ * the legacy JSON path and hybrid fusion (below) share one query
+ * implementation. Returns NULL only when FTS5 is unavailable, the query has
+ * no usable tokens, or the statement fails to prepare — in every other case
+ * (including zero matching rows) it returns a valid, possibly empty,
+ * allocation. *out_count/*out_total are 0 when NULL is returned. */
+static bm25_candidate_t *bm25_search_core(cg_store_t *store, const char *project,
+                                          const char *query, const char *file_pattern, int limit,
+                                          int offset, int *out_count, int *out_total) {
+    *out_count = 0;
+    *out_total = 0;
     sqlite3 *db = cg_store_get_db(store);
     if (!db) {
         return NULL;
@@ -1376,9 +1468,10 @@ static char *bm25_search(cg_store_t *store, const char *project, const char *que
         free(file_like);
         return NULL;
     }
+    int eff_limit = limit > 0 ? limit : BM25_DEFAULT_LIMIT;
     sqlite3_bind_text(stmt, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, BM25_BIND_LIMIT, limit > 0 ? limit : BM25_DEFAULT_LIMIT);
+    sqlite3_bind_int(stmt, BM25_BIND_LIMIT, eff_limit);
     sqlite3_bind_int(stmt, BM25_BIND_OFFSET, offset > 0 ? offset : 0);
     sqlite3_bind_int(stmt, BM25_BIND_INNER, BM25_INNER_LIMIT);
     if (file_like) {
@@ -1422,38 +1515,448 @@ static char *bm25_search(cg_store_t *store, const char *project, const char *que
         }
     }
 
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
-    yyjson_mut_obj_add_int(doc, root, "total", total);
-    yyjson_mut_obj_add_str(doc, root, "search_mode", "bm25");
-
-    yyjson_mut_val *results = yyjson_mut_arr(doc);
-    int emitted = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        yyjson_mut_val *item = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_strcpy(doc, item, "name",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_NAME));
-        yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_QN));
-        yyjson_mut_obj_add_strcpy(doc, item, "label",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_LABEL));
-        yyjson_mut_obj_add_strcpy(doc, item, "file_path",
-                                  (const char *)sqlite3_column_text(stmt, BM25_COL_FILE));
-        yyjson_mut_obj_add_int(doc, item, "start_line", sqlite3_column_int(stmt, BM25_COL_START));
-        yyjson_mut_obj_add_int(doc, item, "end_line", sqlite3_column_int(stmt, BM25_COL_END));
-        yyjson_mut_obj_add_real(doc, item, "rank", sqlite3_column_double(stmt, BM25_COL_RANK));
-        yyjson_mut_arr_add_val(results, item);
-        emitted++;
+    bm25_candidate_t *cands = malloc((size_t)eff_limit * sizeof(bm25_candidate_t));
+    int count = 0;
+    if (cands) {
+        while (count < eff_limit && sqlite3_step(stmt) == SQLITE_ROW) {
+            bm25_candidate_t *c = &cands[count];
+            c->node_id = sqlite3_column_int64(stmt, BM25_COL_ID);
+            c->label = heap_strdup((const char *)sqlite3_column_text(stmt, BM25_COL_LABEL));
+            c->name = heap_strdup((const char *)sqlite3_column_text(stmt, BM25_COL_NAME));
+            c->qualified_name = heap_strdup((const char *)sqlite3_column_text(stmt, BM25_COL_QN));
+            c->file_path = heap_strdup((const char *)sqlite3_column_text(stmt, BM25_COL_FILE));
+            c->start_line = sqlite3_column_int(stmt, BM25_COL_START);
+            c->end_line = sqlite3_column_int(stmt, BM25_COL_END);
+            c->score = sqlite3_column_double(stmt, BM25_COL_RANK);
+            count++;
+        }
     }
     sqlite3_finalize(stmt);
     free(file_like);
 
+    *out_count = count;
+    *out_total = total;
+    return cands;
+}
+
+/* Serialize a bm25_candidate_t array (trimmed to `limit`) into the same JSON
+ * shape the legacy bm25_search() produced: {total, search_mode, results[],
+ * has_more}. Shared by the pure-BM25 path and hybrid_search()'s fallbacks. */
+static char *bm25_candidates_to_json(const bm25_candidate_t *cands, int count, int total,
+                                     int offset, int limit, const char *mode) {
+    int emit_n = count < limit ? count : limit;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_int(doc, root, "total", total);
+    yyjson_mut_obj_add_str(doc, root, "search_mode", mode);
+    yyjson_mut_val *results = yyjson_mut_arr(doc);
+    for (int i = 0; i < emit_n; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, item, "name", cands[i].name ? cands[i].name : "");
+        yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                               cands[i].qualified_name ? cands[i].qualified_name : "");
+        yyjson_mut_obj_add_str(doc, item, "label", cands[i].label ? cands[i].label : "");
+        yyjson_mut_obj_add_str(doc, item, "file_path", cands[i].file_path ? cands[i].file_path : "");
+        yyjson_mut_obj_add_int(doc, item, "start_line", cands[i].start_line);
+        yyjson_mut_obj_add_int(doc, item, "end_line", cands[i].end_line);
+        yyjson_mut_obj_add_real(doc, item, "rank", cands[i].score);
+        yyjson_mut_arr_add_val(results, item);
+    }
     yyjson_mut_obj_add_val(doc, root, "results", results);
-    yyjson_mut_obj_add_bool(doc, root, "has_more", total > offset + emitted);
+    yyjson_mut_obj_add_bool(doc, root, "has_more", total > offset + emit_n);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+/* Run the BM25 full-text search path and return the JSON result string.
+ * Returns NULL if FTS5 is unavailable or the query produced no usable tokens,
+ * in which case the caller falls back to the regex-based search path. */
+static char *bm25_search(cg_store_t *store, const char *project, const char *query,
+                         const char *file_pattern, int limit, int offset) {
+    int count = 0;
+    int total = 0;
+    bm25_candidate_t *cands =
+        bm25_search_core(store, project, query, file_pattern, limit, offset, &count, &total);
+    if (!cands) {
+        return NULL;
+    }
+    int eff_limit = limit > 0 ? limit : BM25_DEFAULT_LIMIT;
+    char *json = bm25_candidates_to_json(cands, count, total, offset, eff_limit, "bm25");
+    bm25_candidates_free(cands, count);
+    return json;
+}
+
+/* ── Hybrid (BM25 + vector) fusion ────────────────────────────────────
+ *
+ * search_graph's `query` path used to run BM25 alone and return early. It
+ * now additionally runs the same query's keywords through the deterministic
+ * Random-Indexing vector search and fuses the two rankings with Reciprocal
+ * Rank Fusion (RRF), then applies a small re-rank (label boost, test-file
+ * penalty) and a per-file diversity cap before trimming to the caller's
+ * limit. Every stage degrades gracefully: no vectors for the project →
+ * pure BM25; FTS unavailable → falls through to the regex/label path
+ * unchanged; CG_SEARCH_FUSION=off → exact legacy BM25-only behavior. Fusion
+ * only engages at offset=0 — paginated requests keep the simple BM25 order,
+ * since a fused ranking can't be paginated consistently across calls without
+ * re-running both legs for every page. */
+enum {
+    CG_HYBRID_OVERFETCH_MULT = 3,
+    CG_HYBRID_MAX_OVERFETCH = 300,
+    CG_HYBRID_MAX_KW = 32,
+};
+#define CG_RRF_K_D 60.0
+
+static bool search_fusion_enabled(void) {
+    const char *v = getenv("CG_SEARCH_FUSION");
+    return !(v && strcmp(v, "off") == 0);
+}
+
+#define CG_RANK_TEST_PENALTY_DEFAULT 0.8
+
+static double rank_test_penalty(void) {
+    const char *v = getenv("CG_RANK_TEST_PENALTY");
+    if (!v) {
+        return CG_RANK_TEST_PENALTY_DEFAULT;
+    }
+    char *end = NULL;
+    double parsed = strtod(v, &end);
+    if (end == v || parsed < 0.0 || parsed > 1.0) {
+        return CG_RANK_TEST_PENALTY_DEFAULT;
+    }
+    return parsed;
+}
+
+enum { CG_RANK_FILE_CAP_DEFAULT = 3 };
+
+static int rank_file_cap(void) {
+    const char *v = getenv("CG_RANK_FILE_CAP");
+    if (!v) {
+        return CG_RANK_FILE_CAP_DEFAULT;
+    }
+    char *end = NULL;
+    long parsed = strtol(v, &end, CG_DECIMAL_BASE);
+    if (end == v || parsed < 0) {
+        return CG_RANK_FILE_CAP_DEFAULT;
+    }
+    return (int)parsed;
+}
+
+/* Multiplicative re-rank boost mirroring the label boost baked into the
+ * BM25 SQL, so the same preference applies uniformly to fused scores. */
+static double label_boost_multiplier(const char *label) {
+    if (!label) {
+        return 1.0;
+    }
+    if (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0) {
+        return 1.15;
+    }
+    if (strcmp(label, "Route") == 0) {
+        return 1.12;
+    }
+    if (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+        strcmp(label, "Type") == 0 || strcmp(label, "Enum") == 0) {
+        return 1.08;
+    }
+    return 1.0;
+}
+
+/* Split `buf` on whitespace into up to max_out keyword pointers (buf is
+ * modified in place; tokens are NUL-terminated substrings of buf). Shared by
+ * the hybrid search vector leg and handle_search_semantic's free-text query
+ * parsing. */
+static int split_keywords(char *buf, const char **out, int max_out) {
+    int kw = 0;
+    char *save = NULL;
+    for (char *t = strtok_r(buf, " \t\r\n", &save); t && kw < max_out;
+         t = strtok_r(NULL, " \t\r\n", &save)) {
+        out[kw++] = t;
+    }
+    return kw;
+}
+
+/* One fused candidate: metadata borrowed (not owned) from either a
+ * bm25_candidate_t or a cg_vector_result_t entry — the arrays backing those
+ * pointers must outlive this struct's use. */
+typedef struct {
+    int64_t node_id;
+    const char *name;
+    const char *qualified_name;
+    const char *label;
+    const char *file_path;
+    int start_line;
+    int end_line;
+    double score;
+    bool needs_lines; /* true when start/end line is unknown (vector-only hit) */
+} fused_cand_t;
+
+/* Weight given to the BM25 leg's RRF contribution (vector leg gets 1-w).
+ * The RI vector search has no external language model behind it — on
+ * small-to-medium codebases its scores cluster within a fraction of a
+ * percent of each other (verified empirically: a corpus of ~35 functions
+ * produced a top-4 spread of 0.003 on a clean single-keyword query), so an
+ * even 50/50 RRF blend lets that noise outrank an unambiguous exact BM25
+ * match. Weighting BM25 higher keeps the vector leg useful as a recall
+ * booster for queries BM25 can't match at all, without letting it override
+ * a strong lexical signal on ties. */
+#define CG_RRF_BM25_WEIGHT_DEFAULT 0.8
+
+static double rrf_bm25_weight(void) {
+    const char *v = getenv("CG_RRF_BM25_WEIGHT");
+    if (!v) {
+        return CG_RRF_BM25_WEIGHT_DEFAULT;
+    }
+    char *end = NULL;
+    double parsed = strtod(v, &end);
+    if (end == v || parsed < 0.0 || parsed > 1.0) {
+        return CG_RRF_BM25_WEIGHT_DEFAULT;
+    }
+    return parsed;
+}
+
+/* Merge BM25 and vector candidate lists via weighted Reciprocal Rank Fusion
+ * (K=60): each candidate's score is the weighted sum of 1/(K+rank+1) across
+ * whichever list(s) it appears in, deduplicated by node_id. */
+static fused_cand_t *fuse_candidates(bm25_candidate_t *bcands, int bcount,
+                                     cg_vector_result_t *vcands, int vcount, int *out_count) {
+    int cap = bcount + vcount;
+    fused_cand_t *fused = cap > 0 ? calloc((size_t)cap, sizeof(fused_cand_t)) : NULL;
+    int n = 0;
+    if (!fused) {
+        *out_count = 0;
+        return NULL;
+    }
+    double bm25_w = rrf_bm25_weight();
+    double vec_w = 1.0 - bm25_w;
+    for (int i = 0; i < bcount; i++) {
+        fused[n].node_id = bcands[i].node_id;
+        fused[n].name = bcands[i].name;
+        fused[n].qualified_name = bcands[i].qualified_name;
+        fused[n].label = bcands[i].label;
+        fused[n].file_path = bcands[i].file_path;
+        fused[n].start_line = bcands[i].start_line;
+        fused[n].end_line = bcands[i].end_line;
+        fused[n].score = bm25_w * (1.0 / (CG_RRF_K_D + (double)(i + 1)));
+        fused[n].needs_lines = false;
+        n++;
+    }
+    for (int j = 0; j < vcount; j++) {
+        double bonus = vec_w * (1.0 / (CG_RRF_K_D + (double)(j + 1)));
+        int found = -1;
+        for (int k = 0; k < n; k++) {
+            if (fused[k].node_id == vcands[j].node_id) {
+                found = k;
+                break;
+            }
+        }
+        if (found >= 0) {
+            fused[found].score += bonus;
+        } else {
+            fused[n].node_id = vcands[j].node_id;
+            fused[n].name = vcands[j].name;
+            fused[n].qualified_name = vcands[j].qualified_name;
+            fused[n].label = vcands[j].label;
+            fused[n].file_path = vcands[j].file_path;
+            fused[n].start_line = 0;
+            fused[n].end_line = 0;
+            fused[n].score = bonus;
+            fused[n].needs_lines = true;
+            n++;
+        }
+    }
+    *out_count = n;
+    return fused;
+}
+
+/* Apply the label boost and test-file penalty on top of the RRF score. */
+static void apply_rerank(fused_cand_t *fused, int n) {
+    double penalty = rank_test_penalty();
+    for (int i = 0; i < n; i++) {
+        fused[i].score *= label_boost_multiplier(fused[i].label);
+        if (is_test_file(fused[i].file_path)) {
+            fused[i].score *= penalty;
+        }
+    }
+}
+
+static int fused_cmp_desc(const void *a, const void *b) {
+    const fused_cand_t *fa = a;
+    const fused_cand_t *fb = b;
+    if (fa->score < fb->score) {
+        return 1;
+    }
+    if (fa->score > fb->score) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Walk `sorted` (already score-descending) and keep at most `cap_per_file`
+ * entries per file_path, writing kept indices into out_kept (sized >= n).
+ * If the cap leaves fewer than `limit` results, backfill remaining slots
+ * from the suppressed candidates (still in score order) so a heavy cap
+ * never returns fewer results than the caller asked for. cap_per_file <= 0
+ * disables the cap entirely. Returns the number of indices written. */
+static int apply_diversity_cap(const fused_cand_t *sorted, int n, int cap_per_file, int limit,
+                               int *out_kept) {
+    if (cap_per_file <= 0 || n <= 0) {
+        int m = n < limit ? n : limit;
+        for (int i = 0; i < m; i++) {
+            out_kept[i] = i;
+        }
+        return m;
+    }
+    const char **files = malloc((size_t)n * sizeof(char *));
+    int *counts = calloc((size_t)n, sizeof(int));
+    int *overflow = malloc((size_t)n * sizeof(int));
+    if (!files || !counts || !overflow) {
+        free(files);
+        free(counts);
+        free(overflow);
+        int m = n < limit ? n : limit;
+        for (int i = 0; i < m; i++) {
+            out_kept[i] = i;
+        }
+        return m;
+    }
+    int distinct = 0;
+    int overflow_n = 0;
+    int kept = 0;
+    for (int i = 0; i < n && kept < limit; i++) {
+        const char *fp = sorted[i].file_path ? sorted[i].file_path : "";
+        int idx = -1;
+        for (int f = 0; f < distinct; f++) {
+            if (strcmp(files[f], fp) == 0) {
+                idx = f;
+                break;
+            }
+        }
+        if (idx < 0) {
+            idx = distinct++;
+            files[idx] = fp;
+            counts[idx] = 0;
+        }
+        if (counts[idx] < cap_per_file) {
+            counts[idx]++;
+            out_kept[kept++] = i;
+        } else {
+            overflow[overflow_n++] = i;
+        }
+    }
+    for (int i = 0; i < overflow_n && kept < limit; i++) {
+        out_kept[kept++] = overflow[i];
+    }
+    free(files);
+    free(counts);
+    free(overflow);
+    return kept;
+}
+
+/* Runs the BM25 + vector hybrid search for search_graph's `query` path.
+ * Returns the JSON result string, or NULL to signal the caller should fall
+ * through to the regex/label search path (FTS unavailable / no tokens). */
+static char *hybrid_search(cg_store_t *store, const char *project, const char *query,
+                          const char *file_pattern, int limit, int offset) {
+    if (!search_fusion_enabled() || offset > 0) {
+        return bm25_search(store, project, query, file_pattern, limit, offset);
+    }
+
+    int req_limit = limit > 0 ? limit : BM25_DEFAULT_LIMIT;
+    int overfetch = req_limit * CG_HYBRID_OVERFETCH_MULT;
+    if (overfetch > CG_HYBRID_MAX_OVERFETCH) {
+        overfetch = CG_HYBRID_MAX_OVERFETCH;
+    }
+
+    int bcount = 0;
+    int btotal = 0;
+    bm25_candidate_t *bcands =
+        bm25_search_core(store, project, query, file_pattern, overfetch, 0, &bcount, &btotal);
+    if (!bcands) {
+        return NULL; /* FTS unavailable / no usable tokens — fall through */
+    }
+
+    char qbuf[BM25_QUERY_BUF];
+    snprintf(qbuf, sizeof(qbuf), "%s", query);
+    const char *keywords[CG_HYBRID_MAX_KW];
+    int kw_count = split_keywords(qbuf, keywords, CG_HYBRID_MAX_KW);
+
+    cg_vector_result_t *vcands = NULL;
+    int vcount = 0;
+    if (kw_count > 0) {
+        cg_store_vector_search(store, project, keywords, kw_count, overfetch, &vcands, &vcount);
+    }
+
+    if (vcount == 0) {
+        /* No vectors indexed for this project — legacy pure-BM25 output. */
+        char *json = bm25_candidates_to_json(bcands, bcount, btotal, offset, req_limit, "bm25");
+        bm25_candidates_free(bcands, bcount);
+        return json;
+    }
+
+    int fused_count = 0;
+    fused_cand_t *fused = fuse_candidates(bcands, bcount, vcands, vcount, &fused_count);
+    if (!fused) {
+        char *json = bm25_candidates_to_json(bcands, bcount, btotal, offset, req_limit, "bm25");
+        bm25_candidates_free(bcands, bcount);
+        cg_store_free_vector_results(vcands, vcount);
+        return json;
+    }
+    apply_rerank(fused, fused_count);
+    qsort(fused, (size_t)fused_count, sizeof(fused_cand_t), fused_cmp_desc);
+
+    int *kept = malloc((size_t)fused_count * sizeof(int));
+    int kept_n = kept ? apply_diversity_cap(fused, fused_count, rank_file_cap(), req_limit, kept)
+                      : 0;
+
+    /* Hydrate line numbers for the (small) subset of kept results that only
+     * came from the vector leg and therefore lack real start/end lines. */
+    cg_node_t *hydrated = kept_n > 0 ? calloc((size_t)kept_n, sizeof(cg_node_t)) : NULL;
+    for (int i = 0; i < kept_n; i++) {
+        fused_cand_t *fc = &fused[kept[i]];
+        if (fc->needs_lines && hydrated &&
+            cg_store_find_node_by_id(store, fc->node_id, &hydrated[i]) == CG_STORE_OK) {
+            fc->start_line = hydrated[i].start_line;
+            fc->end_line = hydrated[i].end_line;
+        }
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    int total_for_output = fused_count > btotal ? fused_count : btotal;
+    yyjson_mut_obj_add_int(doc, root, "total", total_for_output);
+    yyjson_mut_obj_add_str(doc, root, "search_mode", "hybrid");
+    yyjson_mut_val *results = yyjson_mut_arr(doc);
+    for (int i = 0; i < kept_n; i++) {
+        fused_cand_t *fc = &fused[kept[i]];
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, item, "name", fc->name ? fc->name : "");
+        yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                               fc->qualified_name ? fc->qualified_name : "");
+        yyjson_mut_obj_add_str(doc, item, "label", fc->label ? fc->label : "");
+        yyjson_mut_obj_add_str(doc, item, "file_path", fc->file_path ? fc->file_path : "");
+        yyjson_mut_obj_add_int(doc, item, "start_line", fc->start_line);
+        yyjson_mut_obj_add_int(doc, item, "end_line", fc->end_line);
+        yyjson_mut_obj_add_real(doc, item, "rank", fc->score);
+        yyjson_mut_arr_add_val(results, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "results", results);
+    yyjson_mut_obj_add_bool(doc, root, "has_more", fused_count > kept_n);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+
+    if (hydrated) {
+        for (int i = 0; i < kept_n; i++) {
+            cg_node_free_fields(&hydrated[i]);
+        }
+        free(hydrated);
+    }
+    free(kept);
+    free(fused);
+    bm25_candidates_free(bcands, bcount);
+    cg_store_free_vector_results(vcands, vcount);
     return json;
 }
 
@@ -1580,22 +2083,23 @@ static char *handle_search_graph(cg_mcp_server_t *srv, const char *args) {
         return not_indexed;
     }
 
-    /* BM25 path: if `query` is set, run FTS5 full-text search with ranking
-     * and return early.  The regex/vector path below is untouched for all
-     * other callers.  If FTS5 is unavailable or the query is empty after
-     * tokenization, fall through to the regex path. */
+    /* Hybrid path: if `query` is set, run BM25 + vector fusion (see
+     * hybrid_search above) and return early.  The regex/vector path below is
+     * untouched for all other callers.  If FTS5 is unavailable or the query
+     * is empty after tokenization, fall through to the regex path. */
     char *query = cg_mcp_get_string_arg(args, "query");
     if (query && query[0]) {
         int q_limit = cg_mcp_get_int_arg(args, "limit", BM25_DEFAULT_LIMIT);
         int q_offset = cg_mcp_get_int_arg(args, "offset", 0);
         char *q_file_pattern = cg_mcp_get_string_arg(args, "file_pattern");
-        char *bm25_json = bm25_search(store, project, query, q_file_pattern, q_limit, q_offset);
+        char *hybrid_json =
+            hybrid_search(store, project, query, q_file_pattern, q_limit, q_offset);
         free(q_file_pattern);
-        if (bm25_json) {
+        if (hybrid_json) {
             free(query);
             free(project);
-            char *result = cg_mcp_text_result(bm25_json, false);
-            free(bm25_json);
+            char *result = cg_mcp_text_result(hybrid_json, false);
+            free(hybrid_json);
             return result;
         }
     }
@@ -2295,16 +2799,6 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
     }
     *out_count = n_defaults;
     return NULL;
-}
-
-/* Check if a file path looks like a test file. */
-static bool is_test_file(const char *path) {
-    if (!path) {
-        return false;
-    }
-    return strstr(path, "/test") != NULL || strstr(path, "test_") != NULL ||
-           strstr(path, "_test.") != NULL || strstr(path, "/tests/") != NULL ||
-           strstr(path, "/spec/") != NULL || strstr(path, ".test.") != NULL;
 }
 
 /* Convert BFS traversal results into a yyjson_mut array. */
@@ -4632,12 +5126,72 @@ static char *handle_find_symbol(cg_mcp_server_t *srv, const char *args) {
     return res;
 }
 
+/* Same per-file diversity cap as apply_diversity_cap, but operating directly
+ * on a cg_vector_result_t array (already score-descending from
+ * cg_store_vector_search) so handle_search_semantic doesn't need to build a
+ * fused_cand_t view just to cap its own single-leg results. */
+static int apply_diversity_cap_vec(const cg_vector_result_t *sorted, int n, int cap_per_file,
+                                   int limit, int *out_kept) {
+    if (cap_per_file <= 0 || n <= 0) {
+        int m = n < limit ? n : limit;
+        for (int i = 0; i < m; i++) {
+            out_kept[i] = i;
+        }
+        return m;
+    }
+    const char **files = malloc((size_t)n * sizeof(char *));
+    int *counts = calloc((size_t)n, sizeof(int));
+    int *overflow = malloc((size_t)n * sizeof(int));
+    if (!files || !counts || !overflow) {
+        free(files);
+        free(counts);
+        free(overflow);
+        int m = n < limit ? n : limit;
+        for (int i = 0; i < m; i++) {
+            out_kept[i] = i;
+        }
+        return m;
+    }
+    int distinct = 0;
+    int overflow_n = 0;
+    int kept = 0;
+    for (int i = 0; i < n && kept < limit; i++) {
+        const char *fp = sorted[i].file_path ? sorted[i].file_path : "";
+        int idx = -1;
+        for (int f = 0; f < distinct; f++) {
+            if (strcmp(files[f], fp) == 0) {
+                idx = f;
+                break;
+            }
+        }
+        if (idx < 0) {
+            idx = distinct++;
+            files[idx] = fp;
+            counts[idx] = 0;
+        }
+        if (counts[idx] < cap_per_file) {
+            counts[idx]++;
+            out_kept[kept++] = i;
+        } else {
+            overflow[overflow_n++] = i;
+        }
+    }
+    for (int i = 0; i < overflow_n && kept < limit; i++) {
+        out_kept[kept++] = overflow[i];
+    }
+    free(files);
+    free(counts);
+    free(overflow);
+    return kept;
+}
+
 static char *handle_search_semantic(cg_mcp_server_t *srv, const char *args) {
     char *project = cg_mcp_get_string_arg(args, "project");
     cg_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
     char *query = cg_mcp_get_string_arg(args, "query");
     int limit = cg_mcp_get_int_arg(args, "limit", 10);
+    int eff_limit = limit > 0 ? limit : 10;
 
     /* Split the query into up to 16 whitespace-separated keywords. */
     const char *keywords[16];
@@ -4645,34 +5199,41 @@ static char *handle_search_semantic(cg_mcp_server_t *srv, const char *args) {
     char qbuf[512];
     if (query) {
         snprintf(qbuf, sizeof(qbuf), "%s", query);
-        char *save = NULL;
-        for (char *t = strtok_r(qbuf, " \t\r\n", &save); t && kw < 16;
-             t = strtok_r(NULL, " \t\r\n", &save)) {
-            keywords[kw++] = t;
-        }
+        kw = split_keywords(qbuf, keywords, 16);
+    }
+    /* Overfetch so the diversity cap below has room to swap in results from
+     * other files instead of just truncating the top-scoring file's hits. */
+    int overfetch = eff_limit * CG_HYBRID_OVERFETCH_MULT;
+    if (overfetch > CG_HYBRID_MAX_OVERFETCH) {
+        overfetch = CG_HYBRID_MAX_OVERFETCH;
     }
     cg_vector_result_t *res = NULL;
     int rc_count = 0;
-    cg_store_vector_search(store, project, keywords, kw, limit, &res, &rc_count);
+    cg_store_vector_search(store, project, keywords, kw, overfetch, &res, &rc_count);
+
+    int *kept = rc_count > 0 ? malloc((size_t)rc_count * sizeof(int)) : NULL;
+    int kept_n = kept ? apply_diversity_cap_vec(res, rc_count, rank_file_cap(), eff_limit, kept)
+                     : 0;
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "method", "ri-vector");
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
-    for (int i = 0; i < rc_count; i++) {
+    for (int i = 0; i < kept_n; i++) {
+        cg_vector_result_t *r = &res[kept[i]];
         yyjson_mut_val *o = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, o, "name", res[i].name ? res[i].name : "");
-        yyjson_mut_obj_add_str(doc, o, "qualified_name",
-                               res[i].qualified_name ? res[i].qualified_name : "");
-        yyjson_mut_obj_add_str(doc, o, "file", res[i].file_path ? res[i].file_path : "");
-        yyjson_mut_obj_add_real(doc, o, "score", res[i].score);
+        yyjson_mut_obj_add_str(doc, o, "name", r->name ? r->name : "");
+        yyjson_mut_obj_add_str(doc, o, "qualified_name", r->qualified_name ? r->qualified_name : "");
+        yyjson_mut_obj_add_str(doc, o, "file", r->file_path ? r->file_path : "");
+        yyjson_mut_obj_add_real(doc, o, "score", r->score);
         yyjson_mut_arr_add_val(arr, o);
     }
     yyjson_mut_obj_add_val(doc, root, "results", arr);
-    yyjson_mut_obj_add_int(doc, root, "count", rc_count);
+    yyjson_mut_obj_add_int(doc, root, "count", kept_n);
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    free(kept);
     if (res) {
         cg_store_free_vector_results(res, rc_count);
     }
@@ -4882,6 +5443,9 @@ char *cg_mcp_handle_tool(cg_mcp_server_t *srv, const char *tool_name, const char
     }
     if (strcmp(tool_name, "get_architecture") == 0) {
         return handle_get_architecture(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_layout") == 0) {
+        return handle_get_layout(srv, args_json);
     }
 
     /* Pipeline-dependent tools */

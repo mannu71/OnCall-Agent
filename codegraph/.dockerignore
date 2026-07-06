@@ -1,4 +1,2 @@
-graph-ui/node_modules
-graph-ui/dist
 build
 **/*.o

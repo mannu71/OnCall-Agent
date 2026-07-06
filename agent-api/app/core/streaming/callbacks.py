@@ -61,14 +61,19 @@ class StreamCallback(Protocol):
         self,
         tool_name: str,
         result: str,
-        duration: Optional[float] = None
+        duration: Optional[float] = None,
+        failed: bool = False
     ) -> None:
         """Called when tool execution completes.
-        
+
         Args:
             tool_name: Name of the tool that completed
             result: Tool execution result (may be truncated for display)
             duration: Optional execution duration in seconds
+            failed: Content-based failure classification (classify_tool_failure),
+                    not just "the call completed without raising" — a tool can
+                    return normally while its content reports an error (e.g. a
+                    DB connection-refused message).
         """
         ...
     
@@ -211,27 +216,32 @@ class LoggingStreamCallback:
         self,
         tool_name: str,
         result: str,
-        duration: Optional[float] = None
+        duration: Optional[float] = None,
+        failed: bool = False
     ) -> None:
         """Log tool result completion.
-        
+
         Args:
             tool_name: Name of the tool that completed
             result: Tool execution result (truncated for logging)
             duration: Optional execution duration in seconds
+            failed: Content-based failure classification from the caller
+                    (classify_tool_failure). ORed with the local
+                    _looks_like_error heuristic so a caller that hasn't been
+                    updated to pass this yet keeps today's behavior.
         """
         # Truncate result for logging
         result_preview = result[:200] if result else ""
         if len(result) > 200:
             result_preview += "..."
-        
+
         # Format duration if provided
         duration_str = f" ({duration:.1f}s)" if duration is not None else ""
-        
+
         # Format log message based on TTY mode
         if self.tty_mode:
             # TTY mode: use emoji indicators
-            if self._looks_like_error(result):
+            if failed or self._looks_like_error(result):
                 emoji = "❌"
             else:
                 emoji = "✅"

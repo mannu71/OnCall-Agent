@@ -1,0 +1,217 @@
+"""Runtime-editable feature-flag overlay.
+
+Feature flags are declared in ``app.config.Settings`` and default from environment
+variables. This module lets an operator override them at runtime from the Settings
+UI without a container restart, following the same persist-then-apply pattern used
+for the global timezone (``app.core.app_timezone``):
+
+  * Overrides are stored in the generic ``app_settings`` key/value table under the
+    ``flag:`` prefix (migration 011 — no new table needed).
+  * On startup (and on every write) the stored overrides are applied in-place to
+    the process-wide ``settings`` singleton, so all existing ``settings.<flag>``
+    reads transparently see the effective value.
+
+Single-worker assumption: the shipped deployment runs ``UVICORN_WORKERS=1``, so the
+singleton is the source of truth. If multiple workers are ever enabled, a write in
+one worker won't propagate to the others until they reload — acceptable for these
+opt-in toggles, and callable via ``load_overlay()`` on demand.
+
+Infrastructure/security/startup-only flags (API auth, secrets manager, OTEL,
+startup indexing recovery, supervisor HITL) are intentionally NOT exposed here —
+they must stay environment-controlled.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional
+
+from app.config import settings
+from app.infrastructure.persistence import app_settings_repository
+
+logger = logging.getLogger(__name__)
+
+_DB_PREFIX = "flag:"
+
+# Declarative catalog. ``key`` matches a ``Settings`` attribute exactly; ``type``
+# drives coercion + the UI control. Grouped for display. Keep this list as the
+# single source of truth — the API and UI both render from it.
+FLAG_CATALOG: List[Dict[str, Any]] = [
+    # ── Tool-output compression ──
+    {"key": "compression_enabled", "type": "bool", "group": "Compression",
+     "label": "Compress MCP tool output",
+     "help": "Send large MCP tool results through the compression sidecar before they enter context."},
+    {"key": "compression_all_tools", "type": "bool", "group": "Compression",
+     "label": "Compress all tool output",
+     "help": "Extend compression to non-MCP tools (CloudWatch, DB, crawler). Biggest win for log-heavy runs."},
+    {"key": "compression_min_chars", "type": "int", "group": "Compression",
+     "label": "Min chars to compress",
+     "help": "Outputs below this size skip compression (they gain little and add latency)."},
+    {"key": "compression_timeout_ms", "type": "int", "group": "Compression",
+     "label": "Sidecar timeout (ms)",
+     "help": "Hard timeout for one compress call; on expiry it falls back to truncation."},
+    {"key": "compression_max_retries", "type": "int", "group": "Compression",
+     "label": "Sidecar retries",
+     "help": "Retries on transient sidecar errors. Keep low — the truncation fallback is always correct."},
+    {"key": "compression_model_hint", "type": "str", "group": "Compression",
+     "label": "Tokenizer model hint",
+     "help": "Model id the sidecar uses to pick a tokenizer. Leave blank for the neutral default."},
+
+    # ── Memory & learning ──
+    {"key": "semantic_memory_enabled", "type": "bool", "group": "Memory & learning",
+     "label": "Semantic memory recall",
+     "help": "Retrieve bank-scoped semantic memories (hybrid FTS+vector) per turn."},
+    {"key": "memory_fact_extraction_enabled", "type": "bool", "group": "Memory & learning",
+     "label": "Durable-fact extraction",
+     "help": "After each turn, extract a few durable facts into semantic memory."},
+    {"key": "memory_audit_enabled", "type": "bool", "group": "Memory & learning",
+     "label": "Memory audit / consolidation",
+     "help": "Let the curator run LLM consolidation of stored memories."},
+    {"key": "pinned_facts_enabled", "type": "bool", "group": "Memory & learning",
+     "label": "Pinned facts",
+     "help": "Inject the operator-pinned facts memory tier into context."},
+    {"key": "metamemory_enabled", "type": "bool", "group": "Memory & learning",
+     "label": "Metamemory summary",
+     "help": "Let the agent maintain a context summary that supersedes LLM compaction."},
+    {"key": "context_references_enabled", "type": "bool", "group": "Memory & learning",
+     "label": "Context references",
+     "help": "Attach node-driven context references to the run."},
+
+    # ── Agent behaviour ──
+    {"key": "agent_planning_enabled", "type": "bool", "group": "Agent behaviour",
+     "label": "Plan → execute → verify",
+     "help": "Add the planning discipline and planning tools to the system prompt."},
+    {"key": "skill_rag_selection_enabled", "type": "bool", "group": "Agent behaviour",
+     "label": "RAG skill selection",
+     "help": "Select relevant skills via retrieval instead of always injecting all."},
+    {"key": "pii_pseudonymization_enabled", "type": "bool", "group": "Agent behaviour",
+     "label": "PII pseudonymization",
+     "help": "Pseudonymize PII in flagship/KYC flows before it reaches the model."},
+    {"key": "vfs_session_persistence_enabled", "type": "bool", "group": "Agent behaviour",
+     "label": "Persist virtual filesystem",
+     "help": "Keep the agent's virtual filesystem across turns in a session."},
+
+    # ── Reliability ──
+    {"key": "routing_fallback_enabled", "type": "bool", "group": "Reliability",
+     "label": "Model routing fallback",
+     "help": "On Bedrock errors, fall back across credential/region/model chains."},
+
+    # ── Self-improvement & governance ──
+    {"key": "self_improvement_enabled", "type": "bool", "group": "Self-improvement & governance",
+     "label": "Self-improvement analyzer",
+     "help": "Compute hill-climbing improvement signals from run history."},
+    {"key": "hillclimb_apply_enabled", "type": "bool", "group": "Self-improvement & governance",
+     "label": "Apply improvement proposals",
+     "help": "Allow accepted improvement proposals to be applied automatically."},
+    {"key": "governance_conversion_enabled", "type": "bool", "group": "Self-improvement & governance",
+     "label": "Recurring-failure governance",
+     "help": "Convert recurring tool failures into governance/eval proposals."},
+    {"key": "token_economy_enabled", "type": "bool", "group": "Self-improvement & governance",
+     "label": "Token economy (delegation budgets)",
+     "help": "Grant per-branch token budgets to delegated subagents."},
+
+    # ── Chat history & telemetry ──
+    {"key": "chat_tool_history_max_tokens", "type": "int", "group": "Chat history & telemetry",
+     "label": "Chat tool-replay budget (tokens)",
+     "help": "How many tokens of prior tool activity to replay on a follow-up question."},
+    {"key": "chat_tool_history_max_executions", "type": "int", "group": "Chat history & telemetry",
+     "label": "Chat tool-replay executions",
+     "help": "Max prior tool executions replayed on a follow-up question."},
+    {"key": "step_events_enabled", "type": "bool", "group": "Chat history & telemetry",
+     "label": "Per-step telemetry events",
+     "help": "Record per-turn/per-tool step events (batched at run end)."},
+]
+
+_CATALOG_BY_KEY = {spec["key"]: spec for spec in FLAG_CATALOG}
+
+# Pristine environment/default values, snapshotted at import BEFORE any overlay is
+# applied, so the UI can offer "reset to default".
+_DEFAULTS: Dict[str, Any] = {spec["key"]: getattr(settings, spec["key"]) for spec in FLAG_CATALOG}
+
+
+def _coerce(spec: Dict[str, Any], raw: Any) -> Any:
+    t = spec["type"]
+    if t == "bool":
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    if t == "int":
+        return int(raw)
+    return "" if raw is None else str(raw)
+
+
+def _apply(key: str, value: Any) -> None:
+    setattr(settings, key, value)
+
+
+async def load_overlay() -> Dict[str, Any]:
+    """Read stored overrides and apply them to the settings singleton.
+
+    Best-effort: a failure here must never block startup. Returns the applied
+    overrides (for logging/inspection).
+    """
+    applied: Dict[str, Any] = {}
+    try:
+        stored = await app_settings_repository.all()
+    except Exception as exc:  # noqa: BLE001 — settings overlay must not block startup
+        logger.warning("feature_flags: could not load overrides (%s)", exc)
+        return applied
+
+    for db_key, raw in stored.items():
+        if not db_key.startswith(_DB_PREFIX):
+            continue
+        key = db_key[len(_DB_PREFIX):]
+        spec = _CATALOG_BY_KEY.get(key)
+        if spec is None:
+            continue
+        try:
+            value = _coerce(spec, raw)
+            _apply(key, value)
+            applied[key] = value
+        except Exception as exc:  # noqa: BLE001 — skip a bad row, keep the rest
+            logger.warning("feature_flags: skipping bad override %s=%r (%s)", key, raw, exc)
+
+    if applied:
+        logger.info("feature_flags: applied %d runtime override(s): %s",
+                    len(applied), ", ".join(f"{k}={v!r}" for k, v in applied.items()))
+    return applied
+
+
+async def set_flags(updates: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Persist and apply a batch of flag updates. Returns the new effective list.
+
+    A value of ``None`` clears the override and restores the environment default.
+    Unknown keys are rejected (ValueError) so the API returns 400.
+    """
+    for key in updates:
+        if key not in _CATALOG_BY_KEY:
+            raise ValueError(f"Unknown feature flag: {key!r}")
+
+    for key, raw in updates.items():
+        spec = _CATALOG_BY_KEY[key]
+        db_key = f"{_DB_PREFIX}{key}"
+        if raw is None:
+            await app_settings_repository.set(db_key, "")  # tombstone → treat as default
+            _apply(key, _DEFAULTS[key])
+            continue
+        value = _coerce(spec, raw)
+        await app_settings_repository.set(db_key, str(value))
+        _apply(key, value)
+
+    return effective()
+
+
+def effective() -> List[Dict[str, Any]]:
+    """Return the catalog annotated with current value + environment default."""
+    out: List[Dict[str, Any]] = []
+    for spec in FLAG_CATALOG:
+        key = spec["key"]
+        out.append({
+            "key": key,
+            "label": spec["label"],
+            "group": spec["group"],
+            "type": spec["type"],
+            "help": spec["help"],
+            "value": getattr(settings, key),
+            "default": _DEFAULTS[key],
+        })
+    return out

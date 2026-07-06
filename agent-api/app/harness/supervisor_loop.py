@@ -16,16 +16,39 @@ built and run:
 """
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from app.core.supervisor import SupervisorAction
+from app.harness.helpers import estimate_confidence
+from app.harness.hitl import emit_hitl_pause
 
-# NOTE: ``emit_hitl_pause`` and ``estimate_confidence`` are imported lazily inside
-# ``run_supervised`` — importing them at module load creates a cycle
-# (harness.supervisor_loop → strategies.react.hitl → strategies/__init__ →
-#  strategies.react.strategy → harness.supervisor_loop).
+
+async def _record_supervisor_reward(execution_id: Optional[str], score: Any) -> None:
+    """Best-effort late-bound reward: attach the supervisor's quality score
+    to the run's trajectory_events (see ``append_reward_for_trace``).
+
+    Gated on ``settings.step_events_enabled`` — a no-op trace (nothing
+    recorded) is expected whenever step events are off, so this never
+    raises and never logs above debug in that case.
+    """
+    if not execution_id:
+        return
+    try:
+        from app.config import settings
+        if not bool(getattr(settings, "step_events_enabled", False)):
+            return
+        from app.infrastructure.persistence import trajectory_event_repository
+        await trajectory_event_repository.append_reward_for_trace(
+            execution_id, "supervisor_score", score,
+        )
+    except Exception as exc:  # noqa: BLE001 — reward recording must never break a run
+        logging.getLogger(__name__).debug(
+            "supervisor_loop: reward recording skipped for execution_id=%s (%s)",
+            execution_id, exc,
+        )
 
 
 async def run_supervised(
@@ -47,10 +70,6 @@ async def run_supervised(
     already the non-cached portion — cache_read/cache_creation are additional,
     not a subset of it (see ``TokenUsageCallback`` in ``core/streaming/callbacks.py``).
     """
-    # Lazy imports to avoid the import cycle documented at module top.
-    from app.workflow.strategies.react.helpers import estimate_confidence
-    from app.workflow.strategies.react.hitl import emit_hitl_pause
-
     supervisor_retry_count = 0
     current_query = base_query
     result: Dict[str, Any] = {}
@@ -124,6 +143,7 @@ async def run_supervised(
             retry_count=supervisor_retry_count,
             messages=result.get("messages", []),
         )
+        await _record_supervisor_reward(execution_id, verdict.score)
 
         if verdict.action == SupervisorAction.PASS:
             break

@@ -103,7 +103,7 @@ def register_schema(name: str, model: Type[BaseModel]) -> None:
 
 
 def resolve_output_schema(name: Optional[str]) -> Type[BaseModel]:
-    """Resolve a schema name to a Pydantic model, defaulting to InvestigationReport.
+    """Resolve a schema name to a Pydantic model, defaulting to GenericReport.
 
     Unknown names fall back to the default so a bad config never breaks a run.
     """

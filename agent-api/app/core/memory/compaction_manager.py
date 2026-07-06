@@ -178,6 +178,19 @@ class ContextCompactionManager:
         """Estimate total tokens for a message list (chars/4 heuristic)."""
         return sum(_msg_token_estimate(m) for m in messages)
 
+    @property
+    def compaction_threshold_tokens(self) -> int:
+        """The hard threshold (default 85% of budget) that triggers the
+        expensive LLM-summary tier. Read-only; purely additive so external
+        callers (e.g. app.harness.engine.compression's metamemory pre-check)
+        can mirror compact_if_needed's own gate without duplicating the
+        window/reserve/fraction math."""
+        return self._compaction_threshold
+
+    @property
+    def keep_recent_tokens(self) -> int:
+        return self._keep_recent_tokens
+
     async def compact_if_needed(
         self,
         messages: List[BaseMessage],
@@ -206,7 +219,7 @@ class ContextCompactionManager:
             )
             return messages
 
-        from app.workflow.strategies.react.helpers import compact_input_state
+        from app.harness.helpers import compact_input_state
         micro_messages = compact_input_state({"messages": messages})["messages"]
         micro_total = self.estimate_tokens(micro_messages) if micro_messages is not messages else total
 

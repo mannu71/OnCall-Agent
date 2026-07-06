@@ -22,7 +22,7 @@ from app.harness.spec import AgentSpec
 from app.harness.spec_factory import build_agent_spec, resolve_profile_fields
 from app.harness.tool_assembler import add_extension_tools, assemble_base_tools
 from app.workflow.execution_port import ExecutionPort
-from app.workflow.strategies.react.hitl import make_checkpointer
+from app.harness.hitl import make_checkpointer
 from app.workflow.strategies.react.llm_factory import build_llm
 from app.workflow.strategies.react.streaming import StreamCallback
 from app.workflow.llm_config import resolve_llm_config_for_consumer_port
@@ -58,6 +58,7 @@ class RunPlan:
     recall_hits: int
     selected_skills: List[str]
     code_analyzer_config: Dict[str, Any]
+    conversation_history: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
@@ -115,6 +116,15 @@ async def build_run_plan(
         logger.warning("ReactStrategy: profile merge skipped (%s)", _prof_err)
 
     llm_config = await resolve_llm_config_for_workflow(workflow)
+
+    # Tag the stream callback with the main agent's resolved model so the chat
+    # can show which model ran each tool call (delegated subagents override this
+    # per-event with their own model). Best-effort — never breaks a run.
+    if stream_callback is not None:
+        try:
+            setattr(stream_callback, "model_name", llm_config.get("model") or "")
+        except Exception:  # noqa: BLE001
+            pass
 
     # Node-level gateway: resolve the model wired to the Code Crawler
     # node's dedicated ``lm`` port. Optional — when unwired it defaults
@@ -204,6 +214,24 @@ async def build_run_plan(
             except Exception:  # noqa: BLE001
                 pass
 
+    # Tool-inclusive chat history replay: a follow-up turn's history
+    # normally carries only user/assistant TEXT (see build_initial_messages),
+    # so a follow-up re-runs every tool from scratch. When this run is
+    # chat-triggered, rebuild the session's history from prior turns'
+    # persisted trajectories (tool_calls + tool_results included) instead of
+    # the UI's text-only ``history``. Fails open: any error or a non-chat
+    # run leaves ``conversation_history`` None, and the caller (executor.py)
+    # falls back to ``context.inputs.history`` exactly as today.
+    _chat_session_id = (context.get("inputs") or {}).get("_chat_session_id")
+    conversation_history: Optional[List[Dict[str, Any]]] = None
+    if _chat_session_id:
+        from app.harness.chat_history import rebuild_chat_history
+        conversation_history = await rebuild_chat_history(
+            _chat_session_id,
+            current_user_query=user_query,
+            logger_instance=logger_instance,
+        )
+
     # Expand @file / @folder / @url / @git references in the query into
     # inline context (best-effort, no-op when none present). File access
     # is restricted to the configured root for safety.
@@ -242,7 +270,7 @@ async def build_run_plan(
 
     # Prepend a knowledge-base recall block (similar past issues /
     # patterns / skills) so the agent starts with institutional memory.
-    _has_history = bool((context.get("inputs") or {}).get("history"))
+    _has_history = bool(conversation_history or (context.get("inputs") or {}).get("history"))
     augmented_query, recall_hits, selected_skills = await build_recall_query(
         user_query=user_query,
         cloudwatch_config=cloudwatch_config,
@@ -332,6 +360,23 @@ async def build_run_plan(
         execution_id=execution_id,
         logger_instance=logger_instance,
     )
+    # Metamemory: hydrate this execution's VFS from the chat session's
+    # persisted metamemory (opt-in, postgres-backend only — a no-op
+    # otherwise), then seed /plan.txt, /milestones.txt, /context_summary.txt
+    # if still absent (add_extension_tools already bound the VFS session
+    # above when the filesystem profile flag is on). Idempotent — a
+    # hydrated or resumed session with existing files is left untouched.
+    # Off by default; requires both the global flag and the profile's
+    # filesystem flag.
+    try:
+        from app.harness import metamemory as _metamemory
+        from app.harness.spec_factory import resolve_profile_fields as _resolve_profile_fields
+        _mm_flags = _resolve_profile_fields(agent_config)
+        if _metamemory.is_active(bool(_mm_flags.get("filesystem"))):
+            await _metamemory.sync_session_persistence_in(execution_id, _chat_session_id)
+            await _metamemory.seed_if_absent(execution_id, user_query)
+    except Exception as _mm_err:  # noqa: BLE001 — metamemory must never break a run
+        logger_instance.warning("ReactStrategy: metamemory seed skipped (%s)", _mm_err)
     # Pseudonymize coroutine-tool output before it re-enters the LLM (MCP
     # tools are scrubbed at their own choke point). No-op when disabled.
     tools = wrap_tools_with_pseudonymization(tools)
@@ -373,6 +418,7 @@ async def build_run_plan(
         recall_hits=recall_hits,
         selected_skills=selected_skills,
         code_analyzer_config=code_analyzer_config,
+        conversation_history=conversation_history,
     )
 
 

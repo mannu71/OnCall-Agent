@@ -2,6 +2,7 @@ export const queryKeys = {
   workflows: ['workflows'],
   activeWorkflows: ['workflows', 'active'],
   settings: ['settings'],
+  featureFlags: ['settings', 'features'],
   status: ['status'],
   health: ['health'],
   mcp: ['mcp'],

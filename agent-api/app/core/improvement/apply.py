@@ -5,6 +5,9 @@ an ImprovementReport into live actions:
 
   skill        → create a confidence-gated draft skill (curator promotes later)
   reliability  → logged as a structured audit event (no silent state change)
+  eval         → mark the source failure_ledger fingerprint 'converted'
+                 (bookkeeping only — see app.core.improvement.analyzer.
+                 convert_recurring_failures; never fabricates eval assertions)
 
 'prompt' and 'policy' proposals are always left as human-reviewed drafts
 because the system-prompt CACHE CONTRACT makes auto-editing off-limits and
@@ -24,7 +27,7 @@ from app.core.improvement.analyzer import ImprovementReport
 
 logger = logging.getLogger(__name__)
 
-_SAFE_KINDS = frozenset({"skill", "reliability"})
+_SAFE_KINDS = frozenset({"skill", "reliability", "eval"})
 
 
 def _eligible(proposals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -95,6 +98,8 @@ async def apply_proposals(
                 ok = await _apply_skill_proposal(proposal)
             elif kind == "reliability":
                 ok = await _apply_reliability_proposal(proposal)
+            elif kind == "eval":
+                ok = await _apply_eval_proposal(proposal)
             else:
                 ok = False
 
@@ -188,3 +193,29 @@ async def _apply_reliability_proposal(proposal: Dict[str, Any]) -> bool:
         (proposal.get("suggestion") or "")[:120],
     )
     return True
+
+
+async def _apply_eval_proposal(proposal: Dict[str, Any]) -> bool:
+    """Mark the source failure_ledger fingerprint 'converted' (bookkeeping
+    only). See app.core.improvement.analyzer.convert_recurring_failures —
+    an 'eval'-kind proposal's control_ref is always the fingerprint; the
+    actual regression case/policy/selftest still needs a human to author,
+    the suggestion text describes what to do. Marking it converted stops it
+    from re-proposing on every analyze_recent() run.
+    """
+    fingerprint = proposal.get("control_ref")
+    if not fingerprint:
+        return False
+    try:
+        from app.infrastructure.persistence import failure_ledger_repository
+        await failure_ledger_repository.mark_converted(
+            fingerprint, control_ref=f"proposal:{proposal.get('target', '')}",
+        )
+        logger.info(
+            "apply_proposals [eval]: marked failure_ledger fingerprint '%s' converted",
+            fingerprint,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("apply_proposals [eval]: skipped (%s)", exc)
+        return False

@@ -14,10 +14,30 @@ from app.workflow.executor.handlers.cloudwatch import _read_cw_config
 logger = logging.getLogger(__name__)
 
 def extract_agent_config(workflow: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract agent node configuration from workflow."""
+    """Extract agent node configuration from workflow.
+
+    Nodes ship in two dialects: legacy config lives under ``node['data']`` while
+    the LangflowEditor writes config to the node's top-level ``node['params']``.
+    A ``params``-dialect agent node has no ``data`` at all, so reading only
+    ``data`` silently dropped the ENTIRE agent profile (subagents, planning,
+    role prompt, instructions, output schema) — e.g. a squad's ``subagents`` was
+    never seen, so no delegate tool was built and squad tools leaked onto the
+    main agent. Merge both dialects: ``data`` wins on key conflicts (explicit
+    legacy override) and a ``params`` key is preserved so callers that look one
+    level deeper (``resolve_profile_fields`` reads ``cfg['params'][k]``) keep
+    working.
+    """
     nodes = workflow.get("nodes", [])
     agent_node = next((n for n in nodes if n.get("type") == "agent"), None)
-    return agent_node.get("data", {}) if agent_node else {}
+    if not agent_node:
+        return {}
+    data = agent_node.get("data") or {}
+    params = agent_node.get("params") or {}
+    if not params:
+        return data
+    merged = {**params, **data}
+    merged.setdefault("params", params)
+    return merged
 
 def find_agent_node_id(workflow: Dict[str, Any]) -> Optional[str]:
     """Return the id of the first ``agent`` node (or None)."""
@@ -68,6 +88,15 @@ async def resolve_llm_config_for_workflow(workflow: Dict[str, Any]) -> Dict[str,
 # share one definition.
 MEMORY_NODE_TYPES = ("vector_memory", "memory")
 
+# Shared "resource provider" nodes: a Language Model or Memory node wired into a
+# consumer's optional ``lm``/``memory`` port. The connectivity BFS may LAND on
+# one (to detect a direct agent↔resource link) but must never traverse THROUGH
+# it. A model/memory node shared between the agent and a tool node's ``lm`` port
+# would otherwise bridge that tool onto the agent even though the user never
+# wired it to the agent's tools port — the reported bug where an agent sharing a
+# multi-model node with an unwired Code Search node still bound codegraph tools.
+RESOURCE_NODE_TYPES = tuple(dict.fromkeys(LLM_NODE_TYPES + MEMORY_NODE_TYPES))
+
 
 def has_memory_node(workflow: Dict[str, Any]) -> bool:
     """True when a Memory node is connected to the agent (drives ``spec.memory``)."""
@@ -104,16 +133,28 @@ def get_connected_node_ids(
     if not agent_ids or not target_ids:
         return []
 
-    # Build undirected adjacency.
-    neighbours: Dict[str, set] = {}
-    for edge in edges:
-        src = edge.get("source")
-        tgt = edge.get("target")
-        if src and tgt:
-            neighbours.setdefault(src, set()).add(tgt)
-            neighbours.setdefault(tgt, set()).add(src)
+    node_type = {n.get("id"): n.get("type") for n in nodes if n.get("id")}
 
-    # BFS from every agent node.
+    # Build undirected adjacency from edges PLUS ``parentId`` containment: a squad
+    # member carries ``parentId`` = its ``subagent_window`` frame (no edge), and
+    # the frame has a real edge to the agent's Subagents port — so a contained
+    # tool node is reachable agent → frame → member and its config still gets
+    # built (it's scoped to the delegate child later by strict scoping).
+    neighbours: Dict[str, set] = {}
+
+    def _link(a: Optional[str], b: Optional[str]) -> None:
+        if a and b:
+            neighbours.setdefault(a, set()).add(b)
+            neighbours.setdefault(b, set()).add(a)
+
+    for edge in edges:
+        _link(edge.get("source"), edge.get("target"))
+    for n in nodes:
+        _link(n.get("id"), n.get("parentId"))
+
+    # BFS from every agent node. A resource node (shared LM/memory) is recorded
+    # if it is itself a target, but we never expand its neighbours — see
+    # RESOURCE_NODE_TYPES. Agent start nodes always expand (never resource types).
     visited: set = set()
     queue = list(agent_ids)
     connected: List[str] = []
@@ -125,6 +166,8 @@ def get_connected_node_ids(
         visited.add(current)
         if current in target_ids:
             connected.append(current)
+        if current not in agent_ids and node_type.get(current) in RESOURCE_NODE_TYPES:
+            continue  # do not bridge through a shared resource provider
         for neighbour in neighbours.get(current, set()):
             if neighbour not in visited:
                 queue.append(neighbour)

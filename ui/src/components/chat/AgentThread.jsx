@@ -44,6 +44,33 @@ function ThreadNode({ step }) {
         <span className="font-mono text-[11px] font-semibold text-slate-700 dark:text-slate-200 truncate">
           {step.name}
         </span>
+        {(() => {
+          const origin = step.agent || 'agent';
+          const isMain = origin === 'agent';
+          const model = step.model || '';
+          const who = isMain ? 'Run by the main agent' : `Run by subagent: ${origin}`;
+          return (
+            <span
+              className={cn(
+                'shrink-0 rounded-full px-1.5 py-px text-[9px] font-semibold tracking-wide',
+                isMain
+                  ? 'bg-slate-100 text-slate-500 dark:bg-white/10 dark:text-slate-400'
+                  : 'bg-violet-100 text-violet-700 dark:bg-violet-500/20 dark:text-violet-300',
+              )}
+              title={model ? `${who} · ${model}` : who}
+            >
+              {isMain ? 'agent' : origin}
+            </span>
+          );
+        })()}
+        {step.model && (
+          <span
+            className="hidden sm:inline shrink-0 max-w-[130px] truncate text-[9px] text-slate-400 font-mono"
+            title={`Model: ${step.model}`}
+          >
+            {step.model}
+          </span>
+        )}
         <span className="ml-auto flex items-center gap-1.5 shrink-0">
           {dur && <span className="text-[9.5px] text-slate-400 font-mono">{dur}</span>}
           {status === 'running' && <Loader2 className="size-3 text-primary animate-spin" />}

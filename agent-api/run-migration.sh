@@ -55,6 +55,8 @@ MIGRATIONS=(
   "migrations/026_workflow_type.sql"
   "migrations/027_multiagent_profile.sql"
   "migrations/028_session_tokens_and_chat_source.sql"
+  "migrations/029_execution_scratch_store.sql"
+  "migrations/030_governance_and_trajectory.sql"
 )
 
 for migration in "${MIGRATIONS[@]}"; do

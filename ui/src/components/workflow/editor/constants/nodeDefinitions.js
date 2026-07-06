@@ -111,6 +111,7 @@ export const NODE_TYPES = {
         options: ['15m','1h','6h','24h'] },
       { kind: 'field',  id: 'threshold', label: 'Error threshold', suffix: 'errors' },
       { kind: 'toggle', id: 'alerts',   label: 'Enable alerts' },
+      { kind: 'port-in',  id: 'lm',    label: 'Model', portType: 'model', optional: true },
       { kind: 'port-out', id: 'tool',   label: 'Tool', portType: 'tool' },
     ],
   },
@@ -119,6 +120,7 @@ export const NODE_TYPES = {
     desc: 'SQL query tool',
     slots: [
       { kind: 'field',    id: 'connection', label: 'Connection', mono: true },
+      { kind: 'port-in',  id: 'lm',         label: 'Model', portType: 'model', optional: true },
       { kind: 'port-out', id: 'tool',       label: 'Tool', portType: 'tool' },
     ],
   },
@@ -128,6 +130,7 @@ export const NODE_TYPES = {
     paletteHidden: true,  // superseded by mcp_server node
     slots: [
       { kind: 'db-select', id: 'server', label: 'Server' },
+      { kind: 'port-in',   id: 'lm',     label: 'Model', portType: 'model', optional: true },
       { kind: 'port-out',  id: 'tool',   label: 'Tool', portType: 'tool' },
     ],
   },
@@ -136,6 +139,7 @@ export const NODE_TYPES = {
     desc: 'Connect MCP servers from Settings · wire each independently',
     slots: [
       { kind: 'mcp-select', id: 'servers', label: 'MCP Servers' },
+      { kind: 'port-in',    id: 'lm',      label: 'Model', portType: 'model', optional: true },
       { kind: 'port-out',   id: 'tool',    label: 'Tool', portType: 'tool' },
     ],
   },
@@ -176,11 +180,37 @@ export const NODE_TYPES = {
   },
 
   // ── Agents ───────────────────────────────────────────────────
+  // Legacy JSON-textarea subagent editor — superseded by `subagent_window`
+  // (drag tool nodes into a named box on the canvas). Kept registered
+  // (paletteHidden) so older saved workflows still load; the canvas
+  // auto-generates an equivalent node of this type at save time from the
+  // subagent_window boxes, so the two never need to coexist in the UI.
   subagents: {
-    category: 'Agents', label: 'Subagents', icon: 'workflow',
+    category: 'Agents', label: 'Subagents', icon: 'workflow', paletteHidden: true,
     desc: 'Define named subagents · wire to Agent',
     slots: [
       { kind: 'subagents-editor', id: 'subagents', label: 'Subagent Definitions' },
+      { kind: 'port-out', id: 'specialists', label: 'Subagents', portType: 'data' },
+    ],
+  },
+  // Visual subagent grouping box: drag Tool-category nodes inside its
+  // boundary on the canvas to scope them to this named subagent, instead of
+  // the main agent. Rendered as a dashed frame (see SubagentWindowFrame in
+  // LangflowEditor.jsx), not a normal port-driven node for its BODY —
+  // membership is geometric (child node's parentId === this node's id). It
+  // carries one real wireable port: `specialists`, to the Agent's own
+  // `specialists` input (same as the legacy Subagents node) so the
+  // connection is visible on the canvas. Model choice is per-TOOL (each
+  // Tool node has its own optional `lm` port), not per-window — a subagent
+  // can mix tools that each use a different model.
+  subagent_window: {
+    category: 'Agents', label: 'Subagent Window', icon: 'workflow',
+    desc: 'Group tools into a named subagent · drag tools inside',
+    width: 300,
+    container: true,
+    slots: [
+      { kind: 'field',    id: 'name',        label: 'Subagent name' },
+      { kind: 'textarea', id: 'description', label: 'Description (optional)' },
       { kind: 'port-out', id: 'specialists', label: 'Subagents', portType: 'data' },
     ],
   },
@@ -244,6 +274,7 @@ export const NODE_DEFAULTS = {
   vector_memory: { collection: '', topK: '5' },
   cloudwatch_tool: { region: 'us-east-1', profile: '', groups: '', analysis: 'error-patterns', analysis_depth: 'auto', tool_mode: 'auto', range: '15m', threshold: '10', alerts: 'false' },
   subagents:   { subagents: '[]' },
+  subagent_window: { name: 'Subagent', description: '', w: '300', h: '360' },
   agent:       { system: '', maxIter: '10', skills: '', autoLearn: 'false', sandbox: 'false', supervisor_enabled: 'true' },
   if:          { condition: '' },
   wiki:        { format: 'Summary', platform: 'Azure DevOps Wiki', wikiUrl: '', pagePath: '', project: '', pat: '', tokenVar: 'ADO_WIKI_PAT' },

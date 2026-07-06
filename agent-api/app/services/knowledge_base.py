@@ -575,7 +575,7 @@ class KnowledgeBaseService:
         """
         try:
             from app.core.skills import skill_service
-            return await skill_service.recall(query, limit=limit, allowed=allowed)
+            return await skill_service.recall_two_stage(query, limit=limit, allowed=allowed)
         except Exception as exc:
             logger.debug("knowledge_base.recall_skills_for_agent: %s", exc)
             return []

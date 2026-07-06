@@ -10,6 +10,7 @@ const GeneralSection = lazy(() => import('../components/settings/GeneralSection'
 const McpSection = lazy(() => import('../components/settings/McpSection'));
 const ModelsTab = lazy(() => import('../components/settings/ModelsTab'));
 const CertificatesSection = lazy(() => import('../components/settings/CertificatesSection'));
+const FeatureFlagsSection = lazy(() => import('../components/settings/FeatureFlagsSection'));
 const AddMcpDialog = lazy(() => import('../components/settings/AddMcpDialog'));
 const AddLlmDialog = lazy(() => import('../components/settings/AddLlmDialog'));
 const BedrockCredentialsDialog = lazy(() => import('../components/settings/BedrockCredentialsDialog'));
@@ -31,6 +32,7 @@ const Settings = () => {
         mcp,
         models,
         certs,
+        features,
     } = useSettingsPage();
 
     const pageHeadActions = useMemo(() => {
@@ -140,6 +142,13 @@ const Settings = () => {
                                 certificates={certs.certificates}
                                 onUpload={certs.uploadCertificate}
                                 onDelete={certs.deleteCertificate}
+                            />
+                        )}
+                        {active === 'features' && (
+                            <FeatureFlagsSection
+                                flags={features.flags}
+                                onChange={features.onChange}
+                                busy={features.busy}
                             />
                         )}
                     </Suspense>

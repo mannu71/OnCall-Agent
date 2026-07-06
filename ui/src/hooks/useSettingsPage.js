@@ -14,7 +14,7 @@ import {
     updateMCPInputValue,
 } from '../services/mcpService';
 import { deleteModelKey, upsertModelKey } from '../services/modelKeyService';
-import { updateGeneralSettings } from '../services/apiClient';
+import { updateGeneralSettings, updateFeatureFlags } from '../services/apiClient';
 import agentApiClient from '../services/agentApiClient';
 import { useAgentApiHealth } from './useAgentApiHealth';
 import { usePersistedState, useSettingsToast } from './usePersistedState';
@@ -22,6 +22,7 @@ import { useMcpConfigQuery } from './queries/useConfigQueries';
 import { useLlmConfigQuery, useCertificatesQuery } from './queries/useConfigQueries';
 import { useModelKeysQuery } from './queries/useModelKeysQuery';
 import { useSettingsQuery } from './queries/useSettingsQuery';
+import { useFeatureFlagsQuery } from './queries/useFeatureFlagsQuery';
 import { queryKeys } from '../lib/queryKeys';
 import {
     discoverBedrockModels,
@@ -61,6 +62,7 @@ export function useSettingsPage() {
     const [timezone, setTimezone] = usePersistedState(LS_TIMEZONE, DEFAULT_TIMEZONE);
     const queryClient = useQueryClient();
     const { data: settingsData } = useSettingsQuery();
+    const { data: featureFlagsData } = useFeatureFlagsQuery();
     const { data: mcpData } = useMcpConfigQuery();
     const { data: llmData } = useLlmConfigQuery();
     const { data: certData } = useCertificatesQuery();
@@ -80,6 +82,24 @@ export function useSettingsPage() {
             .then(() => showToast('Timezone updated'))
             .catch((err) => showToast(err?.message || 'Failed to update timezone', 'error'));
     }, [setTimezone, showToast]);
+
+    const [featureFlagsBusy, setFeatureFlagsBusy] = useState(false);
+    const featureFlags = featureFlagsData?.flags || [];
+
+    // Persist a single flag change and live-apply it (backend needs no restart).
+    const handleFeatureFlagChange = useCallback((key, value) => {
+        setFeatureFlagsBusy(true);
+        updateFeatureFlags({ [key]: value })
+            .then((resp) => {
+                queryClient.setQueryData(queryKeys.featureFlags, { flags: resp.flags });
+                showToast('Feature flag updated');
+            })
+            .catch((err) => {
+                showToast(err?.message || 'Failed to update flag', 'error');
+                queryClient.invalidateQueries({ queryKey: queryKeys.featureFlags });
+            })
+            .finally(() => setFeatureFlagsBusy(false));
+    }, [queryClient, showToast]);
 
     const { apiHealth, loading: healthLoading, recheckWithSpinner } = useAgentApiHealth({
         initialShowSpinner: true,
@@ -611,6 +631,11 @@ export function useSettingsPage() {
             certUploadLoading,
             uploadCertificate,
             deleteCertificate,
+        },
+        features: {
+            flags: featureFlags,
+            onChange: handleFeatureFlagChange,
+            busy: featureFlagsBusy,
         },
     };
 }

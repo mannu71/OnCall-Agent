@@ -18,7 +18,7 @@ from app.models.workflow import (
 )
 from app.infrastructure.persistence import WorkflowRepository
 from app.core.executor import task_executor
-from app.workflow.routing import execute_visual_workflow, is_visual_workflow
+from app.workflow.routing import execute_workflow as routing_execute_workflow, is_visual_workflow
 from app.infrastructure.persistence import ExecutionRepository
 from app.config import settings
 from app.core.app_timezone import get_global_timezone_name
@@ -59,9 +59,15 @@ class WorkflowScheduler:
             if self._leader_lock is None:
                 self._leader_lock = LeaderLock("workflow_scheduler")
             self._is_leader = await self._leader_lock.acquire()
-        except Exception as exc:  # noqa: BLE001 — fail-open for single node
-            logger.warning("scheduler: leader check failed (%s) — assuming leader", exc)
-            self._is_leader = True
+        except Exception as exc:  # noqa: BLE001
+            if getattr(settings, "leader_lock_fail_closed", False):
+                logger.warning(
+                    "scheduler: leader check failed (%s) — fail-closed, assuming NOT leader", exc
+                )
+                self._is_leader = False
+            else:
+                logger.warning("scheduler: leader check failed (%s) — assuming leader", exc)
+                self._is_leader = True
         return self._is_leader
 
     def start(self):
@@ -236,7 +242,14 @@ class WorkflowScheduler:
             logger.debug(f"Workflow '{workflow_name}' was not scheduled")
 
     async def _execute_workflow_wrapper(self, workflow_name: str):
-        """Wrapper for a *scheduled* workflow fire (cron-triggered)."""
+        """Wrapper for a *scheduled* workflow fire (cron-triggered).
+
+        Visual workflows are dispatched through ``app.workflow.routing.execute_workflow``
+        — the SAME canonical entry point manual API runs and nested-workflow tasks use —
+        instead of a scheduler-local duplicate of the visual/legacy branch. This is the
+        one place that decision is made; ``self.execute_workflow`` below now only ever
+        handles the legacy task-based runtime.
+        """
         # Only the leader replica fires scheduled runs, so a multi-replica
         # deployment doesn't double-execute the same cron. Manual API runs go
         # through execute_workflow() directly and are never gated.
@@ -246,23 +259,31 @@ class WorkflowScheduler:
             )
             return
         try:
-            await self.execute_workflow(workflow_name)
+            workflow_data = await self.workflow_repo.get_by_name(workflow_name)
+            if not workflow_data:
+                logger.error(f"Scheduled workflow '{workflow_name}' not found")
+                return
+            if is_visual_workflow(workflow_data):
+                await routing_execute_workflow(workflow_data, manual=False)
+            else:
+                await self.execute_workflow(workflow_name)
         except Exception as e:
             logger.error(f"Error in background execution of '{workflow_name}': {e}", exc_info=True)
 
     async def execute_workflow(self, workflow_name: str, manual: bool = False) -> Optional[WorkflowExecution]:
-        """Execute a workflow and return the execution record."""
+        """Execute a LEGACY (task-based) workflow and return the execution record.
+
+        Visual (node-based) workflows never reach here — both the cron path
+        (``_execute_workflow_wrapper``) and ``app.workflow.routing.execute_legacy_workflow``
+        (manual API / nested-workflow tasks) only call this for legacy workflows,
+        having already dispatched visual workflows through
+        ``app.workflow.routing.execute_workflow`` instead.
+        """
         workflow_data = await self.workflow_repo.get_by_name(workflow_name)
         if not workflow_data:
             logger.error(f"Workflow '{workflow_name}' not found")
             return None
-        
-        # Visual workflows (node-based) — canonical path via routing layer
-        if is_visual_workflow(workflow_data):
-            await execute_visual_workflow(workflow_data)
-            return None
 
-        # Legacy workflows (task-based)
         workflow = Workflow(**workflow_data)
         execution_repo = ExecutionRepository()
         workflow_id: Optional[int] = None
@@ -287,7 +308,7 @@ class WorkflowScheduler:
         # In-process tracking for scheduler SSE subscribers only.
         self.active_executions[execution_id] = execution
         
-        await self._emit_event(workflow_name, WorkflowExecutionEvent(
+        await self._emit_event(execution_id, WorkflowExecutionEvent(
             event_type="workflow_start",
             workflow_name=workflow_name,
             execution_id=execution_id,
@@ -304,7 +325,7 @@ class WorkflowScheduler:
                 from app.models.workflow import Task
                 task = Task(**task_data) if isinstance(task_data, dict) else task_data
                 
-                await self._emit_event(workflow_name, WorkflowExecutionEvent(
+                await self._emit_event(execution_id, WorkflowExecutionEvent(
                     event_type="task_start",
                     workflow_name=workflow_name,
                     execution_id=execution_id,
@@ -315,7 +336,7 @@ class WorkflowScheduler:
                 result = await task_executor.execute_task_with_retry(task)
                 execution.task_results.append(result)
                 
-                await self._emit_event(workflow_name, WorkflowExecutionEvent(
+                await self._emit_event(execution_id, WorkflowExecutionEvent(
                     event_type="task_complete",
                     workflow_name=workflow_name,
                     execution_id=execution_id,
@@ -372,7 +393,7 @@ class WorkflowScheduler:
 
             self.active_executions.pop(execution_id, None)
             
-            await self._emit_event(workflow_name, WorkflowExecutionEvent(
+            await self._emit_event(execution_id, WorkflowExecutionEvent(
                 event_type="workflow_complete",
                 workflow_name=workflow_name,
                 execution_id=execution_id,
@@ -389,13 +410,19 @@ class WorkflowScheduler:
         
         return execution
 
-    async def _emit_event(self, workflow_name: str, event: WorkflowExecutionEvent):
-        """Emit an event to all subscribed queues."""
-        if workflow_name not in self.event_queues:
+    async def _emit_event(self, execution_id: str, event: WorkflowExecutionEvent):
+        """Emit an event to all subscribers of this specific execution.
+
+        Keyed by execution_id (not workflow_name) so concurrent runs of the same
+        legacy workflow don't conflate streaming events — matches the canonical
+        visual-workflow path (``visual_workflow_executor.py``), which was already
+        execution_id-keyed.
+        """
+        if execution_id not in self.event_queues:
             return
 
         dead_queues = set()
-        for queue in self.event_queues[workflow_name]:
+        for queue in self.event_queues[execution_id]:
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
@@ -404,20 +431,20 @@ class WorkflowScheduler:
                 dead_queues.add(queue)
 
         if dead_queues:
-            self.event_queues[workflow_name] -= dead_queues
+            self.event_queues[execution_id] -= dead_queues
 
-    def subscribe_to_events(self, workflow_name: str) -> asyncio.Queue:
-        """Subscribe to workflow execution events."""
+    def subscribe_to_events(self, execution_id: str) -> asyncio.Queue:
+        """Subscribe to a specific legacy workflow execution's events."""
         queue = asyncio.Queue(maxsize=settings.sse_queue_maxsize)
-        if workflow_name not in self.event_queues:
-            self.event_queues[workflow_name] = set()
-        self.event_queues[workflow_name].add(queue)
+        if execution_id not in self.event_queues:
+            self.event_queues[execution_id] = set()
+        self.event_queues[execution_id].add(queue)
         return queue
 
-    def unsubscribe_from_events(self, workflow_name: str, queue: asyncio.Queue):
-        """Unsubscribe from workflow execution events."""
-        if workflow_name in self.event_queues:
-            self.event_queues[workflow_name].discard(queue)
+    def unsubscribe_from_events(self, execution_id: str, queue: asyncio.Queue):
+        """Unsubscribe from a specific legacy workflow execution's events."""
+        if execution_id in self.event_queues:
+            self.event_queues[execution_id].discard(queue)
 
     def get_active_executions(self) -> Dict[str, WorkflowExecution]:
         """Get all active workflow executions."""

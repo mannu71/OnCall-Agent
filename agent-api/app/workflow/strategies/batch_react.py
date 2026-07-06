@@ -638,10 +638,10 @@ class _SubAgentCallback:
             except Exception:
                 pass
 
-    async def on_tool_result(self, tool_name: str, result: str) -> None:
+    async def on_tool_result(self, tool_name: str, result: str, failed: bool = False) -> None:
         if self._parent:
             try:
-                await self._parent.on_tool_result(f"[{self._node_id}] {tool_name}", result)
+                await self._parent.on_tool_result(f"[{self._node_id}] {tool_name}", result, failed=failed)
             except Exception:
                 pass
 
