@@ -323,5 +323,5 @@ This implementation satisfies the following requirements from the design documen
 ## See Also
 
 - [Error Classifier](../error_classifier.py) - Error classification system
-- [ReactStrategy](../../workflow/strategies/react.py) - Agent execution strategy
+- [ReactStrategy](../../workflow/strategies/react/strategy.py) - Agent execution strategy
 - [Tool Registry](../tool_registry.py) - Tool management system

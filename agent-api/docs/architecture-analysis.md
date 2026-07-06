@@ -92,8 +92,8 @@ flowchart TB
 | `app/harness/tool_assembler.py` | Base + extension tool assembly |
 | `app/harness/react_agent.py` | LangGraph agent construction (policy, caching, compaction, HITL) |
 | `app/harness/supervisor_loop.py` | Bounded outer loop with supervisor verdict routing |
-| `app/workflow/strategies/react/agent_builder.py` | Cache-stable system prompt (CACHE CONTRACT) |
-| `app/workflow/strategies/react/agent_runner.py` | Inner ReAct loop: invoke, stream, recovery |
+| `app/harness/agent_builder.py` | Cache-stable system prompt (CACHE CONTRACT) |
+| `app/harness/agent_runner.py` | Inner ReAct loop: invoke, stream, recovery |
 | `app/core/supervisor.py` | Quality scoring + PASS/RETRY/HITL/ESCALATE verdicts |
 | `app/core/grader.py` | Optional LLM-judge for verification loop |
 | `app/core/scheduler.py` | Cron scheduling, curator, hill-climb periodic jobs |

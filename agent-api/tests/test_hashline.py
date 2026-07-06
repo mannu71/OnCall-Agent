@@ -1,7 +1,7 @@
 """Unit tests for hashline content-hash-anchored edits."""
 import pytest
 
-from app.workflow.strategies.react.hashline import (
+from app.harness.hashline import (
     line_hash,
     annotate,
     parse_anchor,

@@ -429,7 +429,7 @@ class ToolApprovalModel(Base):
     """Audit record for a human-in-the-loop tool approval gate.
 
     One row per ``ask`` tool call (see
-    ``app/workflow/strategies/react/tool_permissions.py``): written as
+    ``app/harness/tool_permissions.py``): written as
     ``pending`` before the agent blocks on operator approval, then updated to
     ``approved`` / ``denied`` / ``timeout`` when the decision resolves. Durable
     replacement for the prior browser-localStorage-only record. See migration

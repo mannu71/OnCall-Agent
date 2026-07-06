@@ -2,7 +2,7 @@
 -- Server-side audit trail for human-in-the-loop tool approvals.
 --
 -- Each row records one "ask" tool gate (see
--- app/workflow/strategies/react/tool_permissions.py): a pending row is written
+-- app/harness/tool_permissions.py): a pending row is written
 -- before the agent blocks on operator approval, then updated with the decision
 -- (approved / denied / timeout) when it resolves. This replaces the previous
 -- browser-localStorage-only record so approvals are durable and auditable, and

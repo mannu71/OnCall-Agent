@@ -25,7 +25,7 @@ The foundational "give the model context + tools, iterate until done" cycle.
 | Component | File | What it does |
 |---|---|---|
 | Supervisor retry loop | `app/harness/supervisor_loop.py` | Bounded `while True`: iteration cap, wall-clock deadline, token budget, supervisor verdict routing (PASS / RETRY / HITL / ESCALATE) |
-| ReAct inner loop | `app/workflow/strategies/react/agent_runner.py` | LangGraph ReAct with recursion limit (12 steps ≈ 6 ReAct iterations); post-invocation recovery for truncation, overflow, mid-thought preamble |
+| ReAct inner loop | `app/harness/agent_runner.py` | LangGraph ReAct with recursion limit (12 steps ≈ 6 ReAct iterations); post-invocation recovery for truncation, overflow, mid-thought preamble |
 | Context compaction | `app/core/compaction/compressor.py` + `app/core/memory/compaction_manager.py` | Pre-invocation LLM summarization; mid-loop deterministic pruning; overflow recovery — all code-driven, not prompt-steered |
 | Progressive tool disclosure | `app/harness/tool_disclosure.py` | When >25 deferrable tools or ≥20K tokens: replace with `search_tools` + `call_tool` bridge (BM25 ranking).  Agent discovers tools on demand |
 
