@@ -36,9 +36,6 @@ services:
     environment:
       - API_HOST=0.0.0.0
       - API_PORT=8000
-      - STORAGE_PATH=/app/data/storage
-      - WORKFLOW_DIR=/app/data/workflows
-      - LOGS_DIR=/app/data/logs
       - SCHEDULER_TIMEZONE=UTC
       - MAX_CONCURRENT_WORKFLOWS=5
       - LOG_LEVEL=INFO

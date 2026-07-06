@@ -150,11 +150,6 @@ class Settings(BaseSettings):
         default="memory", validation_alias="SCRATCH_STORE_BACKEND",
     )
 
-    # Storage paths (kept for backward compatibility, but database is preferred)
-    storage_path: str = "data/storage"
-    workflow_dir: str = "data/workflows"
-    logs_dir: str = "data/logs"
-
     # Crawler / code analyzer
     repos_base_path: str = Field(
         default="/tmp/indexed_repos",
@@ -174,12 +169,6 @@ class Settings(BaseSettings):
     codegraph_cache_dir: str = Field(
         default=os.path.expanduser("~/.cache/codegraph"),
         validation_alias="CODEGRAPH_CACHE_DIR",
-    )
-    # Legacy single-DB path (used by v0.1.x); kept for reference only — no
-    # longer read by admin code. Override via CODEGRAPH_STORE_DB.
-    codegraph_db_path: str = Field(
-        default="/tmp/codegraph.db",
-        validation_alias="CODEGRAPH_STORE_DB",
     )
     # Per-call timeout (seconds) for codegraph's `search_code` tool only. It shells
     # out to grep over source files (the one non-graph, potentially slow tool); the

@@ -192,11 +192,6 @@ PROVIDER_TRANSPORT=bedrock
 AWS_REGION=eu-west-1
 AWS_PROFILE=your-aws-profile
 
-# Paths (created automatically on first run)
-STORAGE_PATH=data/storage
-WORKFLOW_DIR=data/workflows
-LOGS_DIR=data/logs
-
 # Code analyzer — local folder containing repos to index
 REPOS_BASE_PATH=C:/path/to/your/repos
 
