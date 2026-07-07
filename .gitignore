@@ -2,7 +2,9 @@
 node_modules/
 */node_modules/
 **/node_modules/
-package-lock.json
+# NOTE: package-lock.json MUST be committed — the UI Docker build runs
+# `npm ci`, which requires an in-sync lockfile in the repo. Ignoring it broke
+# the image build on every machine except ones with a stale local lockfile.
 
 # Logs
 logs/
