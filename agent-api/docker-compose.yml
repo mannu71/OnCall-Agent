@@ -25,6 +25,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Builds the default runtime-full target (core + crawler + Node/codegraph).
+      # For a ~40-50% smaller image without npx MCP servers or the code crawler,
+      # build the slim target instead:
+      #   docker build --target runtime-slim -t agent-api:slim -f Dockerfile .
     container_name: kyc-agent-api
     ports:
       - "8000:8000"

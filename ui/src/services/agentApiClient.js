@@ -2,8 +2,15 @@ import axios from 'axios';
 
 /**
  * Agent-API Client
- * 
+ *
  * Provides methods to communicate directly with the agent-api service.
+ *
+ * One of two HTTP clients (both hit the same agent-api host): this axios-based
+ * client carries most feature endpoints (sessions, workflows, MCP config, model
+ * keys) with interceptors, while apiClient.js is the lighter fetch-based wrapper
+ * and owns base-URL resolution (`getApiBaseUrl`). For new feature calls, prefer
+ * extending this client for consistency unless the endpoint area already lives
+ * in apiClient.js.
  */
 
 function getAgentApiHost() {
@@ -705,15 +712,6 @@ export const agentApiClient = {
         return response.data; // { success, output_schemas, capabilities }
     },
 
-    /**
-     * List DB-backed executable skills + read-only filesystem (SKILL.md) skills,
-     * for the Agent node's Skills picker.
-     */
-    async listSkills() {
-        const response = await client.get('/api/v1/skills');
-        return response.data; // { success, db: [...], filesystem: [...] }
-    },
-
     async getAgentProfile(name) {
         const response = await client.get(`/api/v1/agent-profiles/${encodeURIComponent(name)}`);
         return response.data;
@@ -736,36 +734,12 @@ export const agentApiClient = {
     },
 
     // ==================== Skills ====================
-    // DB-backed executable skills (+ read-only filesystem skills).
+    // File-based markdown (SKILL.md) skills, for the Agent node's Skills picker
+    // and the Skills management page.
 
     async listSkills() {
         const response = await client.get('/api/v1/skills');
-        return response.data; // { success, db: [...], filesystem: [...] }
-    },
-
-    async createSkill(body) {
-        const response = await client.post('/api/v1/skills', body);
-        return response.data;
-    },
-
-    async deleteSkill(name) {
-        const response = await client.delete(`/api/v1/skills/${encodeURIComponent(name)}`);
-        return response.data;
-    },
-
-    async deleteAllSkills() {
-        const response = await client.delete('/api/v1/skills?confirm=true');
-        return response.data;
-    },
-
-    async getSkill(name) {
-        const response = await client.get(`/api/v1/skills/${encodeURIComponent(name)}`);
-        return response.data; // { success, skill: {...} }
-    },
-
-    async updateSkill(name, body) {
-        const response = await client.put(`/api/v1/skills/${encodeURIComponent(name)}`, body);
-        return response.data;
+        return response.data; // { success, filesystem: [...] }
     },
 
     async deleteFsSkill(name) {

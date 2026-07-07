@@ -87,7 +87,8 @@ async def patch_session(
         changed |= await repo.set_archived(session_id, body.archived)
     if body.is_important is not None:
         changed |= await repo.set_important(session_id, body.is_important)
-    data = await repo.get_session(session_id)
+    # A metadata patch never needs the turn history hydrated — skip that query.
+    data = await repo.get_session(session_id, include_messages=False)
     if data is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
     return data

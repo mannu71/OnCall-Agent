@@ -146,39 +146,34 @@ def _slugify(text: str) -> str:
 
 
 async def _apply_skill_proposal(proposal: Dict[str, Any]) -> bool:
-    """Create a draft skill from a 'skill' proposal via the skill service."""
-    try:
-        from app.core.skills.service import SkillService
+    """Draft a filesystem markdown skill (SKILL.md) from a 'skill' proposal.
 
-        svc = SkillService()
+    Skills are file-based: this writes a ``draft-`` prefixed SKILL.md under the
+    user skills directory via :class:`SkillManager`. An operator reviews/renames
+    it before it becomes a first-class skill.
+    """
+    try:
+        from app.core.skills import get_default_skill_manager
+
         suggestion = proposal.get("suggestion", "")
         rationale = proposal.get("rationale", "")
-        slug = _slugify(suggestion)[:60]
-        await svc.create_manual(
-            name=slug,
-            title=suggestion[:120],
-            description=f"{suggestion}\n\nRationale: {rationale}",
-            trigger_patterns=[],
-            steps=[],
+        slug = ("draft_" + _slugify(suggestion))[:60]
+        content = (
+            f"---\n"
+            f"name: {slug}\n"
+            f"description: {suggestion[:200]}\n"
+            f"---\n\n"
+            f"## Protocol\n\n"
+            f"{suggestion}\n\n"
+            f"## Rationale\n\n"
+            f"{rationale}\n"
         )
+        get_default_skill_manager().write_skill(slug, content)
         logger.info(
-            "apply_proposals [skill]: drafted '%s' from proposal: %s",
+            "apply_proposals [skill]: drafted SKILL.md '%s' from proposal: %s",
             slug,
             suggestion[:80],
         )
-        # Mark the drafted skill as 'draft' so the confidence-gate applies.
-        # create_manual sets status='active'; patch it back to 'draft' since
-        # this is an LLM-generated proposal, not a manually curated skill.
-        try:
-            from app.core.skills import service as _svc_mod
-
-            rec = _svc_mod._CACHE.get(slug)
-            if rec is not None:
-                rec["status"] = "draft"
-                rec["confidence"] = 0.0
-                _svc_mod._write_record(rec)
-        except Exception:  # noqa: BLE001 — best-effort downgrade
-            pass
         return True
     except Exception as exc:  # noqa: BLE001
         logger.warning("apply_proposals [skill]: skipped (%s)", exc)

@@ -150,7 +150,7 @@ async `_main()` runner — instead of `pytest evals/harness_selftest.py`. The
 
 Git shows `deep_agent.py` deleted. Verified against the current working tree:
 `app/harness/deep_agent.py` does not exist on disk. `__init__.py`'s claim that
-deepagents was removed is accurate. No action needed.
+the alternate agent-builder path was removed is accurate. No action needed.
 
 ---
 

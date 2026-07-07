@@ -10,9 +10,8 @@ When an agent execution finishes the module optionally:
      appended to ``DEFAULT_SINKS`` before the service is instantiated.
   3. **Trajectory write** — append a structured JSONL record to the
      trajectory file for audit and quality tracking.
-  4. **Skill distillation** — when ≥ MIN_TOOL_CALLS tool calls were made,
-     delegate to ``SkillService.distill()`` to produce a structured, executable
-     skill.
+  4. **Dynamic node compilation** (opt-in) — when ≥ MIN_TOOL_CALLS tool calls
+     were made and enabled, compile a reusable GraphNode from the trajectory.
 
 Usage (call from the synthesis / learn node in the LangGraph graph)::
 
@@ -56,8 +55,8 @@ class AutoLearnConfig:
         os.getenv("AUTO_LEARN_THRESHOLD", "0.85")
     )
 
-    # Minimum number of tool calls before skill distillation is attempted
-    # (prevents generating trivial one-liner skills).
+    # Minimum number of tool calls before dynamic-node compilation is attempted
+    # (prevents generating trivial one-liner nodes).
     min_tool_calls_for_skill: int = int(
         os.getenv("AUTO_LEARN_MIN_TOOL_CALLS", "5")
     )
@@ -73,9 +72,6 @@ class AutoLearnConfig:
         "FAILED_TRAJECTORY_PATH",
         str(Path.home() / ".kyc_protect" / "trajectories" / "failed_trajectories.jsonl"),
     )
-
-    # Whether to attempt skill distillation.
-    distill_skills: bool = os.getenv("AUTO_LEARN_DISTILL_SKILLS", "true").lower() != "false"
 
     # Whether to attempt dynamic node code generation. OFF by default: this
     # compiles and registers LLM-generated Python at runtime, which is an
@@ -334,7 +330,6 @@ class AutoLearnResult:
     kb_upserted: bool = False        # IncidentKBSink compat alias
     pattern_bumped: bool = False     # LogPatternSink compat alias
     trajectory_saved: bool = False
-    skill_distilled: bool = False
     dynamic_node_compiled: bool = False
     skipped_reason: Optional[str] = None   # set when learning was skipped
     error: Optional[str] = None
@@ -351,8 +346,8 @@ class AutoLearnService:
     Args:
         db:     AsyncSession from SQLAlchemy.  When ``None`` all DB writes are
                 skipped (useful for testing or environments without a DB).
-        llm:    LangChain LLM used for skill distillation.  When ``None``,
-                distillation is skipped.
+        llm:    LangChain LLM used for dynamic-node compilation.  When ``None``,
+                compilation is skipped.
         config: AutoLearnConfig instance.  Defaults to environment-driven config.
         sinks:  List of LearningSink instances.  Defaults to DEFAULT_SINKS
                 (IncidentKBSink + LogPatternSink).  Pass an empty list or a
@@ -454,16 +449,8 @@ class AutoLearnService:
         result.trajectory_saved = True
         logger.info("auto_learn: trajectory appended → %s", path)
 
-        # ── 3. Skill distillation ─────────────────────────────────────────────
+        # ── 3. Dynamic Node Compilation ───────────────────────────────────────
         tool_calls = state.get("tool_calls") or []
-        if (
-            self._cfg.distill_skills
-            and self._llm is not None
-            and len(tool_calls) >= self._cfg.min_tool_calls_for_skill
-        ):
-            result.skill_distilled = await self._distill_skill(execution_id, state)
-
-        # ── 4. Dynamic Node Compilation ───────────────────────────────────────
         if (
             self._cfg.compile_dynamic_nodes
             and self._llm is not None
@@ -494,28 +481,7 @@ class AutoLearnService:
         except Exception as exc:
             logger.warning("auto_learn: failed trajectory write error: %s", exc)
 
-    # ── Private: skill distillation ───────────────────────────────────────────
-
-    async def _distill_skill(
-        self,
-        execution_id: str,
-        state: Dict[str, Any],
-    ) -> bool:
-        """Delegate to SkillService to distil the run into an executable skill."""
-        try:
-            from app.core.skills import SkillService
-            svc = SkillService(llm=self._llm)
-            result = await svc.distill(execution_id=execution_id, state=state)
-            if result:
-                logger.info(
-                    "auto_learn: skill distilled → '%s' (id=%s, execution_id=%s)",
-                    result.get("name"), result.get("id"), execution_id,
-                )
-                return True
-            return False
-        except Exception as exc:
-            logger.warning("auto_learn: skill distillation failed — %s", exc)
-            return False
+    # ── Private: dynamic node compilation ─────────────────────────────────────
 
     async def _distill_dynamic_node(
         self,

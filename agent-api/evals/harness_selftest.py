@@ -838,7 +838,7 @@ async def test_compression_metamemory_precheck() -> None:
         def estimate_tokens(self, messages) -> int:
             return sum(len(str(getattr(m, "content", ""))) for m in messages)
 
-        async def compact_if_needed(self, messages):
+        async def compact_if_needed(self, messages, precomputed_total=None):
             self.compact_if_needed_calls += 1
             return messages
 
@@ -2488,6 +2488,58 @@ def test_memory_capability_and_autolearn() -> None:
           LogPatternSink().applies(incident_state) is True)
 
 
+async def test_autolearn_learn_flow() -> None:
+    """End-to-end AutoLearnService.learn() pass — trajectory write + skip gate,
+    DB-free (db=None, llm=None). Also guards the markdown-only skills collapse:
+    no skill distillation config/field remains."""
+    import os, tempfile, json as _json
+    from dataclasses import fields as _dc_fields
+    from app.core.auto_learn import AutoLearnService, AutoLearnConfig, AutoLearnResult
+
+    tmpdir = tempfile.mkdtemp(prefix="autolearn_")
+    traj = os.path.join(tmpdir, "trajectory.jsonl")
+    cfg = AutoLearnConfig(
+        trajectory_path=traj,
+        failed_trajectory_path=os.path.join(tmpdir, "failed.jsonl"),
+    )
+
+    # Regression guards for the DB/JSON SkillService removal.
+    check("autolearn: config dropped distill_skills", not hasattr(cfg, "distill_skills"))
+    check("autolearn: result dropped skill_distilled",
+          "skill_distilled" not in {f.name for f in _dc_fields(AutoLearnResult)})
+    check("autolearn: compile_dynamic_nodes off by default", cfg.compile_dynamic_nodes is False)
+
+    svc = AutoLearnService(db=None, llm=None, config=cfg)
+
+    # Approved incident run → trajectory written; DB sinks no-op; no code compile.
+    incident_state = {
+        "root_cause": "DB pool exhausted",
+        "matched_pattern_ids": [1],
+        "final_answer": "Increased pool size.",
+        "tool_calls": [{"tool": "cloudwatch_get_logs"}],
+        "engineer_approved": True,
+        "confidence_score": 0.9,
+    }
+    r1 = await svc.learn("exec-1", incident_state)
+    check("autolearn: trajectory saved on approved run", r1.trajectory_saved is True)
+    check("autolearn: kb sink no-op without db", r1.kb_upserted is False)
+    check("autolearn: pattern sink no-op without db", r1.pattern_bumped is False)
+    check("autolearn: dynamic node not compiled by default", r1.dynamic_node_compiled is False)
+    check("autolearn: approved run not skipped", r1.skipped_reason is None)
+
+    lines = [l for l in open(traj, encoding="utf-8").read().splitlines() if l.strip()]
+    check("autolearn: exactly one trajectory line", len(lines) == 1)
+    check("autolearn: trajectory record carries execution_id",
+          _json.loads(lines[0]).get("execution_id") == "exec-1")
+
+    # Unapproved, low-confidence run → skipped; no additional trajectory line.
+    r2 = await svc.learn("exec-2", {"final_answer": "meh", "confidence_score": 0.1, "tool_calls": []})
+    check("autolearn: low-confidence unapproved run skipped", bool(r2.skipped_reason))
+    check("autolearn: skipped run wrote no trajectory", r2.trajectory_saved is False)
+    lines2 = [l for l in open(traj, encoding="utf-8").read().splitlines() if l.strip()]
+    check("autolearn: still one trajectory line after skip", len(lines2) == 1)
+
+
 def test_persona_and_supervisor_toggle() -> None:
     """Persona is additive (empty → unchanged); supervisor toggle coerces. DB-free."""
     from app.harness.agent_builder import compose_system_prompt
@@ -2581,28 +2633,6 @@ def test_memory_audit_logic() -> None:
     check("audit mass-deletion guard trips", (not ok2) and reason2 == "delete_guard")
     # no groups → noop
     check("audit noop when nothing to merge", _plan_deletions(rows, [], 0.5) == ([], True, "noop"))
-
-
-# ── self-evolving skills upgrade ──────────────────────────────────────────────
-def test_skill_audit_helpers() -> None:
-    """Confidence clamping, title normalisation, and description composition. DB-free."""
-    from app.core.skills.service import _coerce_confidence, _normalize_title, _compose_description
-
-    check("skill confidence clamps high", _coerce_confidence("1.5") == 1.0)
-    check("skill confidence clamps low", _coerce_confidence(-3) == 0.0)
-    check("skill confidence default on bad", _coerce_confidence(None) == 0.5 and _coerce_confidence("x") == 0.5)
-
-    check("skill title normalise", _normalize_title("Restart  API, Pods!") == "restart api pods")
-    check("skill title dedupe key matches", _normalize_title("restart api pods") == _normalize_title("Restart API Pods"))
-
-    desc = _compose_description({
-        "description": "Fix the pool",
-        "pitfalls": ["don't restart blindly"],
-        "verification": ["error rate back to baseline"],
-    })
-    check("skill desc folds pitfalls", "Pitfalls: don't restart blindly" in desc)
-    check("skill desc folds verification", "Verify: error rate back to baseline" in desc)
-    check("skill desc capped", len(_compose_description({"description": "x" * 5000})) <= 2000)
 
 
 def test_seed_skill_library() -> None:
@@ -3321,8 +3351,8 @@ async def test_subagent_engine_routing() -> None:
     the SAME engine resolution as the parent (per-def agent_config['engine']
     override, or the global AGENT_ENGINE default) — not a hardcoded
     LangGraph path. Also verifies the max_turns*2 -> recursion_limit unit
-    both engines share, and that a child keeps a skill tool it was scoped
-    (execute_skill isn't in the blocked-tools list)."""
+    both engines share, and that a child keeps a scoped tool
+    (pin_fact isn't in the blocked-tools list)."""
     import json
     import app.harness.engine as engine_mod
     from app.harness import subagent_factory as sf
@@ -3343,7 +3373,7 @@ async def test_subagent_engine_routing() -> None:
     engine_mod.run_agent_once = _fake_run_agent_once
     try:
         result = await sf._run_child(
-            llm=None, sub_tools=[_RoutingFakeTool("execute_skill")], agent_config={"engine": "native"},
+            llm=None, sub_tools=[_RoutingFakeTool("pin_fact")], agent_config={"engine": "native"},
             name="test-child", role_prompt=None, capabilities=[], output_schema=None,
             model_name=None, depth_remaining=1, parent_execution_id="parent-1",
             timeout_s=0, output_max=4000, task="do the thing", max_turns=3,
@@ -3351,7 +3381,7 @@ async def test_subagent_engine_routing() -> None:
         parsed = json.loads(result)
         check("subagent: dispatch honors per-def engine override", captured.get("engine") == "native")
         check("subagent: recursion_limit = max_turns*2", captured.get("recursion_limit") == 6)
-        check("subagent: child keeps the skill tool it was scoped", "execute_skill" in captured.get("tool_names", []))
+        check("subagent: child keeps the scoped tool", "pin_fact" in captured.get("tool_names", []))
         check("subagent: child result envelope status ok", parsed.get("status") == "ok")
         check("subagent: child result carries answer", parsed.get("answer") == "child done")
 
@@ -3457,6 +3487,39 @@ async def test_delegation_phase_b() -> None:
     check("delegate_parallel returns None for empty defs",
           build_delegate_parallel_tool(llm=None, base_tools=[], agent_config={},
                                        subagent_defs=[]) is None)
+
+    # ── 3b. delegate descriptions surface each specialist's ACTUAL tools + a
+    #    route-by-capability steer (mirrors claude-code-main formatAgentLine),
+    #    so the parent keeps direct-tool work (e.g. CloudWatch) on itself and
+    #    doesn't misroute to a name-mismatched squad. Reproduces the workflow-13
+    #    "CloudWatch Squad" that was scoped to code/DB tools, no cloudwatch. ────
+    _misnamed = [{"name": "cloudwatch-squad", "description": "",
+                  "tools": ["cloudwatch_*"]}]  # only cloudwatch_scan exists in parent_tools
+    _routed = build_delegate_parallel_tool(
+        llm=None, base_tools=parent_tools, agent_config={}, subagent_defs=_misnamed,
+        parent_execution_id="test-parent",
+    )
+    _rd = _routed.description
+    check("delegate_parallel lists specialist's actual tools",
+          "cloudwatch_scan" in _rd, _rd)
+    check("delegate_parallel carries route-by-capability steer",
+          "Route by the tools" in _rd and "your OWN" in _rd, _rd)
+    # A squad scoped to a family the parent lacks must NOT advertise that family.
+    _codeonly = [{"name": "code-squad", "description": "", "tools": ["crawler_*"]}]
+    _co = build_delegate_parallel_tool(
+        llm=None, base_tools=parent_tools, agent_config={}, subagent_defs=_codeonly,
+        parent_execution_id="test-parent",
+    ).description
+    check("delegate_parallel does not advertise unscoped families",
+          "cloudwatch" not in _co.split("Specialists:")[-1], _co)
+    _serial_rt = build_subagent_tools(
+        llm=None, base_tools=parent_tools, agent_config={}, subagent_defs=_misnamed,
+        parent_execution_id="test-parent",
+    )
+    check("delegate_to_<name> description surfaces tools + steer",
+          "cloudwatch_scan" in _serial_rt[0].description
+          and "Route by the tools" in _serial_rt[0].description,
+          _serial_rt[0].description)
 
     # ── 4. no fire-and-forget delegation surface ─────────────────────────────────
     # delegate_async / collect_delegations / _ASYNC_REGISTRY were removed — they
@@ -3806,128 +3869,6 @@ async def test_delegate_batch_budget_economy() -> None:
         _tes2.token_economy_stall_limit = _orig_stall
 
 
-async def test_file_skills() -> None:
-    # File-backed SkillService: create/list/get/recall/execute/audit/delete, no DB.
-    import tempfile, json as _json
-    from app.config import settings as _s
-    _s.skills_store_dir = tempfile.mkdtemp(prefix="skselftest_")
-    from app.core.skills.service import SkillService, _skill_path
-    from app.core.skills import service as _svc_mod
-    svc = SkillService()
-
-    s = await svc.create_manual(name="Restart Pods", title="Restart",
-                                trigger_patterns=["pods crashing"],
-                                steps=[{"order": 1, "description": "noop", "tool": None}])
-    check("file skill create slug+source", s["name"] == "restart_pods" and s["source"] == "manual")
-    check("file skill written to disk", _skill_path("restart_pods").exists())
-    check("file skill list", len(await svc.list_skills(status="all")) == 1)
-    check("file skill recall", bool(await svc.recall("the pods crashing again")))
-    res = await svc.execute("restart_pods", context={})
-    disk = _json.loads(_skill_path("restart_pods").read_text("utf-8"))
-    check("file skill execute bumps counters in file",
-          res.success and disk["recall_count"] == 1 and disk["success_count"] == 1)
-    # audit promotes a proven draft
-    await svc.create_manual(name="draft_one", title="D", steps=[])
-    _svc_mod._CACHE["draft_one"]["status"] = "draft"
-    _svc_mod._CACHE["draft_one"]["success_count"] = 5
-    _svc_mod._write_record(_svc_mod._CACHE["draft_one"])
-    a = await svc.audit()
-    check("file skill audit promotes draft", a["promoted"] >= 1)
-    # ── 4.4 schema extension defaults (category_path/tags/applicability/provenance) ──
-    check(
-        "file skill schema: new fields default to empty/backward-compatible",
-        disk.get("category_path") == "" and disk.get("tags") == []
-        and disk.get("applicability") == "" and disk.get("provenance") == {"source": "manual"},
-    )
-
-    # ── 4.4 two-stage recall: richer signal (tags/applicability/category_path)
-    #     finds a skill trigger_patterns-only keyword match would miss ──
-    await svc.create_manual(
-        name="throttle_recovery", title="Throttle Recovery",
-        trigger_patterns=["totally unrelated phrase xyz"],
-        steps=[],
-    )
-    _svc_mod._CACHE["throttle_recovery"]["tags"] = ["throttling", "rate-limit"]
-    _svc_mod._CACHE["throttle_recovery"]["applicability"] = (
-        "Use when a CloudWatch Logs Insights query is throttled or rate-limited."
-    )
-    _svc_mod._CACHE["throttle_recovery"]["category_path"] = "cloudwatch/logs/throttle-recovery"
-    _svc_mod._write_record(_svc_mod._CACHE["throttle_recovery"])
-
-    query = "my logs insights query keeps getting throttled and rate-limited"
-    check(
-        "file skill recall(): trigger_patterns-only match misses the throttle skill",
-        not any(r["name"] == "throttle_recovery" for r in await svc.recall(query)),
-    )
-
-    _orig_two_stage = _s.skill_two_stage_recall
-    _orig_shortlist_k = _s.skill_shortlist_k
-    try:
-        _s.skill_two_stage_recall = False
-        off_result = await svc.recall_two_stage(query, use_llm=False)
-        check(
-            "recall_two_stage: falls back to recall() when flag is off",
-            [r["name"] for r in off_result] == [r["name"] for r in await svc.recall(query)],
-        )
-
-        _s.skill_two_stage_recall = True
-        on_result = await svc.recall_two_stage(query, use_llm=False)
-        check(
-            "recall_two_stage: BM25 stage finds the tags/applicability match keyword recall missed",
-            any(r["name"] == "throttle_recovery" for r in on_result),
-        )
-
-        # LLM stage selects a subset (including zero) from the shortlist.
-        import unittest.mock as _mock2
-
-        async def _fake_call_llm_pick(*a, **k):
-            return ('["throttle_recovery"]', 10, 5, False)
-
-        with _mock2.patch("app.crawler.call_llm.call_llm", side_effect=_fake_call_llm_pick):
-            llm_result = await svc.recall_two_stage(query, use_llm=True)
-        check(
-            "recall_two_stage: LLM stage keeps the genuinely matching skill",
-            any(r["name"] == "throttle_recovery" for r in llm_result),
-        )
-
-        async def _fake_call_llm_empty(*a, **k):
-            return ("[]", 10, 5, False)
-
-        with _mock2.patch("app.crawler.call_llm.call_llm", side_effect=_fake_call_llm_empty):
-            empty_result = await svc.recall_two_stage(query, use_llm=True)
-        check("recall_two_stage: LLM stage may select zero from a non-empty shortlist", empty_result == [])
-
-        async def _fake_call_llm_garbage(*a, **k):
-            return ("not valid json at all", 10, 5, False)
-
-        with _mock2.patch("app.crawler.call_llm.call_llm", side_effect=_fake_call_llm_garbage):
-            garbage_result = await svc.recall_two_stage(query, use_llm=True)
-        check(
-            "recall_two_stage: unparseable LLM response fails open to the BM25 shortlist",
-            any(r["name"] == "throttle_recovery" for r in garbage_result),
-        )
-
-        # ── dead-flag fix: knowledge_base.recall_skills_for_agent must reach
-        #    recall_two_stage(), not the flat recall() it silently called
-        #    before — otherwise skill_two_stage_recall can never take effect
-        #    at the actual agent-prompt-injection call site. ──
-        from app.services.knowledge_base import knowledge_base as _kb
-        kb_result = await _kb.recall_skills_for_agent(query)
-        check(
-            "knowledge_base.recall_skills_for_agent: reaches two-stage recall "
-            "(finds tags/applicability match recall() alone misses)",
-            any(r["name"] == "throttle_recovery" for r in kb_result),
-        )
-    finally:
-        _s.skill_two_stage_recall = _orig_two_stage
-        _s.skill_shortlist_k = _orig_shortlist_k
-        await svc.delete("throttle_recovery")
-
-    check("file skill delete", (await svc.delete("restart_pods")) and not _skill_path("restart_pods").exists())
-    await svc.delete_all()
-    check("file skill delete_all clears store", (await svc.list_skills(status="all")) == [])
-
-
 async def test_chat_session_compaction() -> None:
     """Per-chat-session compaction helpers — role mapping + replay fix. DB-free."""
     from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -4148,6 +4089,107 @@ async def test_loop_engineering() -> None:
         _fl_instance.record = _orig_record
 
 
+def test_code_semantic() -> None:
+    """ONNX code-embedding semantic search — pure (no onnxruntime) coverage.
+
+    The model forward pass needs onnxruntime+tokenizers+a provisioned model (an
+    image/container concern), so here we verify everything around it: the model
+    registry, the SHA256(model+content) cache round-trip, the corpus embed-text
+    composition, and the provision guard when downloads are disabled.
+    """
+    import os
+    import tempfile
+
+    from app.core.code_semantic import provision
+    from app.core.code_semantic.embedding_cache import (
+        EmbeddingCache,
+        content_hash,
+    )
+    from app.core.code_semantic.models import (
+        DEFAULT_MODEL_KEY,
+        MODEL_REGISTRY,
+        get_model_spec,
+    )
+
+    # ── model registry ──
+    check("code_semantic: arctic-embed-s is the default", DEFAULT_MODEL_KEY == "snowflake-arctic-embed-s")
+    spec = get_model_spec(None)
+    check("code_semantic: default spec resolves to the fast tier", spec.dim == 384 and spec.pooling == "cls")
+    bge = get_model_spec("bge-small-en-v1.5")
+    check("code_semantic: bge is 384-dim CLS", bge.dim == 384 and bge.pooling == "cls")
+    check("code_semantic: unknown key falls back to default", get_model_spec("nope").key == DEFAULT_MODEL_KEY)
+    nomic = get_model_spec("nomic-embed-text-v1.5")
+    check("code_semantic: nomic is 768-dim mean + prefixes",
+          nomic.dim == 768 and nomic.pooling == "mean" and nomic.query_prefix.startswith("search_query"))
+    # external-weights sidecar is listed (onnxruntime needs it beside the graph)
+    check("code_semantic: bge lists its .onnx_data sidecar",
+          any(f.endswith(".onnx_data") for f in MODEL_REGISTRY["bge-small-en-v1.5"].files))
+    check("code_semantic: files flatten to basenames",
+          spec.flat_files()["onnx/model_quantized.onnx"] == "model_quantized.onnx")
+
+    # ── SHA256(model+content) cache ──
+    check("code_semantic: content_hash is model+content keyed",
+          content_hash("m1", "x") != content_hash("m2", "x")
+          and content_hash("m1", "x") == content_hash("m1", "x"))
+    with tempfile.TemporaryDirectory() as d:
+        cache = EmbeddingCache(os.path.join(d, "nested", "emb.db"))
+        cache.put_batch("bge", [("alpha", [0.1, 0.2, 0.3]), ("beta", [1.0, 2.0, 3.0])])
+        got = cache.get_batch("bge", ["beta", "absent", "alpha"])
+        check("code_semantic: cache returns only stored keys", set(got) == {"alpha", "beta"})
+        check("code_semantic: cache round-trips float32 vectors",
+              got["beta"] == [1.0, 2.0, 3.0])
+        check("code_semantic: cache miss under a different model",
+              cache.get_batch("other", ["alpha"]) == {})
+        check("code_semantic: stats count rows per model", cache.stats().get("bge") == 2)
+
+    # ── embed-text composition (concept signal over raw tokens) ──
+    from app.core.code_semantic.search import _embed_text
+
+    text = _embed_text({
+        "kind": "Function", "name": "validate_login",
+        "qualified_name": "auth.validate_login",
+        "signature": "def validate_login(username, password)",
+        "summary": "Check credentials against the user store.",
+    })
+    check("code_semantic: embed-text includes name", "validate_login" in text)
+    check("code_semantic: embed-text includes signature", "username, password" in text)
+    check("code_semantic: embed-text includes summary", "credentials" in text)
+
+    # ── provision guard: missing model + downloads off must raise, not fetch ──
+    with tempfile.TemporaryDirectory() as d:
+        raised = False
+        try:
+            provision.ensure_model(d, "bge-small-en-v1.5", allow_download=False)
+        except FileNotFoundError:
+            raised = True
+        check("code_semantic: provision refuses to fetch when downloads disabled", raised)
+        check("code_semantic: is_provisioned false when files absent",
+              provision.is_provisioned(d, spec) is False)
+
+    # ── test-path detection + query intent (relevance tuning, never destructive) ──
+    from app.core.code_semantic.search import is_test_path, query_wants_tests
+
+    check("code_semantic: detects test paths (dir + filename markers)",
+          is_test_path("test/Foo/BarTests.cs") and is_test_path("src/__tests__/x.spec.ts")
+          and is_test_path("pkg/foo_test.go"))
+    check("code_semantic: real source is not a test path",
+          not is_test_path("src/services/MonitorClient.cs"))
+    check("code_semantic: query intent detects test-writing requests",
+          query_wants_tests("write unit tests for the uploader")
+          and query_wants_tests("find the spec for login"))
+    check("code_semantic: plain concept query has no test intent",
+          not query_wants_tests("where are credentials validated"))
+
+    # ── new-model registry entries are well-formed ──
+    check("code_semantic: arctic-embed-s registered (fast/small tier)",
+          "snowflake-arctic-embed-s" in MODEL_REGISTRY
+          and MODEL_REGISTRY["snowflake-arctic-embed-s"].dim == 384)
+    check("code_semantic: jina code model registered (code-specific)",
+          "jina-embeddings-v2-base-code" in MODEL_REGISTRY
+          and MODEL_REGISTRY["jina-embeddings-v2-base-code"].pooling == "mean")
+    check("code_semantic: default is the fast arctic tier", DEFAULT_MODEL_KEY == "snowflake-arctic-embed-s")
+
+
 async def _main() -> int:
     print("=== Agent Harness self-test ===")
     test_import_order_no_cycles()
@@ -4188,6 +4230,7 @@ async def _main() -> int:
     test_pinned_facts_budget()
     test_agent_spec()
     test_memory_capability_and_autolearn()
+    await test_autolearn_learn_flow()
     test_persona_and_supervisor_toggle()
     await test_supervisor_loop()
     await test_trajectory_export_step_events()
@@ -4216,7 +4259,6 @@ async def _main() -> int:
     test_session_answer_extraction()
     test_fact_extractor()
     test_memory_audit_logic()
-    test_skill_audit_helpers()
     test_seed_skill_library()
     test_conversational_intent()
     test_cloudwatch_prescan_gate()
@@ -4233,10 +4275,10 @@ async def _main() -> int:
     await test_delegate_batch_budget_economy()
     # ── Phase 5: delegated children route through the engine flag ──
     await test_subagent_engine_routing()
-    # ── file-backed skills (no DB) ──
-    await test_file_skills()
     # ── loop engineering: Loop 2 grader + Loop 4 hill-climbing ──
     await test_loop_engineering()
+    # ── ONNX code-embedding semantic search (registry/cache/provision) ──
+    test_code_semantic()
     print("-" * 40)
     if _FAILURES:
         print(f"FAILED: {len(_FAILURES)} check(s): {', '.join(_FAILURES)}")

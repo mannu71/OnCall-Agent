@@ -98,8 +98,8 @@ function ValueInput({ type, value, onCommit, busy }) {
 
     const commit = () => {
         if (String(draft) === String(value ?? '')) return;
-        if (type === 'int') {
-            const n = parseInt(draft, 10);
+        if (type === 'int' || type === 'float') {
+            const n = type === 'int' ? parseInt(draft, 10) : parseFloat(draft);
             if (Number.isNaN(n)) {
                 setDraft(String(value ?? ''));
                 return;
@@ -113,7 +113,8 @@ function ValueInput({ type, value, onCommit, busy }) {
     return (
         <SInput
             className="max-w-[220px]"
-            type={type === 'int' ? 'number' : 'text'}
+            type={type === 'int' || type === 'float' ? 'number' : 'text'}
+            step={type === 'float' ? '0.05' : undefined}
             value={draft}
             disabled={busy}
             onChange={(e) => setDraft(e.target.value)}

@@ -244,6 +244,49 @@ def _scope_tools(
     return scoped, unmatched
 
 
+def _summarize_tool_names(sub_tools: List[Any], limit: int = 12) -> str:
+    """Human-readable summary of a child's ACTUAL scoped tool names.
+
+    Mirrors claude-code-main's ``getToolsDescription`` — the parent model is
+    shown exactly which tools each specialist holds, so it routes by capability
+    rather than by the specialist's (possibly misleading) NAME. A squad named
+    "CloudWatch Squad" that was scoped to ``codegraph__*``/``postgres-*`` reads
+    as such here, so the parent keeps CloudWatch work on its own direct tools.
+    """
+    names = [n for n in (_tool_name(t) for t in sub_tools) if n]
+    if not names:
+        return "none"
+    if len(names) > limit:
+        return ", ".join(names[:limit]) + f", …(+{len(names) - limit} more)"
+    return ", ".join(names)
+
+
+def _format_specialist_line(name: str, description: str, sub_tools: List[Any]) -> str:
+    """Format one specialist listing line: ``- <name>: <desc> (tools: …)``.
+
+    Mirrors claude-code-main's ``formatAgentLine``. The tool list is the child's
+    resolved scoped set (post allow/deny/blocked filtering), not the raw glob,
+    so the parent sees what the specialist can ACTUALLY do.
+    """
+    desc = (description or "").strip()
+    tools_desc = _summarize_tool_names(sub_tools)
+    if desc:
+        return f"- {name}: {desc} (tools: {tools_desc})"
+    return f"- {name} (tools: {tools_desc})"
+
+
+# Steering shared by every fan-out tool: keep direct-tool work on the parent,
+# reserve delegation for what a specialist's OWN tools can do. Prevents the
+# parent from routing a task to a specialist that lacks the needed tool family
+# (e.g. delegating CloudWatch work to a code/DB-scoped squad) when the parent
+# holds that tool directly.
+_DELEGATION_ROUTING_STEER = (
+    "Route by the tools listed for each specialist below — NOT by its name. "
+    "Use your OWN directly-attached tools for anything they cover; only delegate "
+    "a sub-task when a specialist actually holds the tool(s) it needs and you do not."
+)
+
+
 def _infer_child_context_flags(sub_tools: List[Any]) -> Tuple[bool, bool]:
     """Infer (has_code_analyzer, has_cloudwatch) for a child from its ACTUAL
     scoped tool set, so a named specialist scoped to ``crawler_*`` / ``cloudwatch_*``
@@ -528,23 +571,46 @@ async def _run_child(
             child_cb = _ChildStreamCallback(_pcb, name, model=_child_model)
 
         child_engine = resolve_engine(sub_agent_config)
-        if timeout_s > 0:
-            result = await asyncio.wait_for(
-                run_agent_once(
+
+        # Detach the child from the parent's LangChain callback context. When the
+        # parent runs via LangGraph ``astream_events`` (e.g. HITL forces it), that
+        # stream otherwise ALSO captures the child's nested tool calls and tags
+        # them as the main agent — producing duplicate rows (one "agent", one
+        # subagent) for every child call. The child reports its own activity via
+        # ``child_cb``, so we reset the propagated config to None for the child's
+        # run. Best-effort: a missing internal API just leaves the harmless dupes.
+        _var_cfg = None
+        _cfg_token = None
+        try:
+            from langchain_core.runnables.config import var_child_runnable_config as _var_cfg
+            _cfg_token = _var_cfg.set(None)
+        except Exception:  # noqa: BLE001
+            _var_cfg = None
+
+        try:
+            if timeout_s > 0:
+                result = await asyncio.wait_for(
+                    run_agent_once(
+                        sub_spec, sub_llm, sub_tools, q,
+                        logger_instance=logger, execution_id=sub_id, thread_id=sub_id,
+                        recursion_limit=recursion_limit, checkpointer=cp, engine=child_engine,
+                        stream_callback=child_cb,
+                    ),
+                    timeout=timeout_s,
+                )
+            else:
+                result = await run_agent_once(
                     sub_spec, sub_llm, sub_tools, q,
                     logger_instance=logger, execution_id=sub_id, thread_id=sub_id,
                     recursion_limit=recursion_limit, checkpointer=cp, engine=child_engine,
                     stream_callback=child_cb,
-                ),
-                timeout=timeout_s,
-            )
-        else:
-            result = await run_agent_once(
-                sub_spec, sub_llm, sub_tools, q,
-                logger_instance=logger, execution_id=sub_id, thread_id=sub_id,
-                recursion_limit=recursion_limit, checkpointer=cp, engine=child_engine,
-                stream_callback=child_cb,
-            )
+                )
+        finally:
+            if _var_cfg is not None and _cfg_token is not None:
+                try:
+                    _var_cfg.reset(_cfg_token)
+                except Exception:  # noqa: BLE001
+                    pass
 
         answer = (result.get("final_answer") or "").strip()
         if not answer:
@@ -566,8 +632,37 @@ async def _run_child(
         return envelope[:output_max]
     except asyncio.TimeoutError:
         logger.warning("delegation: child %s timed out after %.0fs", sub_id, timeout_s)
-        return json.dumps({"subagent": name, "task": task, "status": "timeout",
-                           "error": f"child timed out after {timeout_s:.0f}s"})
+        # Best-effort: recover what the child accomplished before the cutoff from
+        # its checkpointer so the parent can report an accurate PARTIAL result.
+        partial = ""
+        n_calls = 0
+        try:
+            _snap = await cp.aget_tuple({"configurable": {"thread_id": sub_id}})
+            _msgs = ((_snap.checkpoint or {}).get("channel_values", {}) or {}).get("messages", []) if _snap else []
+            for _m in reversed(_msgs):
+                if getattr(_m, "type", "") == "ai" and getattr(_m, "content", ""):
+                    _c = _m.content
+                    partial = _c if isinstance(_c, str) else str(_c)
+                    break
+            n_calls = sum(1 for _m in _msgs if getattr(_m, "type", "") == "tool")
+        except Exception:  # noqa: BLE001 — partial recovery must never mask the timeout
+            partial, n_calls = "", 0
+        # Steer the parent away from concluding the TOOLS are unavailable: they
+        # responded (n_calls completed) but the queries are slow on a large repo
+        # and the subagent hit its time budget. This is a partial/slow result.
+        guidance = (
+            f"The '{name}' subagent hit its {timeout_s:.0f}s time budget. Its tools ARE "
+            f"available and responded ({n_calls} tool call(s) completed) — the queries are "
+            "just slow on this large codebase, so it could not finish in time. Treat this as "
+            "a PARTIAL / slow result: do NOT report the code-analysis tools as unavailable. "
+            "If you need more, retry with ONE narrower, specific query."
+        )
+        return json.dumps({
+            "subagent": name, "task": task, "status": "timeout",
+            "answer": (partial + "\n\n" + guidance) if partial else guidance,
+            "sub_tool_calls": n_calls,
+            "error": f"exceeded {timeout_s:.0f}s budget (tools available but slow)",
+        })
     except Exception as exc:  # noqa: BLE001
         logger.warning("delegation: child %s failed: %s", sub_id, exc)
         return json.dumps({"subagent": name, "task": task, "status": "error", "error": str(exc)})
@@ -611,10 +706,6 @@ def build_subagent_tools(
         model_name = _def.get("model") or None
         max_turns = _def.get("max_turns")
         permission_mode = _def.get("permission_mode") or "auto_allow"
-        description = _def.get("description") or (
-            f"Delegate a scoped task to the '{name}' subagent, which runs its own loop "
-            f"and returns a concise summary. Use for a separable part of a larger task."
-        )
 
         sub_tools, unmatched = _scope_tools(
             base_tools, tool_globs, blocked_patterns, depth_remaining,
@@ -624,6 +715,18 @@ def build_subagent_tools(
             logger.warning(
                 "subagent def '%s': tool glob(s) matched nothing: %s", name, unmatched,
             )
+
+        # Surface the child's ACTUAL scoped tools + a route-by-capability steer so
+        # the parent doesn't delegate work this specialist can't do (e.g. sending
+        # CloudWatch work to a code/DB-scoped squad the parent misread by name).
+        description = _def.get("description") or (
+            f"Delegate a scoped task to the '{name}' subagent, which runs its own loop "
+            f"and returns a concise summary. Use for a separable part of a larger task."
+        )
+        description = (
+            f"{description}\n(tools: {_summarize_tool_names(sub_tools)}) "
+            f"{_DELEGATION_ROUTING_STEER}"
+        )
 
         tools.append(
             _make_serial_tool(
@@ -688,6 +791,7 @@ def _build_specialist_registry(
                 "subagent def '%s': tool glob(s) matched nothing: %s", n, _unmatched,
             )
         by_name[n] = {
+            "description": _def.get("description") or "",
             "role_prompt": _def.get("role_prompt") or None,
             "capabilities": _def.get("capabilities") or [],
             "output_schema": _def.get("output_schema") or None,
@@ -766,14 +870,19 @@ def build_delegate_parallel_tool(
                 parsed.append({"raw": r})
         return json.dumps(parsed, default=str)[:output_max * len(delegations)]
 
+    _specialist_listing = "\n".join(
+        _format_specialist_line(n, _by_name[n]["description"], _by_name[n]["sub_tools"])
+        for n in valid_names
+    )
     return StructuredTool.from_function(
         coroutine=_parallel,
         name="delegate_parallel",
         description=(
             "Fan out tasks to multiple specialists concurrently in one call. "
-            f"Pass a list of {{specialist, task, context?}} items (specialists: "
-            f"{', '.join(valid_names)}). All run in parallel; results are returned "
-            "together as a JSON array. Use when tracks are independent."
+            "Pass a list of {specialist, task, context?} items. All run in "
+            "parallel; results are returned together as a JSON array. Use when "
+            "tracks are independent.\n\n"
+            f"{_DELEGATION_ROUTING_STEER}\n\nSpecialists:\n{_specialist_listing}"
         ),
         args_schema=_ParallelInput,
     )
@@ -911,15 +1020,20 @@ def build_delegate_batch_tool(
         }
         return json.dumps(summary, default=str)[: output_max * max(1, len(items))]
 
+    _specialist_listing = "\n".join(
+        _format_specialist_line(n, _by_name[n]["description"], _by_name[n]["sub_tools"])
+        for n in valid_names
+    )
     return StructuredTool.from_function(
         coroutine=_batch,
         name="delegate_batch",
         description=(
             "Fan out MANY specialist tasks at once (better than delegate_parallel past "
             "~5 items). Write a JSON array of {specialist?, task, context?} objects to a "
-            f"virtual file with fs_write, then call this with that path. Specialists: "
-            f"{', '.join(valid_names)}. Each result is also saved to its own "
-            "/batch_out/<index>_<specialist>.json file for deterministic aggregation."
+            "virtual file with fs_write, then call this with that path. Each result is "
+            "also saved to its own /batch_out/<index>_<specialist>.json file for "
+            "deterministic aggregation.\n\n"
+            f"{_DELEGATION_ROUTING_STEER}\n\nSpecialists:\n{_specialist_listing}"
         ),
         args_schema=_BatchInput,
     )

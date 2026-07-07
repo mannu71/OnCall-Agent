@@ -29,6 +29,114 @@ logger = logging.getLogger(__name__)
 #: workflow with two codegraph nodes reuses one connection (is_connected guard).
 CODEGRAPH_SERVER_ID = "codegraph"
 
+#: Fast index-backed search tools — annotated as preferred over search_code.
+_FAST_SEARCH_TOOLS = frozenset({"search_semantic", "find_symbol", "search_graph"})
+
+#: Prepended to search_code's description to steer the model to the fast tools.
+_SEARCH_CODE_WARNING = (
+    "[SLOW — greps raw source, often 30-60s on a large repo and may time out. "
+    "PREFER the indexed tools first: codegraph__search_semantic(query) for a "
+    "concept/description, codegraph__find_symbol(name) for a known symbol, "
+    "codegraph__search_graph(query) for structure — each uses the prebuilt index "
+    "and returns in ~1s. Use search_code ONLY for an exact literal string the "
+    "index can't surface, scoped as narrowly as possible.]\n"
+)
+
+#: Prepended to each fast index-backed search tool's description.
+_FAST_SEARCH_HINT = (
+    "[Fast — uses the prebuilt index; prefer over codegraph__search_code.] "
+)
+
+
+def _build_onnx_semantic_tool(repo_names: List[str]) -> Optional[Any]:
+    """Build the ONNX-backed ``codegraph__search_semantic`` StructuredTool.
+
+    Replaces codegraph's native (empty) random-indexing ``search_semantic`` with
+    real sentence-transformer embeddings over the project's symbol nodes. Same
+    tool name so all existing fast-tool steering / disclosure keeps working.
+    Returns None if the feature is off or LangChain isn't importable.
+    """
+    if not settings.code_semantic_enabled:
+        return None
+    try:
+        from langchain_core.tools import StructuredTool
+        from pydantic import BaseModel, Field
+    except Exception:  # noqa: BLE001
+        logger.debug("code_semantic: langchain/pydantic unavailable — skipping tool")
+        return None
+
+    from app.core.code_semantic.search import get_code_semantic_search
+
+    _default_project = repo_names[0] if len(repo_names) == 1 else None
+
+    class _SemanticSearchInput(BaseModel):
+        query: str = Field(
+            description="Natural-language concept/description to search for, e.g. "
+            "'where user credentials are validated'."
+        )
+        project: Optional[str] = Field(
+            default=None,
+            description="Repo name to search. Optional when only one repo is wired.",
+        )
+        top_k: int = Field(default=10, ge=1, le=50, description="Max results.")
+        include_tests: Optional[bool] = Field(
+            default=None,
+            description="Test handling. Leave unset for smart default (tests are "
+            "de-prioritized unless the query is about tests). Set true when you "
+            "WANT tests (e.g. writing/finding test cases); false to suppress them.",
+        )
+
+    async def _search_semantic(
+        query: str, project: Optional[str] = None, top_k: int = 10,
+        include_tests: Optional[bool] = None,
+    ) -> str:
+        import json
+
+        proj = project or _default_project
+        if not proj:
+            return json.dumps({
+                "error": "specify 'project' — multiple repos are wired",
+                "available": repo_names,
+            })
+        svc = get_code_semantic_search()
+        try:
+            hits = svc.search(proj, query, top_k=top_k, include_tests=include_tests)
+        except FileNotFoundError as exc:
+            return json.dumps({"error": f"embedding model not provisioned: {exc}"})
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("code_semantic: search failed")
+            return json.dumps({"error": str(exc)})
+        if not hits:
+            # Distinguish "index still building in the background" from "no matches"
+            # so the agent knows to retry shortly rather than give up.
+            if svc.is_indexing(proj):
+                return json.dumps({
+                    "status": "indexing",
+                    "note": f"Semantic index for '{proj}' is building in the "
+                            "background (first use on this repo). Retry in a few "
+                            "seconds, or use codegraph__search_graph meanwhile.",
+                })
+            return json.dumps({
+                "results": [],
+                "note": f"no semantic matches in '{proj}' (indexed by codegraph?)",
+            })
+        return json.dumps({"project": proj, "results": hits}, ensure_ascii=False)
+
+    return StructuredTool.from_function(
+        coroutine=_search_semantic,
+        name="codegraph__search_semantic",
+        description=(
+            _FAST_SEARCH_HINT
+            + "Semantic (embedding) search over indexed code — embeds the actual "
+            "function/class SOURCE, so it finds code by MEANING, not literal "
+            "tokens. Best first choice for a concept or description (e.g. "
+            "'credential handling', 'retry with backoff'). Tests are de-prioritized "
+            "by default; pass include_tests=true when you want test code. Returns "
+            "ranked entities with file:line."
+        ),
+        args_schema=_SemanticSearchInput,
+    )
+
 
 def codegraph_inline_config() -> Dict[str, Any]:
     """Inline MCP config to spawn ``codegraph serve`` — no DB row required.
@@ -112,15 +220,42 @@ async def build_codegraph_tools(
     # passed the canonical name) is left unchanged.
     _project_aliases = {name: cg_project_name(name) for name in _repo_names}
     for _t in tools:
-        if getattr(_t, "name", "") == f"{CODEGRAPH_SERVER_ID}__search_code":
+        _suffix = getattr(_t, "name", "").split("__", 1)[-1]
+        if _suffix == "search_code":
             try:
                 _t.tool_timeout = _search_timeout
+                # Steer the model to the fast INDEXED tools first. search_code
+                # greps raw source (30-60s on a large repo, often times out); the
+                # engine's own description carries no such warning, and the
+                # code-analyzer capability prompt is written for the crawler
+                # backend's tool names — so without this the agent defaults to the
+                # slow grep and stalls (the reported "tools timing out" behaviour).
+                _t.description = _SEARCH_CODE_WARNING + (_t.description or "")
             except Exception:  # noqa: BLE001 — never break tool build on this
-                logger.debug("build_codegraph_tools: could not cap search_code timeout")
+                logger.debug("build_codegraph_tools: could not steer search_code")
+        elif _suffix in _FAST_SEARCH_TOOLS:
+            try:
+                _t.description = _FAST_SEARCH_HINT + (_t.description or "")
+            except Exception:  # noqa: BLE001 — never break tool build on this
+                logger.debug("build_codegraph_tools: could not annotate %s", _suffix)
         try:
             _t.project_aliases = _project_aliases
         except Exception:  # noqa: BLE001 — never break tool build on this
             logger.debug("build_codegraph_tools: could not set project_aliases on %s", getattr(_t, "name", "?"))
+
+    # When ONNX code embeddings are enabled, swap codegraph's native (empty)
+    # random-indexing `search_semantic` for the real embedding-backed tool. Same
+    # tool name, so all the fast-tool steering above and progressive disclosure
+    # keep working — the agent just gets meaningful results instead of nothing.
+    _onnx_tool = _build_onnx_semantic_tool(_repo_names)
+    if _onnx_tool is not None:
+        tools = [
+            t for t in tools
+            if getattr(t, "name", "").split("__", 1)[-1] != "search_semantic"
+        ]
+        tools.append(_onnx_tool)
+        logger.info("build_codegraph_tools: enabled ONNX search_semantic (model=%s)",
+                    settings.code_semantic_model)
 
     logger.info(
         "build_codegraph_tools: exposed %d codegraph tools (repos=%s)",

@@ -87,8 +87,8 @@ class WorkflowScheduler:
         except RuntimeError:
             asyncio.run(self.reload_workflows())
 
-        # Periodic self-improvement curator: promotes verified skills, pins
-        # frequently-recalled memories, and (when enabled) consolidates memory.
+        # Periodic self-improvement curator: pins frequently-recalled memories
+        # and (when enabled) consolidates memory.
         # Leader-locked like cron fires so a multi-replica deployment runs it
         # once. Interval is operator-tunable; cheap promotions run every cycle.
         try:

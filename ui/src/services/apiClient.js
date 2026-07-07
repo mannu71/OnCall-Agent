@@ -2,6 +2,14 @@
  * API Client for communicating with the FastAPI backend.
  * This service provides a unified interface for the UI to interact with the backend,
  * whether running in Docker (nginx same-origin proxy) or local Vite dev.
+ *
+ * Two HTTP clients exist (both hit the same agent-api host):
+ *   - apiClient.js (this file, fetch-based) — the lightweight generic wrapper;
+ *     also the single source of truth for the base URL (`getApiBaseUrl`).
+ *   - agentApiClient.js (axios-based) — carries most feature endpoints
+ *     (sessions, workflows, MCP config, model keys) with interceptors.
+ * For new code, extend whichever client already covers that endpoint area;
+ * reuse `getApiBaseUrl` here for base-URL resolution rather than re-deriving it.
  */
 
 const DEFAULT_API_HOST = 'http://localhost:8000';

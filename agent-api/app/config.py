@@ -241,6 +241,58 @@ class Settings(BaseSettings):
     )
     code_correlation_concurrency: int = 5
 
+    # ── ONNX code-embedding semantic search ──────────────────────────────────
+    # A Bedrock-independent embedding path for concept-level code search (fills
+    # codegraph's empty search_semantic). Runs a small quantized sentence-
+    # transformer on CPU via onnxruntime with a SHA256(model+content) cache.
+    # Always on: it degrades gracefully (the tool returns an error/indexing note)
+    # until a model is provisioned, so there's no reason to gate it. The env var
+    # remains as an escape hatch for a locked-down build.
+    code_semantic_enabled: bool = Field(
+        default=True, validation_alias="CODE_SEMANTIC_ENABLED"
+    )
+    # The single embedding model used: snowflake-arctic-embed-s — best accuracy in
+    # the fast 384-dim/34MB tier (see app/core/code_semantic/models.py). Fixed
+    # (not user-selectable); the env var stays for an ops override if ever needed.
+    code_semantic_model: str = Field(
+        default="snowflake-arctic-embed-s", validation_alias="CODE_SEMANTIC_MODEL"
+    )
+    # Base dir holding one subdir per model. Defaults to /opt/models, where the
+    # arctic-embed-s model is baked into the image (NOT /app/data — a mounted
+    # volume that would shadow baked files). The Docker image also sets
+    # CODE_SEMANTIC_MODELS_ROOT=/opt/models explicitly.
+    code_semantic_models_root: str = Field(
+        default="/opt/models", validation_alias="CODE_SEMANTIC_MODELS_ROOT"
+    )
+    # SQLite embedding cache path (SHA256(model+content) → float32 vector).
+    code_semantic_cache_db: str = Field(
+        default="/app/data/code_semantic/embeddings.db",
+        validation_alias="CODE_SEMANTIC_CACHE_DB",
+    )
+    # When the model files are missing, allow fetching them from HuggingFace over
+    # an unverified TLS context (the only path past the corp self-signed-cert
+    # wall). Off by default — a locked-down deploy should vendor the files.
+    code_semantic_allow_download: bool = Field(
+        default=False, validation_alias="CODE_SEMANTIC_ALLOW_DOWNLOAD"
+    )
+    code_semantic_batch_size: int = Field(
+        default=32, validation_alias="CODE_SEMANTIC_BATCH_SIZE"
+    )
+    # Max chars of a symbol's real source body folded into its embedding text
+    # (0 = header-only). Embedding the body is the main accuracy lever, but longer
+    # text = proportionally slower indexing, so this is the primary index-cost
+    # knob. 600 ≈ ~15-20 lines — the signature + opening (most of the signal) —
+    # and indexes ~3x faster than the fuller 2000.
+    code_semantic_body_max_chars: int = Field(
+        default=600, validation_alias="CODE_SEMANTIC_BODY_MAX_CHARS"
+    )
+    # Score multiplier applied to test/build-output entities when the query does
+    # NOT express test intent — de-prioritizes tests without hiding them (mirrors
+    # code-context-engine's 0.8 path penalty). 1.0 disables the penalty.
+    code_semantic_test_penalty: float = Field(
+        default=0.85, validation_alias="CODE_SEMANTIC_TEST_PENALTY"
+    )
+
     # Agent / tools / output limits
     provider_transport: str = "anthropic"
     crawler_model: str = "anthropic.claude-3-5-haiku-20241022-v1:0"
@@ -364,17 +416,6 @@ class Settings(BaseSettings):
     # reach the same table set persistence for todos/offload scratch does.
     vfs_session_persistence_enabled: bool = Field(
         default=False, validation_alias="VFS_SESSION_PERSISTENCE_ENABLED",
-    )
-    skill_min_tool_calls: int = 3
-    # Confidence-gated distillation: a distilled skill scoring
-    # below this is saved as 'draft' (hidden from recall) until audited/proven.
-    skill_confidence_min: float = Field(
-        default=0.6, validation_alias="SKILL_CONFIDENCE_MIN"
-    )
-    # A draft skill with at least this many successful executions is auto-promoted
-    # to 'active' by the curator audit (proven-by-use).
-    skill_promote_success_count: int = Field(
-        default=2, validation_alias="SKILL_PROMOTE_SUCCESS_COUNT"
     )
     guardrail_hard_stop: bool = False
 
@@ -526,22 +567,9 @@ class Settings(BaseSettings):
         default=True, validation_alias="SKILL_RAG_SELECTION_ENABLED"
     )
     skill_rag_k: int = Field(default=2, validation_alias="SKILL_RAG_K")
-    # 4.4 two-stage skill retrieval (app.core.skills.service.SkillService.
-    # recall_two_stage). OFF by default — recall() (trigger_patterns-only
-    # keyword match) is unchanged unless explicitly opted into. When on:
-    # BM25 shortlist over name/tags/applicability/category_path, then an
-    # LLM pass that may select zero from the shortlist.
-    skill_two_stage_recall: bool = Field(
-        default=False, validation_alias="SKILL_TWO_STAGE_RECALL"
-    )
-    skill_shortlist_k: int = Field(default=6, validation_alias="SKILL_SHORTLIST_K")
 
     # ── Skill storage (file-based; no DB) ────────────────────────────────────
-    # Executable skills (distilled + user-created) are stored as one JSON file
-    # per skill here. Markdown guidance skills (SkillManager) live under skills_dir.
-    skills_store_dir: str = Field(
-        default="data/skills_store", validation_alias="SKILLS_STORE_DIR"
-    )
+    # Skills are markdown SKILL.md files (SkillManager) under skills_dir.
     skills_dir: str = Field(default="data/skills", validation_alias="SKILLS_DIR")
 
     # ── Delegation (multi-agent) ─────────────────────────────────────────────

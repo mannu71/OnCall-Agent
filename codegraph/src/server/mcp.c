@@ -418,7 +418,11 @@ static const tool_def_t TOOLS[] = {
      "signatures+metadata (default). full: with source. files: just file list.\"},"
      "\"context\":{\"type\":\"integer\",\"description\":\"Lines of context around each match "
      "(like grep -C). Only used in compact mode.\"},"
-     "\"regex\":{\"type\":\"boolean\",\"default\":false},\"limit\":{\"type\":\"integer\","
+     "\"regex\":{\"type\":\"boolean\",\"default\":false},"
+     "\"include_tests\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Also scan "
+     "the test tree and build output. Default false — excluded for speed (tests can be the "
+     "majority of a repo). Set true only when you specifically need matches inside tests.\"},"
+     "\"limit\":{\"type\":\"integer\","
      "\"description\":\"Max enriched results per call. Default 10. Response includes "
      "'total_grep_matches' and 'total_results' so callers can detect truncation. No "
      "offset parameter — raise limit or narrow with file_pattern / path_filter to see more."
@@ -3972,8 +3976,10 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
          * filtering is also moot here — files are passed explicitly via
          * xargs, not discovered by a directory walk, so rg searches exactly
          * the given list regardless of ignore rules.) */
+        /* -r (--no-run-if-empty): when test-exclusion leaves the filelist empty,
+         * do NOT invoke rg with no path args (it would read stdin and hang). */
         snprintf(cmd, cmd_sz,
-                 "xargs rg -Hn --no-heading --hidden %s -f '%s' < '%s' 2>/dev/null",
+                 "xargs -r rg -Hn --no-heading --hidden %s -f '%s' < '%s' 2>/dev/null",
                  rg_flag, tmpfile, filelist);
     } else if (file_pattern) {
         /* Real recursive walk (no pre-built file list) — here grep's --include
@@ -4375,8 +4381,34 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cg_store_t *s
 }
 
 /* Write indexed file list for scoped grep. Returns true if scoped. */
+/* True when a root-relative path is a test / build-output file. search_code
+ * skips these by default: on a large repo the test tree dominates scan time
+ * (e.g. compliance-api's tests/ is 4.8GB of 7.5GB indexed) for low-value hits,
+ * so excluding it roughly halves search_code latency. include_tests=true
+ * restores them. Segment-aware (leading or "/"-delimited component) so
+ * "latest/" or "contest.cs" are NOT skipped. */
+static bool cg_search_path_is_test(const char *rel) {
+    if (!rel) {
+        return false;
+    }
+    if (strstr(rel, "/tests/") || strstr(rel, "/test/") || strstr(rel, "/__tests__/") ||
+        strstr(rel, "/obj/") || strstr(rel, "/coverlet/") || strstr(rel, "node_modules/")) {
+        return true;
+    }
+    if (strncmp(rel, "tests/", 6) == 0 || strncmp(rel, "test/", 5) == 0 ||
+        strncmp(rel, "obj/", 4) == 0) {
+        return true;
+    }
+    /* Common test-file name markers (.NET / JS / Python). */
+    if (strstr(rel, ".Tests.") || strstr(rel, "Tests.cs") || strstr(rel, "_test.") ||
+        strstr(rel, ".spec.") || strstr(rel, ".test.")) {
+        return true;
+    }
+    return false;
+}
+
 static bool write_scoped_filelist(cg_mcp_server_t *srv, const char *project, const char *root_path,
-                                  const char *filelist) {
+                                  const char *filelist, bool include_tests) {
     cg_store_t *pre_store = resolve_store(srv, project);
     if (!pre_store) {
         return false;
@@ -4391,6 +4423,9 @@ static bool write_scoped_filelist(cg_mcp_server_t *srv, const char *project, con
     bool ok = false;
     if (fl) {
         for (int fi = 0; fi < indexed_count; fi++) {
+            if (!include_tests && cg_search_path_is_test(indexed_files[fi])) {
+                continue; /* skip test/build-output files (see cg_search_path_is_test) */
+            }
             /* Use forward slashes so xargs doesn't interpret Windows
              * backslashes as escape sequences (e.g. \n becomes newline).
              * Binary mode to prevent CRLF (xargs would see trailing \r). */
@@ -4492,6 +4527,9 @@ static char *handle_search_code(cg_mcp_server_t *srv, const char *args) {
     int limit = cg_mcp_get_int_arg(args, "limit", MCP_DEFAULT_LIMIT);
     int context_lines = cg_mcp_get_int_arg(args, "context", 0);
     bool use_regex = cg_mcp_get_bool_arg(args, "regex");
+    /* Exclude the (often huge) test tree from the grep scope by default — it
+     * dominates scan time for low-value hits. Pass include_tests=true to scan it. */
+    bool include_tests = cg_mcp_get_bool_arg(args, "include_tests");
     uint64_t search_t0 = cg_now_ms();
     /* In literal (non-regex) mode a '|' is matched as a byte, not alternation —
      * a common silent 0-match trap; flagged in the result warnings (#282). */
@@ -4627,7 +4665,7 @@ static char *handle_search_code(cg_mcp_server_t *srv, const char *args) {
     snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
     bool scoped = false;
 
-    scoped = write_scoped_filelist(srv, project, root_path, filelist);
+    scoped = write_scoped_filelist(srv, project, root_path, filelist, include_tests);
 
     char cmd[CG_SZ_4K];
     build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist, root_path);

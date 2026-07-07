@@ -87,16 +87,22 @@ class SessionRepository(BaseAsyncRepository):
         rows = await self._all(stmt)
         return [self._session_to_dict(r) for r in rows]
 
-    async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Return one session's metadata + hydrated messages, or None."""
+    async def get_session(
+        self, session_id: str, *, include_messages: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """Return one session's metadata (+ hydrated messages), or None.
+
+        ``include_messages=False`` skips the second ``chat_messages`` query — for
+        callers that only mutate/return metadata (e.g. the PATCH rename/pin
+        endpoint), where hydrating the full turn history is pure waste.
+        """
         row = await self._one(
             select(ChatSessionModel).where(ChatSessionModel.id == session_id)
         )
         if row is None:
             return None
-        messages = await self.get_messages(session_id)
         data = self._session_to_dict(row)
-        data["messages"] = messages
+        data["messages"] = await self.get_messages(session_id) if include_messages else []
         return data
 
     async def rename(self, session_id: str, title: str) -> bool:

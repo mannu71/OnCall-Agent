@@ -90,6 +90,14 @@ FLAG_CATALOG: List[Dict[str, Any]] = [
      "label": "Persist virtual filesystem",
      "help": "Keep the agent's virtual filesystem across turns in a session."},
 
+    # ── Delegation / subagents ──
+    {"key": "delegation_child_timeout_seconds", "type": "int", "group": "Delegation & subagents",
+     "label": "Subagent time budget (s)",
+     "help": "Max wall-clock a delegated subagent runs before it's cut off. Raise it if subagents time out on slow tools (e.g. codegraph on a large repo)."},
+    {"key": "delegation_max_concurrent", "type": "int", "group": "Delegation & subagents",
+     "label": "Max parallel subagents",
+     "help": "How many subagents run at once for delegate_parallel/batch. Lower it (e.g. 1) to avoid duplicate slow work."},
+
     # ── Reliability ──
     {"key": "routing_fallback_enabled", "type": "bool", "group": "Reliability",
      "label": "Model routing fallback",
@@ -119,6 +127,20 @@ FLAG_CATALOG: List[Dict[str, Any]] = [
     {"key": "step_events_enabled", "type": "bool", "group": "Chat history & telemetry",
      "label": "Per-step telemetry events",
      "help": "Record per-turn/per-tool step events (batched at run end)."},
+
+    # ── Code semantic search (ONNX embeddings) ──
+    # The feature is always on and always uses snowflake-arctic-embed-s with its
+    # model files vendored locally, so the enable toggle, model picker, and
+    # download switch are intentionally NOT exposed — only the tuning knobs are.
+    {"key": "code_semantic_body_max_chars", "type": "int", "group": "Code semantic search",
+     "label": "Source body chars embedded",
+     "help": "How much of each function's real source is folded into its embedding (0 = name/signature only). Biggest accuracy lever; higher = slower index."},
+    {"key": "code_semantic_test_penalty", "type": "float", "group": "Code semantic search",
+     "label": "Test result penalty",
+     "help": "Score multiplier for test files when the query isn't about tests (1.0 = no penalty). De-prioritizes tests without hiding them."},
+    {"key": "code_semantic_batch_size", "type": "int", "group": "Code semantic search",
+     "label": "Embedding batch size",
+     "help": "Texts per ONNX forward pass during indexing. Higher = faster but more memory."},
 ]
 
 _CATALOG_BY_KEY = {spec["key"]: spec for spec in FLAG_CATALOG}
@@ -136,6 +158,8 @@ def _coerce(spec: Dict[str, Any], raw: Any) -> Any:
         return str(raw).strip().lower() in ("1", "true", "yes", "on")
     if t == "int":
         return int(raw)
+    if t == "float":
+        return float(raw)
     return "" if raw is None else str(raw)
 
 

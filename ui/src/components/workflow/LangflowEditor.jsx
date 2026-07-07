@@ -2477,7 +2477,9 @@ function SkillsPicker({ value, onChange, skillCatalog }) {
     () => (value ? String(value).split(',').map(s => s.trim()).filter(Boolean) : []),
     [value],
   );
-  const dbSkills = skillCatalog?.db || [];
+  // Skills are file-based markdown (SKILL.md). Selecting any chip scopes the
+  // agent to "only these"; an empty selection means auto-select over the whole
+  // library (see build_recall_query).
   const fsSkills = skillCatalog?.filesystem || [];
   const toggle = (name) => {
     const next = selected.includes(name) ? selected.filter(n => n !== name) : [...selected, name];
@@ -2512,11 +2514,9 @@ function SkillsPicker({ value, onChange, skillCatalog }) {
           (optional — none selected = auto-select from the global library)
         </span>
       </div>
-      {fsSkills.length > 0 && renderGroup(fsSkills, '#7c3aed')}
-      {dbSkills.length > 0 && renderGroup(dbSkills, '#0891b2')}
-      {fsSkills.length === 0 && dbSkills.length === 0 && (
-        <span style={{ fontSize: 10, color: '#94a3b8' }}>No skills available yet</span>
-      )}
+      {fsSkills.length > 0
+        ? renderGroup(fsSkills, '#7c3aed')
+        : <span style={{ fontSize: 10, color: '#94a3b8' }}>No skills available yet</span>}
     </div>
   );
 }
@@ -3603,8 +3603,8 @@ const LangflowEditor = forwardRef(function LangflowEditor(
   // capability ids) — used by the Subagents node's per-subagent editor.
   const [toolCatalog, setToolCatalog]     = useState([]);
   const [profileCatalog, setProfileCatalog] = useState({ output_schemas: [], capabilities: [] });
-  // DB-backed + filesystem (SKILL.md) skills, for the Agent node's Skills picker.
-  const [skillCatalog, setSkillCatalog] = useState({ db: [], filesystem: [] });
+  // File-based markdown (SKILL.md) skills, for the Agent node's Skills picker.
+  const [skillCatalog, setSkillCatalog] = useState({ filesystem: [] });
   const loadMcpServers = useCallback(() => {
     getMCPServers().then(all => {
       if (!all || !Object.keys(all).length) return; // don't overwrite good data with empty
@@ -3631,7 +3631,7 @@ const LangflowEditor = forwardRef(function LangflowEditor(
     }).catch(() => {});
     agentApiClient.listSkills().then(data => {
       if (!data) return;
-      setSkillCatalog({ db: data.db || [], filesystem: data.filesystem || [] });
+      setSkillCatalog({ filesystem: data.filesystem || [] });
     }).catch(() => {});
   }, [loadMcpServers]);
 

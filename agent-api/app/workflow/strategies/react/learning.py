@@ -113,11 +113,10 @@ async def auto_learn(
 
         logger_instance.info(
             "ReactStrategy: AutoLearnService completed — "
-            "kb=%s pattern=%s trajectory=%s skill=%s skipped=%s",
+            "kb=%s pattern=%s trajectory=%s skipped=%s",
             _learn_result.kb_upserted,
             _learn_result.pattern_bumped,
             _learn_result.trajectory_saved,
-            _learn_result.skill_distilled,
             _learn_result.skipped_reason or "none",
             extra={"execution_id": execution_id},
         )

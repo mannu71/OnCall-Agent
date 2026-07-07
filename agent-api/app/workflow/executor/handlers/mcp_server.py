@@ -87,6 +87,17 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
                     len(kept), len(mcp_manager.tools.get(conn_key, [])),
                 )
             context.setdefault("connected_tool_server", conn_key)
+
+            # Build label → connection key map so a downstream SQL orchestrator
+            # can route '-- db: <server_name>' directives to the right
+            # connection. Without this, a workflow wiring multiple DBs through
+            # ONE mcp_server node (rather than separate `database` nodes) leaves
+            # db_server_map empty and every statement falls back to the default
+            # server — sending e.g. postgres-acuris-production queries to
+            # postgres-production. Mirrors the `database` node handler.
+            if "db_server_map" not in context:
+                context["db_server_map"] = {}
+            context["db_server_map"][server_name] = conn_key
             connected.append(server_name)
         else:
             reason = mcp_manager.last_errors.get(conn_key, "connection failed")

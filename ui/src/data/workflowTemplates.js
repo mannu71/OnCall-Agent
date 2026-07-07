@@ -2,277 +2,278 @@
 //
 // Each template is in the canvas-normalized shape LangflowEditor consumes
 // (node: { id, type, x, y, name, status, params }; edge: { id, source,
-// sourceSlot, target, targetSlot }). They are modeled on real working
-// workflows but SANITIZED: AWS profiles, log groups, repo names, DB
-// connections and wiki URLs/credentials are blanked to placeholders, and every
-// schedule starts disabled so instantiating a template never auto-runs. The
-// user fills the blanks in the editor, then saves as a normal workflow.
-
-const CLOUDWATCH_RCA_SYSTEM = `You are the on-call engineer. Your goal is to diagnose production incidents using CloudWatch logs and metrics.
-## Investigation Protocol
-1. **Start with alarms** — always call cloudwatch_list_alarms(state_value="ALARM") first. If any are firing, they define the blast radius.
-2. **Detect anomalies** — call cloudwatch_detect_anomalies on the affected log groups. Focus on severity=critical/high and z_score > 2. Note the time window.
-3. **Identify error patterns** — call cloudwatch_analyze_patterns(pattern_types=["error","critical"]). Sort by occurrence_count. Group semantically similar patterns.
-4. **Drill into raw evidence** — for any pattern with occurrence_count > 5 or z_score > 3, call cloudwatch_search_logs with a targeted Insights query and drill_down=true to capture stack traces.
-5. **Correlate across services** — if errors span multiple log groups, call cloudwatch_correlate_logs with the correlation_id or trace_id from the error messages.
-6. **Confirm with metrics** — cross-check log error spikes against Lambda error rates, ALB 5xx counts, or RDS connection counts.
-## Output Format
-Always end your investigation with:
-**Summary**: One sentence describing what happened.
-**Root Cause**: The specific error pattern or service that caused the incident.
-**Evidence**: Log group, timestamp range, occurrence count or z_score, example message.
-**Impact**: Which services/users affected and estimated scope.
-**Recommended Action**: Concrete next step.
-**Confidence**: high / medium / low — and why if medium/low.
-## Rules
-- Never conclude without at least one raw log example.
-- If evidence_grade is "low" or data_quality.partial is true, say so explicitly and qualify your confidence.
-- If credentials are expired, report immediately — do not retry tool calls.
-- Stop after 10 tool calls unless the root cause is still unconfirmed; report what you found so far.`;
-
-const CODE_INVESTIGATION_SYSTEM = `You are a code investigation assistant for the connected repository. Use the code search tool to answer questions and trace root causes in the codebase.
-## Protocol
-1. **Locate** — find the relevant symbol(s), file(s), or feature with the code search tool.
-2. **Read** — open the body of each candidate to confirm relevance.
-3. **Trace** — follow callers/callees and imports to map how the code connects.
-4. **Explain** — summarize the answer or root cause, citing concrete file paths and line numbers.
-## Rules
-- Always cite file paths (and line numbers where possible) as evidence.
-- Prefer the indexed code graph over guessing; if a symbol is ambiguous, list the candidates.
-- If you cannot find something after a focused search, say so rather than inventing it.`;
-
-const EXAMPLE_SQL = `-- db: <your-database>
--- label: Example Daily Count
-SELECT COUNT(*) AS value
-FROM your_table
-WHERE created_at >= {current_date}
-  AND created_at < {next_date};`;
-
-const FULLSTACK_RCA_SYSTEM = `You are a full-stack on-call engineer. Diagnose production incidents end-to-end by correlating CloudWatch log errors with the code and data that produced them.
-## Protocol
-1. **Triage logs** — review the pre-computed CloudWatch analysis: alarms, anomalies, and top error patterns. Pick the highest-impact errors (by occurrence_count / z_score) and extract the exception class, message, stack frames, and any correlation/request/trace IDs.
-2. **Locate the code** — for each error, use the code crawler to search the connected repositories for the exception, log message, or stack-frame symbols. Open the offending function and trace its callers/callees to find the defect. Repos may span multiple services — search each relevant one.
-3. **Check the data** — if an error implicates data (constraint violations, nulls, missing rows, timeouts), query the connected database(s) to confirm the data condition behind the error.
-4. **Correlate** — tie the log evidence to the specific code path and/or data state. Follow correlation/trace IDs across services where possible.
-## Output
-**Summary** — one sentence.
-**Root Cause** — the specific code path or data condition, with file path + line and/or the query result that proves it.
-**Evidence** — log group + example error, code citation (file:line), and any DB finding.
-**Impact** — services/users affected.
-**Recommended Action** — concrete fix or mitigation.
-**Confidence** — high / medium / low, with reasoning.
-## Rules
-- Ground every conclusion in concrete evidence: a raw log line AND a code citation or query result.
-- If logs point at a service whose repo isn't connected, say so and name the repo to add.
-- Never assert a root cause you haven't located in code or data.`;
-
-const CODE_RCA_SYSTEM = `You are a code-defect RCA specialist. This incident was routed to you as application/code-related.
-1. Review the pre-computed CloudWatch analysis: top error patterns, exception classes, stack frames, correlation/trace IDs.
-2. Use the code crawler to search the connected repositories for the exception, log message, or stack-frame symbols. Open the offending function and trace its callers/callees.
-3. Report the root cause with a concrete code citation (file:line), the raw log line that proves it, impact, and a recommended fix. State confidence (high/medium/low). If the implicated service's repo isn't connected, name the repo to add.`;
-
-const DB_RCA_SYSTEM = `You are a data/database RCA specialist. This incident was routed to you as data-related.
-1. Review the pre-computed CloudWatch analysis for the failing operation: SQL errors, constraint violations, timeouts, connection-pool exhaustion, missing/inconsistent rows.
-2. Query the connected database(s) to confirm the data condition behind the error (use targeted, read-only queries — never full scans).
-3. Report the root cause with the query result as evidence, the raw log line, impact, and a recommended fix or mitigation. State confidence (high/medium/low).`;
+// sourceSlot, target, targetSlot }). Generated from the two curated agent
+// workflows and SANITIZED: the model is left unset (pick one in the LM node),
+// CloudWatch profile/log-groups and Code Crawler repos are blanked, and any
+// per-subagent model override is dropped. Fill the blanks in the editor, then
+// save as a normal workflow.
 
 export const WORKFLOW_TEMPLATES = [
   {
-    id: 'multi-agent-rca',
-    label: 'Multi-Agent Incident RCA',
-    description: 'An orchestrator agent delegates to named subagents you define — CloudWatch, code, database or any domain. Edit the "Subagent Definitions" field to configure your own roles.',
-    icon: 'users',
-    type: 'workflow',
-    nodes: [
-      { id: 'mar_schedule', type: 'schedule', x: 820, y: 40, name: 'Schedule', status: 'idle',
-        params: { frequency: 'Daily', time: '09:00', days: 'Mon,Tue,Wed,Thu,Fri', tz: 'UTC', enabled: false } },
-      { id: 'mar_lm', type: 'language_model', x: 120, y: 120, name: 'Language Model', status: 'idle',
-        params: { llm: '', temp: '0.2' } },
-      { id: 'mar_cw', type: 'cloudwatch_tool', x: 120, y: 380, name: 'CloudWatch Tool', status: 'idle',
-        params: { region: 'us-east-1', profile: '', groups: '', analysis: 'error-patterns',
-                  range: '1h', threshold: '10', alerts: 'false', activeAlarmsOnly: 'false', analysis_depth: 'deep' } },
-      { id: 'mar_code', type: 'code_search_tool', x: 120, y: 640, name: 'Code Crawler', status: 'idle',
-        params: { repos: '' } },
-      { id: 'mar_db', type: 'database', x: 120, y: 880, name: 'Database', status: 'idle',
-        params: { server: '' } },
-      { id: 'mar_agent', type: 'agent', x: 820, y: 400, name: 'Incident Commander', status: 'idle',
-        params: {
-          maxIter: '15',
-          supervisor_enabled: 'true',
-          system: 'You are the lead incident commander. Decompose the incident and delegate evidence-gathering to your subagents rather than gathering it yourself. Synthesise their summaries into a single root-cause analysis.\n\nDELEGATION PROTOCOL\n1. Issue all relevant delegate_to_* calls before synthesising.\n2. Only call raw tools directly for quick cross-checks the subagents did not cover.\n\nOUTPUT FORMAT\n**Summary**: one sentence.\n**Root Cause**: specific error, code path, or data condition.\n**Evidence**: cite subagent findings.\n**Recommended Action**: concrete next step.\n**Confidence**: high / medium / low.',
-          subagents: JSON.stringify([
-            {
-              name: 'cloudwatch-subagent',
-              description: 'Analyse CloudWatch logs, metrics and alarms. Returns top error patterns, anomalies and example log lines.',
-              role_prompt: 'You are a CloudWatch subagent. Investigate using the CloudWatch tools: list alarms, detect anomalies, analyse error patterns, and drill into raw logs. Cite log group, time range, occurrence count and example message.',
-              capabilities: ['cloudwatch'],
-              tools: ['cloudwatch_*'],
-            },
-            {
-              name: 'code-subagent',
-              description: 'Investigate source code: locate the error origin, trace call paths, map log errors to file and line.',
-              role_prompt: 'You are a code investigation subagent. Use the code crawler to find where the incident originates. MANDATORY: confirm every finding in code before asserting it. Cite repo, file path, symbol and line numbers.',
-              capabilities: ['code_analyzer'],
-              tools: ['crawler_*'],
-            },
-            {
-              name: 'db-subagent',
-              description: 'Run targeted read-only diagnostic SQL to confirm any data condition behind the incident.',
-              role_prompt: 'You are a database subagent. Discover tables lazily (db_list_tables), describe only what you need, run targeted read-only queries. Never dump information_schema or use SELECT *.',
-              capabilities: ['database', 'rds_performance'],
-              tools: ['db_*', 'query'],
-            },
-          ], null, 2),
-        },
+    "id": "rca-analyzer",
+    "label": "RCA Analyzer",
+    "description": "Full-stack incident RCA: the agent triages CloudWatch logs directly, then delegates code tracing and read-only DB checks to a code+database subagent, and synthesises a single root-cause analysis.",
+    "icon": "layers",
+    "type": "agent",
+    "nodes": [
+      {
+        "id": "fsr_lm",
+        "type": "language_model",
+        "x": -112.06658064516137,
+        "y": -105.72056774193553,
+        "name": "Language Model",
+        "status": "idle",
+        "params": {
+          "llm": "",
+          "temp": "0.4"
+        }
       },
+      {
+        "id": "fsr_cw",
+        "type": "cloudwatch_tool",
+        "x": -393.9673133768061,
+        "y": 396.72039991809476,
+        "name": "CloudWatch Tool",
+        "status": "idle",
+        "params": {
+          "range": "1h",
+          "alerts": "false",
+          "groups": "",
+          "region": "eu-west-1",
+          "profile": "",
+          "analysis": "error-patterns",
+          "threshold": "10",
+          "tool_mode": "auto",
+          "analysis_depth": "auto",
+          "activeAlarmsOnly": "false"
+        }
+      },
+      {
+        "id": "fsr_code",
+        "type": "code_search_tool",
+        "x": -2.9995320638020644,
+        "y": 528.3333129882812,
+        "name": "Code Crawler",
+        "status": "idle",
+        "params": {
+          "repos": "",
+          "backend": "codegraph",
+          "repo_group": ""
+        },
+        "parentId": "subagent_window_1783006310489"
+      },
+      {
+        "id": "fsr_agent",
+        "type": "agent",
+        "x": 780,
+        "y": 380,
+        "name": "Full-Stack RCA Agent",
+        "status": "idle",
+        "params": {
+          "system": "# Role\nYou are an autonomous Full-Stack On-Call Remediation Agent. Diagnose production incidents end-to-end by correlating CloudWatch log evidence with the code and data that produced it, then synthesize a single root-cause analysis.\n\n# Your Tools vs. Your Subagent\n- **DIRECT (call these yourself):** CloudWatch tools \u2014 cloudwatch_list_alarms, cloudwatch_detect_anomalies, cloudwatch_analyze_patterns, cloudwatch_search_logs, cloudwatch_correlate_logs. Use them for ALL log / metric / alarm triage.\n- **DELEGATED (via your subagent):** you do NOT hold code or database tools directly. To investigate source code or verify data state, delegate to the `code-db-investigator` subagent (call delegate_to_code_db_investigator, or delegate_parallel for independent tracks). It holds codegraph code-search and read-only PostgreSQL tools. Give it a specific, self-contained task and it returns a concise summary. Do NOT try to call codegraph_* or postgres_* yourself \u2014 you don't have them.\n\n# Execution Protocol\n### 1. Log Triage (you, directly)\n- Call cloudwatch_list_alarms(state_value=\"ALARM\") first, then cloudwatch_detect_anomalies + cloudwatch_analyze_patterns on the affected log groups within the incident window.\n- Sort errors by impact (occurrence_count * z_score). For the top patterns extract: exception class & message, stack-frame symbols, and any correlation / request / trace IDs.\n\n### 2. Code Investigation (delegate)\n- Delegate to code-db-investigator: \"Search the connected repos for <exception / message / stack symbol>; open the offending function and trace its callers/callees; return repo/file:line and the offending snippet.\" If trace IDs span multiple services, say so in the task.\n\n### 3. Data Verification (delegate, if implicated)\n- If the logs/code implicate data (constraint violations, nulls, missing rows, timeouts), delegate to code-db-investigator: \"Run targeted read-only SELECTs to confirm <data condition>; return the exact rows / counts.\" Never request writes.\n- Tracks 2 and 3 are often independent \u2014 you may issue them together via delegate_parallel.\n\n### 4. Correlation & Synthesis (you)\n- Tie the log evidence to the subagent's code citation and/or data finding: Log Evidence -> Code Path -> Database State.\n\n# Output Schema\n## [SUMMARY]\nOne sentence.\n## [ROOT CAUSE]\nThe exact code path or data condition, with repo/file:line and/or the query result that proves it.\n## [EVIDENCE CHAIN]\n- **Log:** log group | example raw error line | trace ID\n- **Code:** repo/path/file.ext:line (offending snippet) \u2014 from code-db-investigator\n- **Data:** SELECT executed | result state / row count \u2014 from code-db-investigator\n## [IMPACT ASSESSMENT]\nBlast radius: services degraded, APIs failing, estimated user impact.\n## [RECOMMENDED MITIGATION]\nConcrete code fix, config change, or migration.\n## [CONFIDENCE SCORE]\n**Score:** High / Medium / Low\n**Reasoning:** why.\n\n# Guardrails\n- Ground every conclusion in concrete evidence \u2014 a raw log line AND a code citation or query result. Never assert a root cause you (or your subagent) haven't located.\n- If the subagent reports it lacks visibility into a repo, surface: \"ERROR: Missing visibility into repository [name]. Please connect it to proceed.\"\n- Read-only data access only \u2014 never INSERT / UPDATE / DELETE / DDL.\n- Use your OWN CloudWatch tools for log work; delegate ONLY code / data work to code-db-investigator (route by capability, not by name).",
+          "maxIter": "15",
+          "sandbox": "true",
+          "autoLearn": "true",
+          "subagents": "[{\"name\": \"code-db-investigator\", \"description\": \"Investigates source code with codegraph (semantic / symbol / graph search, callers & callees) and verifies data state with read-only PostgreSQL SELECT queries. Delegate code-path tracing and DB checks here. Has NO CloudWatch tools.\", \"tools\": [\"codegraph__*\", \"postgres-production__*\"]}]"
+        }
+      },
+      {
+        "id": "vector_memory_1782212508133",
+        "type": "vector_memory",
+        "x": 372.6774193548387,
+        "y": -32.322580645161295,
+        "name": "Vector Memory",
+        "status": "idle",
+        "params": {
+          "topK": "5",
+          "collection": ""
+        }
+      },
+      {
+        "id": "mcp_server_1782227580582",
+        "type": "mcp_server",
+        "x": -2.9995320638020644,
+        "y": 794.3333129882812,
+        "name": "MCP",
+        "status": "idle",
+        "params": {
+          "servers": "postgres-production"
+        },
+        "parentId": "subagent_window_1783006310489"
+      },
+      {
+        "id": "subagent_window_1783006310489",
+        "type": "subagent_window",
+        "x": -16.999532063802064,
+        "y": 502.33331298828125,
+        "name": "Subagent Window",
+        "status": "idle",
+        "params": {
+          "h": "672",
+          "w": "554",
+          "name": "Code & DB",
+          "description": ""
+        }
+      }
     ],
-    edges: [
-      { id: 'mar_e_lm',   source: 'mar_lm',       sourceSlot: 'lm',      target: 'mar_agent', targetSlot: 'lm' },
-      { id: 'mar_e_cw',   source: 'mar_cw',        sourceSlot: 'tool',    target: 'mar_agent', targetSlot: 'tools' },
-      { id: 'mar_e_code', source: 'mar_code',      sourceSlot: 'tool',    target: 'mar_agent', targetSlot: 'tools' },
-      { id: 'mar_e_db',   source: 'mar_db',        sourceSlot: 'tool',    target: 'mar_agent', targetSlot: 'tools' },
-      { id: 'mar_e_sched',source: 'mar_schedule',  sourceSlot: 'trigger', target: 'mar_agent', targetSlot: 'trigger' },
-    ],
+    "edges": [
+      {
+        "id": "fsr_e_lm",
+        "source": "fsr_lm",
+        "sourceSlot": "lm",
+        "target": "fsr_agent",
+        "targetSlot": "lm"
+      },
+      {
+        "id": "e_1781607122937",
+        "source": "fsr_lm",
+        "sourceSlot": "lm",
+        "target": "fsr_code",
+        "targetSlot": "lm"
+      },
+      {
+        "id": "e_1782212510359",
+        "source": "vector_memory_1782212508133",
+        "sourceSlot": "mem",
+        "target": "fsr_agent",
+        "targetSlot": "memory"
+      },
+      {
+        "id": "e_1783151546005",
+        "source": "fsr_lm",
+        "sourceSlot": "lm",
+        "target": "mcp_server_1782227580582",
+        "targetSlot": "lm"
+      },
+      {
+        "id": "e_1783151555178",
+        "source": "fsr_lm",
+        "sourceSlot": "lm",
+        "target": "fsr_cw",
+        "targetSlot": "lm"
+      },
+      {
+        "id": "e_1783181853219",
+        "source": "subagent_window_1783006310489",
+        "sourceSlot": "specialists",
+        "target": "fsr_agent",
+        "targetSlot": "specialists"
+      },
+      {
+        "id": "e_1783330928225",
+        "source": "fsr_cw",
+        "sourceSlot": "tool",
+        "target": "fsr_agent",
+        "targetSlot": "tools"
+      }
+    ]
   },
   {
-    id: 'cloudwatch-rca',
-    label: 'CloudWatch RCA',
-    description: 'Investigate a CloudWatch incident: pulls error patterns, anomalies and alarms, then an agent performs root-cause analysis.',
-    icon: 'cloud',
-    type: 'workflow',
-    nodes: [
-      { id: 'cwrca_schedule', type: 'schedule', x: 430, y: 40, name: 'Schedule', status: 'idle',
-        params: { frequency: 'Daily', time: '09:00', days: 'Mon,Tue,Wed,Thu,Fri', tz: 'UTC', enabled: false } },
-      { id: 'cwrca_lm', type: 'language_model', x: 420, y: 360, name: 'Language Model', status: 'idle',
-        params: { llm: '', temp: '0.4' } },
-      { id: 'cwrca_tool', type: 'cloudwatch_tool', x: 420, y: 700, name: 'CloudWatch Tool', status: 'idle',
-        params: { region: 'us-east-1', profile: '', groups: '', analysis: 'error-patterns',
-                  range: '1h', threshold: '10', alerts: 'false', activeAlarmsOnly: 'false', analysis_depth: 'deep' } },
-      { id: 'cwrca_agent', type: 'agent', x: 1030, y: 240, name: 'RCA Agent', status: 'idle',
-        params: { maxIter: '10', system: CLOUDWATCH_RCA_SYSTEM, supervisor_enabled: 'false' } },
+    "id": "test-case-generator",
+    "label": "Test Case Generator",
+    "description": "Generate test cases from an Azure DevOps work item: fetch the PBI via the ADO MCP server, analyse the affected code and data model, then produce functional and impact/regression test cases.",
+    "icon": "search",
+    "type": "agent",
+    "nodes": [
+      {
+        "id": "agent_1782216341910",
+        "type": "agent",
+        "x": 786,
+        "y": 99,
+        "name": "Agent",
+        "status": "idle",
+        "params": {
+          "system": "# Role\nYou are an autonomous Full-Stack AI Engineer. Your objective is to analyze a\nspecific Azure DevOps Work Item, crawl the relevant codebase, determine the\narchitectural blast radius, and generate comprehensive test cases and an\nimpact-driven test plan.\n\n# Toolset & Capabilities\n1. **ADO MCP Server** \u2014 fetch Work Item details, PBI descriptions, acceptance\n   criteria, comments, and linked pull requests.\n2. **Code Crawler** \u2014 search and read source code across connected repositories.\n3. **Database Client (PostgreSQL, read-only)** \u2014 run SELECT queries to understand\n   schemas or data models relevant to the work item.\n\n# MANDATORY FIRST STEP \u2014 ADO Lookup\n**Before touching any other tool**, extract the Work Item ID from the user's\nmessage (e.g. \"PBI 596877\", \"#596877\", \"work item 596877\") and call the ADO MCP\nServer to fetch that work item. Do not assume you know the content \u2014 fetch it.\n\nIf no Work Item ID is present in the user's message, stop and ask:\n> \"Please provide the ADO Work Item ID (PBI / Bug / Story number) to proceed.\"\n\n# Execution Protocol\n\n### 1. Fetch Work Item via ADO MCP  \u2190 ALWAYS FIRST\n- Extract the numeric ID from the user message.\n- Call the ADO MCP Server to retrieve: Title, Description, Acceptance Criteria,\n  comments, linked branches / PRs.\n- Synthesize the full PBI context before proceeding.\n\n### 2. Codebase & Architectural Analysis\n- Use Code Crawler to locate code paths, components, classes, and APIs affected\n  by this work item.\n- Map the internal call stack to identify edge cases, boundary conditions, and\n  potential regression points.\n\n### 3. Data Model Verification (if applicable)\n- If the PBI touches persisted data, query the relevant PostgreSQL tables to\n  understand schema, constraints, and valid state transitions.\n\n### 4. Test Case Generation\nGenerate two sets based strictly on what ADO and the crawler returned:\n- **Functional Test Cases** \u2014 acceptance criteria validation (positive, negative,\n  boundary).\n- **Impact & Regression Test Cases** \u2014 upstream/downstream components in the\n  blast radius.\n\n# Output Format\n\n## [PBI SUMMARY & CONTEXT]\n**Title:** [fetched from ADO] | **ID:** #[work item ID]  \n**Core Objective:** What business value or fix this introduces.  \n**Key Acceptance Criteria:** Bulleted list from ADO.\n\n## [CODE ARCHITECTURE & BLAST RADIUS]\n- **Target Components:** `repo/path/to/file.ext`\n- **Logic / Data Flow Impact:** Code paths, APIs, or DB tables touched.\n- **Identified Risk Areas:** Shared utilities, downstream dependencies.\n\n## [FUNCTIONAL TEST CASES]\n| Test ID | Scenario | Input / Preconditions | Expected Behavior | Type |\n|:---|:---|:---|:---|:---|\n| FT-01 | | | | Positive/Negative/Edge |\n\n## [IMPACT & REGRESSION TEST CASES]\n| Test ID | Impacted Component | Regression Scenario | Verification Step | Risk Value |\n|:---|:---|:---|:---|:---|\n| IT-01 | | | | |\n\n# Guardrails\n- **No hallucinations** \u2014 every test case must be grounded in ADO criteria or\n  crawled code. Never invent acceptance criteria.\n- **Missing repos** \u2014 if Code Crawler lacks access to a referenced repo, note:\n  `WARNING: Partial analysis \u2014 crawler has no visibility into [repo-name].`\n- **Read-only DB** \u2014 only SELECT statements; never mutate data.\n# CRITICAL: ADO Failure = Hard Stop\nIf the ADO work item fetch fails for ANY reason (tool error, validation error,\npermission denied, work item not found), **STOP IMMEDIATELY** and respond with:\n\n> \"**ADO lookup failed** \u2014 could not fetch Work Item #[ID]: [error message].\n> Unable to generate test cases without PBI details.\n> Please verify the Work Item ID exists in the creditsafe project and that ADO\n> access is configured correctly.\"\n\nDo NOT fall back to crawling the codebase.\nDo NOT ask the user to paste PBI details.\nDo NOT attempt alternative ADO tools.\nJust stop and report the exact error.\n\n# CRITICAL: ADO Project Parameter (prevents hangs)\nThe Azure DevOps **organization** is `creditsafe` and the **project** is `Compliance`.\nWhen calling ANY ADO work-item tool (wit_get_work_item, wit_get_work_items_batch_by_ids,\nwit_query_by_wiql, testplan_*, etc.) you MUST pass `project=\"Compliance\"` explicitly.\nNEVER omit the project parameter \u2014 omitting it makes the server hang waiting for\ninteractive input that never comes (60s timeout per call). Always include project.",
+          "harness": "",
+          "maxIter": "10",
+          "sandbox": "false",
+          "autoLearn": "false"
+        }
+      },
+      {
+        "id": "language_model_1782216349485",
+        "type": "language_model",
+        "x": 7,
+        "y": 50,
+        "name": "Language Model",
+        "status": "idle",
+        "params": {
+          "llm": "",
+          "temp": "0.4"
+        }
+      },
+      {
+        "id": "code_search_tool_1782216372219",
+        "type": "code_search_tool",
+        "x": 340.2903816469254,
+        "y": 413.54843631867436,
+        "name": "Code Crawler",
+        "status": "idle",
+        "params": {
+          "repos": ""
+        }
+      },
+      {
+        "id": "mcp_server_1782227558910",
+        "type": "mcp_server",
+        "x": 2,
+        "y": 779,
+        "name": "MCP",
+        "status": "idle",
+        "params": {
+          "servers": "ado"
+        }
+      },
+      {
+        "id": "database_tcgen_1783100000000",
+        "type": "database",
+        "x": 2,
+        "y": 1019,
+        "name": "Database",
+        "status": "idle",
+        "params": {
+          "server": "postgres-production"
+        }
+      }
     ],
-    edges: [
-      { id: 'cwrca_e_lm', source: 'cwrca_lm', sourceSlot: 'lm', target: 'cwrca_agent', targetSlot: 'lm' },
-      { id: 'cwrca_e_tool', source: 'cwrca_tool', sourceSlot: 'tool', target: 'cwrca_agent', targetSlot: 'tools' },
-      { id: 'cwrca_e_sched', source: 'cwrca_schedule', sourceSlot: 'trigger', target: 'cwrca_agent', targetSlot: 'trigger' },
-    ],
-  },
-  {
-    id: 'code-crawler-investigation',
-    label: 'Code Crawler Investigation',
-    description: 'Ask questions about a codebase: an agent uses the code crawler to find symbols, trace call paths and explain how features work.',
-    icon: 'search',
-    type: 'workflow',
-    nodes: [
-      { id: 'ccinv_lm', type: 'language_model', x: 100, y: 128, name: 'Language Model', status: 'idle',
-        params: { llm: '' } },
-      { id: 'ccinv_tool', type: 'code_search_tool', x: 100, y: 460, name: 'Code Crawler', status: 'idle',
-        // Select one or more repos; the agent searches across all of them.
-        params: { repos: '' } },
-      { id: 'ccinv_agent', type: 'agent', x: 660, y: 200, name: 'Investigation Agent', status: 'idle',
-        params: { maxIter: '10', system: CODE_INVESTIGATION_SYSTEM, supervisor_enabled: 'false' } },
-    ],
-    edges: [
-      { id: 'ccinv_e_tool', source: 'ccinv_tool', sourceSlot: 'tool', target: 'ccinv_agent', targetSlot: 'tools' },
-      { id: 'ccinv_e_lm', source: 'ccinv_lm', sourceSlot: 'lm', target: 'ccinv_agent', targetSlot: 'lm' },
-    ],
-  },
-  {
-    id: 'scheduled-oncall-report',
-    label: 'Scheduled On-Call Report',
-    description: 'Run SQL on a schedule and publish the results to a wiki page — a starting point for a daily on-call status report.',
-    icon: 'calendar',
-    type: 'workflow',
-    nodes: [
-      { id: 'soc_schedule', type: 'schedule', x: 108, y: 148, name: 'Schedule', status: 'idle',
-        params: { frequency: 'Daily', time: '09:00', days: 'Mon,Tue,Wed,Thu,Fri', tz: 'UTC', enabled: false } },
-      { id: 'soc_database', type: 'database', x: 178, y: 560, name: 'Database', status: 'idle',
-        params: { server: '' } },
-      { id: 'soc_orchestrator', type: 'orchestrator', x: 725, y: 273, name: 'SQL Orchestrator', status: 'idle',
-        params: { sqlFile: 'OnCall Report.sql', sqlContent: EXAMPLE_SQL } },
-      { id: 'soc_wiki', type: 'wiki', x: 1115, y: 496, name: 'Wiki', status: 'idle',
-        params: { format: 'Table', platform: 'Azure DevOps Wiki', wikiUrl: '', pagePath: '',
-                  project: '', pat: '', tokenVar: 'ADO_WIKI_PAT' } },
-    ],
-    edges: [
-      { id: 'soc_e_sched', source: 'soc_schedule', sourceSlot: 'trigger', target: 'soc_orchestrator', targetSlot: 'trigger' },
-      { id: 'soc_e_db', source: 'soc_database', sourceSlot: 'tool', target: 'soc_orchestrator', targetSlot: 'tool' },
-      { id: 'soc_e_wiki', source: 'soc_orchestrator', sourceSlot: 'result', target: 'soc_wiki', targetSlot: 'msg' },
-    ],
-  },
-  {
-    id: 'full-stack-incident-rca',
-    label: 'Full-Stack Incident RCA',
-    description: 'Analyze CloudWatch logs, then trace each error into the owning codebase(s) and the database to find the root cause across the whole stack.',
-    icon: 'layers',
-    type: 'workflow',
-    nodes: [
-      { id: 'fsr_schedule', type: 'schedule', x: 760, y: 40, name: 'Schedule', status: 'idle',
-        params: { frequency: 'Daily', time: '09:00', days: 'Mon,Tue,Wed,Thu,Fri', tz: 'UTC', enabled: false } },
-      { id: 'fsr_lm', type: 'language_model', x: 120, y: 120, name: 'Language Model', status: 'idle',
-        params: { llm: '', temp: '0.2' } },
-      { id: 'fsr_cw', type: 'cloudwatch_tool', x: 120, y: 380, name: 'CloudWatch Tool', status: 'idle',
-        params: { region: 'us-east-1', profile: '', groups: '', analysis: 'error-patterns',
-                  range: '1h', threshold: '10', alerts: 'false', activeAlarmsOnly: 'false', analysis_depth: 'deep' } },
-      { id: 'fsr_code', type: 'code_search_tool', x: 120, y: 640, name: 'Code Crawler', status: 'idle',
-        params: { repos: '' } },
-      { id: 'fsr_db', type: 'database', x: 120, y: 880, name: 'Database', status: 'idle',
-        params: { server: '' } },
-      { id: 'fsr_agent', type: 'agent', x: 780, y: 380, name: 'Full-Stack RCA Agent', status: 'idle',
-        params: { maxIter: '15', system: FULLSTACK_RCA_SYSTEM, supervisor_enabled: 'false' } },
-    ],
-    edges: [
-      { id: 'fsr_e_lm', source: 'fsr_lm', sourceSlot: 'lm', target: 'fsr_agent', targetSlot: 'lm' },
-      { id: 'fsr_e_cw', source: 'fsr_cw', sourceSlot: 'tool', target: 'fsr_agent', targetSlot: 'tools' },
-      { id: 'fsr_e_code', source: 'fsr_code', sourceSlot: 'tool', target: 'fsr_agent', targetSlot: 'tools' },
-      { id: 'fsr_e_db', source: 'fsr_db', sourceSlot: 'tool', target: 'fsr_agent', targetSlot: 'tools' },
-      { id: 'fsr_e_sched', source: 'fsr_schedule', sourceSlot: 'trigger', target: 'fsr_agent', targetSlot: 'trigger' },
-    ],
-  },
-  {
-    id: 'routed-rca-specialists',
-    label: 'Routed RCA Agents',
-    description: 'A semantic router classifies the incident from its CloudWatch errors and dispatches to a dedicated agent — code-defect (code crawler) or data (database).',
-    icon: 'route',
-    type: 'workflow',
-    nodes: [
-      { id: 'rr_lm', type: 'language_model', x: 100, y: 60, name: 'Language Model', status: 'idle',
-        params: { llm: '', temp: '0.2' } },
-      { id: 'rr_schedule', type: 'schedule', x: 100, y: 300, name: 'Schedule', status: 'idle',
-        params: { frequency: 'Daily', time: '09:00', days: 'Mon,Tue,Wed,Thu,Fri', tz: 'UTC', enabled: false } },
-      { id: 'rr_cw', type: 'cloudwatch_tool', x: 100, y: 540, name: 'CloudWatch Tool', status: 'idle',
-        params: { region: 'us-east-1', profile: '', groups: '', analysis: 'error-patterns',
-                  range: '1h', threshold: '10', alerts: 'false', activeAlarmsOnly: 'false', analysis_depth: 'deep' } },
-      { id: 'rr_router', type: 'router', x: 440, y: 160, name: 'Semantic Router', status: 'idle',
-        params: {
-          routes: { code: 'rr_code_agent', data: 'rr_db_agent' },
-          routes_description: {
-            code: 'Application or code-level errors: exceptions, stack traces, null references, logic bugs, failed deployments.',
-            data: 'Database or data-level errors: SQL errors, constraint violations, query timeouts, connection-pool exhaustion, missing or inconsistent rows.',
-          },
-        } },
-      { id: 'rr_code', type: 'code_search_tool', x: 460, y: 560, name: 'Code Crawler', status: 'idle',
-        params: { repos: '' } },
-      { id: 'rr_db', type: 'database', x: 460, y: 780, name: 'Database', status: 'idle',
-        params: { server: '' } },
-      { id: 'rr_code_agent', type: 'agent', x: 860, y: 60, name: 'Code-RCA Agent', status: 'idle',
-        params: { maxIter: '12', system: CODE_RCA_SYSTEM, supervisor_enabled: 'false' } },
-      { id: 'rr_db_agent', type: 'agent', x: 860, y: 380, name: 'DB-RCA Agent', status: 'idle',
-        params: { maxIter: '12', system: DB_RCA_SYSTEM, supervisor_enabled: 'false' } },
-    ],
-    edges: [
-      { id: 'rr_e_lm_router', source: 'rr_lm', sourceSlot: 'lm', target: 'rr_router', targetSlot: 'model' },
-      { id: 'rr_e_lm_code', source: 'rr_lm', sourceSlot: 'lm', target: 'rr_code_agent', targetSlot: 'lm' },
-      { id: 'rr_e_lm_db', source: 'rr_lm', sourceSlot: 'lm', target: 'rr_db_agent', targetSlot: 'lm' },
-      { id: 'rr_e_sched', source: 'rr_schedule', sourceSlot: 'trigger', target: 'rr_router', targetSlot: 'trigger' },
-      { id: 'rr_e_route_code', source: 'rr_router', sourceSlot: 'route-output', target: 'rr_code_agent', targetSlot: 'input' },
-      { id: 'rr_e_route_db', source: 'rr_router', sourceSlot: 'route-output', target: 'rr_db_agent', targetSlot: 'input' },
-      { id: 'rr_e_cw_code', source: 'rr_cw', sourceSlot: 'tool', target: 'rr_code_agent', targetSlot: 'tools' },
-      { id: 'rr_e_cw_db', source: 'rr_cw', sourceSlot: 'tool', target: 'rr_db_agent', targetSlot: 'tools' },
-      { id: 'rr_e_code', source: 'rr_code', sourceSlot: 'tool', target: 'rr_code_agent', targetSlot: 'tools' },
-      { id: 'rr_e_db', source: 'rr_db', sourceSlot: 'tool', target: 'rr_db_agent', targetSlot: 'tools' },
-    ],
-  },
+    "edges": [
+      {
+        "id": "e_1782216369320",
+        "source": "language_model_1782216349485",
+        "sourceSlot": "lm",
+        "target": "agent_1782216341910",
+        "targetSlot": "lm"
+      },
+      {
+        "id": "e_1782216375511",
+        "source": "code_search_tool_1782216372219",
+        "sourceSlot": "tool",
+        "target": "agent_1782216341910",
+        "targetSlot": "tools"
+      },
+      {
+        "id": "e_1782216416430",
+        "source": "language_model_1782216349485",
+        "sourceSlot": "lm",
+        "target": "code_search_tool_1782216372219",
+        "targetSlot": "lm"
+      },
+      {
+        "id": "e_1782227566332",
+        "source": "mcp_server_1782227558910",
+        "sourceSlot": "tool",
+        "target": "agent_1782216341910",
+        "targetSlot": "tools"
+      },
+      {
+        "id": "tcgen_e_db",
+        "source": "database_tcgen_1783100000000",
+        "sourceSlot": "tool",
+        "target": "agent_1782216341910",
+        "targetSlot": "tools"
+      }
+    ]
+  }
 ];
 
 export default WORKFLOW_TEMPLATES;

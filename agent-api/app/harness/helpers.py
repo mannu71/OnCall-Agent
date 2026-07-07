@@ -49,7 +49,6 @@ def cap_context_block(label: str, payload: Any, max_chars: int = _CONTEXT_BLOCK_
 def build_recall_context(
     issues: List[Dict[str, Any]],
     patterns: List[Dict[str, Any]],
-    skills: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build a fenced recall block from KB search results.
 
@@ -75,20 +74,6 @@ def build_recall_context(
             f"Log Pattern [{pattern.get('pattern_type', '')} / severity {pattern.get('severity', '')}]: "
             f"{pattern.get('name', '')}\n"
             f"  {(pattern.get('description') or '')[:200]}"
-        )
-
-    # Matching skills — tell the agent it can call execute_skill to run them.
-    for skill in (skills or [])[:3]:
-        steps = skill.get("steps") or []
-        step_preview = "; ".join(
-            str(s.get("description") or s) for s in steps[:3]
-        )
-        if len(steps) > 3:
-            step_preview += f" … (+{len(steps) - 3} more steps)"
-        parts.append(
-            f"Executable Skill: {skill.get('title', skill.get('name', ''))}\n"
-            f"  Name (for execute_skill): {skill.get('name', '')}\n"
-            f"  Steps: {step_preview or '(see tool)'}"
         )
 
     if not parts:

@@ -70,6 +70,7 @@ async def maybe_metamemory_summary(
     compaction_threshold_tokens: int,
     keep_recent_tokens: int,
     estimate_tokens: Any,
+    precomputed_total: Any = None,
 ) -> Any:
     """Shared metamemory-supersedes-compaction pre-check (used by BOTH
     engines — the native CompressionPipeline below and the LangGraph
@@ -87,7 +88,8 @@ async def maybe_metamemory_summary(
     if not vfs_session_id:
         return None
     try:
-        if estimate_tokens(messages) <= compaction_threshold_tokens:
+        total = precomputed_total if precomputed_total is not None else estimate_tokens(messages)
+        if total <= compaction_threshold_tokens:
             return None  # not over threshold yet — let the normal ladder decide
 
         from app.harness import metamemory
@@ -128,15 +130,20 @@ class CompressionPipeline:
         as before this pre-check existed.
         """
         if self._vfs_session_id:
+            # Estimate once and share it with both the metamemory pre-check and
+            # the manager's own threshold gate — they walk the identical list.
+            total = self._mgr.estimate_tokens(messages)
             metamemory_messages = await maybe_metamemory_summary(
                 messages,
                 vfs_session_id=self._vfs_session_id,
                 compaction_threshold_tokens=self._mgr.compaction_threshold_tokens,
                 keep_recent_tokens=self._mgr.keep_recent_tokens,
                 estimate_tokens=self._mgr.estimate_tokens,
+                precomputed_total=total,
             )
             if metamemory_messages is not None:
                 return metamemory_messages
+            return await self._mgr.compact_if_needed(messages, precomputed_total=total)
         return await self._mgr.compact_if_needed(messages)
 
     async def reactive_compact(self, messages: List[Any]) -> List[Any]:

@@ -3,7 +3,7 @@
 Mirrors claude-code's ``hasPermissionsToUseTool``: every tool call is classified
 ``allow | ask | deny`` by name-pattern rules, with a precedence of
 deny > ask > allow. Read-only investigation tools auto-allow; mutating tools
-(``save_playbook``, ``execute_skill``, ``crawler_index_repo``, ``delegate_*``,
+(``save_playbook``, ``crawler_index_repo``, ``delegate_*``,
 ``*_write`` …) require approval.
 
 Enforcement wraps each tool's coroutine:
@@ -33,7 +33,6 @@ Behavior = str        # "allow" | "ask" | "deny"
 DEFAULT_ASK_PATTERNS = (
     "save_playbook",
     "patch_playbook",
-    "execute_skill",
     "crawler_index_repo",
     "delegate_investigation",
     "edit_file",

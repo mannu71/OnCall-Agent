@@ -194,6 +194,7 @@ class ContextCompactionManager:
     async def compact_if_needed(
         self,
         messages: List[BaseMessage],
+        precomputed_total: Optional[int] = None,
     ) -> List[BaseMessage]:
         """Compact the message list if the token estimate exceeds a threshold.
 
@@ -211,7 +212,11 @@ class ContextCompactionManager:
         microcompacted list, or a compacted list starting with a
         SystemMessage summary.
         """
-        total = self.estimate_tokens(messages)
+        # ``precomputed_total`` lets a caller that already estimated this exact
+        # message list (e.g. the engine's metamemory pre-check) hand the value
+        # in, skipping a redundant O(n) walk. Defaults to computing it here, so
+        # every other caller is unchanged.
+        total = precomputed_total if precomputed_total is not None else self.estimate_tokens(messages)
         if total <= self._microcompact_threshold:
             logger.debug(
                 "ContextCompactionManager[%s]: no compaction needed (%d <= %d tokens)",

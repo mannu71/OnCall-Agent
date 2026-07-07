@@ -137,18 +137,6 @@ def build_playbook_tools() -> List[Any]:
             description="Repo name to scope the fact to; omit to pin it globally.",
         )
 
-    class ExecuteSkillInput(BaseModel):
-        skill_name: str = PydanticField(
-            description="Slug name of the skill to execute (as shown in the memory-context block)."
-        )
-        context: dict = PydanticField(
-            default_factory=dict,
-            description=(
-                "Key-value pairs injected into the skill's args_template placeholders. "
-                "For example: {\"log_group\": \"/aws/app\", \"threshold\": \"100\"}."
-            ),
-        )
-
     async def _save_playbook(title: str, symptoms: List[str], solution: str, category: str) -> str:
         try:
             from app.services.knowledge_base import knowledge_base as _kb
@@ -192,15 +180,6 @@ def build_playbook_tools() -> List[Any]:
         except Exception as exc:
             return f"pin_fact failed: {exc}"
 
-    async def _execute_skill(skill_name: str, context: dict) -> str:
-        """Run a named skill's steps against the live MCP tool set."""
-        try:
-            from app.core.skills import skill_service
-            exec_result = await skill_service.execute(skill_name, context=context)
-            return exec_result.to_agent_text()
-        except Exception as exc:
-            return f"execute_skill failed: {exc}"
-
     return [
         StructuredTool.from_function(
             coroutine=_save_playbook,
@@ -231,16 +210,5 @@ def build_playbook_tools() -> List[Any]:
                 "(use save_playbook for those)."
             ),
             args_schema=PinFactInput,
-        ),
-        StructuredTool.from_function(
-            coroutine=_execute_skill,
-            name="execute_skill",
-            description=(
-                "Execute a named, pre-built remediation skill by running its ordered steps "
-                "against the live MCP tool set. Use this when the memory-context block "
-                "shows a matching 'Executable Skill' and you want to apply it directly. "
-                "Pass any required placeholder values in the 'context' dict."
-            ),
-            args_schema=ExecuteSkillInput,
         ),
     ]

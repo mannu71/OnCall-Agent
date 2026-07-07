@@ -1,16 +1,19 @@
-"""Skill systems — DB-backed procedures (SkillService) and markdown commands (SkillManager)."""
+"""Skill system — file-based markdown commands (SkillManager).
+
+Skills are ``SKILL.md`` markdown files (YAML frontmatter + body) discovered on
+disk. There is NO database and no separate "executable" skill store — a skill is
+reusable guidance the agent follows, auto-selected per query (RAG) or invoked by
+slash-command. See :mod:`app.core.skills.manager`.
+"""
 
 from pathlib import Path
 from typing import Optional
 
 from .manager import Skill, SkillManager
-from .service import SkillService, skill_service
 
 __all__ = [
     "Skill",
     "SkillManager",
-    "SkillService",
-    "skill_service",
     "get_default_skill_manager",
 ]
 

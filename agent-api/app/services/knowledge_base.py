@@ -557,30 +557,6 @@ class KnowledgeBaseService:
             return issues
     
     # ============================================
-    # SKILL RECALL (convenience wrapper)
-    # ============================================
-
-    async def recall_skills_for_agent(
-        self,
-        query: str,
-        limit: int = 3,
-        allowed: Optional[set] = None,
-    ) -> List[Dict[str, Any]]:
-        """Return matching skills for injection into the agent prompt.
-
-        Delegates to :class:`~app.core.skills.SkillService`.  Returns an
-        empty list (never raises) so callers don't need to guard. ``allowed``
-        restricts candidates to a per-agent skill-name set (Skills picker);
-        ``None`` = no scoping.
-        """
-        try:
-            from app.core.skills import skill_service
-            return await skill_service.recall_two_stage(query, limit=limit, allowed=allowed)
-        except Exception as exc:
-            logger.debug("knowledge_base.recall_skills_for_agent: %s", exc)
-            return []
-
-    # ============================================
     # BASELINE METRIC OPERATIONS
     # ============================================
     

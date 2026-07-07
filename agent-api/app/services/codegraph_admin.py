@@ -269,6 +269,88 @@ def get_node(project: str, qualified_name: str) -> Optional[Dict[str, Any]]:
         conn.close()
 
 
+def project_db_path(project: str) -> Optional[str]:
+    """Return the on-disk SQLite path for a user-facing repo name, or None."""
+    found = _find_project(project)
+    return found[0] if found else None
+
+
+def project_root_path(project: str) -> Optional[str]:
+    """Return the indexed repo's absolute root path (for reading source), or None.
+
+    Node ``file_path`` values are stored relative to this root, so
+    ``os.path.join(root, file_path)`` is the on-disk source file.
+    """
+    found = _find_project(project)
+    if not found:
+        return None
+    db_path, _ = found
+    conn = _connect(db_path)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute("SELECT root_path FROM projects LIMIT 1").fetchone()
+        return (row["root_path"] or "").rstrip("/") if row else None
+    finally:
+        conn.close()
+
+
+def code_nodes_for_embedding(
+    project: str, limit: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """Return code (non-meta) nodes as embedding corpus rows for *project*.
+
+    Each row: ``{id, kind, name, qualified_name, file, line_start, line_end,
+    signature, summary}``. Meta labels (File/Folder/Project/…) are excluded — we
+    only embed actual code entities (functions, methods, classes). Ordered by
+    file then line for a stable corpus.
+    """
+    found = _find_project(project)
+    if not found:
+        return []
+    db_path, _ = found
+    conn = _connect(db_path)
+    if conn is None:
+        return []
+    try:
+        sql = (
+            "SELECT id, label, name, qualified_name, file_path, "
+            "start_line, end_line, properties FROM nodes "
+            "WHERE label NOT IN "
+            "('File','Folder','Project','Branch','Module','Section','Resource') "
+            "ORDER BY file_path, start_line"
+        )
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        rows = conn.execute(sql).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            props = _props(r["properties"])
+            out.append({
+                "id": r["id"],
+                "kind": (r["label"] or "").lower(),
+                "name": r["name"] or "",
+                "qualified_name": r["qualified_name"] or "",
+                "file": r["file_path"] or "",
+                "line_start": r["start_line"],
+                "line_end": r["end_line"],
+                "signature": props.get("signature") or "",
+                "summary": props.get("summary") or props.get("docstring") or "",
+            })
+        return out
+    finally:
+        conn.close()
+
+
+def db_signature(project: str) -> Optional[str]:
+    """A cheap change token (mtime:size) for a project's DB — cache invalidation."""
+    p = project_db_path(project)
+    if not p or not os.path.exists(p):
+        return None
+    st = os.stat(p)
+    return f"{int(st.st_mtime)}:{st.st_size}"
+
+
 def delete_project(project: str) -> Dict[str, Any]:
     """Delete the project DB file for *project*.
 

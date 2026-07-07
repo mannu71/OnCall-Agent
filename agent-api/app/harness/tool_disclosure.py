@@ -43,7 +43,7 @@ _DEFAULT_KEEP_PREFIXES = "cloudwatch_,code_,crawler_,db_,database_,sql_"
 # Bridge + agent-writable tool names that must always stay directly bound.
 _ALWAYS_KEEP_NAMES = {
     "search_tools", "call_tool",
-    "save_playbook", "patch_playbook", "pin_fact", "execute_skill",
+    "save_playbook", "patch_playbook", "pin_fact",
     "delegate_investigation", "edit_file", "apply_edit",
     "write_todos", "update_todo", "run_command",
     "fs_write", "fs_read", "fs_ls", "fs_grep",

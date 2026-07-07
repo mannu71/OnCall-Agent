@@ -13,6 +13,7 @@ Two behaviour-preserving primitives extracted from ``ReactStrategy.execute``:
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, Optional, Tuple
 
 from app.core.redact import redact
@@ -65,6 +66,15 @@ async def build_recall_query(
     turn now lets the agent route CloudWatch tool calls itself instead of a
     keyword-gated deterministic re-scan).
     """
+    # Query-aware gate: a purely conversational turn (e.g. "Hi", "thanks") needs
+    # no institutional memory — skip the pinned/semantic/KB/skill recalls (several
+    # DB + vector lookups) entirely. Mirrors the CloudWatch tool-binding skip in
+    # ``tool_assembler``. Guarded on ``not cloudwatch_config`` so a CW-configured
+    # node's behaviour is never altered.
+    from app.core.intent import is_conversational
+    if not cloudwatch_config and is_conversational(user_query):
+        return user_query, 0, []
+
     _allowed_set = set(allowed_skills) if allowed_skills else None
     from app.config import settings
     recall_hits = 0
@@ -82,68 +92,91 @@ async def build_recall_query(
         )
 
     # ── (a) Pinned facts — always injected, NOT similarity-gated ─────────────
-    try:
-        if getattr(settings, "pinned_facts_enabled", True):
-            from app.services.semantic_memory import semantic_memory, format_pinned_block
-            _pinned = await semantic_memory.list_pinned(repo=repos or None)
-            _pinned_block = format_pinned_block(_pinned)
-            if _pinned_block:
-                recall_hits += len(_pinned)
-                blocks.append(_pinned_block)
-    except Exception as _pin_err:  # noqa: BLE001 — best-effort
-        logger_instance.warning(
-            "ReactStrategy: pinned-facts recall failed (non-fatal): %s",
-            redact(str(_pin_err)),
-            extra={"execution_id": execution_id},
-        )
+    async def _recall_pinned() -> Tuple[Optional[str], int]:
+        try:
+            if getattr(settings, "pinned_facts_enabled", True):
+                from app.services.semantic_memory import semantic_memory, format_pinned_block
+                _pinned = await semantic_memory.list_pinned(repo=repos or None)
+                _pinned_block = format_pinned_block(_pinned)
+                if _pinned_block:
+                    return _pinned_block, len(_pinned)
+        except Exception as _pin_err:  # noqa: BLE001 — best-effort
+            logger_instance.warning(
+                "ReactStrategy: pinned-facts recall failed (non-fatal): %s",
+                redact(str(_pin_err)),
+                extra={"execution_id": execution_id},
+            )
+        return None, 0
 
     # ── (b) Learned semantic memory ──────────────────────────────────────────
     # Driven by a Memory node connected to the agent (``memory_enabled``). The
     # global ``semantic_memory_enabled`` remains a master enable-all override for
     # non-graph callers; default off so memory is purely node-driven per workflow.
-    try:
-        if memory_enabled or settings.semantic_memory_enabled:
-            from app.services.semantic_memory import semantic_memory, format_recall_block
-            _mem = await semantic_memory.recall(user_query, repo=repos or None)
-            _mem_block = format_recall_block(_mem)
-            if _mem_block:
-                recall_hits += len(_mem)
-                blocks.append(_mem_block)
-    except Exception as _mem_err:  # noqa: BLE001 — memory recall is best-effort
-        logger_instance.warning(
-            "ReactStrategy: semantic memory recall failed (non-fatal): %s",
-            redact(str(_mem_err)),
-            extra={"execution_id": execution_id},
-        )
+    async def _recall_semantic() -> Tuple[Optional[str], int]:
+        try:
+            if memory_enabled or settings.semantic_memory_enabled:
+                from app.services.semantic_memory import semantic_memory, format_recall_block
+                _mem = await semantic_memory.recall(user_query, repo=repos or None)
+                _mem_block = format_recall_block(_mem)
+                if _mem_block:
+                    return _mem_block, len(_mem)
+        except Exception as _mem_err:  # noqa: BLE001 — memory recall is best-effort
+            logger_instance.warning(
+                "ReactStrategy: semantic memory recall failed (non-fatal): %s",
+                redact(str(_mem_err)),
+                extra={"execution_id": execution_id},
+            )
+        return None, 0
 
-    try:
-        from app.services.knowledge_base import knowledge_base as _kb
-        from app.harness.helpers import build_recall_context
+    # ── (c) KB recall (known issues / similar patterns) ──────────────────────
+    async def _recall_kb() -> Tuple[Optional[str], int]:
+        try:
+            from app.services.knowledge_base import knowledge_base as _kb
+            from app.harness.helpers import build_recall_context
 
-        _issues = await _kb.search_known_issues(user_query, limit=3, threshold=0.65)
-        _patterns = await _kb.search_similar_patterns(user_query, limit=3, threshold=0.65)
-        if cloudwatch_config:
-            _lg_query = " ".join(cloudwatch_config.get("log_groups") or [])
-            if _lg_query:
-                _cw_pat = await _kb.search_similar_patterns(
-                    _lg_query, limit=2, threshold=0.55,
-                )
-                seen = {p.get("id") for p in _patterns}
-                for _p in _cw_pat:
-                    if _p.get("id") not in seen:
-                        _patterns.append(_p)
-                        seen.add(_p.get("id"))
-        _skills = await _kb.recall_skills_for_agent(user_query, limit=3, allowed=_allowed_set)
-        recall_hits += len(_issues) + len(_patterns) + len(_skills)
-        recall_block = build_recall_context(_issues, _patterns, _skills)
-        if recall_block:
-            blocks.append(recall_block)
-    except Exception as _recall_err:  # noqa: BLE001 — recall is best-effort
-        logger_instance.warning(
-            "ReactStrategy: KB recall failed (non-fatal): %s",
-            redact(str(_recall_err)),
-            extra={"execution_id": execution_id},
-        )
+            # The two base lookups are independent — fan them out concurrently.
+            _issues, _patterns = await asyncio.gather(
+                _kb.search_known_issues(user_query, limit=3, threshold=0.65),
+                _kb.search_similar_patterns(user_query, limit=3, threshold=0.65),
+            )
+            # CloudWatch log-group patterns depend on _patterns for dedupe, so they
+            # run after the fan-out and merge in the same order as before.
+            if cloudwatch_config:
+                _lg_query = " ".join(cloudwatch_config.get("log_groups") or [])
+                if _lg_query:
+                    _cw_pat = await _kb.search_similar_patterns(
+                        _lg_query, limit=2, threshold=0.55,
+                    )
+                    seen = {p.get("id") for p in _patterns}
+                    for _p in _cw_pat:
+                        if _p.get("id") not in seen:
+                            _patterns.append(_p)
+                            seen.add(_p.get("id"))
+            hits = len(_issues) + len(_patterns)
+            recall_block = build_recall_context(_issues, _patterns)
+            return (recall_block or None), hits
+        except Exception as _recall_err:  # noqa: BLE001 — recall is best-effort
+            logger_instance.warning(
+                "ReactStrategy: KB recall failed (non-fatal): %s",
+                redact(str(_recall_err)),
+                extra={"execution_id": execution_id},
+            )
+        return None, 0
+
+    # Run the three independent recall legs concurrently; append their blocks in
+    # the same fixed priority order (pinned > semantic > KB) the sequential code
+    # used, so the assembled prompt is byte-identical. Legs log their own
+    # failures; return_exceptions guards against anything they don't catch.
+    for _res in await asyncio.gather(
+        _recall_pinned(), _recall_semantic(), _recall_kb(),
+        return_exceptions=True,
+    ):
+        if isinstance(_res, BaseException):
+            continue
+        _block, _hits = _res
+        recall_hits += _hits
+        if _block:
+            blocks.append(_block)
 
     # ── (c) RAG-auto-selected markdown skills ────────────────────────────────
     selected_skills: list[str] = []
@@ -158,7 +191,7 @@ async def build_recall_query(
                 selected_skills = [s.name for s in _hits]
                 lines = ["## Suggested skills (auto-selected for this query)"]
                 for s in _hits:
-                    lines.append(f"- **{s.name}** — {s.description} (invoke with execute_skill)")
+                    lines.append(f"- **{s.name}** — {s.description} (follow this runbook's steps)")
                 blocks.append("\n".join(lines))
                 recall_hits += len(_hits)
     except Exception as _skill_err:  # noqa: BLE001 — skill recall is best-effort

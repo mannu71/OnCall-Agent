@@ -7,7 +7,7 @@
     exposed via ``GET /api/v1/tools``.
 
 The in-house ``build_agent`` (``app.harness.react_agent``) is the sole agent
-builder — the deepagents path has been removed.
+builder — the alternate agent-builder path has been removed.
 """
 from typing import Any, List, Optional
 

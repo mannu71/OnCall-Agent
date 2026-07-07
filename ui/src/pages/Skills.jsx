@@ -2,18 +2,13 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
-import { Badge } from '@/components/ui/badge';
 import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger,
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog';
 import {
-  Loader2, Plus, Trash2, RefreshCw, Wrench, FileText, Database, Eye, Pencil, Upload,
+  Loader2, Plus, Trash2, RefreshCw, Wrench, FileText, Eye, Pencil, Upload,
 } from 'lucide-react';
 import agentApiClient from '../services/agentApiClient.js';
-
-const STATUS_VARIANT = { active: 'success', draft: 'warning', archived: 'muted' };
-
-const EMPTY_FORM = { name: '', title: '', description: '', trigger_patterns: '', steps: '' };
 
 const FS_SKILL_TEMPLATE = `---
 name: my_new_skill
@@ -30,30 +25,10 @@ description: One paragraph describing when to use this skill.
 - Rule one.
 `;
 
-function skillToForm(s) {
-  return {
-    name: s.name || '',
-    title: s.title || '',
-    description: s.description || '',
-    trigger_patterns: (s.trigger_patterns || []).join(', '),
-    steps: s.steps?.length ? JSON.stringify(s.steps, null, 2) : '',
-  };
-}
-
 export default function Skills() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [dbSkills, setDbSkills] = useState([]);
   const [fsSkills, setFsSkills] = useState([]);
-
-  // Add / Edit dialog
-  const [addOpen, setAddOpen] = useState(false);
-  const [editTarget, setEditTarget] = useState(null); // null = add mode, skill obj = edit mode
-  const [saving, setSaving] = useState(false);
-  const [form, setForm] = useState(EMPTY_FORM);
-
-  // View dialog
-  const [viewSkill, setViewSkill] = useState(null);
 
   // Filesystem (markdown) skill add/edit/view dialogs
   const [fsEditOpen, setFsEditOpen] = useState(false);
@@ -69,7 +44,6 @@ export default function Skills() {
     setError(null);
     try {
       const data = await agentApiClient.listSkills();
-      setDbSkills(data.db || []);
       setFsSkills(data.filesystem || []);
     } catch (e) {
       setError(e?.response?.data?.detail || e.message || 'Failed to load skills');
@@ -80,64 +54,8 @@ export default function Skills() {
 
   useEffect(() => { load(); }, [load]);
 
-  // ── Open add dialog ──────────────────────────────────────────────────────
-  const openAdd = () => {
-    setEditTarget(null);
-    setForm(EMPTY_FORM);
-    setAddOpen(true);
-  };
-
-  // ── Open edit dialog ─────────────────────────────────────────────────────
-  const openEdit = (skill) => {
-    setEditTarget(skill);
-    setForm(skillToForm(skill));
-    setAddOpen(true);
-  };
-
-  // ── Save (add or edit) ───────────────────────────────────────────────────
-  const handleSave = async () => {
-    setSaving(true);
-    try {
-      let steps = [];
-      let triggers = [];
-      if (form.steps.trim()) {
-        try { steps = JSON.parse(form.steps); }
-        catch { alert('Steps must be valid JSON (an array).'); setSaving(false); return; }
-      }
-      if (form.trigger_patterns.trim()) {
-        triggers = form.trigger_patterns.split(',').map((s) => s.trim()).filter(Boolean);
-      }
-      const body = {
-        name: editTarget ? editTarget.name : form.name,
-        title: form.title,
-        description: form.description,
-        trigger_patterns: triggers,
-        steps,
-      };
-      if (editTarget) {
-        await agentApiClient.updateSkill(editTarget.name, body);
-      } else {
-        await agentApiClient.createSkill(body);
-      }
-      setAddOpen(false);
-      setEditTarget(null);
-      setForm(EMPTY_FORM);
-      await load();
-    } catch (e) {
-      alert(e?.response?.data?.detail || e.message);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleDelete = async (name) => {
-    if (!window.confirm(`Delete skill "${name}"? This cannot be undone.`)) return;
-    try { await agentApiClient.deleteSkill(name); await load(); }
-    catch (e) { alert(e?.response?.data?.detail || e.message); }
-  };
-
   const handleDeleteFs = async (name) => {
-    if (!window.confirm(`Delete filesystem skill "${name}"? This removes the file from disk and cannot be undone.`)) return;
+    if (!window.confirm(`Delete skill "${name}"? This removes the file from disk and cannot be undone.`)) return;
     try { await agentApiClient.deleteFsSkill(name); await load(); }
     catch (e) { alert(e?.response?.data?.detail || e.message); }
   };
@@ -219,14 +137,6 @@ export default function Skills() {
 
   const isFsEditMode = fsEditTarget !== null;
 
-  const handleDeleteAll = async () => {
-    if (!window.confirm(`Delete ALL ${dbSkills.length} DB skills? This is irreversible.`)) return;
-    try { await agentApiClient.deleteAllSkills(); await load(); }
-    catch (e) { alert(e?.response?.data?.detail || e.message); }
-  };
-
-  const isEditMode = editTarget !== null;
-
   return (
     <div className="p-8 min-h-screen bg-background">
       <div className="max-w-6xl mx-auto">
@@ -236,7 +146,7 @@ export default function Skills() {
               <Wrench className="size-6 text-primary" /> Skills
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              Executable skills (file-backed, callable via the agent's execute_skill tool) and read-only markdown guidance.
+              File-based markdown (SKILL.md) skills — reusable guidance the agent auto-selects per query or runs by slash-command.
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -253,182 +163,17 @@ export default function Skills() {
           <div className="mb-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>
         )}
 
-        {/* Add / Edit dialog */}
-        <Dialog open={addOpen} onOpenChange={(o) => { if (!o) { setAddOpen(false); setEditTarget(null); } }}>
-          <DialogContent className="sm:max-w-lg">
-            <DialogHeader>
-              <DialogTitle>{isEditMode ? `Edit skill — ${editTarget.name}` : 'Add skill'}</DialogTitle>
-            </DialogHeader>
-            <div className="space-y-3">
-              {!isEditMode && (
-                <div>
-                  <label className="text-xs font-semibold text-muted-foreground">Name</label>
-                  <Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="restart_api_pods" />
-                </div>
-              )}
-              <div>
-                <label className="text-xs font-semibold text-muted-foreground">Title</label>
-                <Input value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="Restart API pods" />
-              </div>
-              <div>
-                <label className="text-xs font-semibold text-muted-foreground">Description</label>
-                <Textarea rows={2} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
-              </div>
-              <div>
-                <label className="text-xs font-semibold text-muted-foreground">Trigger patterns (comma-separated)</label>
-                <Input value={form.trigger_patterns} onChange={(e) => setForm({ ...form, trigger_patterns: e.target.value })} placeholder="pods crashing, restart deployment" />
-              </div>
-              <div>
-                <label className="text-xs font-semibold text-muted-foreground">Steps (JSON array)</label>
-                <Textarea rows={5} className="font-mono text-xs" value={form.steps} onChange={(e) => setForm({ ...form, steps: e.target.value })} placeholder='[{"order":1,"description":"...","tool":"...","args_template":{}}]' />
-              </div>
-            </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => { setAddOpen(false); setEditTarget(null); }}>Cancel</Button>
-              <Button onClick={handleSave} disabled={saving || (!isEditMode && !form.name.trim())}>
-                {saving ? <Loader2 className="size-4 animate-spin" /> : isEditMode ? 'Update' : 'Save'}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        {/* View detail dialog */}
-        <Dialog open={!!viewSkill} onOpenChange={(o) => { if (!o) setViewSkill(null); }}>
-          <DialogContent className="sm:max-w-2xl max-h-[80vh] overflow-y-auto">
-            <DialogHeader>
-              <DialogTitle className="flex items-center gap-2">
-                <Eye className="size-4" />
-                {viewSkill?.title || viewSkill?.name}
-              </DialogTitle>
-            </DialogHeader>
-            {viewSkill && (
-              <div className="space-y-4 text-sm">
-                <div className="flex gap-2 flex-wrap">
-                  <Badge variant={STATUS_VARIANT[viewSkill.status] || 'muted'}>{viewSkill.status}</Badge>
-                  <Badge variant="outline">{viewSkill.source}</Badge>
-                  {viewSkill.confidence != null && (
-                    <Badge variant="outline">conf {Math.round(viewSkill.confidence * 100)}%</Badge>
-                  )}
-                </div>
-
-                {viewSkill.description && (
-                  <div>
-                    <p className="text-xs font-semibold text-muted-foreground mb-1">Description</p>
-                    <p className="text-sm">{viewSkill.description}</p>
-                  </div>
-                )}
-
-                {viewSkill.trigger_patterns?.length > 0 && (
-                  <div>
-                    <p className="text-xs font-semibold text-muted-foreground mb-1">Trigger patterns</p>
-                    <div className="flex flex-wrap gap-1">
-                      {viewSkill.trigger_patterns.map((p) => (
-                        <span key={p} className="inline-block bg-muted rounded px-2 py-0.5 text-xs">{p}</span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {viewSkill.steps?.length > 0 && (
-                  <div>
-                    <p className="text-xs font-semibold text-muted-foreground mb-1">Steps ({viewSkill.steps.length})</p>
-                    <pre className="bg-muted rounded p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap">
-                      {JSON.stringify(viewSkill.steps, null, 2)}
-                    </pre>
-                  </div>
-                )}
-
-                <div className="grid grid-cols-3 gap-2 text-xs text-muted-foreground border-t pt-3">
-                  <div><span className="font-semibold">Recall</span><br />{viewSkill.recall_count ?? '—'}</div>
-                  <div><span className="font-semibold">Success</span><br />{viewSkill.success_count ?? '—'}</div>
-                  <div><span className="font-semibold">Workflow</span><br />{viewSkill.workflow_name || '—'}</div>
-                </div>
-              </div>
-            )}
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setViewSkill(null)}>Close</Button>
-              <Button onClick={() => { setViewSkill(null); openEdit(viewSkill); }}>
-                <Pencil className="size-3.5 mr-1.5" /> Edit
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        {/* DB skills */}
-        <div className="mb-8">
-          <div className="flex items-center justify-between mb-2">
-            <h2 className="text-sm font-semibold flex items-center gap-1.5">
-              <Database className="size-4 text-slate-500" /> Skills ({dbSkills.length})
-            </h2>
-            {dbSkills.length > 0 && (
-              <Button variant="destructive" size="sm" onClick={handleDeleteAll} className="gap-1.5">
-                <Trash2 className="size-3.5" /> Delete all
-              </Button>
-            )}
-          </div>
-          {loading ? (
-            <div className="flex items-center gap-2 text-sm text-muted-foreground p-4"><Loader2 className="size-4 animate-spin" /> Loading…</div>
-          ) : dbSkills.length === 0 ? (
-            <p className="text-sm text-muted-foreground p-4 border rounded-lg">No skills yet. They are auto-distilled from runs (when auto-learn is on) or added here.</p>
-          ) : (
-            <div className="border rounded-lg overflow-hidden">
-              <table className="w-full text-sm">
-                <thead className="bg-muted/50 text-xs text-muted-foreground">
-                  <tr>
-                    <th className="text-left px-3 py-2 font-semibold">Name</th>
-                    <th className="text-left px-3 py-2 font-semibold">Status</th>
-                    <th className="text-left px-3 py-2 font-semibold">Source</th>
-                    <th className="text-right px-3 py-2 font-semibold">Conf</th>
-                    <th className="text-right px-3 py-2 font-semibold">Recall</th>
-                    <th className="text-right px-3 py-2 font-semibold">Success</th>
-                    <th className="px-3 py-2" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {dbSkills.map((s) => (
-                    <tr key={s.id || s.name} className="border-t hover:bg-muted/20">
-                      <td className="px-3 py-2">
-                        <div className="font-mono text-xs font-semibold">{s.name}</div>
-                        {s.title && <div className="text-[11px] text-muted-foreground">{s.title}</div>}
-                      </td>
-                      <td className="px-3 py-2"><Badge variant={STATUS_VARIANT[s.status] || 'muted'}>{s.status}</Badge></td>
-                      <td className="px-3 py-2 text-xs text-muted-foreground">{s.source}</td>
-                      <td className="px-3 py-2 text-right font-mono text-xs">{s.confidence != null ? `${Math.round(s.confidence * 100)}%` : '—'}</td>
-                      <td className="px-3 py-2 text-right font-mono text-xs">{s.recall_count}</td>
-                      <td className="px-3 py-2 text-right font-mono text-xs">{s.success_count}</td>
-                      <td className="px-3 py-2 text-right">
-                        <div className="flex items-center justify-end gap-0.5">
-                          <Button variant="ghost" size="icon" className="size-7 text-slate-400 hover:text-foreground" title="View details" onClick={() => setViewSkill(s)}>
-                            <Eye className="size-3.5" />
-                          </Button>
-                          <Button variant="ghost" size="icon" className="size-7 text-slate-400 hover:text-foreground" title="Edit" onClick={() => openEdit(s)}>
-                            <Pencil className="size-3.5" />
-                          </Button>
-                          <Button variant="ghost" size="icon" className="size-7 text-slate-400 hover:text-red-600" title="Delete" onClick={() => handleDelete(s.name)}>
-                            <Trash2 className="size-3.5" />
-                          </Button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-
         {/* Filesystem skills */}
         <div>
           <div className="flex items-center justify-between mb-2">
             <h2 className="text-sm font-semibold flex items-center gap-1.5">
-              <FileText className="size-4 text-slate-500" /> Guidance (markdown) ({fsSkills.length})
+              <FileText className="size-4 text-slate-500" /> Skills ({fsSkills.length})
             </h2>
-            <Button variant="outline" size="sm" className="gap-1.5" onClick={openFsAdd}>
-              <Plus className="size-3.5" /> Add markdown skill
-            </Button>
           </div>
-          {fsSkills.length === 0 ? (
-            <p className="text-sm text-muted-foreground p-4 border rounded-lg">No filesystem skills found.</p>
+          {loading ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground p-4"><Loader2 className="size-4 animate-spin" /> Loading…</div>
+          ) : fsSkills.length === 0 ? (
+            <p className="text-sm text-muted-foreground p-4 border rounded-lg">No skills found. Add one with the button above.</p>
           ) : (
             <div className="grid sm:grid-cols-2 gap-2">
               {fsSkills.map((s) => (
@@ -444,7 +189,7 @@ export default function Skills() {
                     <Button variant="ghost" size="icon" className="size-7 text-slate-400 hover:text-foreground" title="Edit" disabled={fsLoading} onClick={() => openFsEdit(s.name)}>
                       <Pencil className="size-3.5" />
                     </Button>
-                    <Button variant="ghost" size="icon" className="size-7 text-slate-400 hover:text-red-600" title="Delete filesystem skill" onClick={() => handleDeleteFs(s.name)}>
+                    <Button variant="ghost" size="icon" className="size-7 text-slate-400 hover:text-red-600" title="Delete skill" onClick={() => handleDeleteFs(s.name)}>
                       <Trash2 className="size-3.5" />
                     </Button>
                   </div>
@@ -482,7 +227,7 @@ export default function Skills() {
         <Dialog open={fsEditOpen} onOpenChange={(o) => { if (!o) { setFsEditOpen(false); setFsEditTarget(null); } }}>
           <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto">
             <DialogHeader>
-              <DialogTitle>{isFsEditMode ? `Edit markdown skill — ${fsEditTarget}` : 'Add markdown skill'}</DialogTitle>
+              <DialogTitle>{isFsEditMode ? `Edit skill — ${fsEditTarget}` : 'Add skill'}</DialogTitle>
             </DialogHeader>
             <div className="space-y-3">
               {!isFsEditMode && (

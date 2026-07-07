@@ -137,9 +137,9 @@ def compose_system_prompt(
         "needs — never read whole files or dump an entire schema when a targeted lookup will do.\n"
         "- When you reach a useful conclusion or resolution worth reusing, call save_playbook to "
         "record it so future runs can benefit from it.\n"
-        "- If the memory-context block at the start of the query lists 'Executable Skill' entries "
-        "that match the current issue, prefer calling execute_skill with the skill's name before "
-        "running manual tool calls — this reuses proven remediation steps and is faster."
+        "- If the memory-context block at the start of the query lists 'Suggested skills' that match "
+        "the current issue, follow that skill's runbook steps before improvising manual tool calls "
+        "— this reuses a proven procedure and is faster."
     )
 
     # ── Capability sections (registry-driven; stable order) ──────────────

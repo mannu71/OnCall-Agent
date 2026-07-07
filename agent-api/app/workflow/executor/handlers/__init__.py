@@ -32,3 +32,4 @@ from . import router  # noqa: E402,F401  — new LangflowEditor 'router' node ty
 from . import wiki  # noqa: E402,F401  — new Wiki output node type
 from . import code_analyzer  # noqa: E402,F401
 from . import vector_memory  # noqa: E402,F401  — semantic recall node
+from . import subagent_window  # noqa: E402,F401  — visual squad-grouping container (no-op)

@@ -240,17 +240,6 @@ async def run_curator() -> Dict[str, Any]:
         except Exception as exc:
             logger.debug("Curator: pinned promotion skipped — %s", exc)
 
-        # ── Skills: self-curation audit (draft→published lifecycle) ──
-        # Promote proven drafts, archive shaky never-recalled drafts, dedupe
-        # near-duplicate titles. LLM-free; complements the SQL passes above.
-        try:
-            from app.core.skills.service import skill_service
-            skill_audit = await skill_service.audit()
-            if any(skill_audit.values()):
-                logger.info("Curator: skill audit — %s", skill_audit)
-        except Exception as exc:
-            logger.debug("Curator: skill audit skipped — %s", exc)
-
         # ── Semantic memory: LLM audit / consolidation ──
         # Merge memories stating the same fact in different words. A SHA256
         # fingerprint short-circuits the LLM call when nothing changed, and a

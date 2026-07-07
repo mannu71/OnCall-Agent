@@ -165,7 +165,8 @@ class TurnLoop:
         pre_model_hook runs)."""
         try:
             return await self._compression.maybe_compact(list(messages))
-        except Exception:  # noqa: BLE001 — compaction must never break a run
+        except Exception as exc:  # noqa: BLE001 — compaction must never break a run
+            self.log.debug("engine: compaction skipped (%s)", exc)
             return messages
 
     async def _call_model_once(
@@ -182,8 +183,8 @@ class TurnLoop:
             if text:
                 try:
                     await self.stream_callback.on_llm_token(text)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001 — a stream hiccup must not abort the turn
+                    self.log.debug("engine: stream token callback failed (%s)", exc)
             accumulated = chunk if accumulated is None else accumulated + chunk
         return accumulated
 
@@ -436,8 +437,8 @@ class TurnLoop:
                     "cache_read_tokens": cache_read_tokens,
                     "cache_creation_tokens": cache_creation_tokens,
                 })
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001 — token telemetry must not break a run
+                self.log.debug("engine: token-usage publish failed (%s)", exc)
 
         result: Dict[str, Any] = {
             "final_answer": parsed["final_answer"],
@@ -469,8 +470,8 @@ class TurnLoop:
             )
             if flagged:
                 result["ungrounded_ids"] = flagged
-        except Exception:  # noqa: BLE001 — a telemetry guard must never break a run
-            pass
+        except Exception as exc:  # noqa: BLE001 — a telemetry guard must never break a run
+            self.log.debug("engine: grounding check skipped (%s)", exc)
 
         await self._recorder.flush()
 
@@ -484,8 +485,8 @@ class TurnLoop:
             return
         try:
             await self.stream_callback.on_error(message)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001 — surfacing an error must not itself raise
+            self.log.debug("engine: error surfacing failed (%s)", exc)
 
     @staticmethod
     def _last_user_text(messages: List[Any]) -> str:

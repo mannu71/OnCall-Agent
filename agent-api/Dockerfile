@@ -97,12 +97,13 @@ ENV AWS_DEFAULT_REGION=eu-west-1 \
     CODEGRAPH_DB=/app/data/codegraph.db
 
 # ripgrep powers the crawler's code-grep tool; git backs codegraph's
-# detect_changes / symbol_history; libtree-sitter0 is the runtime for codegraph's
-# AST backend (the grammar bundle is copied in below).
+# detect_changes / symbol_history. libtree-sitter is only needed by codegraph's
+# AST backend, which ships in runtime-full — so it's installed there, keeping
+# runtime-slim (no codegraph, no tree-sitter wheels) minimal.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
-        ripgrep git libtree-sitter0.22 libcurl4
+        ripgrep git libcurl4
 
 # App code (shared by both runtime targets).
 COPY agent-api/app/ ./app/
@@ -161,6 +162,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
  && printf 'allow-insecure-host = ["pypi.org", "files.pythonhosted.org"]\nsystem-certs = true\n' \
     > /root/.config/uv/uv.toml
 
+# libtree-sitter runtime for codegraph's AST backend (grammar bundle copied
+# below). Installed here rather than runtime-base so runtime-slim, which ships
+# neither codegraph nor the tree-sitter wheels, does not carry it.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        libtree-sitter0.22
+
 # codegraph — the native code-intelligence MCP server, registered as a stdio MCP
 # server (command=/usr/local/bin/codegraph). Built inline via the cg-* stages
 # above. The COPY is in runtime-full only (the target that also carries Node for
@@ -169,3 +178,10 @@ COPY --from=cg-runtime /usr/local/bin/codegraph /usr/local/bin/codegraph
 # Grammar bundle for codegraph's tree-sitter AST backend (150+ languages).
 COPY --from=cg-runtime /opt/codegraph/languages.so /opt/codegraph/languages.so
 ENV CODEGRAPH_TS_SO=/opt/codegraph/languages.so
+
+# Vendored ONNX embedding model for code semantic search (snowflake-arctic-embed-s,
+# ~34MB). Baked into the image at /opt/models (NOT /app/data — that path is a
+# mounted volume at runtime and would shadow anything baked there). code_semantic
+# runs fully offline against these files; no runtime HuggingFace download.
+COPY agent-api/vendor/models/ /opt/models/
+ENV CODE_SEMANTIC_MODELS_ROOT=/opt/models

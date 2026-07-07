@@ -269,9 +269,11 @@ class LogPatternModel(Base):
 class KnowledgeEntryModel(Base):
     """Knowledge entry — generic RAG store for resolutions, playbooks, and findings."""
     __tablename__ = "knowledge_entries"
+    # title is the natural upsert key — IncidentKBSink (auto-learn) upserts with
+    # ON CONFLICT (title), which requires this unique constraint (migration 032).
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    title = Column(String(255), nullable=False)
+    title = Column(String(255), nullable=False, unique=True)
     description = Column(Text, nullable=False)
     symptoms = Column(JSON)          # Array of symptom/trigger strings
     solution = Column(Text)          # Resolution text
@@ -284,62 +286,6 @@ class KnowledgeEntryModel(Base):
 
 # Backward-compat alias — remove once all import sites are updated
 KnownIssueModel = KnowledgeEntryModel
-
-
-class SkillModel(Base):
-    """Executable skill — a structured, reusable resolution procedure.
-
-    DEPRECATED / UNUSED: skills are now FILE-backed (one JSON per skill under
-    ``settings.skills_store_dir``); see ``app.core.skills.service``. This model
-    is retained only so the legacy ``skills`` table remains importable for the
-    one-time file migration. Do not add new reads/writes against it.
-    """
-    __tablename__ = "skills"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-
-    # Identity
-    name  = Column(String(255), unique=True, nullable=False)  # slug: restart_api_pods
-    title = Column(String(255), nullable=False)               # human label
-
-    description = Column(Text)
-
-    # Matching — phrases / regex patterns that indicate this skill is relevant
-    trigger_patterns = Column(JSON)   # List[str]
-
-    # Execution — ordered list of step dicts:
-    #   [{order, description, tool, args_template, condition, on_failure}]
-    steps = Column(JSON, nullable=False, default=list)
-
-    # Optional: run a named workflow instead of individual steps
-    workflow_name = Column(String(255))
-
-    # Provenance
-    source = Column(String(50), default="distilled")
-    # distilled  — auto-generated from investigation
-    # manual     — written by an engineer
-    # promoted   — promoted from a knowledge_entry
-
-    # Lifecycle
-    status = Column(String(50), default="active")
-    # active | draft | archived
-
-    # Confidence (0..1) from the distillation LLM. Below the configured
-    # threshold a distilled skill is saved as 'draft' (hidden from recall).
-    confidence = Column(Float)
-    # Last curator decision: kept | demoted | promoted | archived (migration 023).
-    audit_verdict = Column(String(16))
-
-    # Usage counters (updated by SkillService)
-    success_count = Column(Integer, default=0)
-    recall_count  = Column(Integer, default=0)
-    last_used_at  = Column(DateTime(timezone=True))
-
-    # Lineage — knowledge_entries.id this skill was promoted from (nullable)
-    promoted_from_id = Column(Integer)
-
-    created_at = Column(DateTime(timezone=True))
-    updated_at = Column(DateTime(timezone=True))
 
 
 class BaselineMetricModel(Base):
