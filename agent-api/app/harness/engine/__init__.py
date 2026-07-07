@@ -87,6 +87,7 @@ async def run_agent_once(
     model_name: Optional[str] = None,
     checkpointer: Any = None,
     engine: Optional[str] = None,
+    compiled_agent: Any = None,
 ) -> Dict[str, Any]:
     """Run one agent turn-loop to completion, routed by ``engine``.
 
@@ -94,6 +95,10 @@ async def run_agent_once(
     Both branches return the same result-dict contract as
     ``app.harness.agent_runner.execute_agent``
     (``final_answer``, ``messages``, ``tool_calls``, token counts, ...).
+
+    ``compiled_agent`` (LangGraph engine only): a pre-built agent graph to run
+    instead of building one from ``spec`` — used by the subagent compiled-agent
+    cache to skip ``build_agent_from_spec`` on repeated delegations.
     """
     agent_config = getattr(spec, "agent_config", None) or {}
     resolved = engine or resolve_engine(agent_config)
@@ -114,9 +119,21 @@ async def run_agent_once(
     from app.harness import build_agent_from_spec
     from app.harness.agent_runner import execute_agent
 
-    agent = build_agent_from_spec(
+    agent = compiled_agent if compiled_agent is not None else build_agent_from_spec(
         spec, llm, tools, checkpointer=checkpointer, execution_port=execution_port,
     )
+
+    # Checkpoint durability: use the configured mode, but clamp HITL runs to
+    # "async" — a HITL pause/resume relies on interrupt-time checkpoints, which
+    # "exit" would skip (it only writes when the run finishes). Non-HITL runs
+    # get the full benefit of "exit" when configured.
+    _durability = getattr(settings, "agent_durability", "async")
+    if agent_config.get("hitl_enabled", False) and _durability == "exit":
+        logger.debug(
+            "run_agent_once: HITL run — clamping durability '%s' → 'async'", _durability,
+        )
+        _durability = "async"
+
     return await execute_agent(
         agent,
         user_query,
@@ -129,6 +146,7 @@ async def run_agent_once(
         retry_predicate=retry_predicate,
         recursion_limit=recursion_limit,
         model_name=model_name,
+        durability=_durability,
     )
 
 

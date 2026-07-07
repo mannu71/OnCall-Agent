@@ -90,6 +90,68 @@ def set_parent_stream_callback(cb: Any) -> None:
         pass
 
 
+# ── Compiled-agent cache (opt-in: settings.subagent_compiled_cache_enabled) ──
+# Repeated / parallel delegation to the same specialist rebuilds the child agent
+# — an async DB model-role lookup, a boto client build, and a create_react_agent
+# compile — on every call. When enabled, we build the child graph once and reuse
+# it. Scoped to children with an EXPLICIT per-def model so the baked LLM is a
+# fixed DB config (children that inherit the parent LLM are never cached: the
+# parent's fallback chain may swap model/region/creds mid-run). Bounded LRU so
+# it can't grow without limit (the leak that retired the old async registry).
+from collections import OrderedDict as _OrderedDict  # noqa: E402
+
+_COMPILED_CHILD_CACHE: "_OrderedDict[tuple, Any]" = _OrderedDict()
+_COMPILED_CHILD_CACHE_MAX = 32
+_child_checkpointer_singleton: Optional[Any] = None
+
+
+def _child_cache_key(
+    name: str, model_name: str, sub_tools: List[Any],
+    role_prompt: Optional[str], output_schema: Optional[str],
+    capabilities: List[str], permission_mode: str,
+) -> tuple:
+    """Everything that affects the compiled child graph. Excludes the per-call
+    session/thread id (that is passed at invoke time, not baked into structure)."""
+    tools_sig = tuple(sorted(getattr(t, "name", "") or "" for t in (sub_tools or [])))
+    caps_sig = tuple(sorted(capabilities or []))
+    return (name, model_name, tools_sig, role_prompt or "", output_schema or "",
+            caps_sig, permission_mode or "")
+
+
+def _child_cache_get(key: tuple) -> Optional[Any]:
+    agent = _COMPILED_CHILD_CACHE.get(key)
+    if agent is not None:
+        _COMPILED_CHILD_CACHE.move_to_end(key)
+    return agent
+
+
+def _child_cache_put(key: tuple, agent: Any) -> None:
+    _COMPILED_CHILD_CACHE[key] = agent
+    _COMPILED_CHILD_CACHE.move_to_end(key)
+    while len(_COMPILED_CHILD_CACHE) > _COMPILED_CHILD_CACHE_MAX:
+        _COMPILED_CHILD_CACHE.popitem(last=False)
+
+
+async def _shared_child_checkpointer() -> Any:
+    """A stable checkpointer to bake into cached child graphs. Prefers the
+    process-wide durable saver (children keyed by their own thread_id); falls
+    back to one shared in-memory saver. Shared (not per-call) so a cached agent
+    keeps a valid checkpointer across delegations, and timeout recovery can read
+    a child's partial state back by thread_id."""
+    global _child_checkpointer_singleton
+    try:
+        from app.harness.runtime import get_saver
+        saver = get_saver()
+        if saver is not None:
+            return saver
+    except Exception:  # noqa: BLE001 — fall through to the in-memory singleton
+        pass
+    if _child_checkpointer_singleton is None:
+        from app.harness.hitl import make_checkpointer
+        _child_checkpointer_singleton = await make_checkpointer()
+    return _child_checkpointer_singleton
+
+
 class _ChildStreamCallback:
     """Wrap the parent run's stream callback so a delegated child's tool activity
     surfaces on the PARENT's chat stream, tagged with the child (subagent) name.
@@ -501,33 +563,59 @@ async def _run_child(
     logger.info("delegation: spawning child %s (depth_remaining=%d)", sub_id, depth_remaining)
     t0 = time.monotonic()
 
+    inherit = isinstance(model_name, str) and model_name.strip().lower() == "inherit"
+
+    # ── Compiled-agent cache (opt-in) ────────────────────────────────────
+    # Eligible only for LangGraph children with an explicit per-def model (a
+    # fixed DB config). On a hit we skip LLM resolution AND the graph build.
+    from app.config import settings as _settings
+    _explicit_model = bool(model_name) and not inherit
+    _cache_eligible = (
+        getattr(_settings, "subagent_compiled_cache_enabled", False)
+        and _explicit_model
+        and resolve_engine(agent_config if isinstance(agent_config, dict) else {}) == "langgraph"
+    )
+    _cache_key: Optional[tuple] = None
+    _cached_compiled: Optional[Any] = None
+    if _cache_eligible:
+        _cache_key = _child_cache_key(
+            name, model_name.strip(), sub_tools, role_prompt, output_schema,
+            capabilities, permission_mode or "auto_allow",
+        )
+        _cached_compiled = _child_cache_get(_cache_key)
+
     # ── Child LLM resolution (single precedence chain for every delegation
     #    tool: per-def model → "inherit" sentinel → subagent role → parent) ──
+    # Skipped entirely on a compiled-cache hit — the LLM is baked into the graph.
     sub_llm = llm
-    inherit = isinstance(model_name, str) and model_name.strip().lower() == "inherit"
-    try:
-        from app.workflow.strategies.react.llm_factory import build_llm
-        if model_name and not inherit:
-            from app.workflow.llm_config import resolve_llm_config_by_name
-            sub_cfg = await resolve_llm_config_by_name(model_name)
-            sub_llm = build_llm(sub_cfg)
-            logger.info("delegation: child %s using per-def model=%s", sub_id, model_name)
-        elif inherit:
-            logger.info("delegation: child %s explicitly inheriting parent LLM", sub_id)
-        else:
-            from app.infrastructure.persistence import model_role_repository
-            role_name = await model_role_repository.get("subagent")
-            if role_name:
-                from app.workflow.llm_config import resolve_llm_config_for_role
-                sub_cfg = await resolve_llm_config_for_role("subagent")
+    if _cached_compiled is not None:
+        logger.info("delegation: child %s reusing cached compiled agent (model=%s)", sub_id, model_name)
+    else:
+        try:
+            from app.workflow.strategies.react.llm_factory import build_llm
+            if model_name and not inherit:
+                from app.workflow.llm_config import resolve_llm_config_by_name
+                sub_cfg = await resolve_llm_config_by_name(model_name)
                 sub_llm = build_llm(sub_cfg)
-                logger.info("delegation: child %s using role model=%s", sub_id, role_name)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("delegation: child %s LLM resolution failed (%s) — using parent LLM", sub_id, exc)
-        sub_llm = llm
+                logger.info("delegation: child %s using per-def model=%s", sub_id, model_name)
+            elif inherit:
+                logger.info("delegation: child %s explicitly inheriting parent LLM", sub_id)
+            else:
+                from app.infrastructure.persistence import model_role_repository
+                role_name = await model_role_repository.get("subagent")
+                if role_name:
+                    from app.workflow.llm_config import resolve_llm_config_for_role
+                    sub_cfg = await resolve_llm_config_for_role("subagent")
+                    sub_llm = build_llm(sub_cfg)
+                    logger.info("delegation: child %s using role model=%s", sub_id, role_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("delegation: child %s LLM resolution failed (%s) — using parent LLM", sub_id, exc)
+            sub_llm = llm
 
     try:
-        cp = await make_checkpointer()
+        # A cached child bakes in a SHARED checkpointer (keyed by thread_id per
+        # call); an uncached child gets its own fresh one, as before.
+        cp = await _shared_child_checkpointer() if _cache_eligible else await make_checkpointer()
         sub_agent_config = agent_config if isinstance(agent_config, dict) else (agent_config or {})
         has_code_analyzer, has_cloudwatch = _infer_child_context_flags(sub_tools)
         sub_spec = AgentSpec(
@@ -541,6 +629,30 @@ async def _run_child(
             output_schema=output_schema,
             subagents=[],  # depth-capped
         )
+
+        # Build the compiled child once and cache it (miss path). Uses a stable
+        # session id (per specialist, not per call) so the compaction closure is
+        # consistent across reuse, forces HITL off (children never interrupt),
+        # and bakes in the shared checkpointer. The per-call task/thread_id/
+        # recursion_limit/stream are still passed at invoke time below.
+        if _cache_eligible and _cached_compiled is None:
+            from app.harness import build_agent_from_spec
+            _cached_spec = AgentSpec(
+                agent_config={**sub_agent_config, "hitl_enabled": False},
+                has_code_analyzer=has_code_analyzer,
+                has_cloudwatch=has_cloudwatch,
+                permission_mode=permission_mode or "auto_allow",
+                session_id=f"child:{name}",
+                capabilities=list(capabilities),
+                role_prompt=role_prompt,
+                output_schema=output_schema,
+                subagents=[],
+            )
+            _cached_compiled = build_agent_from_spec(
+                _cached_spec, sub_llm, sub_tools, checkpointer=cp, execution_port=None,
+            )
+            _child_cache_put(_cache_key, _cached_compiled)
+            logger.info("delegation: child %s compiled + cached (model=%s)", sub_id, model_name)
 
         # ~2 LangGraph steps per ReAct turn (agent + tool node) — see
         # agent_runner.execute_agent's own recursion_limit comment. Coerce
@@ -594,7 +706,7 @@ async def _run_child(
                         sub_spec, sub_llm, sub_tools, q,
                         logger_instance=logger, execution_id=sub_id, thread_id=sub_id,
                         recursion_limit=recursion_limit, checkpointer=cp, engine=child_engine,
-                        stream_callback=child_cb,
+                        stream_callback=child_cb, compiled_agent=_cached_compiled,
                     ),
                     timeout=timeout_s,
                 )
@@ -603,7 +715,7 @@ async def _run_child(
                     sub_spec, sub_llm, sub_tools, q,
                     logger_instance=logger, execution_id=sub_id, thread_id=sub_id,
                     recursion_limit=recursion_limit, checkpointer=cp, engine=child_engine,
-                    stream_callback=child_cb,
+                    stream_callback=child_cb, compiled_agent=_cached_compiled,
                 )
         finally:
             if _var_cfg is not None and _cfg_token is not None:

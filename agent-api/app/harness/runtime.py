@@ -42,9 +42,27 @@ async def init_persistence() -> None:
         )
         await _pool.open(wait=True)
 
-        _saver = AsyncPostgresSaver(_pool)
+        # Optional shallow saver: keeps only the latest checkpoint per thread
+        # (no time-travel history). HITL resume needs only the latest checkpoint,
+        # so pause/resume keeps working. Fall back to the full saver if the class
+        # is unavailable in the installed langgraph-checkpoint-postgres.
+        _saver_cls = AsyncPostgresSaver
+        _saver_label = "AsyncPostgresSaver"
+        from app.config import settings as _settings
+        if getattr(_settings, "checkpoint_shallow", False):
+            try:
+                from langgraph.checkpoint.postgres.aio import AsyncShallowPostgresSaver
+                _saver_cls = AsyncShallowPostgresSaver
+                _saver_label = "AsyncShallowPostgresSaver"
+            except Exception as _shallow_exc:  # noqa: BLE001 — fall back to full saver
+                logger.warning(
+                    "checkpoint_shallow requested but AsyncShallowPostgresSaver "
+                    "unavailable (%s) — using full AsyncPostgresSaver", _shallow_exc,
+                )
+
+        _saver = _saver_cls(_pool)
         await _saver.setup()
-        logger.info("LangGraph persistence ready (AsyncPostgresSaver)")
+        logger.info("LangGraph persistence ready (%s)", _saver_label)
     except Exception as exc:  # noqa: BLE001 — never block startup
         logger.warning(
             "LangGraph persistence unavailable (%s) — falling back to in-memory checkpointer", exc

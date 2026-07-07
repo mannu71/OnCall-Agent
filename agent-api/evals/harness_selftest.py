@@ -3399,6 +3399,197 @@ async def test_subagent_engine_routing() -> None:
         engine_mod.run_agent_once = orig
 
 
+async def test_agent_durability_and_max_concurrency() -> None:
+    """LangGraph perf knobs: invoke_agent forwards ``durability`` to ainvoke
+    (and omits it when None), and run_agent_once clamps HITL runs to 'async'
+    while passing the configured mode through for non-HITL runs."""
+    from app.config import settings
+    from app.harness import agent_runner
+    import app.harness.engine as engine_mod
+
+    # ── invoke_agent forwards durability to ainvoke ──
+    captured: dict = {}
+
+    class _FakeAgent:
+        async def ainvoke(self, input_state, config=None, **kw):
+            captured["durability"] = kw.get("durability", "<unset>")
+            return {"messages": []}
+
+    await agent_runner.invoke_agent(_FakeAgent(), {"messages": []}, {}, durability="exit")
+    check("durability: invoke_agent forwards durability to ainvoke", captured.get("durability") == "exit")
+
+    captured.clear()
+    await agent_runner.invoke_agent(_FakeAgent(), {"messages": []}, {})
+    check("durability: omitted (None) → ainvoke gets no durability kwarg", captured.get("durability") == "<unset>")
+
+    # ── run_agent_once: HITL clamp + non-HITL passthrough ──
+    import app.harness as harness_mod
+
+    class _Spec:
+        def __init__(self, hitl):
+            self.agent_config = {"engine": "langgraph", "hitl_enabled": hitl}
+
+    seen: dict = {}
+
+    async def _fake_execute_agent(agent, user_query, logger_instance, execution_id=None,
+                                  stream_callback=None, **kw):
+        seen["durability"] = kw.get("durability")
+        return {"final_answer": "ok", "messages": [], "tool_calls": []}
+
+    orig_build = harness_mod.build_agent_from_spec
+    orig_exec = agent_runner.execute_agent
+    orig_setting = settings.agent_durability
+    harness_mod.build_agent_from_spec = lambda *a, **k: object()
+    agent_runner.execute_agent = _fake_execute_agent
+    settings.agent_durability = "exit"
+    try:
+        await engine_mod.run_agent_once(_Spec(hitl=False), None, [], "q", engine="langgraph")
+        check("durability: non-HITL run passes configured 'exit' through", seen.get("durability") == "exit")
+
+        seen.clear()
+        await engine_mod.run_agent_once(_Spec(hitl=True), None, [], "q", engine="langgraph")
+        check("durability: HITL run clamped to 'async'", seen.get("durability") == "async")
+    finally:
+        harness_mod.build_agent_from_spec = orig_build
+        agent_runner.execute_agent = orig_exec
+        settings.agent_durability = orig_setting
+
+
+async def test_stream_mode_v2() -> None:
+    """execute_agent_stream_v2 (astream stream_mode path): streams LLM tokens,
+    emits on_tool_call/on_tool_result from update messages, and returns the
+    COMPLETE final state ('values'), including ToolMessages — the fix for the
+    events loop dropping tool results from the returned state."""
+    from langchain_core.messages import (
+        AIMessage, AIMessageChunk, ToolMessage, HumanMessage,
+    )
+    from app.harness import agent_runner
+
+    tool_msg = ToolMessage(content="RESULT-DATA", tool_call_id="call_1", name="foo")
+    final_values = {"messages": [
+        HumanMessage(content="q"),
+        AIMessage(content="", tool_calls=[{"name": "foo", "args": {"x": 1}, "id": "call_1", "type": "tool_call"}]),
+        tool_msg,
+        AIMessage(content="done"),
+    ]}
+
+    class _FakeAgent:
+        async def astream(self, input_state, config=None, stream_mode=None, **kw):
+            check("stream_mode: v2 requests messages+updates+values",
+                  stream_mode == ["messages", "updates", "values"])
+            yield ("messages", (AIMessageChunk(content="hel"), {}))
+            yield ("messages", (AIMessageChunk(content="lo"), {}))
+            yield ("updates", {"agent": {"messages": [
+                AIMessage(content="", tool_calls=[{"name": "foo", "args": {"x": 1}, "id": "call_1", "type": "tool_call"}]),
+            ]}})
+            yield ("updates", {"tools": {"messages": [tool_msg]}})
+            yield ("values", final_values)
+
+    events: dict = {"tokens": [], "tool_calls": [], "tool_results": []}
+
+    class _CB:
+        async def on_llm_token(self, t): events["tokens"].append(t)
+        async def on_tool_call(self, name, args): events["tool_calls"].append((name, args))
+        async def on_tool_result(self, name, out, failed=False): events["tool_results"].append((name, out, failed))
+        async def on_error(self, msg): events.setdefault("errors", []).append(msg)
+
+    result = await agent_runner.execute_agent_stream_v2(
+        _FakeAgent(), {"messages": [HumanMessage(content="q")]}, _CB(),
+        logging.getLogger("selftest"), execution_id="e1", run_config={}, execution_port=None,
+        durability="exit",
+    )
+
+    check("stream_mode: LLM tokens streamed in order", "".join(events["tokens"]) == "hello")
+    check("stream_mode: on_tool_call emitted with name+args",
+          events["tool_calls"] == [("foo", {"x": 1})])
+    check("stream_mode: on_tool_result emitted with tool output",
+          len(events["tool_results"]) == 1 and events["tool_results"][0][0] == "foo"
+          and "RESULT-DATA" in events["tool_results"][0][1])
+    check("stream_mode: returns complete final state incl. ToolMessage",
+          any(isinstance(m, ToolMessage) for m in result.get("messages", [])))
+
+
+async def test_subagent_compiled_cache() -> None:
+    """Opt-in compiled-agent cache: a child with an explicit per-def model is
+    built once and reused across delegations (build_agent_from_spec called once,
+    compiled_agent threaded into run_agent_once); an inherit-model child is
+    never cached (compiled_agent stays None, per-call build path)."""
+    from app.config import settings
+    from app.harness import subagent_factory as sf
+    import app.harness as harness_mod
+    import app.harness.engine as engine_mod
+    import app.workflow.llm_config as llm_config_mod
+    import app.workflow.strategies.react.llm_factory as llmf
+
+    class _T:
+        def __init__(self, n): self.name = n
+
+    builds = {"count": 0}
+    captured_compiled: list = []
+
+    def _fake_build(spec, llm, tools, **kw):
+        builds["count"] += 1
+        return f"compiled-{builds['count']}"
+
+    async def _fake_run_once(spec, llm, tools, q, **kw):
+        captured_compiled.append(kw.get("compiled_agent"))
+        return {"final_answer": "ok", "messages": [], "tool_calls": []}
+
+    async def _fake_resolve(name):
+        return {"provider": "bedrock", "model": name}
+
+    async def _fake_cp():
+        return None
+
+    orig_build = harness_mod.build_agent_from_spec
+    orig_run = engine_mod.run_agent_once
+    orig_resolve = getattr(llm_config_mod, "resolve_llm_config_by_name", None)
+    orig_bl = llmf.build_llm
+    orig_cp = sf._shared_child_checkpointer
+    orig_flag = settings.subagent_compiled_cache_enabled
+    sf._COMPILED_CHILD_CACHE.clear()
+    harness_mod.build_agent_from_spec = _fake_build
+    engine_mod.run_agent_once = _fake_run_once
+    llm_config_mod.resolve_llm_config_by_name = _fake_resolve
+    llmf.build_llm = lambda cfg: "fake-llm"
+    sf._shared_child_checkpointer = _fake_cp
+    settings.subagent_compiled_cache_enabled = True
+    try:
+        for _ in range(2):
+            await sf._run_child(
+                llm="parent-llm", sub_tools=[_T("crawler_search")], agent_config={},
+                name="spec-a", role_prompt="r", capabilities=["code_analyzer"],
+                output_schema=None, model_name="cheap-model", depth_remaining=1,
+                parent_execution_id="p1", timeout_s=0, output_max=4000, task="do it",
+                max_turns=3, permission_mode="auto_allow",
+            )
+        check("subagent cache: compiled once across 2 delegations", builds["count"] == 1)
+        check("subagent cache: both calls run the cached compiled agent",
+              captured_compiled == ["compiled-1", "compiled-1"])
+
+        # Ineligible: an inherit-model child is never cached — no compiled_agent.
+        builds["count"] = 0
+        captured_compiled.clear()
+        sf._COMPILED_CHILD_CACHE.clear()
+        await sf._run_child(
+            llm="parent-llm", sub_tools=[_T("crawler_search")], agent_config={},
+            name="spec-b", role_prompt="r", capabilities=[], output_schema=None,
+            model_name="inherit", depth_remaining=1, parent_execution_id="p1",
+            timeout_s=0, output_max=4000, task="do it",
+        )
+        check("subagent cache: inherit-model child is not cached",
+              builds["count"] == 0 and captured_compiled == [None])
+    finally:
+        harness_mod.build_agent_from_spec = orig_build
+        engine_mod.run_agent_once = orig_run
+        if orig_resolve is not None:
+            llm_config_mod.resolve_llm_config_by_name = orig_resolve
+        llmf.build_llm = orig_bl
+        sf._shared_child_checkpointer = orig_cp
+        settings.subagent_compiled_cache_enabled = orig_flag
+        sf._COMPILED_CHILD_CACHE.clear()
+
+
 async def test_delegation_phase_b() -> None:
     """Phase B delegation: config bounds, BLOCKED_TOOLS safety, parallel/async tools."""
     from app.harness import subagent_factory as sf
@@ -4275,6 +4466,10 @@ async def _main() -> int:
     await test_delegate_batch_budget_economy()
     # ── Phase 5: delegated children route through the engine flag ──
     await test_subagent_engine_routing()
+    # ── LangGraph perf knobs: durability/max_concurrency + stream_mode v2 ──
+    await test_agent_durability_and_max_concurrency()
+    await test_stream_mode_v2()
+    await test_subagent_compiled_cache()
     # ── loop engineering: Loop 2 grader + Loop 4 hill-climbing ──
     await test_loop_engineering()
     # ── ONNX code-embedding semantic search (registry/cache/provision) ──

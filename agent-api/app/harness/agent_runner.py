@@ -251,6 +251,7 @@ async def execute_agent(
     retry_predicate: Optional[Any] = None,
     recursion_limit: Optional[int] = None,
     model_name: Optional[str] = None,
+    durability: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Execute the LangGraph ReAct agent with the user's query.
@@ -373,6 +374,18 @@ async def execute_agent(
     # or pass an explicit ``recursion_limit`` (e.g. a subagent's max_turns cap).
     run_config["recursion_limit"] = recursion_limit if recursion_limit is not None else settings.agent_recursion_limit
 
+    # Bound intra-superstep concurrency (parallel tool calls / Send fan-out)
+    # against Bedrock rate limits when configured; 0 = unset (unbounded).
+    _max_conc = getattr(settings, "agent_max_concurrency", 0) or 0
+    if _max_conc > 0:
+        run_config["max_concurrency"] = _max_conc
+
+    # Checkpoint durability for this run. Resolved here (caller override →
+    # settings) and threaded into every ainvoke/astream below. The HITL clamp
+    # lives at the call site (run_agent_once), which passes durability="async"
+    # for HITL runs so interrupt-time checkpoints are always written.
+    _durability = durability or getattr(settings, "agent_durability", "async")
+
     # Attach a token-usage callback so we get exact counts regardless of
     # streaming mode or provider (Bedrock, Anthropic, OpenAI).
     from app.core.streaming.callbacks import TokenUsageCallback
@@ -390,17 +403,24 @@ async def execute_agent(
                 execution_port.set_trace_id(execution_id, trace_id)
 
             if stream_callback is not None:
+                _stream_fn = (
+                    execute_agent_stream_v2
+                    if getattr(settings, "agent_stream_mode_enabled", False)
+                    else execute_agent_stream
+                )
                 result_state = await with_retry(
-                    execute_agent_stream,
+                    _stream_fn,
                     agent, input_state, stream_callback, logger_instance, execution_id,
                     run_config,
                     execution_port,
+                    durability=_durability,
                     max_retries=3,
                     retry_on=retry_predicate,
                 )
             else:
                 result_state = await with_retry(
                     invoke_agent, agent, input_state, run_config,
+                    durability=_durability,
                     max_retries=3,
                     retry_on=retry_predicate,
                 )
@@ -478,6 +498,7 @@ async def execute_agent(
                     result_state = await invoke_agent(
                         agent, {"messages": msgs},
                         {**run_config, "recursion_limit": _CONTINUATION_RECURSION_LIMIT},
+                        durability=_durability,
                     )
                     _recovered = True
         except Exception as _rec_exc:  # noqa: BLE001 — recovery is best-effort
@@ -518,12 +539,19 @@ async def execute_agent(
                     input_state = compact_input_state(input_state)
 
                 if stream_callback is not None:
-                    result_state = await execute_agent_stream(
+                    _retry_stream_fn = (
+                        execute_agent_stream_v2
+                        if getattr(settings, "agent_stream_mode_enabled", False)
+                        else execute_agent_stream
+                    )
+                    result_state = await _retry_stream_fn(
                         agent, input_state, stream_callback, logger_instance, execution_id,
-                        run_config,
+                        run_config, execution_port, durability=_durability,
                     )
                 else:
-                    result_state = await invoke_agent(agent, input_state, run_config)
+                    result_state = await invoke_agent(
+                        agent, input_state, run_config, durability=_durability,
+                    )
             else:
                 raise
 
@@ -553,6 +581,7 @@ async def execute_agent(
                 agent,
                 {"messages": _cont_msgs},
                 {**run_config, "recursion_limit": _CONTINUATION_RECURSION_LIMIT},
+                durability=_durability,
             )
             cont_parsed = _serialize_agent_result(cont_state)
             if cont_parsed["last_ai_truncated"] and not cont_parsed["last_ai_had_tool_calls"]:
@@ -613,6 +642,7 @@ async def execute_agent(
                 agent,
                 {"messages": cont_msgs},
                 {**run_config, "recursion_limit": _CONTINUATION_RECURSION_LIMIT},
+                durability=_durability,
             )
             cont_parsed = _serialize_agent_result(cont_state)
             cont_answer = (cont_parsed.get("final_answer") or "").strip()
@@ -965,6 +995,7 @@ async def invoke_agent(
     input_state: Dict[str, Any],
     run_config: Optional[Dict[str, Any]] = None,
     timeout_seconds: Optional[float] = None,
+    durability: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Non-streaming invocation with timeout.
 
@@ -973,11 +1004,18 @@ async def invoke_agent(
     that wraps this in its own longer wait_for (e.g. subagent delegation's
     DELEGATION_CHILD_TIMEOUT_SECONDS) isn't silently cut short by a shorter
     inner ceiling.
+
+    ``durability`` (sync|async|exit) is forwarded to ``ainvoke`` when set,
+    controlling how often LangGraph checkpoints this run. None → LangGraph's
+    own default ("async"), i.e. today's behavior.
     """
     _timeout = timeout_seconds if timeout_seconds is not None else settings.agent_invoke_timeout_seconds
+    _extra: Dict[str, Any] = {}
+    if durability:
+        _extra["durability"] = durability
     try:
         result_state = await asyncio.wait_for(
-            agent.ainvoke(input_state, config=run_config or {}),
+            agent.ainvoke(input_state, config=run_config or {}, **_extra),
             timeout=_timeout,
         )
     except asyncio.TimeoutError:
@@ -992,8 +1030,13 @@ async def execute_agent_stream(
     execution_id: Optional[str] = None,
     run_config: Optional[Dict[str, Any]] = None,
     execution_port: Optional[ExecutionPort] = None,
+    durability: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Streaming invocation using ``agent.astream_events()`` (v2)."""
+    """Streaming invocation using ``agent.astream_events()`` (v2).
+
+    ``durability`` (sync|async|exit), when set, is forwarded through
+    ``astream_events`` → ``astream`` to control checkpoint frequency.
+    """
     from app.core.tool_guardrails import (
         ToolCallGuardrailController,
         toolguard_synthetic_result,
@@ -1024,8 +1067,14 @@ async def execute_agent_stream(
     guardrail = ToolCallGuardrailController(_guardrail_config)
     _tool_calls_count = 0
 
+    _stream_extra: Dict[str, Any] = {}
+    if durability:
+        _stream_extra["durability"] = durability
+
     try:
-        async for event in agent.astream_events(input_state, config=run_config or {}, version="v2"):
+        async for event in agent.astream_events(
+            input_state, config=run_config or {}, version="v2", **_stream_extra
+        ):
             kind = event.get("event", "")
             data = event.get("data", {})
             name = event.get("name", "")
@@ -1217,4 +1266,224 @@ async def execute_agent_stream(
     if messages:
         return {"messages": messages}
 
-    return await invoke_agent(agent, input_state)
+    return await invoke_agent(agent, input_state, durability=durability)
+
+
+async def execute_agent_stream_v2(
+    agent: Any,
+    input_state: Dict[str, Any],
+    stream_callback: StreamCallback,
+    logger_instance: Any,
+    execution_id: Optional[str] = None,
+    run_config: Optional[Dict[str, Any]] = None,
+    execution_port: Optional[ExecutionPort] = None,
+    durability: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Streaming invocation via ``agent.astream(stream_mode=[...])``.
+
+    A lighter alternative to :func:`execute_agent_stream` (which uses
+    ``astream_events(v2)``). Behaviour-preserving: every side effect of the
+    v2-events loop — LLM-token streaming, the policy tool-call ceiling, the
+    guardrail before/after checks, ``/steer`` note draining at tool
+    boundaries, and error surfacing — is reproduced here. Two improvements
+    over the events loop: the returned state is the *complete* final state
+    (including ``ToolMessage``s, via ``stream_mode="values"``), and there is
+    no duplicate full-agent re-run fallback.
+
+    Gated behind ``settings.agent_stream_mode_enabled``; dispatched from
+    :func:`execute_agent`.
+    """
+    from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
+    from app.core.tool_guardrails import (
+        ToolCallGuardrailController,
+        classify_tool_failure,
+        append_toolguard_guidance,
+    )
+
+    # ── Governance policy (parity with the events loop) ───────────────────
+    _resolved_policy = None
+    try:
+        from app.core import policy as _policy_mod
+        _resolved_policy = _policy_mod.get_current()
+    except Exception:  # noqa: BLE001 — governance must never break a run
+        _resolved_policy = None
+
+    _guardrail_config = getattr(_resolved_policy, "guardrail_config", None)
+    guardrail = ToolCallGuardrailController(_guardrail_config)
+    _tool_calls_count = 0
+
+    # tool_call_id → args, so a ToolMessage's guardrail after_call gets the
+    # exact args of its originating call (more precise than the single
+    # "current tool" the events loop tracked under parallel tool calls).
+    _pending_args: Dict[str, Dict[str, Any]] = {}
+    # Steer notes drained at tool boundaries; appended to the final state so
+    # they reach the next turn's history (same effect as the events loop).
+    _steer_msgs: list = []
+    # Latest full state snapshot ("values" mode) — the complete final state.
+    last_values: Optional[Dict[str, Any]] = None
+
+    async def _emit_tool_call(msg: Any) -> None:
+        nonlocal _tool_calls_count
+        for tc in getattr(msg, "tool_calls", None) or []:
+            tool_name = tc.get("name") or ""
+            tool_args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+            if tc.get("id"):
+                _pending_args[tc["id"]] = tool_args
+
+            # Policy per-session tool-call ceiling.
+            _tool_calls_count += 1
+            if _resolved_policy is not None:
+                try:
+                    from app.core.policy.runtime import evaluate_tool_count
+                    _quota = evaluate_tool_count(_resolved_policy, _tool_calls_count)
+                    if _quota.blocks:
+                        logger_instance.warning(
+                            "ReactStrategy: policy tool-call ceiling hit before '%s' — %s",
+                            tool_name, _quota.reason, extra={"execution_id": execution_id},
+                        )
+                        try:
+                            await stream_callback.on_error(f"[Policy] {_quota.reason}")
+                        except Exception:
+                            pass
+                except Exception:  # noqa: BLE001 — governance must never break a run
+                    pass
+
+            # Guardrail pre-check (log-only, mirrors the events loop).
+            _gc_pre = guardrail.before_call(tool_name, tool_args)
+            if _gc_pre.should_halt:
+                logger_instance.warning(
+                    "ReactStrategy: guardrail HALT before tool '%s' — %s",
+                    tool_name, _gc_pre.message, extra={"execution_id": execution_id},
+                )
+            elif not _gc_pre.allows_execution:
+                logger_instance.warning(
+                    "ReactStrategy: guardrail BLOCK for tool '%s' (count=%d) — %s",
+                    tool_name, _gc_pre.count, _gc_pre.message, extra={"execution_id": execution_id},
+                )
+            elif _gc_pre.action == "warn":
+                logger_instance.info(
+                    "ReactStrategy: guardrail WARN for tool '%s' (count=%d) — %s",
+                    tool_name, _gc_pre.count, _gc_pre.message, extra={"execution_id": execution_id},
+                )
+
+    _extra: Dict[str, Any] = {}
+    if durability:
+        _extra["durability"] = durability
+
+    try:
+        async for stream_mode, chunk in agent.astream(
+            input_state,
+            config=run_config or {},
+            stream_mode=["messages", "updates", "values"],
+            **_extra,
+        ):
+            if stream_mode == "messages":
+                # chunk is (message_chunk, metadata).
+                msg_chunk = chunk[0] if isinstance(chunk, tuple) else chunk
+                text = extract_text_content(getattr(msg_chunk, "content", None))
+                if text:
+                    try:
+                        await stream_callback.on_llm_token(text)
+                    except Exception:
+                        pass
+
+            elif stream_mode == "updates":
+                # chunk is {node_name: {"messages": [...]}, ...}. Process by
+                # message type — node-name-agnostic and robust to graph shape.
+                if not isinstance(chunk, dict):
+                    continue
+                for _node, update in chunk.items():
+                    if not isinstance(update, dict):
+                        continue
+                    for m in update.get("messages", []) or []:
+                        # An AIMessage carrying tool_calls → about-to-execute.
+                        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+                            await _emit_tool_call(m)
+                            for tc in m.tool_calls:
+                                try:
+                                    await stream_callback.on_tool_call(
+                                        tc.get("name") or "",
+                                        tc.get("args") if isinstance(tc.get("args"), dict) else {},
+                                    )
+                                except Exception:
+                                    pass
+                        # A ToolMessage → a tool result just landed.
+                        elif isinstance(m, ToolMessage):
+                            tool_name = getattr(m, "name", "") or ""
+                            output_str = str(getattr(m, "content", "") or "")
+                            _args = _pending_args.get(getattr(m, "tool_call_id", ""), {})
+
+                            _is_failed, _fail_reason = classify_tool_failure(tool_name, output_str)
+                            _gc_post = guardrail.after_call(
+                                tool_name, _args, output_str, failed=_is_failed,
+                            )
+                            if _gc_post.action in ("warn", "block", "halt"):
+                                output_str = append_toolguard_guidance(output_str, _gc_post)
+                                logger_instance.warning(
+                                    "ReactStrategy: guardrail %s after tool '%s' (count=%d) — %s",
+                                    _gc_post.action.upper(), tool_name, _gc_post.count, _gc_post.message,
+                                    extra={"execution_id": execution_id},
+                                )
+                                if _gc_post.action == "halt":
+                                    try:
+                                        await stream_callback.on_error(
+                                            f"Tool '{tool_name}' halted the run: {_gc_post.message}"
+                                        )
+                                    except Exception:
+                                        pass
+                                    raise RuntimeError(
+                                        f"Tool '{tool_name}' halted the agent run: {_gc_post.message}"
+                                    )
+
+                            try:
+                                await stream_callback.on_tool_result(
+                                    tool_name, output_str[:2000], failed=_is_failed,
+                                )
+                            except Exception:
+                                pass
+
+                            # ── /steer injection at the tool boundary ──
+                            if execution_id and execution_port is not None:
+                                for note in execution_port.drain_steer_notes(execution_id):
+                                    _steer_msgs.append(HumanMessage(content=f"[Engineer Note] {note}"))
+                                    logger_instance.info(
+                                        "ReactStrategy: injected steer note at tool boundary "
+                                        "(execution_id=%s)", execution_id,
+                                    )
+
+            elif stream_mode == "values":
+                # Full state after each superstep; the last one is the final state.
+                if isinstance(chunk, dict):
+                    last_values = chunk
+
+    except asyncio.TimeoutError:
+        try:
+            await stream_callback.on_error("ReAct agent timed out after 300 seconds.")
+        except Exception:
+            pass
+        raise RuntimeError("ReAct agent timed out after 300 seconds.")
+    except Exception as exc:  # noqa: BLE001 — surface then re-raise for retry/recovery
+        # GraphInterrupt / GraphRecursionError must propagate to execute_agent's
+        # handler unchanged; only report other errors on the stream.
+        try:
+            from langgraph.errors import GraphInterrupt, GraphRecursionError
+            if isinstance(exc, (GraphInterrupt, GraphRecursionError)):
+                raise
+        except ImportError:
+            pass
+        try:
+            await stream_callback.on_error(str(exc))
+        except Exception:
+            pass
+        raise
+
+    if last_values is not None:
+        if _steer_msgs:
+            last_values = {
+                **last_values,
+                "messages": list(last_values.get("messages", [])) + _steer_msgs,
+            }
+        return last_values
+
+    # No values captured (empty run) — fall back to a plain invoke.
+    return await invoke_agent(agent, input_state, durability=durability)

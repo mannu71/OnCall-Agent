@@ -398,6 +398,47 @@ class Settings(BaseSettings):
     # reachable via the same search_tools/call_tool bridge. Override via env.
     tool_exposure_mode: str = Field(default="legacy", validation_alias="TOOL_EXPOSURE_MODE")
     tool_exposure_max: int = Field(default=12, validation_alias="TOOL_EXPOSURE_MAX")
+    # ── LangGraph runtime perf knobs (all default to today's behavior) ──
+    # Checkpoint durability for a LangGraph agent run. "async" (default) writes
+    # each superstep's state in the background — today's implicit behavior.
+    # "exit" writes only once, when the run finishes or pauses — cuts per-turn
+    # Postgres serialization+I/O for the common case that never resumes. "sync"
+    # blocks each superstep on the write (strongest durability, slowest). HITL
+    # runs are clamped to "async" at the call site (run_agent_once) because
+    # resume relies on interrupt-time checkpoints. Override via env.
+    agent_durability: str = Field(default="async", validation_alias="AGENT_DURABILITY")
+    # Cap on concurrent tasks within a LangGraph superstep (parallel tool calls,
+    # Send() fan-out). 0 = unset (today's unbounded behavior); >0 sets the run
+    # config's ``max_concurrency`` to bound fan-out against Bedrock rate limits.
+    agent_max_concurrency: int = Field(default=0, validation_alias="AGENT_MAX_CONCURRENCY")
+    # When on, the shared durable checkpointer uses AsyncShallowPostgresSaver
+    # (keeps only the latest checkpoint per thread) instead of AsyncPostgresSaver.
+    # HITL pause/resume needs only the latest checkpoint, so it keeps working;
+    # what is dropped is time-travel history (unused product-wise). Off by
+    # default; falls back to the full saver if the class is unavailable.
+    checkpoint_shallow: bool = Field(default=False, validation_alias="CHECKPOINT_SHALLOW")
+    # botocore HTTP connection-pool size for the shared Bedrock runtime client.
+    # Botocore's default is 10; one client serves parallel tool supersteps +
+    # delegate_parallel children, so at 10 concurrent LLM calls queue on the
+    # pool. Raise (e.g. 50) when running wide fan-outs. Override via env.
+    bedrock_max_pool_connections: int = Field(default=10, validation_alias="BEDROCK_MAX_POOL_CONNECTIONS")
+    # Opt into Bedrock latency-optimized inference (performance_config={"latency":
+    # "optimized"}). Support is model/region-dependent, so this is off by default
+    # and left per-deployment opt-in. Override via env.
+    bedrock_latency_optimized: bool = Field(default=False, validation_alias="BEDROCK_LATENCY_OPTIMIZED")
+    # Streaming path for a LangGraph agent run. Off (default) uses the legacy
+    # astream_events(v2) event loop. On switches to the lighter
+    # astream(stream_mode=["messages","updates"]) loop (execute_agent_stream_v2),
+    # which also returns complete final state (incl. ToolMessages) and drops the
+    # duplicate full-agent re-run fallback. Eval-gated before flipping default.
+    agent_stream_mode_enabled: bool = Field(default=False, validation_alias="AGENT_STREAM_MODE_ENABLED")
+    # Cache the compiled child agent across delegate calls instead of rebuilding
+    # it (LLM resolution + create_react_agent) on every delegation. Scoped to
+    # children with an EXPLICIT per-def model (a fixed DB llm_config) so the
+    # baked LLM is stable across runs — children that inherit the parent LLM are
+    # never cached (the parent's fallback chain can swap model/region/creds
+    # mid-run). LangGraph-engine children only. Off by default; eval-gated.
+    subagent_compiled_cache_enabled: bool = Field(default=False, validation_alias="SUBAGENT_COMPILED_CACHE_ENABLED")
     # Step-level trajectory events (app.harness.step_recorder, migration 030's
     # trajectory_events table). Off by default: a no-op recorder is used, zero
     # extra DB writes. When on, the native turn loop records one event per
