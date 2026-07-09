@@ -220,6 +220,9 @@ function Chat() {
   //     silence (no SSE token/tool/status event) so Stop is never the user's
   //     only recourse if they don't think to click it.
   const abortControllerRef = useRef(null);
+  // Live SSE handle for a run we RE-ATTACHED to (navigated away mid-run and came
+  // back). Closed on stop / new turn / unmount so the EventSource never leaks.
+  const reattachHandleRef = useRef(null);
   const lastActivityRef = useRef(0);
   const [watchdogStale, setWatchdogStale] = useState(false);
   const WATCHDOG_SILENCE_MS = 90_000;
@@ -279,6 +282,9 @@ function Chat() {
         console.warn('Could not restore previous chat session:', error);
       }
     })();
+    // On unmount, detach any re-attached live stream so the EventSource is
+    // closed (the backend run keeps going; we just stop listening).
+    return () => { reattachHandleRef.current?.close?.(); reattachHandleRef.current = null; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -303,7 +309,7 @@ function Chat() {
       console.error('Error loading agents:', error);
       setAgents([]);
       if (error.code === 'ERR_NETWORK' || error.message.includes('Network Error')) {
-        console.warn('Cannot connect to Agent API. Please start the API server at http://localhost:8000');
+        console.warn('Cannot connect to Agent API. Please start the API server at http://localhost:48000');
       }
       return [];
     }
@@ -338,6 +344,9 @@ function Chat() {
   };
 
   const resumeSession = async (id, agentsList = agents) => {
+    // Switching sessions: detach any live stream from the session we're leaving.
+    reattachHandleRef.current?.close?.();
+    reattachHandleRef.current = null;
     try {
       const data = await agentApiClient.getSession(id);
       const hydrated = (data.messages || []).map((m) => ({
@@ -370,11 +379,26 @@ function Chat() {
         used: lastCtx.context_used_tokens || 0,
         window: lastCtx.context_window_size || 0,
       });
+      let resumedAgent = null;
       if (data.workflow_name) {
         const match = agentsList.find((a) => a.name === data.workflow_name);
-        if (match) setSelectedAgent(match);
+        if (match) { setSelectedAgent(match); resumedAgent = match; }
       }
       setSessionSheetOpen(false);
+
+      // If the backend run for this session's agent is STILL in flight (the user
+      // navigated away mid-run and came back), reconnect to its live SSE stream
+      // so the chat shows it running and finishes it — instead of appearing idle
+      // with the answer silently lost. Best-effort; a failure just leaves the
+      // resumed history as-is.
+      if (data.workflow_name && !isLoading) {
+        try {
+          const active = await agentApiClient.listActiveWorkflows();
+          if (Array.isArray(active) && active.includes(data.workflow_name)) {
+            reattachRunningRun(resumedAgent || { name: data.workflow_name }, id);
+          }
+        } catch { /* best-effort — no reconnect */ }
+      }
     } catch (error) {
       console.error('Error resuming session:', error);
       if (error?.response?.status === 404 || error?.status === 404) {
@@ -711,6 +735,144 @@ function Chat() {
     }
   };
 
+  // Re-attach to an already-running backend run for *agent* on session *sid*.
+  // Mirrors askAgent's live-streaming wiring but WITHOUT starting a new run: the
+  // by-name SSE stream replays the buffered backlog (opening tokens / tool calls)
+  // then continues live, ending with `stream_end`. On end we pull the
+  // authoritative final answer from the persisted session.
+  const reattachRunningRun = (agent, sid) => {
+    // Detach any previous live handle before opening a new one.
+    reattachHandleRef.current?.close?.();
+
+    const thinkingId = addMessage(MESSAGE_TYPES.AGENT, '', { isLoading: true, statusHistory: [], steps: [], streaming: false });
+    setIsLoading(true);
+    lastActivityRef.current = Date.now();
+    setWatchdogStale(false);
+
+    const pushStatus = (msg) => {
+      if (!msg) return;
+      lastActivityRef.current = Date.now();
+      setMessages(prev => prev.map(m => m.id === thinkingId
+        ? {
+            ...m,
+            statusHistory: [
+              ...((m.statusHistory) || []),
+              { type: 'thinking', message: msg, time: new Date().toLocaleTimeString() },
+            ].slice(-8),
+            currentStatus: { message: msg },
+          }
+        : m));
+    };
+
+    let streamedContent = '';
+    let flushTimer = null;
+    const flushStream = () => {
+      flushTimer = null;
+      setMessages(prev => prev.map(m => (m.id === thinkingId && m.isLoading)
+        ? { ...m, content: streamedContent, streaming: true, isMarkdown: true }
+        : m));
+    };
+    const onToken = (tok) => {
+      if (!tok) return;
+      lastActivityRef.current = Date.now();
+      streamedContent += tok;
+      if (!flushTimer) flushTimer = setTimeout(flushStream, 40);
+    };
+
+    const steps = [];
+    const syncSteps = () => setMessages(prev => prev.map(m =>
+      m.id === thinkingId ? { ...m, steps: [...steps] } : m));
+    const onStepCall = (name, args, who) => {
+      lastActivityRef.current = Date.now();
+      steps.push({ id: `${name}-${steps.length}`, name, args, agent: who || 'agent', model: '', status: 'running', startedAt: Date.now() });
+      syncSteps();
+    };
+    const onStepResult = (name, result, failed, who) => {
+      lastActivityRef.current = Date.now();
+      const origin = who || 'agent';
+      let idx = -1;
+      for (let i = steps.length - 1; i >= 0; i--) {
+        const s = steps[i];
+        if (s.status === 'running' && s.name === name && (s.agent || 'agent') === origin) { idx = i; break; }
+      }
+      if (idx < 0) {
+        for (let i = steps.length - 1; i >= 0; i--) {
+          if (steps[i].status === 'running' && steps[i].name === name) { idx = i; break; }
+        }
+      }
+      if (idx >= 0) {
+        steps[idx] = { ...steps[idx], status: failed ? 'error' : 'done', result, durationMs: Date.now() - steps[idx].startedAt };
+      }
+      syncSteps();
+    };
+
+    const finish = async () => {
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      // Pull the authoritative final answer from the persisted session (the run
+      // records its assistant turn there). Fall back to whatever streamed.
+      try {
+        const data = await agentApiClient.getSession(sid);
+        const msgs = data.messages || [];
+        const lastAssistant = [...msgs].reverse().find(m => m.role === 'assistant');
+        updateMessage(thinkingId, {
+          content: (lastAssistant?.content) || streamedContent || 'Agent completed (no answer text returned).',
+          isLoading: false,
+          streaming: false,
+          isMarkdown: true,
+          currentStatus: null,
+          statusHistory: [],
+          steps: [...steps],
+          privacyRedactions: lastAssistant?.metadata?.privacy_redactions || [],
+          selectedSkills: lastAssistant?.metadata?.selected_skills || [],
+        });
+        setSessionTokens({
+          input: data.total_input_tokens || 0,
+          output: data.total_output_tokens || 0,
+          cacheRead: data.total_cache_read_tokens || 0,
+          cacheCreation: data.total_cache_creation_tokens || 0,
+        });
+        const lc = lastAssistant?.metadata || {};
+        setContextUsage({
+          pct: lc.context_used_pct || 0,
+          used: lc.context_used_tokens || 0,
+          window: lc.context_window_size || 0,
+        });
+      } catch {
+        updateMessage(thinkingId, {
+          content: streamedContent || 'Agent completed.',
+          isLoading: false, streaming: false, isMarkdown: true,
+          currentStatus: null, statusHistory: [], steps: [...steps],
+        });
+      } finally {
+        setIsLoading(false);
+        reattachHandleRef.current = null;
+        invalidateSessions();
+      }
+    };
+
+    const handle = agentApiClient.reattachAgentStream(agent.name, {
+      onToken,
+      onToolCall: (name, args, who) => {
+        onStepCall(name, args, who);
+        const label = who && who !== 'agent' ? `[${who}] ` : '';
+        pushStatus(`${label}Calling ${name}…`);
+      },
+      onToolResult: (name, res, failed, who) => onStepResult(name, res, failed, who),
+      onStatus: (msg) => pushStatus(msg),
+      onTokens: (t) => {
+        lastActivityRef.current = Date.now();
+        setTokens({ input: t.input, output: t.output, total: t.total });
+        if (t.context) setContextUsage(t.context);
+      },
+      onHitlPause: (p) => {
+        pushStatus(`Awaiting approval: ${p.tool}…`);
+        setPendingApprovals(prev => prev.some(x => x.requestId === p.requestId) ? prev : [...prev, p]);
+      },
+      onDone: finish,
+    });
+    reattachHandleRef.current = handle;
+  };
+
   const handleKeyPress = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -772,6 +934,9 @@ function Chat() {
     // askAgent's catch block and ignored there (isAbortError), since this
     // function is the one source of truth for the "Stopped by user." message.
     abortControllerRef.current?.abort();
+    // Detach a reconnected live stream too, if we're stopping a re-attached run.
+    reattachHandleRef.current?.close?.();
+    reattachHandleRef.current = null;
     try {
       if (selectedAgent?.name) {
         // Server-side: actually cancels the backend asyncio.Task (see
