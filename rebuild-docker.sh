@@ -13,8 +13,8 @@ docker compose up --build -d --force-recreate
 echo ""
 docker compose ps
 echo ""
-echo "Open the app: http://localhost:3000"
-echo "Backend API:  http://localhost:8000"
+echo "Open the app: http://localhost:43000"
+echo "Backend API:  http://localhost:48000"
 echo "Logs:         docker compose logs -f"
 echo "Stop:         docker compose down"
 echo ""

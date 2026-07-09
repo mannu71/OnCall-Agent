@@ -1,9 +1,15 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 import { visualizer } from 'rollup-plugin-visualizer'
 
-export default defineConfig(({ mode }) => ({
+export default defineConfig(({ mode }) => {
+  // Single source of truth for the dev proxy target: reuse VITE_AGENT_API_URL
+  // from ui/.env so it can't drift from the client's own base-URL resolution.
+  const env = loadEnv(mode, __dirname, '')
+  const apiTarget = env.VITE_AGENT_API_URL || env.VITE_API_URL || 'http://localhost:48000'
+
+  return {
   base: './',
   plugins: [
     react(),
@@ -15,11 +21,13 @@ export default defineConfig(({ mode }) => ({
     },
   },
   server: {
-    port: process.env.PORT ? parseInt(process.env.PORT) : undefined,
+    // Uncommon default so it doesn't clash with other Vite apps; PORT still wins,
+    // and strictPort stays off so Vite auto-bumps if 45173 is taken.
+    port: process.env.PORT ? parseInt(process.env.PORT) : 45173,
     strictPort: false,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: apiTarget,
         changeOrigin: true,
       },
     },
@@ -71,4 +79,5 @@ export default defineConfig(({ mode }) => ({
   optimizeDeps: {
     include: ['react', 'react-dom', 'react-router-dom', 'reactflow'],
   },
-}))
+  }
+})

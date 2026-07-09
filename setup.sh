@@ -111,6 +111,11 @@ wait_for_postgres() {
   fail "PostgreSQL did not become healthy in time. Check: docker logs $DB_CONTAINER"
 }
 
+psql_exec() {
+  # Run SQL (from stdin) in the DB container, stopping on the first error.
+  docker exec -i "$DB_CONTAINER" psql -v ON_ERROR_STOP=1 -U kycuser -d kycagent "$@"
+}
+
 run_migrations_docker() {
   shopt -s nullglob
   local files=("${AGENT_API}/migrations/"*.sql)
@@ -123,12 +128,46 @@ run_migrations_docker() {
   local sorted_files=()
   mapfile -t sorted_files < <(printf '%s\n' "${files[@]}" | sort)
 
+  # Tracking table so re-runs skip applied files and never silently replay them.
+  echo "CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT now());" \
+    | psql_exec >/dev/null || fail "Could not create the schema_migrations tracking table."
+
+  local applied
+  applied="$(echo "SELECT filename FROM schema_migrations;" | psql_exec -tA 2>/dev/null || true)"
+
+  # Pre-existing install predating tracking: record current files as applied
+  # (don't replay old migrations against a live schema).
+  if [[ -z "$applied" ]]; then
+    local core
+    core="$(echo "SELECT to_regclass('public.workflows') IS NOT NULL;" | psql_exec -tA 2>/dev/null | tr -d '[:space:]')"
+    if [[ "$core" == "t" ]]; then
+      warn "Existing schema found without migration tracking — recording current migrations as applied (not replaying them)."
+      for file in "${sorted_files[@]}"; do
+        echo "INSERT INTO schema_migrations (filename) VALUES ('$(basename "$file")') ON CONFLICT DO NOTHING;" \
+          | psql_exec >/dev/null
+      done
+      ok "Recorded ${#sorted_files[@]} existing migration(s)"
+      return
+    fi
+  fi
+
+  local applied_count=0 skipped_count=0
   for file in "${sorted_files[@]}"; do
-    echo "    -> $(basename "$file")"
-    docker exec -i "$DB_CONTAINER" psql -U kycuser -d kycagent < "$file"
+    local name
+    name="$(basename "$file")"
+    if grep -qxF "$name" <<< "$applied"; then
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
+    echo "    -> $name"
+    # ON_ERROR_STOP + no output suppression: a bad migration fails loudly.
+    psql_exec < "$file" || fail "Migration failed: $name (see psql output above)"
+    echo "INSERT INTO schema_migrations (filename) VALUES ('$name') ON CONFLICT DO NOTHING;" \
+      | psql_exec >/dev/null
+    applied_count=$((applied_count + 1))
   done
 
-  ok "Applied ${#sorted_files[@]} migration(s)"
+  ok "Migrations: ${applied_count} applied, ${skipped_count} already up to date"
 }
 
 echo ""
@@ -146,10 +185,17 @@ ok "Python available via: ${PYTHON_BIN}"
 if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   require_cmd docker
   ok "Docker CLI available"
+  # A present CLI doesn't mean the daemon is up — check before we depend on it.
+  if ! docker info >/dev/null 2>&1; then
+    fail "Docker is not running. Start Docker and re-run ./setup.sh."
+  fi
+  ok "Docker daemon is running"
 fi
 
 step "Creating local configuration"
 REPOS_FOR_ENV="${REPOS_PATH//\\//}"
+# Root .env holds port/proxy overrides — create it if missing.
+create_env_file "${ROOT}/.env.example" "${ROOT}/.env" "$REPOS_FOR_ENV"
 create_env_file "${AGENT_API}/.env.example" "${AGENT_API}/.env" "$REPOS_FOR_ENV"
 create_env_file "${UI}/.env.example" "${UI}/.env" ""
 
@@ -209,11 +255,14 @@ echo ""
 echo "Setup complete."
 echo ""
 
+UI_PORT="${UI_HOST_PORT:-43000}"
+API_PORT="${API_HOST_PORT:-48000}"
+
 if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   echo "Next steps:"
   echo "  The full Docker stack is up and running:"
-  echo "       UI:            http://localhost:3000"
-  echo "       API health:    http://localhost:8000/api/v1/health"
+  echo "       UI:            http://localhost:${UI_PORT}"
+  echo "       API health:    http://localhost:${API_PORT}/api/v1/health"
   echo ""
   echo "  Prefer local dev instead (backend + Vite UI, with hot reload)?"
   echo "  1. Stop the containerized agent-api/ui: docker compose stop agent-api ui"
@@ -221,25 +270,25 @@ if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   echo "  3. Start the backend:"
   echo "       cd agent-api"
   echo "       source venv/bin/activate"
-  echo "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
+  echo "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000"
   echo "  4. Start the UI (new terminal):"
   echo "       cd ui"
-  echo "       npm run dev"
+  echo "       npm run dev   # http://localhost:45173"
 else
   echo "Next steps (Docker was skipped):"
   echo "  Option A — Full Docker stack (from repo root):"
   echo "       docker compose up --build -d"
-  echo "       Open http://localhost:3000"
+  echo "       Open http://localhost:${UI_PORT}"
   echo "  Option B — Local dev (backend + Vite UI):"
   echo "  1. Edit agent-api/.env if you need AWS profile or provider settings"
   echo "  2. Start the backend:"
   echo "       cd agent-api"
   echo "       source venv/bin/activate"
-  echo "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
+  echo "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000"
   echo "  3. Start the UI (new terminal):"
   echo "       cd ui"
-  echo "       npm run dev"
+  echo "       npm run dev   # http://localhost:45173"
   echo ""
-  echo "API health check: http://localhost:8000/api/v1/health"
+  echo "API health check: http://localhost:48000/api/v1/health"
 fi
 echo ""

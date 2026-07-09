@@ -91,7 +91,9 @@ class Settings(BaseSettings):
     
     # API settings
     api_host: str = "0.0.0.0"
-    api_port: int = 8000
+    # Uncommon default for local (non-Docker) runs so it doesn't clash with other
+    # services on 8000. Docker overrides this via API_PORT=8000 in compose.
+    api_port: int = 48000
     api_reload: bool = False
     
     # Logging
@@ -110,7 +112,9 @@ class Settings(BaseSettings):
     
     # Database
     database_url: str = Field(
-        default="postgresql://kycuser:kycpassword@localhost:5432/kycagent",
+        # localhost:45432 matches the uncommon host port the compose postgres
+        # service publishes. Docker overrides this via DATABASE_URL in compose.
+        default="postgresql://kycuser:kycpassword@localhost:45432/kycagent",
         description="PostgreSQL database URL"
     )
     db_pool_size: int = Field(

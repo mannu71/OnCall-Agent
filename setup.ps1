@@ -16,11 +16,21 @@
 
 .PARAMETER SkipDeps
   Skip Python and npm dependency installation.
+
+.PARAMETER Reset
+  Recreate the containers from scratch (down + up --build) WITHOUT touching the
+  database. Your data is preserved. Use this to fix a wedged/half-built stack.
+
+.PARAMETER WipeData
+  DESTRUCTIVE. Delete the Postgres volume so the database starts empty. This is
+  the ONLY option that erases data, and it prompts for typed confirmation.
 #>
 param(
     [switch]$SkipDocker,
     [switch]$SkipMigrations,
-    [switch]$SkipDeps
+    [switch]$SkipDeps,
+    [switch]$Reset,
+    [switch]$WipeData
 )
 
 Set-StrictMode -Version Latest
@@ -31,7 +41,16 @@ $AgentApi = Join-Path $Root "agent-api"
 $Ui = Join-Path $Root "ui"
 $VenvDir = Join-Path $AgentApi "venv"
 $DbContainer = "kyc-agent-db"
+$DbVolume = "oncall-agent-postgres-data"
 $ReposPath = Split-Path -Parent $Root
+
+# Host ports the stack publishes (uncommon by default; overridable in root .env).
+$PortVars = [ordered]@{
+    "POSTGRES_HOST_PORT" = 45432
+    "API_HOST_PORT"      = 48000
+    "UI_HOST_PORT"       = 43000
+    "HEADROOM_HOST_PORT" = 48787
+}
 
 function Write-Step {
     param([string]$Message)
@@ -188,6 +207,16 @@ function Wait-PostgresHealthy {
     Write-Fail "PostgreSQL did not become healthy in time. Check: docker logs $DbContainer"
 }
 
+function Get-AppliedMigrations {
+    # Applied filenames as a string array; empty if the table is absent or empty.
+    $out = "SELECT filename FROM schema_migrations;" |
+        docker exec -i $DbContainer psql -tA -U kycuser -d kycagent 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $out) {
+        return @()
+    }
+    return @($out | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
+}
+
 function Invoke-MigrationsViaDocker {
     $migrationFiles = Get-ChildItem -Path (Join-Path $AgentApi "migrations") -Filter "*.sql" |
         Sort-Object Name
@@ -196,15 +225,139 @@ function Invoke-MigrationsViaDocker {
         Write-Fail "No migration files found in agent-api/migrations"
     }
 
-    foreach ($file in $migrationFiles) {
-        Write-Host ("    -> " + $file.Name)
-        Get-Content -Path $file.FullName -Raw | docker exec -i $DbContainer psql -U kycuser -d kycagent | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Fail "Migration failed: $($file.Name)"
+    # Tracking table so re-runs are fast and never silently replay migrations
+    # (or hide a failure) - see also the ON_ERROR_STOP below.
+    "CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT now());" |
+        docker exec -i $DbContainer psql -v ON_ERROR_STOP=1 -U kycuser -d kycagent | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "Could not create the schema_migrations tracking table."
+    }
+
+    $applied = Get-AppliedMigrations
+
+    # Pre-existing install that predates tracking: if core tables are present but
+    # nothing is recorded, record the current files as applied instead of
+    # replaying old migrations against a live schema.
+    if ($applied.Count -eq 0) {
+        $coreExists = "SELECT to_regclass('public.workflows') IS NOT NULL;" |
+            docker exec -i $DbContainer psql -tA -U kycuser -d kycagent 2>$null
+        if ($LASTEXITCODE -eq 0 -and (($coreExists -join '').Trim() -eq 't')) {
+            Write-Warn "Existing schema found without migration tracking - recording current migrations as applied (not replaying them)."
+            foreach ($file in $migrationFiles) {
+                "INSERT INTO schema_migrations (filename) VALUES ('$($file.Name)') ON CONFLICT DO NOTHING;" |
+                    docker exec -i $DbContainer psql -v ON_ERROR_STOP=1 -U kycuser -d kycagent | Out-Null
+            }
+            Write-Ok "Recorded $($migrationFiles.Count) existing migration(s)"
+            return
         }
     }
 
-    Write-Ok "Applied $($migrationFiles.Count) migration(s)"
+    $appliedCount = 0
+    $skippedCount = 0
+    foreach ($file in $migrationFiles) {
+        if ($applied -contains $file.Name) {
+            $skippedCount++
+            continue
+        }
+        Write-Host ("    -> " + $file.Name)
+        # ON_ERROR_STOP=1 + no Out-Null: a bad migration now fails loudly with the
+        # psql error visible, instead of exiting 0 and being swallowed.
+        Get-Content -Path $file.FullName -Raw |
+            docker exec -i $DbContainer psql -v ON_ERROR_STOP=1 -U kycuser -d kycagent
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail "Migration failed: $($file.Name) (see psql output above)"
+        }
+        "INSERT INTO schema_migrations (filename) VALUES ('$($file.Name)') ON CONFLICT DO NOTHING;" |
+            docker exec -i $DbContainer psql -v ON_ERROR_STOP=1 -U kycuser -d kycagent | Out-Null
+        $appliedCount++
+    }
+
+    Write-Ok "Migrations: $appliedCount applied, $skippedCount already up to date"
+}
+
+function Get-RootEnvValue {
+    # Read a KEY=value from the root .env, if present. Returns $null when absent.
+    param([string]$Key)
+    $envFile = Join-Path $Root ".env"
+    if (-not (Test-Path $envFile)) {
+        return $null
+    }
+    foreach ($line in Get-Content -Path $envFile) {
+        $trimmed = $line.Trim()
+        if ($trimmed.StartsWith("#") -or -not $trimmed.Contains("=")) {
+            continue
+        }
+        $parts = $trimmed.Split("=", 2)
+        if ($parts[0].Trim() -eq $Key) {
+            return $parts[1].Trim()
+        }
+    }
+    return $null
+}
+
+function Get-EffectivePort {
+    # Root .env override wins, else the default from $PortVars.
+    param([string]$VarName)
+    $override = Get-RootEnvValue $VarName
+    if ($override -and ($override -match '^\d+$')) {
+        return [int]$override
+    }
+    return [int]$PortVars[$VarName]
+}
+
+function Test-ExistingInstall {
+    # True if a previous install is present (db volume or db container exists).
+    $vol = docker volume ls --format '{{.Name}}' 2>$null | Where-Object { $_ -eq $DbVolume }
+    if ($vol) { return $true }
+    $ctr = docker ps -a --format '{{.Names}}' 2>$null | Where-Object { $_ -eq $DbContainer }
+    return [bool]$ctr
+}
+
+function Test-HostPorts {
+    # Warn/stop if a required host port is already taken by something that is not
+    # one of our own containers (which is expected on a second run).
+    $conflicts = @()
+
+    foreach ($varName in $PortVars.Keys) {
+        $port = Get-EffectivePort $varName
+        $listeners = @()
+        try {
+            $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction Stop)
+        }
+        catch {
+            # No listener on that port (or cmdlet unavailable) - treat as free.
+            continue
+        }
+        if ($listeners.Count -eq 0) {
+            continue
+        }
+
+        # Is the listener one of our own already-running containers? If so, fine.
+        $ownedByUs = $false
+        $pids = $listeners | ForEach-Object { $_.OwningProcess } | Sort-Object -Unique
+        foreach ($procId in $pids) {
+            $procName = (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName
+            if ($procName -match 'docker|com\.docker|vpnkit|wslrelay') {
+                $ownedByUs = $true
+                break
+            }
+        }
+        if ($ownedByUs) {
+            continue
+        }
+
+        $conflicts += [pscustomobject]@{ Var = $varName; Port = $port }
+    }
+
+    if ($conflicts.Count -gt 0) {
+        Write-Host ""
+        Write-Warn "These host ports are already in use by another program:"
+        foreach ($c in $conflicts) {
+            $suggested = $c.Port + 1
+            Write-Host ("      $($c.Port) - set $($c.Var)=$suggested (or another free port) in the root .env") -ForegroundColor Yellow
+        }
+        Write-Fail "Free the ports above or override them in .env, then re-run setup.bat"
+    }
 }
 
 Write-Host ""
@@ -230,9 +383,50 @@ if (-not $SkipDocker) {
         Write-Fail "Docker is not installed. Install Docker Desktop or rerun with -SkipDocker."
     }
     Write-Ok "Docker CLI available"
+
+    # A present CLI doesn't mean the daemon is up - check before we depend on it.
+    docker info *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "Docker Desktop is not running. Start it and re-run setup.bat."
+    }
+    Write-Ok "Docker daemon is running"
+
+    if (Test-ExistingInstall) {
+        Write-Ok "Existing installation detected - updating in place (database volume preserved)"
+    }
+    else {
+        Write-Ok "First-time setup"
+    }
+
+    $composeFile = Join-Path $Root "docker-compose.yml"
+
+    if ($WipeData) {
+        # The ONLY path that deletes data. 'down -v' removes the named volume.
+        Write-Step "WipeData requested - this DELETES the database (all data lost)"
+        $answer = Read-Host "    Type 'wipe' to confirm erasing the database (anything else cancels)"
+        if ($answer -ne "wipe") {
+            Write-Fail "Wipe cancelled - nothing was deleted."
+        }
+        $compose = Get-DockerComposeCommand
+        Invoke-External -ExeAndArgs ($compose + @("-f", $composeFile, "down", "-v")) -WorkingDirectory $Root
+        Write-Ok "Stack torn down and database volume removed"
+    }
+    elseif ($Reset) {
+        # Recreate containers WITHOUT -v, so the postgres data volume survives.
+        Write-Step "Reset requested - recreating containers (database preserved)"
+        $compose = Get-DockerComposeCommand
+        Invoke-External -ExeAndArgs ($compose + @("-f", $composeFile, "down")) -WorkingDirectory $Root
+        Write-Ok "Containers removed; database volume preserved"
+    }
 }
 
 Write-Step "Creating local configuration"
+
+# Root .env is where port and proxy overrides live; create it if missing so those
+# have a home before we bring the stack up.
+New-EnvFile `
+    -ExamplePath (Join-Path $Root ".env.example") `
+    -TargetPath (Join-Path $Root ".env")
 
 $reposPathForEnv = ($ReposPath -replace "\\", "/")
 New-EnvFile `
@@ -260,6 +454,10 @@ Write-Ok "Ensured agent-api/data directories exist"
 $RootComposeFile = Join-Path $Root "docker-compose.yml"
 
 if (-not $SkipDocker) {
+    Write-Step "Checking host ports are free"
+    Test-HostPorts
+    Write-Ok "Host ports available"
+
     Write-Step "Starting PostgreSQL (Docker)"
     $compose = Get-DockerComposeCommand
     Invoke-External -ExeAndArgs ($compose + @("-f", $RootComposeFile, "up", "-d", "postgres")) -WorkingDirectory $Root
@@ -288,7 +486,25 @@ if (-not $SkipMigrations) {
 
 if (-not $SkipDocker) {
     Write-Step "Building and starting the full Docker stack (agent-api, headroom, ui)"
-    Invoke-External -ExeAndArgs ($compose + @("-f", $RootComposeFile, "up", "--build", "-d")) -WorkingDirectory $Root
+    $buildCmd = $compose + @("-f", $RootComposeFile, "up", "--build", "-d")
+    Write-Host ("    > " + ($buildCmd -join " "))
+    Push-Location $Root
+    try {
+        & $buildCmd[0] @($buildCmd[1..($buildCmd.Length - 1)])
+        $buildExit = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+    if ($buildExit -ne 0) {
+        Write-Host ""
+        Write-Warn "The Docker build failed. Most often this is the corporate proxy blocking npm/pip."
+        Write-Host "    To see the real error (npm/pip message is above the 'exit code: 1' line):" -ForegroundColor Yellow
+        Write-Host "       docker compose build ui --progress=plain --no-cache" -ForegroundColor Yellow
+        Write-Host "    Then set HTTP_PROXY / HTTPS_PROXY / NO_PROXY (and NPM_REGISTRY if you use an" -ForegroundColor Yellow
+        Write-Host "    internal mirror) in the root .env, or configure Docker Desktop's proxy, and re-run." -ForegroundColor Yellow
+        Write-Fail "Docker build failed."
+    }
     Write-Ok "Full stack is running"
 }
 
@@ -312,11 +528,14 @@ Write-Host ""
 Write-Host "Setup complete." -ForegroundColor Green
 Write-Host ""
 
+$uiPort = Get-EffectivePort "UI_HOST_PORT"
+$apiPort = Get-EffectivePort "API_HOST_PORT"
+
 if (-not $SkipDocker) {
     Write-Host "Next steps:"
     Write-Host "  The full Docker stack is up and running:"
-    Write-Host "       UI:            http://localhost:3000"
-    Write-Host "       API health:    http://localhost:8000/api/v1/health"
+    Write-Host "       UI:            http://localhost:$uiPort"
+    Write-Host "       API health:    http://localhost:$apiPort/api/v1/health"
     Write-Host ""
     Write-Host "  Prefer local dev instead (backend + Vite UI, with hot reload)?"
     Write-Host "  1. Stop the containerized agent-api/ui: docker compose stop agent-api ui"
@@ -324,26 +543,26 @@ if (-not $SkipDocker) {
     Write-Host "  3. Start the backend:"
     Write-Host "       cd agent-api"
     Write-Host "       .\venv\Scripts\activate"
-    Write-Host "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
+    Write-Host "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000"
     Write-Host "  4. Start the UI (new terminal):"
     Write-Host "       cd ui"
-    Write-Host "       npm run dev"
+    Write-Host "       npm run dev   # http://localhost:45173"
 }
 else {
     Write-Host "Next steps (Docker was skipped):"
     Write-Host "  Option A - Full Docker stack (from repo root):"
     Write-Host "       docker compose up --build -d"
-    Write-Host "       Open http://localhost:3000"
+    Write-Host "       Open http://localhost:$uiPort"
     Write-Host "  Option B - Local dev (backend + Vite UI):"
     Write-Host "  1. Edit agent-api/.env if you need AWS profile or provider settings"
     Write-Host "  2. Start the backend:"
     Write-Host "       cd agent-api"
     Write-Host "       .\venv\Scripts\activate"
-    Write-Host "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
+    Write-Host "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000"
     Write-Host "  3. Start the UI (new terminal):"
     Write-Host "       cd ui"
-    Write-Host "       npm run dev"
+    Write-Host "       npm run dev   # http://localhost:45173"
     Write-Host ""
-    Write-Host "API health check: http://localhost:8000/api/v1/health"
+    Write-Host "API health check: http://localhost:48000/api/v1/health"
 }
 Write-Host ""

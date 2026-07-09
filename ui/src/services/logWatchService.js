@@ -2,7 +2,7 @@
  * Log-watch API service.
  *
  * Centralises the `/log-watch/*` endpoints that LogWatchConfig previously called
- * with a hardcoded `http://localhost:8000/api/v1`. Base-URL resolution now goes
+ * with a hardcoded `http://localhost:48000/api/v1`. Base-URL resolution now goes
  * through `getApiBaseUrl()` (respects VITE_API_URL). Behaviour is preserved: each
  * call resolves to the parsed JSON body exactly as the old inline `fetch().json()`
  * did, so callers keep their existing `data.success` / `data.id` checks.

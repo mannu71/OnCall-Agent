@@ -81,6 +81,8 @@ chmod +x setup.sh
 | Skip Docker | `-SkipDocker` | `--skip-docker` | Use your own PostgreSQL instance |
 | Skip migrations | `-SkipMigrations` | `--skip-migrations` | Skip SQL migrations |
 | Skip dependencies | `-SkipDeps` | `--skip-deps` | Skip pip / npm install |
+| Reset containers | `-Reset` | _(n/a)_ | Recreate containers from scratch (down + up --build). **Database is preserved.** |
+| Wipe database | `-WipeData` | _(n/a)_ | DESTRUCTIVE — delete the Postgres volume so the DB starts empty (prompts for typed confirmation). The only option that erases data. |
 
 When setup finishes, start the app:
 
@@ -89,7 +91,7 @@ When setup finishes, start the app:
 ```bash
 docker build -t codegraph:latest ./codegraph
 docker compose up --build
-# Open http://localhost:8080
+# Open http://localhost:43000
 ```
 
 **Local development:**
@@ -99,12 +101,12 @@ docker compose up --build
 cd agent-api
 # Windows: .\venv\Scripts\activate
 # Linux/macOS: source venv/bin/activate
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000
 
 # Terminal 2 — UI
 cd ui
 npm run dev
-# Open http://localhost:5173
+# Open http://localhost:45173
 ```
 
 ---
@@ -184,8 +186,8 @@ done
 Create `agent-api/.env` only if you need non-default settings. The defaults work for local development with the Docker database above.
 
 ```env
-# Database (default matches docker-compose postgres service)
-DATABASE_URL=postgresql://kycuser:kycpassword@localhost:5432/kycagent
+# Database (host port matches the docker-compose postgres mapping, 45432)
+DATABASE_URL=postgresql://kycuser:kycpassword@localhost:45432/kycagent
 
 # LLM provider: anthropic | bedrock | openai
 PROVIDER_TRANSPORT=bedrock
@@ -249,7 +251,7 @@ npm install
 cd agent-api
 
 # With venv activated
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000
 ```
 
 Or use the helper script on Windows:
@@ -268,8 +270,8 @@ docker-compose up --build
 
 Verify the API is running:
 
-- Health: http://localhost:8000/api/v1/health
-- Swagger docs: http://localhost:8000/docs
+- Health: http://localhost:48000/api/v1/health
+- Swagger docs: http://localhost:48000/docs
 
 ### Step 8 — Start the UI
 
@@ -281,7 +283,7 @@ docker build -t codegraph:latest ./codegraph
 docker compose up --build
 ```
 
-Open **http://localhost:8080** in your browser. The UI container (`kyc-agent-ui`) proxies `/api` to the backend container (`kyc-agent-api`) over the shared Docker network.
+Open **http://localhost:43000** in your browser. The UI container (`kyc-agent-ui`) proxies `/api` to the backend container (`kyc-agent-api`) over the shared Docker network.
 
 **Local UI development (hot reload):**
 
@@ -292,20 +294,20 @@ cd ui
 npm run dev
 ```
 
-This starts the Vite dev server on **http://localhost:5173**. Vite proxies `/api` to `http://localhost:8000`.
+This starts the Vite dev server on **http://localhost:45173**. Vite proxies `/api` to `http://localhost:48000`.
 
 Optional frontend env file `ui/.env`:
 
 ```env
-VITE_AGENT_API_URL=http://localhost:8000
-VITE_API_URL=http://localhost:8000
+VITE_AGENT_API_URL=http://localhost:48000
+VITE_API_URL=http://localhost:48000
 ```
 
 ### Step 9 — Verify the installation
 
-1. Open http://localhost:8080 (Docker) or http://localhost:5173 (Vite dev).
+1. Open http://localhost:43000 (Docker) or http://localhost:45173 (Vite dev).
 2. Confirm **Settings** loads and the backend health check succeeds.
-3. Open http://localhost:8000/docs and confirm the API responds.
+3. Open http://localhost:48000/docs and confirm the API responds.
 
 ---
 
@@ -370,7 +372,7 @@ docker compose up -d postgres
 docker compose up --build
 ```
 
-Open the app at **http://localhost:8080**.
+Open the app at **http://localhost:43000**.
 
 ### Run stacks independently
 
@@ -417,7 +419,7 @@ Useful Docker commands (from repo root):
 
 | Command | Description |
 |---------|-------------|
-| `npm run dev` | Vite dev server on port 5173 (browser) |
+| `npm run dev` | Vite dev server on port 45173 (browser) |
 | `npm run dev:vite` | Same as `npm run dev` |
 | `npm run build` | Build React frontend for production |
 | `npm run preview` | Preview production build locally |
@@ -427,7 +429,7 @@ Useful Docker commands (from repo root):
 
 | Command | Description |
 |---------|-------------|
-| `python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000` | Dev server with reload |
+| `python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000` | Dev server with reload |
 | `pytest tests/ -v` | Run unit tests |
 | `pytest -m eval -v` | Run eval harness (see `agent-api/evals/README.md`) |
 | `run.bat start` | Start via Docker (Windows) |
@@ -439,12 +441,47 @@ Useful Docker commands (from repo root):
 
 | Problem | What to check |
 |---------|---------------|
-| UI cannot reach API | Backend running on port 8000? Check http://localhost:8000/api/v1/health |
+| UI cannot reach API | Backend running on port 48000? Check http://localhost:48000/api/v1/health |
 | Database errors on startup | Migrations applied? Postgres container healthy? `DATABASE_URL` correct? |
 | MCP server connection fails | Node.js installed? `npx` works? Connection string and SSL certs correct? |
 | Bedrock / AWS errors | `AWS_PROFILE` or credentials configured? `PROVIDER_TRANSPORT=bedrock` set? |
 | Code analyzer cannot see repos | `REPOS_BASE_PATH` (local) or docker-compose volume mount points at your repos |
-| UI shows API errors in Docker | Check `docker compose logs ui agent-api`; confirm http://localhost:8080/api/v1/health |
+| UI shows API errors in Docker | Check `docker compose logs ui agent-api`; confirm http://localhost:43000/api/v1/health |
+| Docker build fails at `npm ci` / pip | Corporate proxy? See **Setup on a locked-down / corporate machine** below |
+| A host port is already in use | Override `POSTGRES_HOST_PORT` / `API_HOST_PORT` / `UI_HOST_PORT` / `HEADROOM_HOST_PORT` in the root `.env` |
+
+---
+
+## Host ports
+
+The stack publishes on uncommon host ports so it doesn't collide with anything already running on your machine. The container-internal ports never change; only the host side is remapped.
+
+| Service | URL | Override in root `.env` |
+|---------|-----|-------------------------|
+| UI | http://localhost:43000 | `UI_HOST_PORT` |
+| API | http://localhost:48000 | `API_HOST_PORT` |
+| Postgres | localhost:45432 | `POSTGRES_HOST_PORT` |
+| headroom (loopback) | 127.0.0.1:48787 | `HEADROOM_HOST_PORT` |
+| Vite dev server | http://localhost:45173 | `PORT` env |
+
+If a default is taken, set the matching variable in the repo-root `.env` (copy `.env.example` first) and re-run — no file edits needed. `setup.bat` / `setup.sh` check these ports up front and tell you exactly which variable to set.
+
+---
+
+## Setup on a locked-down / corporate machine
+
+Two things commonly bite fresh setups behind a corporate network:
+
+1. **Checkout** — use the `feature/v3-optimized-version` branch. `main` predates the UI Dockerfile and committed lockfile.
+2. **Docker build fails at `npm ci` or `pip install`** — almost always the corporate proxy / SSL inspection blocking the registries from inside the build. To see the real error (it's printed *above* the `exit code: 1` line, which the summary hides):
+
+   ```bash
+   docker compose build ui --progress=plain --no-cache
+   ```
+
+   - `ETIMEDOUT` / `ECONNREFUSED` / `EAI_AGAIN` → proxy not reachable from the build. Set `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` in the root `.env` (they're forwarded to the build), or configure Docker Desktop → Settings → Resources → Proxies. If your org runs an internal npm mirror, set `NPM_REGISTRY` too.
+   - `SELF_SIGNED_CERT` / `UNABLE_TO_VERIFY_LEAF_SIGNATURE` → SSL-inspection cert. The UI build already sets `strict-ssl false` and trusts the inspected cert; if it still fails, confirm the proxy vars above are set so npm reaches the registry at all.
+   - `EUSAGE: ... lock file ... not in sync` → your checkout has local edits to `ui/package.json` or a stale `ui/package-lock.json`. Run `git status ui/` and discard the drift.
 
 ---
 

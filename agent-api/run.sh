@@ -11,8 +11,8 @@ case $COMMAND in
     echo "Starting Agent API..."
     docker-compose up -d
     echo "Agent API started!"
-    echo "Access the API at: http://localhost:8000"
-    echo "View docs at: http://localhost:8000/docs"
+    echo "Access the API at: http://localhost:48000"
+    echo "View docs at: http://localhost:48000/docs"
     ;;
   
   stop)
@@ -68,15 +68,15 @@ case $COMMAND in
     ;;
   
   status)
-    curl -s http://localhost:8000/status | jq
+    curl -s http://localhost:48000/status | jq
     ;;
   
   health)
-    curl -s http://localhost:8000/health | jq
+    curl -s http://localhost:48000/health | jq
     ;;
   
   workflows)
-    curl -s http://localhost:8000/workflows | jq
+    curl -s http://localhost:48000/workflows | jq
     ;;
   
   *)

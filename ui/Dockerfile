@@ -5,8 +5,18 @@ FROM node:20-bookworm-slim AS build
 
 WORKDIR /app
 
-# Corporate SSL inspection proxy uses a self-signed cert — tell npm to trust it
-RUN npm config set strict-ssl false
+# Optional internal npm mirror for locked-down networks (set via compose build
+# arg NPM_REGISTRY). Empty by default → the public registry is used.
+ARG NPM_REGISTRY=
+
+# Corporate SSL inspection proxy uses a self-signed cert — tell npm to trust it.
+# NODE_TLS_REJECT_UNAUTHORIZED covers fetches strict-ssl doesn't (build stage
+# only; the shipped image is plain nginx). Retries ride out flaky proxies.
+ENV NODE_TLS_REJECT_UNAUTHORIZED=0
+RUN npm config set strict-ssl false && \
+    npm config set fetch-retries 5 && \
+    npm config set fetch-retry-maxtimeout 120000 && \
+    if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi
 
 # Cache deps in their own layer — only re-runs when package files change
 COPY package.json package-lock.json ./

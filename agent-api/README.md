@@ -78,11 +78,11 @@ python -m venv .venv
 pip install -r requirements.txt
 
 # Set DATABASE_URL and related env vars (see app/config.py / .env.example)
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 0.0.0.0 --port 48000
 ```
 
-- API docs: http://localhost:8000/docs
-- Health: http://localhost:8000/health
+- API docs: http://localhost:48000/docs
+- Health: http://localhost:48000/health
 
 ### Database migrations
 

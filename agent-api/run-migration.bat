@@ -6,13 +6,13 @@ REM Usage:  run-migration.bat
 REM
 REM Environment variables (all have defaults):
 REM   DB_HOST       default: localhost
-REM   DB_PORT       default: 5432
+REM   DB_PORT       default: 45432 (matches the compose postgres host port)
 REM   DB_NAME       default: kycagent
 REM   DB_USER       default: kycuser
 REM   DB_PASSWORD   default: kycpassword
 
 IF "%DB_HOST%"==""     SET DB_HOST=localhost
-IF "%DB_PORT%"==""     SET DB_PORT=5432
+IF "%DB_PORT%"==""     SET DB_PORT=45432
 IF "%DB_NAME%"==""     SET DB_NAME=kycagent
 IF "%DB_USER%"==""     SET DB_USER=kycuser
 IF "%DB_PASSWORD%"=="" SET DB_PASSWORD=kycpassword

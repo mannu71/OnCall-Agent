@@ -9,7 +9,8 @@ services:
       POSTGRES_PASSWORD: kycpassword
       POSTGRES_DB: kycagent
     ports:
-      - "5432:5432"
+      # Override POSTGRES_HOST_PORT in .env if 45432 is taken.
+      - "${POSTGRES_HOST_PORT:-45432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -29,9 +30,16 @@ services:
       # For a ~40-50% smaller image without npx MCP servers or the code crawler,
       # build the slim target instead:
       #   docker build --target runtime-slim -t agent-api:slim -f Dockerfile .
+      args:
+        # Forwarded so pip can reach the index through a corporate proxy. Empty
+        # by default (no-op); set these in .env on locked-down machines.
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
     container_name: kyc-agent-api
     ports:
-      - "8000:8000"
+      # Override API_HOST_PORT in .env if 48000 is taken.
+      - "${API_HOST_PORT:-48000}:8000"
     volumes:
       - ./data:/app/data
       - ~/.aws:/root/.aws:ro

@@ -7,7 +7,7 @@
 #
 # Environment variables (all have defaults):
 #   DB_HOST       default: localhost
-#   DB_PORT       default: 5432
+#   DB_PORT       default: 45432 (matches the compose postgres host port)
 #   DB_NAME       default: kycagent
 #   DB_USER       default: kycuser
 #   DB_PASSWORD   default: kycpassword
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 DB_HOST="${DB_HOST:-localhost}"
-DB_PORT="${DB_PORT:-5432}"
+DB_PORT="${DB_PORT:-45432}"
 DB_NAME="${DB_NAME:-kycagent}"
 DB_USER="${DB_USER:-kycuser}"
 DB_PASSWORD="${DB_PASSWORD:-kycpassword}"

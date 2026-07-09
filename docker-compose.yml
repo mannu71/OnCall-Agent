@@ -9,7 +9,9 @@ services:
       POSTGRES_PASSWORD: kycpassword
       POSTGRES_DB: kycagent
     ports:
-      - "5432:5432"
+      # Host port defaults to an uncommon value to avoid clashing with a local
+      # Postgres. Override POSTGRES_HOST_PORT in .env if 45432 is taken.
+      - "${POSTGRES_HOST_PORT:-45432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -25,9 +27,17 @@ services:
     build:
       context: .
       dockerfile: agent-api/Dockerfile
+      args:
+        # Forwarded to the build so pip can reach the index through a corporate
+        # proxy. Empty by default (no-op); set these in .env on locked-down
+        # machines. Docker Desktop's own proxy settings also work.
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
     container_name: kyc-agent-api
     ports:
-      - "8000:8000"
+      # Override API_HOST_PORT in .env if 48000 is taken.
+      - "${API_HOST_PORT:-48000}:8000"
     volumes:
       - ./agent-api/data:/app/data
       - ~/.aws:/root/.aws:ro
@@ -70,7 +80,8 @@ services:
     container_name: kyc-agent-headroom
     command: ["--port", "8787"]
     ports:
-      - "127.0.0.1:8787:8787"
+      # Loopback-only. Override HEADROOM_HOST_PORT in .env if 48787 is taken.
+      - "127.0.0.1:${HEADROOM_HOST_PORT:-48787}:8787"
     restart: unless-stopped
     networks:
       - oncall-agent
@@ -79,9 +90,18 @@ services:
     build:
       context: ./ui
       dockerfile: Dockerfile
+      args:
+        # Forwarded so `npm ci` can reach the registry through a corporate proxy.
+        # Empty by default (no-op); set in .env on locked-down machines. Set
+        # NPM_REGISTRY to point at an internal mirror if required.
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
     container_name: kyc-agent-ui
     ports:
-      - "3000:80"
+      # Override UI_HOST_PORT in .env if 43000 is taken.
+      - "${UI_HOST_PORT:-43000}:80"
     depends_on:
       - agent-api
     restart: unless-stopped

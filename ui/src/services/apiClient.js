@@ -12,7 +12,7 @@
  * reuse `getApiBaseUrl` here for base-URL resolution rather than re-deriving it.
  */
 
-const DEFAULT_API_HOST = 'http://localhost:8000';
+const DEFAULT_API_HOST = 'http://localhost:48000';
 const RELATIVE_API_BASE = '/api/v1';
 const API_PREFIX = '/api/v1';
 
@@ -23,9 +23,10 @@ const API_PREFIX = '/api/v1';
  * The backend mounts every route under ``/api/v1`` (main.py). Honours both env
  * conventions in use: ``VITE_API_URL`` (apiClient/llmService) preferred, then
  * ``VITE_AGENT_API_URL`` (agentApiClient/modelKeyService) — they point at the same
- * agent-api host. The bare host (e.g. ``http://localhost:8000``) is normalised
+ * agent-api host. The bare host (e.g. ``http://localhost:48000``) is normalised
  * here: strip trailing slashes and ensure the ``/api/v1`` suffix, whether the env
  * var includes it or not. Without this, calls like ``/settings/general`` 404.
+ * (Bare host default is ``http://localhost:48000`` — see DEFAULT_API_HOST.)
  *
  * When env vars are unset in production builds, defaults to relative ``/api/v1``
  * so nginx can proxy API traffic on the same origin as the SPA.
@@ -47,7 +48,7 @@ export function getApiBaseUrl() {
  * Make an HTTP request to the API.
  *
  * Shared fetch wrapper — other services (logWatchService, etc.) should reuse this
- * (or at least :func:`getApiBaseUrl`) rather than hardcoding ``http://localhost:8000``
+ * (or at least :func:`getApiBaseUrl`) rather than hardcoding ``http://localhost:48000``
  * so the ``VITE_API_URL`` env rule is honoured in one place.
  */
 export async function apiRequest(endpoint, options = {}) {
