@@ -8,7 +8,7 @@ many of the non-core tools bind directly, always to the highest-ranked
 subset for the current query, and always keep the rest reachable through the
 same bridge tools.
 
-Core/family tools (CloudWatch, crawler, DB, playbook, delegate, edit,
+Core/family tools (CloudWatch, codegraph, DB, playbook, delegate, edit,
 planning, filesystem — see ``tool_disclosure._is_core_tool``) are exempt
 from the cap, exactly as they already are in ``tool_disclosure`` and
 ``tool_router``: an agent's core investigation primitives must always be

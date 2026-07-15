@@ -34,6 +34,7 @@ _REGISTRY: Dict[str, Callable[..., Policy]] = {
     "max_tool_calls_per_session": builtins.max_tool_calls_per_session,
     "output_cap": builtins.output_cap,
     "loop_guardrails": builtins.loop_guardrails,
+    "supervise_tools": builtins.supervise_tools,
 }
 
 

@@ -118,6 +118,17 @@ class VisualWorkflowExecutor:
             except Exception as e:
                 logger.warning(f"Error publishing event: {e}")
     
+    def get_execution_port(self):
+        """Return an :class:`ExecutionPort` over this executor's runtime state.
+
+        Lets code outside the strategy layer (e.g. the wiki-publish output-node
+        handler) reach the same runtime cache + SSE publisher the ask-gate uses,
+        so it can call ``tool_permissions.request_action_approval`` and surface a
+        pause card on the live execution stream.
+        """
+        from app.workflow.execution_port import ExecutionPort
+        return ExecutionPort(self.active_executions, publish_event=self._publish_event)
+
     async def publish_token_usage_delta(self, execution_id: str, ledger) -> None:
         """Push a ``token_usage_delta`` SSE event with current ledger totals.
 

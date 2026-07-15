@@ -60,7 +60,6 @@ async def run_curator() -> Dict[str, Any]:
     logger.info("Curator: starting pattern_memory + skills + code-analyzer health pass")
     now = datetime.now(timezone.utc)
     stale_threshold    = now - timedelta(days=_STALE_DAYS)
-    unused_threshold   = now - timedelta(days=_SKILL_UNUSED_DAYS)
     mem_threshold      = now - timedelta(days=_MEM_STALE_DAYS)
     cluster_threshold  = now - timedelta(days=_CLUSTER_DORMANT_DAYS)
     staled            = 0
@@ -104,43 +103,10 @@ async def run_curator() -> Dict[str, Any]:
         )
         archived = archive_result.rowcount  # type: ignore[attr-defined]
 
-        # ── Skills: archive unused ────────────────────────────────────────────
-        # Skills that have never been recalled, or not recalled recently
-        try:
-            skill_archive_result = await session.execute(
-                text("""
-                    UPDATE skills
-                       SET status     = 'archived',
-                           updated_at = NOW()
-                     WHERE status = 'active'
-                       AND recall_count = 0
-                       AND (last_used_at IS NULL OR last_used_at < :unused_threshold)
-                """),
-                {"unused_threshold": unused_threshold},
-            )
-            skills_archived = skill_archive_result.rowcount  # type: ignore[attr-defined]
-            if skills_archived:
-                logger.info("Curator: archived %d unused skill(s)", skills_archived)
-        except Exception as exc:
-            logger.debug("Curator: skill archive pass skipped — %s", exc)
-
-        # ── Skills: promote to verified ───────────────────────────────────────
-        try:
-            skill_verify_result = await session.execute(
-                text("""
-                    UPDATE skills
-                       SET status     = 'verified',
-                           updated_at = NOW()
-                     WHERE status = 'active'
-                       AND success_count >= :min_successes
-                """),
-                {"min_successes": _SKILL_VERIFY_SUCCESSES},
-            )
-            skills_verified = skill_verify_result.rowcount  # type: ignore[attr-defined]
-            if skills_verified:
-                logger.info("Curator: promoted %d skill(s) to verified", skills_verified)
-        except Exception as exc:
-            logger.debug("Curator: skill verify pass skipped — %s", exc)
+        # NOTE: skills are now file-based markdown (SKILL.md via SkillManager) —
+        # there is no `skills` table to curate. The old DB-backed archive/verify
+        # passes were removed with migration 031 (drop_skills). Markdown skills
+        # are managed directly on disk (Skills page / files), not by the curator.
 
         # ── Code-analyzer: prune old graph snapshots (keep last N per repo) ──
         try:

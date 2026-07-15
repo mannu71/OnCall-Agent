@@ -132,6 +132,7 @@ static const ext_entry_t EXT_TABLE[] = {
     /* HCL / Terraform */
     {".hcl", CG_LANG_HCL},
     {".tf", CG_LANG_HCL},
+    {".tfvars", CG_LANG_HCL}, /* Terraform variable files — same HCL syntax */
 
     /* HTML */
     {".htm", CG_LANG_HTML},

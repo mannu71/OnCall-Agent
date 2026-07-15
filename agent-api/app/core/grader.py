@@ -4,7 +4,7 @@ grade_answer() scores the agent's final_answer for faithfulness to the
 tool-output evidence gathered during the run.  Fail-soft: returns None on
 any error so it never breaks the supervisor loop.
 
-Model is DB-resolved via app.crawler.call_llm (same path as every other
+Model is DB-resolved via app.core.llm.call_llm (same path as every other
 production LLM call — never hardcoded).
 """
 from __future__ import annotations
@@ -76,7 +76,7 @@ async def grade_answer(
         return None
 
     try:
-        from app.crawler.call_llm import call_llm  # DB-resolved model
+        from app.core.llm.call_llm import call_llm  # DB-resolved model
 
         human = (
             "EVIDENCE the agent was given:\n```\n"

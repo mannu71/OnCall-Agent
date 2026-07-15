@@ -55,7 +55,7 @@ export default function Skills() {
   useEffect(() => { load(); }, [load]);
 
   const handleDeleteFs = async (name) => {
-    if (!window.confirm(`Delete skill "${name}"? This removes the file from disk and cannot be undone.`)) return;
+    if (!window.confirm(`Delete skill "${name}"? A custom skill is removed from disk; a bundled skill is hidden. You can recreate it later with the same name.`)) return;
     try { await agentApiClient.deleteFsSkill(name); await load(); }
     catch (e) { alert(e?.response?.data?.detail || e.message); }
   };
@@ -146,7 +146,7 @@ export default function Skills() {
               <Wrench className="size-6 text-primary" /> Skills
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              File-based markdown (SKILL.md) skills — reusable guidance the agent auto-selects per query or runs by slash-command.
+              File-based markdown (SKILL.md) skills — reusable runbooks the agent loads on demand via the skill tool, or that you invoke by typing /skill-name in chat.
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -181,6 +181,7 @@ export default function Skills() {
                   <div className="min-w-0">
                     <div className="font-mono text-xs font-semibold">{s.name}</div>
                     {s.description && <div className="text-[11px] text-muted-foreground mt-1 line-clamp-3">{s.description}</div>}
+                    {s.when_to_use && <div className="text-[11px] text-muted-foreground/80 mt-1 italic line-clamp-2">When to use: {s.when_to_use}</div>}
                   </div>
                   <div className="flex items-center gap-0.5 shrink-0">
                     <Button variant="ghost" size="icon" className="size-7 text-slate-400 hover:text-foreground" title="View source" disabled={fsLoading} onClick={() => openFsView(s.name)}>

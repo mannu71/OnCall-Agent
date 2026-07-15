@@ -61,7 +61,7 @@ async def extract_facts(
     """Return up to ``memory_fact_max_per_turn`` durable facts for this turn.
 
     ``llm_fn`` is an injectable async ``(prompt) -> str`` for tests; production
-    uses :func:`app.crawler.call_llm.call_llm`.
+    uses :func:`app.core.llm.call_llm.call_llm`.
     """
     if not settings.memory_fact_extraction_enabled:
         return []
@@ -88,7 +88,7 @@ async def _llm_extract(
         if llm_fn is not None:
             raw = await llm_fn(prompt)
         else:
-            from app.crawler.call_llm import call_llm
+            from app.core.llm.call_llm import call_llm
             raw, _, _, _ = await call_llm(prompt, tier="search", use_cache=False)
         return _parse_facts(raw)
     except Exception as exc:  # noqa: BLE001 — fall back to regex, never break a run

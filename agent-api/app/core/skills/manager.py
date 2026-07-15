@@ -36,40 +36,38 @@ class Skill:
     skill_dir: Path
     config_vars: Dict[str, Any]
     setup_note: Optional[str] = None
+    # When the skill applies, in the model's own trigger vocabulary. Surfaced
+    # in the per-turn listing so the model can decide whether to load it.
+    when_to_use: str = ""
+    # If True the skill is hidden from the model-facing listing and the skill
+    # tool (still invocable by an explicit user /slash-command).
+    disable_model_invocation: bool = False
+    # Optional hint about the arguments the skill expects (shown to authors).
+    argument_hint: str = ""
 
 
 class SkillManager:
-    """Manage skill loading and execution.
-    
+    """Manage skill loading and invocation.
+
     Skills are markdown files with YAML frontmatter that define
     reusable prompt templates for common workflows.
-    
+
     Supports:
     - Dynamic skill loading from SKILL.md files
+    - A per-turn listing (name + description) for two-stage disclosure
     - Slash command resolution (/skill-name)
-    - Config variable resolution from environment and settings
-    - Preloaded skills for session-wide activation
-    - Disabled skills filtering
+    - Full-body invocation with config-variable and $ARGUMENTS resolution
     """
-    
-    def __init__(
-        self,
-        skills_dir: Optional[Path] = None,
-        disabled_skills: Optional[Set[str]] = None,
-        preloaded_skills: Optional[List[str]] = None,
-    ):
+
+    def __init__(self, skills_dir: Optional[Path] = None):
         """Initialize SkillManager.
-        
+
         Args:
             skills_dir: Directory containing skill files (default: data/skills)
-            disabled_skills: Set of skill names to skip loading
-            preloaded_skills: List of skill names to preload for session
         """
         self.skills_dir = skills_dir or Path("data/skills")
         self._skills: Dict[str, Skill] = {}
         self._loaded = False
-        self._disabled_skills = disabled_skills or set()
-        self._preloaded_skills = preloaded_skills or []
     
     # Bundled seed skills shipped with the app (tracked in git, unlike
     # ``data/`` which is gitignored/dockerignored) — a starter cookbook so a
@@ -78,17 +76,50 @@ class SkillManager:
     # same name take precedence (see ``scan_skills``).
     _SEED_DIR = Path(__file__).resolve().parent / "seed"
 
+    # Marker file (in the writable skills_dir volume) listing skill names the
+    # operator has hidden. Used to "delete" a bundled seed skill — whose source
+    # lives read-only inside the app package and would otherwise reappear on
+    # restart. One name per line.
+    _DISABLED_FILE = ".disabled_skills"
+
+    def _disabled_path(self) -> Path:
+        return self.skills_dir / self._DISABLED_FILE
+
+    def _load_disabled(self) -> Set[str]:
+        """Names of persistently-hidden skills (best-effort; empty on any error)."""
+        try:
+            path = self._disabled_path()
+            if not path.exists():
+                return set()
+            return {
+                ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()
+                if ln.strip()
+            }
+        except Exception as exc:  # noqa: BLE001 — a bad marker file must not break scanning
+            logger.warning("SkillManager: could not read disabled-skills file: %s", exc)
+            return set()
+
+    def _write_disabled(self, names: Set[str]) -> None:
+        """Persist the hidden-skill set to the marker file (created if absent)."""
+        path = self._disabled_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if names:
+            path.write_text("\n".join(sorted(names)) + "\n", encoding="utf-8")
+        elif path.exists():
+            path.unlink(missing_ok=True)
+
     def scan_skills(self) -> Dict[str, Skill]:
         """Scan skills directory for SKILL.md files.
 
         Merges the bundled seed skills (``_SEED_DIR``) with any user-authored
         skills under ``self.skills_dir`` — a user skill with the same name
-        overrides the bundled default. Skips skills in the disabled_skills set.
+        overrides the bundled default.
 
         Returns:
             Dict mapping skill names to Skill objects
         """
         self._skills.clear()
+        disabled = self._load_disabled()
 
         for source_dir in (self._SEED_DIR, self.skills_dir):
             if not source_dir.exists():
@@ -100,11 +131,12 @@ class SkillManager:
                 try:
                     skill = self._load_skill_file(skill_file)
                     if skill:
-                        # Skip disabled skills (Requirement 7.8)
-                        if skill.name in self._disabled_skills:
+                        # Persistently-hidden skills (a bundled seed the operator
+                        # "deleted") stay gone across restarts. A user-authored
+                        # override re-enables the name (see write_skill).
+                        if skill.name in disabled:
                             logger.info(f"Skipping disabled skill: {skill.name}")
                             continue
-
                         self._skills[skill.name] = skill
                         logger.info(f"Loaded skill: {skill.name} (from {source_dir})")
                 except Exception as e:
@@ -145,17 +177,32 @@ class SkillManager:
         name = frontmatter.get("name")
         description = frontmatter.get("description", "")
         config_vars = frontmatter.get("config", {})
-        
+
         if not name:
             logger.warning(f"Skill file {skill_file} missing 'name' in frontmatter")
             return None
-        
+
+        # Optional disclosure fields (all default-absent so existing seed skills
+        # with only name/description/config load unchanged). Accept both hyphen
+        # and underscore spellings for author convenience.
+        def _fm(*keys: str, default: Any = "") -> Any:
+            for k in keys:
+                if k in frontmatter and frontmatter[k] is not None:
+                    return frontmatter[k]
+            return default
+
+        when_to_use = str(_fm("when_to_use", "when-to-use") or "").strip()
+        argument_hint = str(_fm("argument_hint", "argument-hint") or "").strip()
+        disable_model_invocation = bool(
+            _fm("disable_model_invocation", "disable-model-invocation", default=False)
+        )
+
         # Extract setup note if present
         setup_note = None
         setup_match = re.search(r'## Setup\s*\n(.*?)(?=\n##|\Z)', markdown_content, re.DOTALL)
         if setup_match:
             setup_note = setup_match.group(1).strip()
-        
+
         return Skill(
             name=name,
             description=description,
@@ -163,6 +210,9 @@ class SkillManager:
             skill_dir=skill_file.parent,
             config_vars=config_vars,
             setup_note=setup_note,
+            when_to_use=when_to_use,
+            disable_model_invocation=disable_model_invocation,
+            argument_hint=argument_hint,
         )
     
     def select_for_query(
@@ -193,8 +243,16 @@ class SkillManager:
         for skill in candidates:
             name_tokens = _tokenize(skill.name.replace("-", " ").replace("_", " "))
             desc_tokens = _tokenize(skill.description)
-            # Name matches are strong signals; description matches are supporting.
-            score = 2.0 * len(q_tokens & name_tokens) + len(q_tokens & desc_tokens)
+            # Body tokens let the skill's own "When this triggers" section drive
+            # matching — critical when the frontmatter description is thin or a
+            # placeholder (the body carries the real trigger vocabulary).
+            body_tokens = _tokenize(skill.content)
+            # Name = strong signal; description = supporting; body = weak but wide.
+            score = (
+                2.0 * len(q_tokens & name_tokens)
+                + 1.0 * len(q_tokens & desc_tokens)
+                + 0.5 * len(q_tokens & body_tokens)
+            )
             if score > 0:
                 scored.append((score, skill))
         scored.sort(key=lambda s: s[0], reverse=True)
@@ -269,13 +327,21 @@ class SkillManager:
                 config[key] = os.environ[env_key]
                 logger.debug(f"Resolved config '{key}' from environment variable '{env_key}'")
         
+        # Body: substitute ``$ARGUMENTS`` inline when the runbook uses it,
+        # otherwise fall back to appending a "## User Request" section below.
+        body = skill.content
+        args_substituted = False
+        if "$ARGUMENTS" in body:
+            body = body.replace("$ARGUMENTS", user_instruction or "")
+            args_substituted = True
+
         # Build message
         message_parts = [
             f"# Skill: {skill.name}",
             "",
-            skill.content,
+            body,
         ]
-        
+
         # Add config section if present
         if config:
             message_parts.extend([
@@ -285,32 +351,108 @@ class SkillManager:
             ])
             for key, value in config.items():
                 message_parts.append(f"- **{key}**: {value}")
-        
-        # Add user instruction if present
-        if user_instruction:
+
+        # Add user instruction if present (and not already substituted inline)
+        if user_instruction and not args_substituted:
             message_parts.extend([
                 "",
                 "## User Request",
                 "",
                 user_instruction,
             ])
-        
+
         return "\n".join(message_parts)
+
+    def build_listing(
+        self,
+        allowed: Optional[Set[str]] = None,
+        char_budget: int = 8000,
+        entry_cap: int = 250,
+    ) -> str:
+        """Return a compact, model-facing listing of invocable skills.
+
+        One line per skill: ``- <name>: <description>[ - <when_to_use>]``.
+        Each line is capped at ``entry_cap`` chars; if the joined listing
+        exceeds ``char_budget`` the per-entry text is shrunk (seed/bundled
+        skills keep their full text first, so the shipped cookbook is never the
+        casualty), degrading to names-only in the extreme. Skills flagged
+        ``disable_model_invocation`` are excluded — the model cannot invoke
+        them, so listing them is noise.
+
+        ``allowed``: when non-empty, only skills whose name is in this set are
+        listed (per-agent scoping via the Agent node's Skills picker).
+        """
+        if not self._loaded:
+            self.scan_skills()
+
+        skills = [
+            s for s in self._skills.values()
+            if not s.disable_model_invocation
+            and (not allowed or s.name in allowed)
+        ]
+        if not skills:
+            return ""
+
+        # Bundled seed skills first so, under budget pressure, user skills are
+        # the ones trimmed to names-only rather than the curated cookbook.
+        skills.sort(key=lambda s: (self._skill_origin(s) != "bundled", s.name))
+
+        def _fmt(skill: "Skill", desc_len: int) -> str:
+            desc = (skill.description or "").strip().replace("\n", " ")
+            extra = (skill.when_to_use or "").strip().replace("\n", " ")
+            if extra:
+                desc = f"{desc} - {extra}" if desc else extra
+            if desc_len <= 0:
+                line = f"- {skill.name}"
+            else:
+                if len(desc) > desc_len:
+                    desc = desc[: max(0, desc_len - 1)].rstrip() + "…"
+                line = f"- {skill.name}: {desc}" if desc else f"- {skill.name}"
+            if len(line) > entry_cap:
+                line = line[: entry_cap - 1].rstrip() + "…"
+            return line
+
+        # Full-length pass; shrink descriptions uniformly until it fits.
+        for desc_len in (entry_cap, 160, 100, 60, 0):
+            lines = [_fmt(s, desc_len) for s in skills]
+            listing = "\n".join(lines)
+            if len(listing) <= char_budget or desc_len == 0:
+                return listing
+        return listing
     
-    def list_skills(self) -> List[Dict[str, str]]:
+    def _skill_origin(self, skill: "Skill") -> str:
+        """'bundled' for a git-shipped seed skill, 'user' for a user-authored one.
+
+        Decided by whether the skill's directory lives under the bundled
+        ``_SEED_DIR`` or the user ``skills_dir`` — lets the UI show only custom
+        skills in the per-agent picker while bundled skills auto-select globally.
+        """
+        try:
+            seed_root = str(self._SEED_DIR.resolve())
+            return "bundled" if str(skill.skill_dir.resolve()).startswith(seed_root) else "user"
+        except Exception:  # noqa: BLE001 — origin is best-effort metadata
+            return "user"
+
+    def list_skills(self) -> List[Dict[str, Any]]:
         """List available skills with descriptions.
-        
+
         Returns:
-            List of dicts with 'name' and 'description' keys
+            List of dicts with 'name', 'description', 'origin'
+            ('bundled' | 'user'), 'when_to_use', 'argument_hint' and
+            'disable_model_invocation' keys.
         """
         # Ensure skills are loaded
         if not self._loaded:
             self.scan_skills()
-        
+
         return [
             {
                 "name": skill.name,
                 "description": skill.description,
+                "origin": self._skill_origin(skill),
+                "when_to_use": skill.when_to_use,
+                "argument_hint": skill.argument_hint,
+                "disable_model_invocation": skill.disable_model_invocation,
             }
             for skill in self._skills.values()
         ]
@@ -379,19 +521,27 @@ class SkillManager:
                 "Invalid SKILL.md content — requires YAML frontmatter with a 'name' field"
             )
 
+        # Authoring a skill re-enables its name if it was previously hidden
+        # (e.g. a bundled seed the operator deleted then chose to recreate).
+        disabled = self._load_disabled()
+        if loaded.name in disabled:
+            disabled.discard(loaded.name)
+            self._write_disabled(disabled)
+
         self._skills[loaded.name] = loaded
         self._loaded = True
         logger.info("SkillManager: wrote filesystem skill '%s' to %s", loaded.name, skill_file)
         return loaded
 
     def delete_skill(self, name: str) -> bool:
-        """Delete a filesystem skill by removing its directory.
+        """Delete a skill. Returns True if found and removed, False otherwise.
 
-        Returns True if the skill was found and deleted, False otherwise.
-        Never raises — logs errors instead. Refuses to delete a bundled seed
-        skill's source (under ``_SEED_DIR``, part of the app package, not
-        user data) — only user-authored skills under ``skills_dir`` can be
-        deleted this way.
+        Never raises — logs errors instead. A user-authored skill under
+        ``skills_dir`` is removed from disk. A bundled seed skill (whose source
+        lives read-only inside the app package) cannot be removed from disk, so
+        it is instead persistently HIDDEN via the disabled-skills marker file
+        so it stays gone across restarts. Either way the skill disappears from
+        the listing, which is what "delete" means to the operator.
         """
         if not self._loaded:
             self.scan_skills()
@@ -400,64 +550,35 @@ class SkillManager:
         if skill is None:
             return False
 
-        if skill.skill_dir.is_relative_to(self._SEED_DIR):
-            logger.warning(
-                "SkillManager: refusing to delete bundled seed skill '%s' at %s",
-                name, skill.skill_dir,
-            )
-            return False
+        try:
+            is_seed = skill.skill_dir.is_relative_to(self._SEED_DIR)
+        except Exception:  # noqa: BLE001
+            is_seed = False
 
         try:
+            if is_seed:
+                # Can't delete the packaged file — hide it persistently instead.
+                disabled = self._load_disabled()
+                disabled.add(name)
+                self._write_disabled(disabled)
+                del self._skills[name]
+                logger.info("SkillManager: hid bundled skill '%s' (persisted)", name)
+                return True
+
             import shutil
             skill_dir = skill.skill_dir
             if skill_dir.exists():
                 shutil.rmtree(skill_dir)
             del self._skills[name]
+            # If a same-named bundled seed sits underneath the just-removed user
+            # skill, hide it too so "delete" fully removes the entry rather than
+            # revealing the seed on the next scan.
+            if (self._SEED_DIR / name / "SKILL.md").exists():
+                disabled = self._load_disabled()
+                disabled.add(name)
+                self._write_disabled(disabled)
             logger.info("SkillManager: deleted filesystem skill '%s' from %s", name, skill_dir)
             return True
         except Exception as exc:
             logger.warning("SkillManager: failed to delete skill '%s': %s", name, exc)
             return False
-
-    def get_preloaded_skills_content(
-        self,
-        config_overrides: Optional[Dict[str, Any]] = None,
-    ) -> List[str]:
-        """Get content for all preloaded skills.
-        
-        Preloaded skills are activated for the entire session and their
-        content is injected into the system prompt or initial context.
-        
-        Args:
-            config_overrides: Config values to override defaults
-            
-        Returns:
-            List of formatted skill content strings (Requirements 7.7, 7.8)
-        """
-        if not self._loaded:
-            self.scan_skills()
-        
-        preloaded_content = []
-        
-        for skill_name in self._preloaded_skills:
-            skill = self._skills.get(skill_name)
-            if skill:
-                content = self.build_invocation_message(
-                    skill,
-                    user_instruction="",
-                    config_overrides=config_overrides,
-                )
-                preloaded_content.append(content)
-                logger.info(f"Preloaded skill: {skill_name}")
-            else:
-                logger.warning(f"Preloaded skill not found: {skill_name}")
-        
-        return preloaded_content
-    
-    def has_preloaded_skills(self) -> bool:
-        """Check if any skills are configured for preloading.
-        
-        Returns:
-            True if preloaded skills are configured
-        """
-        return len(self._preloaded_skills) > 0

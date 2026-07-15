@@ -1,0 +1,11 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SEMANTIC extra — ONNX code-embedding semantic search (app/core/code_semantic).
+# CPU-only sentence-transformer inference for concept-level code search — the
+# Bedrock-independent fill for codegraph's empty search_semantic. onnxruntime
+# runs the quantized graph; tokenizers is the HF fast tokenizer. numpy is already
+# pulled in transitively. Feature is opt-in (code_semantic_enabled); the model
+# itself is provisioned separately (vendored or downloaded at runtime).
+# ─────────────────────────────────────────────────────────────────────────────
+
+onnxruntime>=1.20.0
+tokenizers>=0.20.0

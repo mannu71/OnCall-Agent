@@ -24,7 +24,7 @@ built (they need the model), so they are intentionally NOT part of this base set
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from app.core.redact import redact
 
@@ -64,10 +64,18 @@ async def _sts_expired(
         return False
     except _BotoClientError as _sts_err:  # noqa: F821 — bound above unless import itself failed
         _ec = _sts_err.response.get("Error", {}).get("Code", "")
-        if _ec == "ExpiredTokenException" or "ExpiredToken" in str(_sts_err):
+        # Token unusable (expired OR otherwise invalid/unrecognized) → creds not
+        # verified. NOT AccessDenied — that means the token is VALID but lacks a
+        # permission, which is a real (answerable) result, not a creds failure.
+        _bad = {
+            "ExpiredToken", "ExpiredTokenException",
+            "InvalidClientTokenId", "UnrecognizedClientException",
+            "InvalidToken", "SignatureDoesNotMatch", "InvalidAccessKeyId",
+        }
+        if _ec in _bad or any(b in str(_sts_err) for b in ("ExpiredToken", "InvalidClientTokenId")):
             logger_instance.warning(
-                "ReactStrategy: %s AWS credentials expired (exec=%s)",
-                label, execution_id, extra={"execution_id": execution_id},
+                "ReactStrategy: %s AWS credentials not verified (%s) (exec=%s)",
+                label, _ec or "unknown", execution_id, extra={"execution_id": execution_id},
             )
             return True
         return False
@@ -77,6 +85,202 @@ async def _sts_expired(
             label, redact(str(_sts_probe_err)), extra={"execution_id": execution_id},
         )
         return False
+
+
+def _is_aws_server(name: str) -> bool:
+    n = (name or "").lower()
+    return "cloudwatch" in n or n.startswith("aws") or "aws-" in n or "aws_" in n
+
+
+def _aws_creds_from_env(env: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Extract boto-style creds + region from an MCP server's ``env`` dict.
+
+    Mirrors exactly how the server's subprocess resolves credentials: an explicit
+    ``AWS_PROFILE`` (preferred) or ``AWS_ACCESS_KEY_ID``/``SECRET``/``SESSION``
+    keys, else nothing (``{}`` → the default boto3 chain, same as the subprocess
+    with no AWS env set). Returns ``(creds, region)`` where an empty ``creds``
+    means "probe the default chain".
+    """
+    env = env or {}
+    creds: Dict[str, Any] = {}
+    if env.get("AWS_PROFILE"):
+        creds["aws_profile"] = env["AWS_PROFILE"]
+    elif env.get("AWS_ACCESS_KEY_ID"):
+        creds["access_key_id"] = env["AWS_ACCESS_KEY_ID"]
+        creds["secret_access_key"] = env.get("AWS_SECRET_ACCESS_KEY", "")
+        if env.get("AWS_SESSION_TOKEN"):
+            creds["session_token"] = env["AWS_SESSION_TOKEN"]
+    region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION")
+    return creds, region
+
+
+async def _probe_aws_creds(
+    creds: Dict[str, Any], region: Optional[str], *,
+    label: str, execution_id: Optional[str], logger_instance: Any,
+) -> Optional[str]:
+    """Probe one concrete AWS credential set. Returns a refresh message on a
+    CONFIRMED expiry, else None (inconclusive never blocks the turn).
+
+    ``creds`` may be empty (→ default boto3 chain). ``label`` names the backend
+    for the user-facing message so a failure points at the right thing to fix.
+    """
+    import os
+
+    region = region or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    if await _sts_expired(
+        creds, region,
+        logger_instance=logger_instance, execution_id=execution_id, label=label,
+    ):
+        where = creds.get("aws_profile")
+        hint = (
+            f"refresh it (e.g. `aws sso login --profile {where}`)"
+            if where else
+            "refresh the default AWS session (e.g. `aws sso login`)"
+        )
+        return (
+            f"AWS credentials for {label} are expired, so live data cannot be "
+            f"queried. No answer was generated to avoid guessing — {hint}, or set a "
+            f"valid profile/keys in the configuration, and retry."
+        )
+    return None
+
+
+# ---- Pluggable per-provider MCP credential verifiers ------------------------
+# The barrier already verifies EVERY wired server generically BY CONNECTION: a
+# provider whose connect authenticates (ADO PAT, Postgres DSN, GitHub token, …)
+# fails the barrier when its creds are bad, and the gate reports it — no
+# per-provider code, works for any server the user wires. A verifier below is
+# needed ONLY for a provider whose CONNECTION can succeed while its downstream
+# creds are stale, so the failure would otherwise surface mid-run instead of at
+# the gate (AWS STS: token valid at the MCP handshake, then 401s on the first
+# API call). Each verifier probes the SAME identity the server's subprocess
+# uses, resolved from that server's own ``env``. Support another such provider
+# by appending ONE entry — nothing in the gate is hardcoded to a server name.
+class _McpCredVerifier(NamedTuple):
+    name: str                                                       # provider id (dedup + logs)
+    matches: Callable[[str], bool]                                  # server-name predicate
+    extract: Callable[[Optional[Dict[str, Any]]], Tuple[Dict[str, Any], Optional[str]]]  # env → (creds, region)
+    probe: Callable[..., Awaitable[Optional[str]]]                  # (creds, region, *, label, …) → msg|None
+
+
+_MCP_CRED_VERIFIERS: List[_McpCredVerifier] = [
+    _McpCredVerifier("aws", _is_aws_server, _aws_creds_from_env, _probe_aws_creds),
+]
+
+
+async def verify_backends_before_llm(
+    *,
+    wired_mcp_servers: List[str],
+    cloudwatch_config: Optional[Dict[str, Any]],
+    mcp_barrier_failed: List[str],
+    execution_id: Optional[str],
+    logger_instance: Any,
+) -> Optional[str]:
+    """Hard credential/connection gate that runs BEFORE any LLM call.
+
+    Returns a user-facing message (→ caller short-circuits, no model call) when a
+    wired backend can't be verified, else ``None``. Stricter than the
+    degrade-and-continue policy in :func:`assemble_base_tools`: the model must
+    never be invoked against — nor asked to narrate a failure of — an unverified
+    backend. Provider-agnostic:
+
+    1. **Connection** — ANY wired MCP server the barrier could not connect
+       short-circuits. Works for every server type with no special-casing.
+    2. **Credentials** — a successful connection IS the generic verification for
+       every provider whose connect authenticates. Only a provider whose
+       connection can succeed with stale downstream creds needs a deeper probe;
+       those register a :class:`_McpCredVerifier` (currently just AWS) that runs
+       against the *exact* identity the backend will use — a native
+       ``cloudwatch_tool`` node's profile/keys, or the server's own ``env``
+       (``AWS_PROFILE`` / keys), NOT the default chain (a different identity that
+       made the gate block a valid MCP server with a working ``AWS_PROFILE``).
+       A server matching no verifier passes on connection alone.
+    """
+    if mcp_barrier_failed:
+        servers = ", ".join(sorted(set(mcp_barrier_failed)))
+        logger_instance.warning(
+            "ReactStrategy: pre-LLM gate — wired MCP server(s) not connected: %s (exec=%s)",
+            servers, execution_id, extra={"execution_id": execution_id},
+        )
+        return (
+            f"The required tool server(s) [{servers}] are not connected, so live data "
+            f"cannot be queried. No answer was generated to avoid guessing — reconnect "
+            f"the server(s) (check the MCP configuration / network) and retry."
+        )
+
+    # Deep credential verification via the provider-verifier registry. Probe the
+    # SAME creds each backend will actually use, deduped by (provider, creds,
+    # region) so two servers sharing an identity probe once. A probe error is
+    # inconclusive and never blocks the turn.
+    probed_signatures: set = set()
+
+    async def _run(verifier: _McpCredVerifier, creds: Dict[str, Any],
+                   region: Optional[str], label: str) -> Optional[str]:
+        sig = (verifier.name, tuple(sorted((creds or {}).items())), region or "")
+        if sig in probed_signatures:
+            return None
+        probed_signatures.add(sig)
+        try:
+            return await verifier.probe(
+                creds, region, label=label,
+                execution_id=execution_id, logger_instance=logger_instance,
+            )
+        except Exception as _probe_err:  # noqa: BLE001 — inconclusive never blocks
+            logger_instance.debug(
+                "ReactStrategy: pre-LLM %s probe for %s skipped (%s)",
+                verifier.name, label, redact(str(_probe_err)),
+                extra={"execution_id": execution_id},
+            )
+            return None
+
+    # Native CloudWatch node — an AWS capability without an MCP node. Verified by
+    # the AWS verifier, but its creds resolve via the model-key store (explicit
+    # profile/keys) or the default chain, not a server env.
+    if cloudwatch_config:
+        aws = next((v for v in _MCP_CRED_VERIFIERS if v.name == "aws"), None)
+        if aws is not None:
+            if cloudwatch_config.get("aws_profile") or cloudwatch_config.get("access_key_id"):
+                from app.core.aws_credentials import resolve_aws_credentials
+                cw_creds, cw_region = await resolve_aws_credentials(
+                    aws_profile=cloudwatch_config.get("aws_profile"),
+                    aws_region=cloudwatch_config.get("aws_region", "us-east-1"),
+                )
+            else:
+                cw_creds, cw_region = {}, cloudwatch_config.get("aws_region")
+            msg = await _run(aws, cw_creds, cw_region, "the CloudWatch backend")
+            if msg:
+                return msg
+
+    # Every wired MCP server — the FIRST verifier that matches probes the
+    # server's own env creds (the exact identity its subprocess runs with),
+    # looked up from the MCP settings. A server matching no verifier is already
+    # verified by its connection (the barrier) and needs nothing here.
+    if any(any(v.matches(s) for v in _MCP_CRED_VERIFIERS) for s in wired_mcp_servers):
+        try:
+            from app.infrastructure.persistence import mcp_config_repository
+        except Exception:  # noqa: BLE001 — no repo (tests) → skip deeper probe
+            mcp_config_repository = None  # type: ignore[assignment]
+        for name in wired_mcp_servers:
+            verifier = next((v for v in _MCP_CRED_VERIFIERS if v.matches(name)), None)
+            if verifier is None:
+                continue  # connection was the verification
+            env: Dict[str, Any] = {}
+            if mcp_config_repository is not None:
+                try:
+                    db = await mcp_config_repository.get_by_name(name)
+                    env = (db or {}).get("env") or {}
+                except Exception as _cfg_err:  # noqa: BLE001 — inconclusive never blocks
+                    logger_instance.debug(
+                        "ReactStrategy: pre-LLM gate could not load env for '%s' (%s)",
+                        name, redact(str(_cfg_err)), extra={"execution_id": execution_id},
+                    )
+                    continue
+            creds, region = verifier.extract(env)
+            msg = await _run(verifier, creds, region, f"the '{name}' MCP server")
+            if msg:
+                return msg
+
+    return None
 
 
 async def assemble_base_tools(
@@ -89,7 +293,6 @@ async def assemble_base_tools(
     db_server_map: Dict[str, Any],
     user_query: str,
     logger_instance: Any,
-    crawler_model_id: Optional[str] = None,
     llm_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Any], Optional[str], List[str]]:
     """Build the base tool set. Returns ``(tools, expired_creds_msg, degraded)``.
@@ -160,47 +363,33 @@ async def assemble_base_tools(
             degraded.append("CloudWatch tools failed to initialize this turn (see server logs).")
 
     if code_analyzer_config:
-        backend = (code_analyzer_config.get("backend") or "code_crawler")
         try:
-            if backend == "codegraph":
-                # Native C engine, driven in-process over stdio (no MCP-server
-                # registration). Tools come out as codegraph__<tool> and pass
-                # through tool disclosure below like any other MCP tool set.
-                from app.workflow.tools.codegraph_tools import build_codegraph_tools
+            # Native codegraph C engine, driven in-process over stdio (no MCP-server
+            # registration). Tools come out as codegraph__<tool> and pass through
+            # tool disclosure below like any other MCP tool set. The generic
+            # repo_grep/repo_read_file/repo_list_files tools ride alongside for
+            # text search, file reads, and hashline-anchored edits.
+            from app.workflow.tools.codegraph_tools import build_codegraph_tools
+            from app.workflow.tools.repo_file_tools import build_repo_file_tools
 
-                tools.extend(
-                    await build_codegraph_tools(
-                        mcp_manager, repos=code_analyzer_config.get("repos")
-                    )
+            tools.extend(
+                await build_codegraph_tools(
+                    mcp_manager, repos=code_analyzer_config.get("repos")
                 )
-                logger_instance.info(
-                    "ReactStrategy: code-analyzer backend=codegraph",
-                    extra={"execution_id": execution_id},
-                )
-            else:
-                from app.workflow.tools.code_analyzer_tools import build_crawler_tools
-
-                tools.extend(
-                    build_crawler_tools(
-                        repos=code_analyzer_config.get("repos"),
-                        default_model_id=crawler_model_id,
-                    )
-                )
-                if crawler_model_id:
-                    logger_instance.info(
-                        "ReactStrategy: crawler tools using wired model=%s",
-                        crawler_model_id,
-                        extra={"execution_id": execution_id},
-                    )
+            )
+            tools.extend(build_repo_file_tools(repos=code_analyzer_config.get("repos")))
+            logger_instance.info(
+                "ReactStrategy: code-analyzer backend=codegraph",
+                extra={"execution_id": execution_id},
+            )
         except Exception as _cr_err:
             logger_instance.warning(
-                "ReactStrategy: failed to build code-analyzer tools (backend=%s, non-fatal): %s",
-                backend,
+                "ReactStrategy: failed to build code-analyzer tools (non-fatal): %s",
                 redact(str(_cr_err)),
                 extra={"execution_id": execution_id},
             )
             degraded.append(
-                f"Code-analysis tools (backend={backend}) failed to initialize this turn."
+                "Code-analysis tools failed to initialize this turn."
             )
 
     # Bounded, cached DB schema lookup tools — added only when a database node is

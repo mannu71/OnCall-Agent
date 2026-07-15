@@ -14,11 +14,20 @@ retired: ``build_generic_delegate_tool`` below reuses the exact same
 ``_run_child`` engine as the named specialists, so there is one LLM-resolution
 path, one tool-scoping path, and one result envelope for every delegation tool.
 
-LLM resolution (single precedence chain for every delegation tool):
-  1. per-def ``model`` (a DB-registered llm_config name) — or the literal
+LLM resolution (single precedence chain for every delegation tool) — a child
+inherits the parent by default, and only an EXPLICIT signal overrides that:
+  1. the global ``subagent_model_override`` setting (env ``SUBAGENT_MODEL_OVERRIDE``)
+     — the deliberate operator hammer that forces every child onto one model.
+     Off by default.
+  2. per-def ``model`` (a DB-registered llm_config name) — or the literal
      sentinel ``"inherit"`` to explicitly reuse the parent's LLM instance.
-  2. the global ``subagent`` model-role assignment.
-  3. the parent's LLM instance (implicit fallback, also what ``"inherit"`` picks).
+  3. the parent's LLM instance — the DEFAULT for an unpinned child (also what
+     ``"inherit"`` picks). A workflow's wired/named Language Model node reaches
+     the child THROUGH this step, so the workflow's model wins.
+  4. the global ``subagent`` model-role assignment — a last resort, consulted
+     only when there is no parent LLM to inherit. It no longer silently
+     outranks an explicitly-configured parent model (the former behaviour that
+     made a stale role assignment override a workflow's chosen model).
 
 In addition to the per-specialist ``delegate_to_<name>`` tools (serial), this
 module also builds ``delegate_parallel`` — fan out to several specialists in one
@@ -34,7 +43,7 @@ cover the concurrency use case without any standing state.
 Config bounds (all override-able via env or per-node/profile):
   * ``DELEGATION_MAX_DEPTH`` (default 1) — spawn depth ceiling.
   * ``DELEGATION_MAX_CONCURRENT`` (default 3) — parallel width.
-  * ``DELEGATION_CHILD_TIMEOUT_SECONDS`` (default 180.0) — per-child wall-clock cap.
+  * ``DELEGATION_CHILD_TIMEOUT_SECONDS`` (default 240.0) — per-child wall-clock cap.
   * ``DELEGATION_OUTPUT_MAX_CHARS`` (default 8000) — output envelope cap.
   * ``DELEGATION_BLOCKED_TOOLS`` (CSV fnmatch) — always stripped from children,
     even if an allow-list or a def's ``disallowedTools`` would have kept them.
@@ -45,7 +54,7 @@ A subagent definition dict::
      "description": "…",                 # tool description
      "role_prompt": "You are …",         # role-sentence override
      "capabilities": ["code_analyzer"],  # extra capability ids
-     "tools": ["crawler_*", "fs_*"],     # optional fnmatch allow-list; omit or ["*"] = all
+     "tools": ["codegraph__*", "fs_*"],  # optional fnmatch allow-list; omit or ["*"] = all
      "disallowedTools": ["fs_write*"],   # optional fnmatch subtract-list on top of "tools"
      "output_schema": "generic",         # optional structured-output schema
      "model": "my-cheap-llm-config",     # optional llm_config name, or "inherit" for parent LLM
@@ -236,10 +245,11 @@ def _delegation_bounds(agent_config: Dict[str, Any]):
     s = _get_settings()
     max_depth = int(getattr(s, "delegation_max_depth", 1) if s else 1)
     max_concurrent = int(getattr(s, "delegation_max_concurrent", 3) if s else 3)
-    timeout_s = float(getattr(s, "delegation_child_timeout_seconds", 180.0) if s else 180.0)
+    timeout_s = float(getattr(s, "delegation_child_timeout_seconds", 240.0) if s else 240.0)
     output_max = int(getattr(s, "delegation_output_max_chars", 8000) if s else 8000)
+    from app.config import DEFAULT_DELEGATION_BLOCKED_TOOLS
     blocked_csv = getattr(s, "delegation_blocked_tools",
-                          "delegate_*,apply_fix,edit_file,fs_write*,run_command,write_todos,send_*,wiki_*") if s else ""
+                          DEFAULT_DELEGATION_BLOCKED_TOOLS) if s else DEFAULT_DELEGATION_BLOCKED_TOOLS
     blocked_patterns = [p.strip() for p in (blocked_csv or "").split(",") if p.strip()]
     # Per-node overrides
     if isinstance(agent_config, dict):
@@ -262,8 +272,7 @@ def _scope_tools(
 
     1. Strip ``delegate_*`` unconditionally (depth cap).
     2. Apply the per-subagent fnmatch allow-list. Omitted or ``["*"]`` means
-       "every spawnable tool" — mirrors claude-code-main's ``resolveAgentTools``
-       wildcard semantics (``tools`` undefined or ``['*']`` = all).
+       "every spawnable tool" (``tools`` undefined or ``['*']`` = all).
     3. Subtract the per-def ``disallowedTools`` glob list, if given.
     4. Strip the global BLOCKED_TOOLS floor — always, even if the allow-list or
        a def's ``disallowedTools`` would have kept them.
@@ -309,9 +318,9 @@ def _scope_tools(
 def _summarize_tool_names(sub_tools: List[Any], limit: int = 12) -> str:
     """Human-readable summary of a child's ACTUAL scoped tool names.
 
-    Mirrors claude-code-main's ``getToolsDescription`` — the parent model is
-    shown exactly which tools each specialist holds, so it routes by capability
-    rather than by the specialist's (possibly misleading) NAME. A squad named
+    The parent model is shown exactly which tools each specialist holds, so it
+    routes by capability rather than by the specialist's (possibly misleading)
+    NAME. A squad named
     "CloudWatch Squad" that was scoped to ``codegraph__*``/``postgres-*`` reads
     as such here, so the parent keeps CloudWatch work on its own direct tools.
     """
@@ -326,7 +335,7 @@ def _summarize_tool_names(sub_tools: List[Any], limit: int = 12) -> str:
 def _format_specialist_line(name: str, description: str, sub_tools: List[Any]) -> str:
     """Format one specialist listing line: ``- <name>: <desc> (tools: …)``.
 
-    Mirrors claude-code-main's ``formatAgentLine``. The tool list is the child's
+    The tool list is the child's
     resolved scoped set (post allow/deny/blocked filtering), not the raw glob,
     so the parent sees what the specialist can ACTUALLY do.
     """
@@ -344,19 +353,26 @@ def _format_specialist_line(name: str, description: str, sub_tools: List[Any]) -
 # holds that tool directly.
 _DELEGATION_ROUTING_STEER = (
     "Route by the tools listed for each specialist below — NOT by its name. "
-    "Use your OWN directly-attached tools for anything they cover; only delegate "
-    "a sub-task when a specialist actually holds the tool(s) it needs and you do not."
+    "Use your OWN directly-attached tools for anything they cover. But when a "
+    "request needs a capability you do NOT hold directly and a specialist DOES "
+    "(e.g. querying live logs / metrics / alarms via cloudwatch__* tools, or "
+    "searching code via codegraph__* tools), you MUST delegate that work to the "
+    "specialist that holds those tools. In that case do NOT answer that you lack "
+    "access, and do NOT ask the user where the data lives or which backend to use "
+    "— the specialist already has direct access; hand it the task and use what it "
+    "returns."
 )
 
 
 def _infer_child_context_flags(sub_tools: List[Any]) -> Tuple[bool, bool]:
     """Infer (has_code_analyzer, has_cloudwatch) for a child from its ACTUAL
-    scoped tool set, so a named specialist scoped to ``crawler_*`` / ``cloudwatch_*``
-    gets the same code/CloudWatch-aware system-prompt guidance a top-level agent
-    with those tools would (agent_builder.py / conversational.py branch on these).
+    scoped tool set, so a named specialist scoped to ``codegraph__*`` / ``repo_*`` /
+    ``cloudwatch_*`` gets the same code/CloudWatch-aware system-prompt guidance a
+    top-level agent with those tools would (agent_builder.py / conversational.py
+    branch on these).
     """
     names = [_tool_name(t) for t in sub_tools]
-    has_code_analyzer = any(n.startswith("crawler_") for n in names)
+    has_code_analyzer = any(n.startswith(("codegraph__", "repo_")) for n in names)
     has_cloudwatch = any(n.startswith("cloudwatch_") for n in names)
     return has_code_analyzer, has_cloudwatch
 
@@ -369,7 +385,7 @@ def _extract_fallback_answer(result: Dict[str, Any]) -> str:
     produced one. This is one more defensive layer for the rare case where
     every assistant turn in the child's history was tool-calls-only with no
     text at all (e.g. the child hit its recursion limit before ever
-    synthesizing) — mirrors claude-code-main's ``extractPartialResult`` fallback.
+    synthesizing).
     """
     for entry in reversed(result.get("messages") or []):
         if entry.get("role") == "assistant" and entry.get("content"):
@@ -565,14 +581,22 @@ async def _run_child(
 
     inherit = isinstance(model_name, str) and model_name.strip().lower() == "inherit"
 
+    from app.config import settings as _settings
+    # Explicit global operator override: forces every child onto one model,
+    # ahead of per-def and parent alike.
+    _override = (getattr(_settings, "subagent_model_override", None) or "").strip()
+
     # ── Compiled-agent cache (opt-in) ────────────────────────────────────
     # Eligible only for LangGraph children with an explicit per-def model (a
     # fixed DB config). On a hit we skip LLM resolution AND the graph build.
-    from app.config import settings as _settings
+    # Disabled when an override is active: the cache keys on ``model_name`` but
+    # the baked LLM would be the override's, so a per-def key could return the
+    # wrong compiled agent.
     _explicit_model = bool(model_name) and not inherit
     _cache_eligible = (
         getattr(_settings, "subagent_compiled_cache_enabled", False)
         and _explicit_model
+        and not _override
         and resolve_engine(agent_config if isinstance(agent_config, dict) else {}) == "langgraph"
     )
     _cache_key: Optional[tuple] = None
@@ -585,29 +609,43 @@ async def _run_child(
         _cached_compiled = _child_cache_get(_cache_key)
 
     # ── Child LLM resolution (single precedence chain for every delegation
-    #    tool: per-def model → "inherit" sentinel → subagent role → parent) ──
-    # Skipped entirely on a compiled-cache hit — the LLM is baked into the graph.
+    #    tool — see the module docstring):
+    #      1. explicit global override  →  2. per-def model / "inherit"  →
+    #      3. inherit the parent LLM (default)  →  4. "subagent" role (last resort)
+    # A child inherits the parent by default, so a workflow's wired Language
+    # Model node reaches the child unless it pins its own model or an operator
+    # has set an explicit override. Skipped on a compiled-cache hit — the LLM
+    # is baked into the graph.
     sub_llm = llm
     if _cached_compiled is not None:
         logger.info("delegation: child %s reusing cached compiled agent (model=%s)", sub_id, model_name)
     else:
         try:
             from app.workflow.strategies.react.llm_factory import build_llm
-            if model_name and not inherit:
-                from app.workflow.llm_config import resolve_llm_config_by_name
+            from app.workflow.llm_config import resolve_llm_config_by_name
+            if _override:
+                sub_cfg = await resolve_llm_config_by_name(_override)
+                sub_llm = build_llm(sub_cfg)
+                logger.info("delegation: child %s using global override model=%s", sub_id, _override)
+            elif model_name and not inherit:
                 sub_cfg = await resolve_llm_config_by_name(model_name)
                 sub_llm = build_llm(sub_cfg)
                 logger.info("delegation: child %s using per-def model=%s", sub_id, model_name)
-            elif inherit:
-                logger.info("delegation: child %s explicitly inheriting parent LLM", sub_id)
+            elif llm is not None:
+                # Default: inherit the parent's LLM (also what "inherit" picks).
+                # The wired/named parent model now wins over the "subagent" role.
+                logger.info("delegation: child %s inheriting parent LLM", sub_id)
             else:
+                # Last resort — no parent LLM to inherit. Fall back to the
+                # "subagent" gateway role (then the global default inside
+                # resolve_llm_config_for_role).
                 from app.infrastructure.persistence import model_role_repository
                 role_name = await model_role_repository.get("subagent")
                 if role_name:
                     from app.workflow.llm_config import resolve_llm_config_for_role
                     sub_cfg = await resolve_llm_config_for_role("subagent")
                     sub_llm = build_llm(sub_cfg)
-                    logger.info("delegation: child %s using role model=%s", sub_id, role_name)
+                    logger.info("delegation: child %s using role model=%s (no parent LLM)", sub_id, role_name)
         except Exception as exc:  # noqa: BLE001
             logger.warning("delegation: child %s LLM resolution failed (%s) — using parent LLM", sub_id, exc)
             sub_llm = llm
@@ -676,10 +714,11 @@ async def _run_child(
         child_cb: Optional[Any] = None
         _pcb = _parent_stream_cb.get()
         if _pcb is not None:
-            # Prefer the child's explicitly-configured model for attribution; when
-            # it inherits the parent LLM (model_name unset/"inherit"), leave blank
-            # so the event falls back to the parent's model label.
-            _child_model = "" if (not model_name or inherit) else str(model_name)
+            # Prefer the child's effective model for attribution: an explicit
+            # override wins, else its per-def model. When it inherits the parent
+            # LLM (override unset and model_name unset/"inherit"), leave blank so
+            # the event falls back to the parent's model label.
+            _child_model = _override or ("" if (not model_name or inherit) else str(model_name))
             child_cb = _ChildStreamCallback(_pcb, name, model=_child_model)
 
         child_engine = resolve_engine(sub_agent_config)
@@ -1216,7 +1255,7 @@ def build_generic_delegate_tool(
             "question with separable parts (e.g. several services / modules / areas) — delegate "
             "each part so your own context stays focused on synthesis. The sub-agent cannot "
             "delegate further (depth 1). WHEN NOT TO USE: a single direct lookup — just use "
-            "crawler_find_symbol / crawler_search_semantic yourself."
+            "codegraph__find_symbol / codegraph__search_semantic yourself."
         ),
         args_schema=_DelegateInput,
     )

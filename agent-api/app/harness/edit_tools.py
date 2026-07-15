@@ -45,13 +45,14 @@ def build_edit_tools() -> List[Any]:
         old_string: str = PydanticField(
             default="",
             description="Exact existing text to replace — must appear EXACTLY ONCE in the file. "
-                        "Copy it verbatim (read with crawler_get_body first), include enough "
-                        "surrounding context to be unique. Omit when using start_anchor instead.")
+                        "Copy it verbatim (read with codegraph__get_code_snippet or repo_read_file "
+                        "first), include enough surrounding context to be unique. Omit when using "
+                        "start_anchor instead.")
         new_string: str = PydanticField(description="Replacement text.")
         start_anchor: str = PydanticField(
             default="",
             description="HASHLINE alternative to old_string: anchor of the first line to replace, "
-                        "as 'L<line>#<hash>' copied from a crawler_get_body/crawler_read_file read "
+                        "as 'L<line>#<hash>' copied from a repo_read_file read "
                         "with with_anchors=true (e.g. 'L42#a1b2c3d4'). Robust to whitespace drift "
                         "and duplicate lines. When set, old_string is ignored.")
         end_anchor: str = PydanticField(
@@ -171,15 +172,15 @@ def build_edit_tools() -> List[Any]:
         description=(
             "Apply a fix by replacing code in a source file. Two ways to target the edit: "
             "(1) str-replace — pass old_string (must appear EXACTLY once) + new_string; or "
-            "(2) HASHLINE (more robust) — read with crawler_read_file(with_anchors=true) to get "
+            "(2) HASHLINE (more robust) — read with repo_read_file(with_anchors=true) to get "
             "'L<line>#<hash>' anchors, then pass start_anchor (and end_anchor for a multi-line "
             "span) + new_string. Hashline tolerates whitespace drift and duplicate lines and "
             "fails cleanly if the anchored line changed, so prefer it for edits in files with "
             "repeated snippets. WHEN TO USE: you have LOCATED the bug and want to apply the fix. "
             "This MODIFIES code on disk and REQUIRES operator approval. WHEN NOT TO USE: for "
-            "investigation — use the read-only crawler tools; to create a brand-new file — use "
-            "create_file. After editing, tell the user to build/test (the agent cannot run the "
-            "build itself)."
+            "investigation — use the read-only codegraph/repo tools; to create a brand-new file — "
+            "use create_file. After editing, tell the user to build/test (the agent cannot run "
+            "the build itself)."
         ),
         args_schema=_EditInput,
     )
@@ -189,7 +190,8 @@ def build_edit_tools() -> List[Any]:
         description=(
             "Create a NEW source file with the given content. WHEN TO USE: implementing a feature "
             "that needs a genuinely new file (a new module, test, or migration). First READ a "
-            "sibling file with crawler_get_body so the new file matches existing conventions. "
+            "sibling file with codegraph__get_code_snippet or repo_read_file so the new file "
+            "matches existing conventions. "
             "FAILS if the file already exists — to change an existing file use edit_file. This "
             "MODIFIES the repo on disk and REQUIRES operator approval. After creating, tell the "
             "user to build/test (the agent cannot run the build itself)."

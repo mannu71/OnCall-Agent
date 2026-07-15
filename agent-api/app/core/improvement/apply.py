@@ -145,13 +145,64 @@ def _slugify(text: str) -> str:
     return slug or ("proposal_" + uuid.uuid4().hex[:8])
 
 
+async def _supervise_skill_write(proposal: Dict[str, Any]) -> bool:
+    """Route a self-improvement skill draft through the Action Supervisor.
+
+    Supervised auto-apply: when the Supervisor is enabled, an ``approve`` verdict
+    lets the draft be written; ``deny``/``escalate`` skip it (no live human
+    session during a scheduler fire, so escalate = skip). The verdict is recorded
+    in ``tool_approvals`` under a synthetic ``improvement:<uuid>`` execution id so
+    these autonomous decisions are auditable alongside interactive ones. When the
+    Supervisor is disabled, behaviour is unchanged (always allowed).
+    """
+    try:
+        from app.core.supervision import action_supervisor as _sup
+        if not _sup.is_enabled():
+            return True
+    except Exception:  # noqa: BLE001
+        return True
+
+    import uuid as _uuid
+    exec_id = f"improvement:{_uuid.uuid4().hex}"
+    verdict = await _sup.review("skill_write", proposal, execution_id=exec_id)
+    approved = verdict.decision == "approve"
+
+    # Best-effort audit trail (never flips the decision).
+    try:
+        from app.infrastructure.persistence import tool_approval_repository
+        req_id = _uuid.uuid4().hex
+        await tool_approval_repository.record_pending(
+            exec_id, req_id, "skill_write",
+            (proposal.get("suggestion") or "")[:200],
+            risk_tier=verdict.risk_tier,
+            supervisor_verdict=verdict.decision,
+            supervisor_reasoning=verdict.reasoning,
+        )
+        await tool_approval_repository.record_decision(
+            exec_id, req_id, "approved" if approved else "denied",
+            reason=verdict.reasoning, decided_by="supervisor",
+        )
+    except Exception as exc:  # noqa: BLE001 — audit must never block the gate
+        logger.debug("apply_proposals [skill]: supervisor audit skipped (%s)", exc)
+
+    if not approved:
+        logger.info(
+            "apply_proposals [skill]: supervisor verdict '%s' → skipping draft",
+            verdict.decision,
+        )
+    return approved
+
+
 async def _apply_skill_proposal(proposal: Dict[str, Any]) -> bool:
     """Draft a filesystem markdown skill (SKILL.md) from a 'skill' proposal.
 
     Skills are file-based: this writes a ``draft-`` prefixed SKILL.md under the
     user skills directory via :class:`SkillManager`. An operator reviews/renames
-    it before it becomes a first-class skill.
+    it before it becomes a first-class skill. Gated by the Action Supervisor
+    (see :func:`_supervise_skill_write`) when it is enabled.
     """
+    if not await _supervise_skill_write(proposal):
+        return False
     try:
         from app.core.skills import get_default_skill_manager
 

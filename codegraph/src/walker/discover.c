@@ -13,6 +13,7 @@
 
 #include "base/constants.h"
 #include "base/compat_fs.h"
+#include "base/log.h"
 #include "base/platform.h"
 #ifdef _WIN32
 #include "base/win_utf8.h"
@@ -50,14 +51,21 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     /* Misc */
     ".qdrant_code_embeddings", ".tmp", "vendor", "bundled", NULL};
 
+/* Dirs skipped in FAST/MODERATE (but kept in FULL). Deliberately does NOT
+ * include first-party source dirs that happen to hold generated or auxiliary
+ * code — migrations, integration/e2e test PROJECTS, generated/gen, scripts,
+ * tools, seeds are real, tracked, and were dropping ~1,270 .cs on compliance-api.
+ * Generated code is now INDEXED and DOWN-RANKED at search time
+ * (cg_path_is_generated in mcp.c) rather than skipped here. What remains are
+ * test DATA, docs, web assets, i18n, and build OUTPUT (bin/build/out; obj is in
+ * ALWAYS_SKIP_DIRS) — none of which carry first-party source symbols. */
 static const char *FAST_SKIP_DIRS[] = {
-    "generated", "gen",           "auto-generated", "fixtures",     "testdata",    "test_data",
-    "__tests__", "__mocks__",     "__snapshots__",  "__fixtures__", "__test__",    "docs",
-    "doc",       "documentation", "examples",       "example",      "samples",     "sample",
-    "assets",    "static",        "public",         "media",        "third_party", "thirdparty",
-    "3rdparty",  "external",      "migrations",     "seeds",        "e2e",         "integration",
-    "locale",    "locales",       "i18n",           "l10n",         "scripts",     "tools",
-    "hack",      "bin",           "build",          "out",          NULL};
+    "fixtures",  "testdata",      "test_data",     "__tests__",    "__mocks__",   "__snapshots__",
+    "__fixtures__", "__test__",   "docs",          "doc",          "documentation",
+    "examples",  "example",       "samples",       "sample",       "assets",      "static",
+    "public",    "media",         "third_party",   "thirdparty",   "3rdparty",    "external",
+    "locale",    "locales",       "i18n",          "l10n",         "hack",
+    "bin",       "build",         "out",           NULL};
 
 /* ── Ignored suffixes ───────────────────────────────── */
 
@@ -623,6 +631,9 @@ typedef struct {
     cg_gitignore_t *local_gi;       /* nested .gitignore for this subtree */
     char local_gi_prefix[CG_SZ_4K]; /* rel_prefix when local_gi was loaded */
 } walk_frame_t;
+/* Initial capacity of the LIFO walk stack. The stack GROWS on demand
+ * (walk_push_subdir) — a wide tree with >512 pending sibling directories used to
+ * silently drop subtrees here, losing whole source trees with no log. */
 #define WALK_STACK_CAP 512
 /* Build abs/rel paths and process one directory entry. */
 /* Try to load a nested .gitignore from this directory. Returns owned pointer or NULL. */
@@ -639,16 +650,31 @@ static cg_gitignore_t *try_load_nested_gitignore(const walk_frame_t *frame) {
     return NULL;
 }
 
-/* Push a subdirectory onto the walk stack, inheriting local gitignore context. */
-static void walk_push_subdir(walk_frame_t *stack, int *top, const char *abs_path,
+/* Push a subdirectory onto the walk stack, inheriting local gitignore context.
+ * Grows the stack (doubling) when full so no subtree is silently dropped; only
+ * an actual allocation failure loses a subtree, and that is logged once. */
+static void walk_push_subdir(walk_frame_t **stack, int *top, int *cap, const char *abs_path,
                              const char *rel_path, const walk_frame_t *parent) {
-    if (*top >= WALK_STACK_CAP) {
-        return;
+    if (*top >= *cap) {
+        int new_cap = *cap * 2;
+        walk_frame_t *grown = realloc(*stack, (size_t)new_cap * sizeof(walk_frame_t));
+        if (!grown) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                cg_log_warn("walk.stack_full", "detail",
+                            "directory stack could not grow; some subtrees skipped");
+            }
+            return;
+        }
+        *stack = grown;
+        *cap = new_cap;
     }
-    snprintf(stack[*top].dir, CG_SZ_4K, "%s", abs_path);
-    snprintf(stack[*top].prefix, CG_SZ_4K, "%s", rel_path);
-    stack[*top].local_gi = parent->local_gi;
-    snprintf(stack[*top].local_gi_prefix, CG_SZ_4K, "%s", parent->local_gi_prefix);
+    walk_frame_t *slot = &(*stack)[*top];
+    snprintf(slot->dir, CG_SZ_4K, "%s", abs_path);
+    snprintf(slot->prefix, CG_SZ_4K, "%s", rel_path);
+    slot->local_gi = parent->local_gi;
+    snprintf(slot->local_gi_prefix, CG_SZ_4K, "%s", parent->local_gi_prefix);
     (*top)++;
 }
 
@@ -656,8 +682,8 @@ static void walk_dir_process_entry(cg_dirent_t *entry, const walk_frame_t *frame
                                    const cg_discover_opts_t *opts,
                                    const cg_gitignore_t *gitignore,
                                    const cg_gitignore_t *global_gi,
-                                   const cg_gitignore_t *cgignore, walk_frame_t *stack, int *top,
-                                   file_list_t *out) {
+                                   const cg_gitignore_t *cgignore, walk_frame_t **stack, int *top,
+                                   int *cap, file_list_t *out) {
     char abs_path[CG_SZ_4K];
     char rel_path[CG_SZ_4K];
     snprintf(abs_path, sizeof(abs_path), "%s/%s", frame->dir, entry->name);
@@ -675,7 +701,7 @@ static void walk_dir_process_entry(cg_dirent_t *entry, const walk_frame_t *frame
     if (S_ISDIR(st.st_mode)) {
         if (!should_skip_directory(entry->name, rel_path, opts, gitignore, global_gi, cgignore,
                                    frame->local_gi, frame->local_gi_prefix)) {
-            walk_push_subdir(stack, top, abs_path, rel_path, frame);
+            walk_push_subdir(stack, top, cap, abs_path, rel_path, frame);
         } else {
             /* Record the excluded subtree root so callers can report it (#411). */
             file_list_add_excluded(out, rel_path);
@@ -691,7 +717,8 @@ enum { GI_OWNED_CAP = 64 };
 static void walk_dir(const char *dir_path, const char *rel_prefix, const cg_discover_opts_t *opts,
                      const cg_gitignore_t *gitignore, const cg_gitignore_t *global_gi,
                      const cg_gitignore_t *cgignore, file_list_t *out) {
-    walk_frame_t *stack = calloc(WALK_STACK_CAP, sizeof(walk_frame_t));
+    int cap = WALK_STACK_CAP;
+    walk_frame_t *stack = calloc((size_t)cap, sizeof(walk_frame_t));
     if (!stack) {
         return;
     }
@@ -724,8 +751,8 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cg_disc
 
         cg_dirent_t *entry;
         while ((entry = cg_readdir(d)) != NULL) {
-            walk_dir_process_entry(entry, &frame, opts, gitignore, global_gi, cgignore, stack,
-                                   &top, out);
+            walk_dir_process_entry(entry, &frame, opts, gitignore, global_gi, cgignore, &stack,
+                                   &top, &cap, out);
         }
         cg_closedir(d);
     }

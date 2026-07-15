@@ -310,7 +310,88 @@ class AzureWikiClient:
             project_id=project_wiki["projectId"],
             repository_id=project_wiki.get("repositoryId", "")
         )
-    
+
+    async def list_wikis(
+        self,
+        organization: str,
+        project: str
+    ) -> List[Dict[str, Any]]:
+        """
+        List all wikis available in a project (both projectWiki and codeWiki).
+
+        Args:
+            organization: Azure DevOps organization name
+            project: Project name
+
+        Returns:
+            List of dicts: {id, name, type, url} where `url` is the canonical
+            wiki URL the Wiki node stores (parse_wiki_url understands it).
+
+        Raises:
+            AzureWikiAuthenticationError / AzureWikiConnectionError / AzureWikiError
+        """
+        url = f"https://dev.azure.com/{organization}/{project}/_apis/wiki/wikis"
+        params = {"api-version": self.API_VERSION}
+
+        response = await self._make_request("GET", url, params=params)
+        data = response.json()
+
+        wikis = []
+        for wiki in data.get("value", []):
+            wiki_id = wiki.get("id", "")
+            wikis.append({
+                "id": wiki_id,
+                "name": wiki.get("name", ""),
+                "type": wiki.get("type", ""),
+                # Canonical _wiki URL — parse_wiki_url (pattern 1) extracts
+                # org/project/wiki_id from this, so the handler works unchanged.
+                "url": f"https://dev.azure.com/{organization}/{project}/_wiki/wikis/{wiki_id}",
+            })
+        return wikis
+
+    async def list_organizations(self) -> List[Dict[str, Any]]:
+        """
+        List the Azure DevOps organizations the PAT's owner is a member of.
+
+        Uses the vssps profile + accounts APIs (Basic PAT auth applies to the
+        vssps host too). Returns a list of {name, id}.
+        """
+        prof = await self._make_request(
+            "GET",
+            "https://app.vssps.visualstudio.com/_apis/profile/profiles/me",
+            params={"api-version": self.API_VERSION},
+        )
+        member_id = prof.json().get("id")
+        if not member_id:
+            return []
+
+        resp = await self._make_request(
+            "GET",
+            "https://app.vssps.visualstudio.com/_apis/accounts",
+            params={"memberId": member_id, "api-version": self.API_VERSION},
+        )
+        return [
+            {"name": a.get("accountName", ""), "id": a.get("accountId", "")}
+            for a in resp.json().get("value", [])
+            if a.get("accountName")
+        ]
+
+    async def list_projects(self, organization: str) -> List[Dict[str, Any]]:
+        """
+        List the projects in an Azure DevOps organization. Returns {name, id}.
+        """
+        url = f"https://dev.azure.com/{organization}/_apis/projects"
+        resp = await self._make_request(
+            "GET", url, params={"api-version": self.API_VERSION, "$top": 500}
+        )
+        projects = [
+            {"name": p.get("name", ""), "id": p.get("id", "")}
+            for p in resp.json().get("value", [])
+            if p.get("name")
+        ]
+        projects.sort(key=lambda p: p["name"].lower())
+        return projects
+
     async def create_wiki_page(
         self,
         organization: str,

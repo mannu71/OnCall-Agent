@@ -3,7 +3,7 @@
 Mirrors claude-code's ``hasPermissionsToUseTool``: every tool call is classified
 ``allow | ask | deny`` by name-pattern rules, with a precedence of
 deny > ask > allow. Read-only investigation tools auto-allow; mutating tools
-(``save_playbook``, ``crawler_index_repo``, ``delegate_*``,
+(``save_playbook``, ``edit_file``, ``delegate_*``,
 ``*_write`` …) require approval.
 
 Enforcement wraps each tool's coroutine:
@@ -19,10 +19,12 @@ Modes:
 """
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import json
 import logging
-from typing import Any, List, Optional
+import uuid
+from typing import Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +35,18 @@ Behavior = str        # "allow" | "ask" | "deny"
 DEFAULT_ASK_PATTERNS = (
     "save_playbook",
     "patch_playbook",
-    "crawler_index_repo",
+    "pin_fact",
     "delegate_investigation",
     "edit_file",
     "create_file",   # NOTE: the "*_create" suffix glob below does NOT match this
     "apply_patch",
     "run_command",
     "run_verify",
+    # VFS mutations. fs_write matches "*_write" already; the others match no
+    # suffix glob, so name them so they route through the (Supervisor) gate too.
+    "fs_append",
+    "fs_upsert",
+    "fs_prune",
     "*_write",
     "*_delete",
     "*_update",
@@ -49,9 +56,56 @@ DEFAULT_ASK_PATTERNS = (
 # Nothing denied outright by default; operators can add patterns here / via config.
 DEFAULT_DENY_PATTERNS: tuple = ()
 
+# Generic mutation verbs used as a LAST-RESORT signal for tools whose names the
+# patterns above don't match and that carry no MCP read-only/destructive
+# annotation — chiefly user-added MCP servers, whose tool names we can't
+# enumerate ahead of time. Deliberately generic (no server- or tool-specific
+# names) so any newly-wired server is classified without a code change. Matched
+# as whole words against the leaf tool name ("{server}__{leaf}" → "{leaf}"),
+# so read verbs (get/list/search/describe/query/fetch/read) are never caught.
+_MUTATION_VERBS = frozenset({
+    "create", "update", "delete", "remove", "write", "add", "set", "put",
+    "post", "patch", "publish", "upload", "merge", "rename", "move", "insert",
+    "edit", "destroy", "revoke", "grant", "assign", "close", "cancel",
+    "approve", "reject", "comment", "link", "deploy", "send", "archive",
+})
+
 
 def _match(name: str, patterns) -> bool:
     return any(fnmatch.fnmatch(name, p) for p in patterns)
+
+
+def _leaf(name: str) -> str:
+    """Leaf tool name — strips the ``{server}__`` prefix on MCP composite names."""
+    return name.rsplit("__", 1)[-1] if "__" in name else name
+
+
+def _looks_like_mutation(tool_name: str) -> bool:
+    """Generic verb heuristic: is any ``_``-delimited word of the leaf name a
+    known mutation verb? Catches ``wit_create_work_item`` / ``add_comment`` that
+    the suffix globs miss, while leaving ``describe_log_groups`` alone."""
+    return any(w in _MUTATION_VERBS for w in _leaf(tool_name or "").lower().split("_"))
+
+
+def classify_tool_mutation(tool: Any) -> Optional[bool]:
+    """Best-effort: does *tool* mutate state?
+
+    ``True``/``False`` come from explicit MCP annotations
+    (``read_only_hint`` / ``destructive_hint``, populated by the MCP adapter)
+    when present — the authoritative, server-declared signal. Otherwise a
+    generic verb heuristic on the name yields ``True`` (looks mutating) or
+    ``None`` (unknown). Never infers ``False`` from the name alone: the absence
+    of a known verb doesn't prove a tool is read-only.
+    """
+    destructive = getattr(tool, "destructive_hint", None)
+    read_only = getattr(tool, "read_only_hint", None)
+    if destructive is True:
+        return True
+    if read_only is True:
+        return False
+    if read_only is False:
+        return True
+    return True if _looks_like_mutation(getattr(tool, "name", "") or "") else None
 
 
 def evaluate(
@@ -59,16 +113,31 @@ def evaluate(
     mode: PermissionMode = "default",
     ask_patterns=DEFAULT_ASK_PATTERNS,
     deny_patterns=DEFAULT_DENY_PATTERNS,
+    mutates: Optional[bool] = None,
 ) -> Behavior:
-    """Classify a tool call. Precedence: deny > ask > allow."""
+    """Classify a tool call. Precedence: deny > ask > allow.
+
+    ``mutates`` is an optional tool-driven signal (from
+    :func:`classify_tool_mutation`) for tools the static patterns can't name —
+    e.g. user-added MCP servers. It only ever *promotes* an unmatched tool to
+    ``ask`` (``True``) or confirms ``allow`` (``False``); explicit operator
+    deny/ask patterns still win. When ``mutates`` is omitted, the same verb
+    heuristic is applied to the name directly so name-only callers stay dynamic.
+    """
     name = tool_name or ""
     if _match(name, deny_patterns):
         return "deny"
-    is_ask = _match(name, ask_patterns)
     if mode == "auto_allow":
         return "allow"          # deny already handled above
-    # default and plan both gate risky tools as "ask"
-    return "ask" if is_ask else "allow"
+    if _match(name, ask_patterns):
+        return "ask"
+    # Static patterns didn't match — fall back to the dynamic, tool-driven signal.
+    if mutates is True:
+        return "ask"
+    if mutates is False:
+        return "allow"          # MCP server declared this tool read-only
+    # Unknown: last-resort generic verb heuristic on the name.
+    return "ask" if _looks_like_mutation(name) else "allow"
 
 
 def _clone_with_coroutine(tool: Any, coroutine) -> Any:
@@ -96,6 +165,10 @@ async def _record_approval_pending(
     request_id: str,
     tool_name: str,
     summary: str,
+    *,
+    risk_tier: Optional[str] = None,
+    supervisor_verdict: Optional[str] = None,
+    supervisor_reasoning: Optional[str] = None,
 ) -> None:
     """Best-effort durable audit of a newly-opened approval gate."""
     if not execution_id:
@@ -104,6 +177,9 @@ async def _record_approval_pending(
         from app.infrastructure.persistence import tool_approval_repository
         await tool_approval_repository.record_pending(
             execution_id, request_id, tool_name, summary,
+            risk_tier=risk_tier,
+            supervisor_verdict=supervisor_verdict,
+            supervisor_reasoning=supervisor_reasoning,
         )
     except Exception as exc:  # noqa: BLE001 — audit must never break the gate
         logger.debug("tool_permissions: approval audit (pending) skipped: %s", exc)
@@ -115,6 +191,7 @@ async def _record_approval_decision(
     decision: str,
     *,
     reason: Optional[str] = None,
+    decided_by: Optional[str] = None,
 ) -> None:
     """Best-effort durable audit of a resolved approval decision."""
     if not execution_id:
@@ -122,10 +199,36 @@ async def _record_approval_decision(
     try:
         from app.infrastructure.persistence import tool_approval_repository
         await tool_approval_repository.record_decision(
-            execution_id, request_id, decision, reason=reason,
+            execution_id, request_id, decision, reason=reason, decided_by=decided_by,
         )
     except Exception as exc:  # noqa: BLE001 — audit must never break the gate
         logger.debug("tool_permissions: approval audit (decision) skipped: %s", exc)
+
+
+async def _publish_supervisor_decision(
+    execution_port: Any,
+    execution_id: Optional[str],
+    action_name: str,
+    verdict: str,
+    reasoning: Optional[str],
+    risk_tier: Optional[str],
+) -> None:
+    """Emit a non-blocking ``supervisor_decision`` status event so the trace
+    shows a Supervisor-auto-decided action (no human card was raised)."""
+    if not execution_id or execution_port is None:
+        return
+    publish = getattr(execution_port, "publish_supervisor_decision", None)
+    if publish is None:
+        return
+    try:
+        await publish(execution_id, {
+            "tool": action_name,
+            "verdict": verdict,
+            "reasoning": reasoning,
+            "risk_tier": risk_tier,
+        })
+    except Exception as exc:  # noqa: BLE001 — telemetry must never break the gate
+        logger.debug("tool_permissions: supervisor_decision publish skipped: %s", exc)
 
 
 def _json_safe(value: Any) -> Any:
@@ -173,6 +276,138 @@ def _summarize_args(tool_name: str, args: dict) -> str:
     return f"Approve running '{tool_name}'?"
 
 
+async def request_action_approval(
+    execution_id: Optional[str],
+    execution_port: Any,
+    action_name: str,
+    args: Optional[dict] = None,
+    summary: Optional[str] = None,
+    *,
+    risk_tier: Optional[str] = None,
+    supervisor_verdict: Optional[str] = None,
+    supervisor_reasoning: Optional[str] = None,
+    timeout_s: float = _APPROVAL_TIMEOUT_SECONDS,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Request human approval for a single write-class action and block until
+    it resolves (or times out). Returns ``(approved, reason, decided_by)``.
+
+    This is the shared approval primitive: it registers a per-``request_id``
+    Future on the execution runtime, writes the durable pending audit row
+    (carrying any Action Supervisor verdict), publishes the ``hitl_pause`` card,
+    and awaits ``POST /executions/{id}/approve``. It powers both the per-tool
+    ask-gate (:func:`wrap_tools_with_permissions`) and non-tool call sites such
+    as the wiki-publish workflow handler, so their approval UX and audit trail
+    are identical.
+
+    Fail-safe: when no approval channel is available (no execution port/runtime)
+    it returns ``(False, ...)`` — a high-risk action is skipped rather than run
+    unreviewed.
+    """
+    runtime = execution_port.get_runtime(execution_id) if (execution_port and execution_id) else None
+    if not isinstance(runtime, dict) or not runtime:
+        logger.warning(
+            "tool_permissions: action '%s' has no approval channel; blocking", action_name,
+        )
+        return False, (
+            f"Action '{action_name}' requires approval but no approval channel is available."
+        ), None
+
+    approvals = runtime.get("tool_approvals")
+    if approvals is None:
+        approvals = {}
+        runtime["tool_approvals"] = approvals
+
+    request_id = uuid.uuid4().hex
+    decision_future: "asyncio.Future" = asyncio.get_event_loop().create_future()
+    approvals[request_id] = decision_future
+    safe_args = _json_safe(args or {})
+    _summary = summary or _summarize_args(action_name, safe_args)
+
+    # Action Supervisor review (inline). When enabled and the caller didn't
+    # already supply a verdict, review the action so the risk tier + advisory
+    # verdict are recorded and shown on the approval card.
+    _enforce = False
+    if supervisor_verdict is None:
+        try:
+            from app.core.supervision import action_supervisor as _sup
+            if _sup.is_enabled():
+                _ctx = runtime.get("agent_context") if isinstance(runtime, dict) else None
+                _verdict = await _sup.review(
+                    action_name, args or {}, execution_id=execution_id, context=_ctx,
+                )
+                risk_tier = risk_tier or _verdict.risk_tier
+                supervisor_verdict = _verdict.decision
+                supervisor_reasoning = _verdict.reasoning
+                _enforce = not _sup.is_shadow_mode()
+        except Exception as exc:  # noqa: BLE001 — supervisor must never break the gate
+            logger.warning("tool_permissions: action supervisor review error (%s): %s", action_name, exc)
+
+    await _record_approval_pending(
+        execution_id, request_id, action_name, _summary,
+        risk_tier=risk_tier,
+        supervisor_verdict=supervisor_verdict,
+        supervisor_reasoning=supervisor_reasoning,
+    )
+
+    # Enforcement (non-shadow): the Supervisor decides LOW-risk actions itself —
+    # no human card. HIGH-risk actions, and any "escalate", always fall through
+    # to the human card below (the verdict rides along as advice).
+    if _enforce and risk_tier == "low" and supervisor_verdict in ("approve", "deny"):
+        approvals.pop(request_id, None)
+        _approved = supervisor_verdict == "approve"
+        await _record_approval_decision(
+            execution_id, request_id,
+            "approved" if _approved else "denied",
+            reason=supervisor_reasoning, decided_by="supervisor",
+        )
+        await _publish_supervisor_decision(
+            execution_port, execution_id, action_name,
+            supervisor_verdict, supervisor_reasoning, risk_tier,
+        )
+        logger.info(
+            "tool_permissions: %s '%s' auto-%s by supervisor",
+            risk_tier, action_name, "approved" if _approved else "denied",
+        )
+        return _approved, supervisor_reasoning, "supervisor"
+
+    try:
+        await execution_port.publish_hitl_pause(execution_id, {
+            "request_id": request_id,
+            "draft_answer": "",
+            "message": _summary,
+            "type": "tool_approval",
+            "tool": action_name,
+            "args": safe_args,
+            "risk_tier": risk_tier,
+            "supervisor_verdict": supervisor_verdict,
+            "supervisor_reasoning": supervisor_reasoning,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("tool_permissions: ASK %s publish failed (%s)", action_name, exc)
+
+    logger.info("tool_permissions: ASK %s → awaiting approval (request_id=%s)", action_name, request_id)
+    try:
+        decision = await asyncio.wait_for(decision_future, timeout=timeout_s)
+    except asyncio.TimeoutError:
+        logger.info("tool_permissions: ASK %s → approval timed out", action_name)
+        await _record_approval_decision(
+            execution_id, request_id, "timeout", reason="Approval timed out",
+        )
+        return False, f"Action '{action_name}' was not approved in time.", None
+    finally:
+        approvals.pop(request_id, None)
+
+    approved = isinstance(decision, dict) and decision.get("approved") is True
+    reason = decision.get("reason") if isinstance(decision, dict) else None
+    decided_by = decision.get("decided_by") if isinstance(decision, dict) else None
+    await _record_approval_decision(
+        execution_id, request_id,
+        "approved" if approved else "denied",
+        reason=reason, decided_by=decided_by,
+    )
+    return approved, reason, decided_by
+
+
 def wrap_tools_with_permissions(
     tools: List[Any],
     mode: PermissionMode = "default",
@@ -193,13 +428,14 @@ def wrap_tools_with_permissions(
     ``POST /executions/{id}/approve`` channel as supervisor HITL. Without that
     channel it fails safe (blocks the tool with an explanatory message).
     """
-    import asyncio
-    import uuid
-
     wrapped: List[Any] = []
     for tool in tools:
         name = getattr(tool, "name", "") or ""
-        behavior = evaluate(name, mode, ask_patterns=ask_patterns, deny_patterns=deny_patterns)
+        mutates = classify_tool_mutation(tool)
+        behavior = evaluate(
+            name, mode, ask_patterns=ask_patterns, deny_patterns=deny_patterns,
+            mutates=mutates,
+        )
         if behavior == "allow":
             wrapped.append(tool)
             continue
@@ -224,74 +460,17 @@ def wrap_tools_with_permissions(
         # register a per-request_id Future and the approve endpoint resolves the
         # matching one. See app/api/v1/endpoints/executions.py::approve_hitl_request.
         async def _gated(*_a, __orig=original, __tool=tool, __name=name, **kwargs) -> Any:
-            runtime = execution_port.get_runtime(execution_id) if (execution_port and execution_id) else None
-            if not isinstance(runtime, dict) or not runtime:
-                logger.warning("tool_permissions: ASK %s has no approval channel; blocking", __name)
-                return json.dumps({
-                    "blocked": True, "tool": __name,
-                    "reason": f"Tool '{__name}' requires approval but no approval channel is "
-                              f"available. Re-run with permission_mode=auto_allow to allow.",
-                })
-            approvals = runtime.get("tool_approvals")
-            if approvals is None:
-                approvals = {}
-                runtime["tool_approvals"] = approvals
-
-            request_id = uuid.uuid4().hex
-            decision_future: "asyncio.Future" = asyncio.get_event_loop().create_future()
-            approvals[request_id] = decision_future
-            safe_args = _json_safe(kwargs)
-            _summary = _summarize_args(__name, safe_args)
-
-            # Durable audit: write a pending row BEFORE blocking so the approval
-            # is visible across page reloads / other operators, and the eventual
-            # decision is recorded even if this process restarts mid-wait. Best
-            # effort — never let an audit write break the live gate.
-            await _record_approval_pending(execution_id, request_id, __name, _summary)
-
-            try:
-                await execution_port.publish_hitl_pause(execution_id, {
-                    "request_id": request_id,
-                    "draft_answer": "",
-                    "message": _summary,
-                    "type": "tool_approval",
-                    "tool": __name,
-                    "args": safe_args,
-                })
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("tool_permissions: ASK %s publish failed (%s)", __name, exc)
-
-            logger.info("tool_permissions: ASK %s → awaiting approval (request_id=%s)", __name, request_id)
-            try:
-                decision = await asyncio.wait_for(decision_future, timeout=_APPROVAL_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                logger.info("tool_permissions: ASK %s → approval timed out", __name)
-                await _record_approval_decision(
-                    execution_id, request_id, "timeout",
-                    reason="Approval timed out",
-                )
-                return json.dumps({
-                    "blocked": True, "tool": __name,
-                    "reason": f"Tool '{__name}' was not approved in time and was skipped.",
-                })
-            finally:
-                approvals.pop(request_id, None)
-
-            approved = isinstance(decision, dict) and decision.get("approved") is True
-            _reason = decision.get("reason") if isinstance(decision, dict) else None
-            if not approved:
-                logger.info("tool_permissions: ASK %s → denied by operator", __name)
-                await _record_approval_decision(
-                    execution_id, request_id, "denied", reason=_reason,
-                )
-                return json.dumps({
-                    "blocked": True, "tool": __name,
-                    "reason": _reason or f"Tool '{__name}' was not approved by the operator.",
-                })
-            logger.info("tool_permissions: ASK %s → approved", __name)
-            await _record_approval_decision(
-                execution_id, request_id, "approved", reason=_reason,
+            # Delegate the register→publish→await→audit dance to the shared
+            # primitive so this gate and non-tool call sites (wiki publish, etc.)
+            # behave identically. Returns (approved, reason, decided_by).
+            approved, reason, _decided_by = await request_action_approval(
+                execution_id, execution_port, __name, kwargs,
             )
+            if not approved:
+                return json.dumps({
+                    "blocked": True, "tool": __name,
+                    "reason": reason or f"Tool '{__name}' was not approved by the operator.",
+                })
             # Tools that expose a plain `.coroutine` (StructuredTool) are invoked
             # directly. Tools that only implement `_arun` (MCPToolWrapper, several
             # builtin BaseTools like fs_write) have no `.coroutine`, so `__orig`

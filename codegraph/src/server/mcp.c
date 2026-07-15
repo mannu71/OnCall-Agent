@@ -1314,43 +1314,133 @@ static sqlite3_destructor_type mcp_sqlite_transient(void) {
 }
 #define MCP_SQLITE_TRANSIENT (mcp_sqlite_transient())
 
+/* True if a camelCase/PascalCase boundary falls BEFORE s[i] (lower→Upper, or
+ * Upper-run→Upper-then-lower). Language-agnostic — pure character case. Mirrors
+ * camel_should_split (store.c) so query subtokens line up with the index. */
+static bool bm25_camel_boundary(const char *s, size_t i, size_t len) {
+    if (i == 0 || i >= len) {
+        return false;
+    }
+    char cur = s[i], prev = s[i - 1];
+    char next = (i + 1 < len) ? s[i + 1] : '\0';
+    bool cur_up = cur >= 'A' && cur <= 'Z';
+    if (cur_up && prev >= 'a' && prev <= 'z') {
+        return true;
+    }
+    if (cur_up && prev >= 'A' && prev <= 'Z' && next >= 'a' && next <= 'z') {
+        return true;
+    }
+    return false;
+}
+
+/* Append a literal string, NUL-terminating; false if it wouldn't fit. */
+static bool bm25_put(char *out, size_t out_size, size_t *pos, const char *s, size_t slen) {
+    if (*pos + slen + 1 >= out_size) {
+        return false;
+    }
+    memcpy(out + *pos, s, slen);
+    *pos += slen;
+    out[*pos] = '\0';
+    return true;
+}
+
+#define BM25_IS_WORD(c)                                                                            \
+    (((c) >= 'a' && (c) <= 'z') || ((c) >= 'A' && (c) <= 'Z') || ((c) >= '0' && (c) <= '9') ||     \
+     (c) == '_')
+
+/* Build the FTS5 MATCH string from a free-text query, splitting identifiers by
+ * camelCase AND snake_case so partial/multi-word names still match the index
+ * (which stores camel-split names). Language-agnostic — case + underscore only.
+ *
+ * Precision matters: a SINGLE identifier's segments are AND-combined (all parts
+ * must be present) so "GetObjectRequest" becomes (get AND object AND request)
+ * finds a symbol containing all three, NOT everything named Get, Object or Request.
+ * Distinct query WORDS stay OR-joined (recall), preserving prior behavior. A
+ * one-segment token is a plain prefix term. */
 static int bm25_build_match(const char *query, char *out, size_t out_size) {
     if (!query || !out || out_size < BM25_MIN_BUF) {
         return 0;
     }
     size_t pos = 0;
-    int tokens = 0;
+    out[0] = '\0';
+    int groups = 0;
     const char *p = query;
     while (*p) {
-        while (*p && !((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                       (*p >= '0' && *p <= '9') || *p == '_')) {
+        while (*p && !BM25_IS_WORD(*p)) {
             p++;
         }
         if (!*p) {
             break;
         }
-        const char *tok_start = p;
-        while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                      (*p >= '0' && *p <= '9') || *p == '_')) {
+        const char *ts = p;
+        while (*p && BM25_IS_WORD(*p)) {
             p++;
         }
-        size_t tok_len = (size_t)(p - tok_start);
-        if (tok_len == 0) {
+        size_t tl = (size_t)(p - ts);
+        if (tl == 0) {
             continue;
         }
-        const char *sep = (tokens > 0) ? " OR " : "";
-        size_t sep_len = strlen(sep);
-        if (pos + sep_len + tok_len + BM25_SEP_RESERVE >= out_size) {
-            break; /* out of room — stop cleanly, keep what we have */
+
+        /* Collect >=2-char segments split on camelCase boundaries and '_'. */
+        struct {
+            const char *s;
+            size_t l;
+        } seg[24];
+        int ns = 0;
+        size_t i = 0;
+        while (i < tl && ns < 24) {
+            if (ts[i] == '_') {
+                i++;
+                continue;
+            }
+            size_t st = i;
+            i++;
+            while (i < tl && ts[i] != '_' && !bm25_camel_boundary(ts, i, tl)) {
+                i++;
+            }
+            if (i - st >= 2) {
+                seg[ns].s = ts + st;
+                seg[ns].l = i - st;
+                ns++;
+            }
         }
-        memcpy(out + pos, sep, sep_len);
-        pos += sep_len;
-        memcpy(out + pos, tok_start, tok_len);
-        pos += tok_len;
-        tokens++;
+        if (ns == 0) {
+            /* Too short to segment; use whole token if it's a clean bareword. */
+            if (memchr(ts, '_', tl)) {
+                continue;
+            }
+            seg[0].s = ts;
+            seg[0].l = tl;
+            ns = 1;
+        }
+
+        size_t save = pos;
+        bool ok = true;
+        if (groups > 0) {
+            ok = bm25_put(out, out_size, &pos, " OR ", 4);
+        }
+        if (ok && ns == 1) {
+            ok = bm25_put(out, out_size, &pos, seg[0].s, seg[0].l) &&
+                 bm25_put(out, out_size, &pos, "*", 1);
+        } else if (ok) {
+            ok = bm25_put(out, out_size, &pos, "(", 1);
+            for (int k = 0; ok && k < ns; k++) {
+                if (k) {
+                    ok = bm25_put(out, out_size, &pos, " AND ", 5);
+                }
+                ok = ok && bm25_put(out, out_size, &pos, seg[k].s, seg[k].l) &&
+                     bm25_put(out, out_size, &pos, "*", 1);
+            }
+            ok = ok && bm25_put(out, out_size, &pos, ")", 1);
+        }
+        if (!ok) {
+            pos = save; /* roll back a partial group; keep a valid query */
+            out[pos] = '\0';
+            break;
+        }
+        groups++;
     }
-    out[pos] = '\0';
-    return tokens;
+    return groups;
 }
 
 static char *bm25_file_pattern_like(const char *file_pattern) {
@@ -1383,6 +1473,34 @@ static bool is_test_file(const char *path) {
     return strstr(path, "/test") != NULL || strstr(path, "test_") != NULL ||
            strstr(path, "_test.") != NULL || strstr(path, "/tests/") != NULL ||
            strstr(path, "/spec/") != NULL || strstr(path, ".test.") != NULL;
+}
+
+/* Machine-generated / boilerplate code, across ALL languages. Now INDEXED (see
+ * FAST_SKIP_DIRS in discover.c) so nothing tracked is invisible, but DOWN-RANKED
+ * in search since RCA rarely wants scaffolding. Language-agnostic: ORM migrations
+ * (Rails/Django/Laravel/EF, lower- and upper-case), the `.generated.` marker used
+ * across ecosystems, protobuf/gRPC stubs (Go/Python/C++/Dart/C#), designer/codegen
+ * suffixes (.g.<ext> / *.Designer.cs / *.freezed.dart), and minified web output. */
+static bool cg_path_is_generated(const char *path) {
+    if (!path) {
+        return false;
+    }
+    return
+        /* ORM/DB migrations — Rails, Django, Laravel, EF Core, Flyway, etc. */
+        strstr(path, "/migrations/") != NULL || strstr(path, "/Migrations/") != NULL ||
+        /* universal generated marker + common codegen suffixes */
+        strstr(path, ".generated.") != NULL || strstr(path, ".g.cs") != NULL ||
+        strstr(path, ".g.dart") != NULL || strstr(path, ".g.ts") != NULL ||
+        strstr(path, ".freezed.dart") != NULL || strstr(path, ".designer.cs") != NULL ||
+        strstr(path, ".Designer.cs") != NULL ||
+        /* protobuf / gRPC across languages */
+        strstr(path, ".pb.go") != NULL || strstr(path, ".pb.cc") != NULL ||
+        strstr(path, ".pb.h") != NULL || strstr(path, ".pb.dart") != NULL ||
+        strstr(path, "_pb2.py") != NULL || strstr(path, "_pb2_grpc.py") != NULL ||
+        strstr(path, "Grpc.cs") != NULL || strstr(path, "_grpc.pb.go") != NULL ||
+        /* Go stringer, minified web assets */
+        strstr(path, "_string.go") != NULL || strstr(path, ".min.js") != NULL ||
+        strstr(path, ".min.css") != NULL;
 }
 
 /* One BM25 (or fused) search hit, kept in memory instead of serialized JSON
@@ -1543,6 +1661,21 @@ static bm25_candidate_t *bm25_search_core(cg_store_t *store, const char *project
     return cands;
 }
 
+/* When a symbol search finds nothing on the first page, add an actionable hint.
+ * The FTS index holds DEFINITIONS only, so an external/library type referenced
+ * (but not defined) here can never match — turn the dead-end 0-result into a
+ * hand-off to the literal grep tool instead of a silent empty list. */
+static void add_zero_result_hint(yyjson_mut_doc *doc, yyjson_mut_val *root, int total, int offset) {
+    if (total == 0 && offset == 0) {
+        yyjson_mut_obj_add_str(
+            doc, root, "hint",
+            "No indexed symbol matches. The graph indexes symbols DEFINED in this "
+            "project; an external/library type (e.g. an SDK class) referenced but not "
+            "defined here will never match. Use codegraph__search_code for a literal "
+            "text search, or codegraph__find_symbol with a partial name.");
+    }
+}
+
 /* Serialize a bm25_candidate_t array (trimmed to `limit`) into the same JSON
  * shape the legacy bm25_search() produced: {total, search_mode, results[],
  * has_more}. Shared by the pure-BM25 path and hybrid_search()'s fallbacks. */
@@ -1569,6 +1702,7 @@ static char *bm25_candidates_to_json(const bm25_candidate_t *cands, int count, i
     }
     yyjson_mut_obj_add_val(doc, root, "results", results);
     yyjson_mut_obj_add_bool(doc, root, "has_more", total > offset + emit_n);
+    add_zero_result_hint(doc, root, total, offset);
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return json;
@@ -1618,18 +1752,28 @@ static bool search_fusion_enabled(void) {
 }
 
 #define CG_RANK_TEST_PENALTY_DEFAULT 0.8
+/* Generated code is lower-value than tests for RCA, so a stronger default. */
+#define CG_RANK_GENERATED_PENALTY_DEFAULT 0.5
 
-static double rank_test_penalty(void) {
-    const char *v = getenv("CG_RANK_TEST_PENALTY");
+static double rank_penalty_env(const char *env, double dflt) {
+    const char *v = getenv(env);
     if (!v) {
-        return CG_RANK_TEST_PENALTY_DEFAULT;
+        return dflt;
     }
     char *end = NULL;
     double parsed = strtod(v, &end);
     if (end == v || parsed < 0.0 || parsed > 1.0) {
-        return CG_RANK_TEST_PENALTY_DEFAULT;
+        return dflt;
     }
     return parsed;
+}
+
+static double rank_test_penalty(void) {
+    return rank_penalty_env("CG_RANK_TEST_PENALTY", CG_RANK_TEST_PENALTY_DEFAULT);
+}
+
+static double rank_generated_penalty(void) {
+    return rank_penalty_env("CG_RANK_GENERATED_PENALTY", CG_RANK_GENERATED_PENALTY_DEFAULT);
 }
 
 enum { CG_RANK_FILE_CAP_DEFAULT = 3 };
@@ -1773,13 +1917,18 @@ static fused_cand_t *fuse_candidates(bm25_candidate_t *bcands, int bcount,
     return fused;
 }
 
-/* Apply the label boost and test-file penalty on top of the RRF score. */
+/* Apply the label boost + test-file and generated-file penalties on top of the
+ * RRF score. This is the default (fusion) ranking path for search_graph. */
 static void apply_rerank(fused_cand_t *fused, int n) {
     double penalty = rank_test_penalty();
+    double gen_penalty = rank_generated_penalty();
     for (int i = 0; i < n; i++) {
         fused[i].score *= label_boost_multiplier(fused[i].label);
         if (is_test_file(fused[i].file_path)) {
             fused[i].score *= penalty;
+        }
+        if (cg_path_is_generated(fused[i].file_path)) {
+            fused[i].score *= gen_penalty;
         }
     }
 }
@@ -1947,6 +2096,7 @@ static char *hybrid_search(cg_store_t *store, const char *project, const char *q
     }
     yyjson_mut_obj_add_val(doc, root, "results", results);
     yyjson_mut_obj_add_bool(doc, root, "has_more", fused_count > kept_n);
+    add_zero_result_hint(doc, root, total_for_output, 0); /* hybrid only runs at offset 0 */
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
@@ -3866,7 +4016,7 @@ typedef struct {
 } search_result_t;
 
 /* Score a result for ranking: project source first, bundled last, tests lowest */
-enum { SCORE_FUNC = 10, SCORE_ROUTE = 15, SCORE_Bundled = -50, SCORE_TEST = -5 };
+enum { SCORE_FUNC = 10, SCORE_ROUTE = 15, SCORE_Bundled = -50, SCORE_TEST = -5, SCORE_GENERATED = -40 };
 enum { MAX_LINE_SPAN = 999999 };
 
 static int compute_search_score(const search_result_t *r) {
@@ -3885,6 +4035,10 @@ static int compute_search_score(const search_result_t *r) {
     if (strstr(r->file, "test") || strstr(r->file, "spec") || strstr(r->file, "_test.")) {
         score += SCORE_TEST;
     }
+    /* Penalize generated/boilerplate (now indexed, but low-value for RCA). */
+    if (cg_path_is_generated(r->file)) {
+        score += SCORE_GENERATED;
+    }
     return score;
 }
 
@@ -3899,7 +4053,7 @@ static int search_result_cmp(const void *a, const void *b) {
  * On POSIX, uses grep with colon-delimited output. */
 static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
                            const char *file_pattern, const char *tmpfile, const char *filelist,
-                           const char *root_path) {
+                           const char *root_path, bool exclude_tests) {
 #ifdef _WIN32
     const char *sm = use_regex ? "" : " -SimpleMatch";
     if (scoped) {
@@ -3965,6 +4119,17 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
      * minutes); --hidden alone (respecting .gitignore) found the IDENTICAL
      * match set in 4.4s. Dropped --no-ignore; kept --hidden. */
     const char *rg_flag = use_regex ? "" : "-F";
+    /* Directory-level exclusions for the recursive walk. The test tree and
+     * build/dependency output dominate scan time for low-value hits (e.g.
+     * compliance-api's tests/ is 4.8GB). rg's --glob prunes these DURING the
+     * walk, so it never opens them. This replaces the old xargs-explicit
+     * filelist, which stat/opened every indexed file one-by-one (~27s on a
+     * bind-mounted 9GB repo — 42MB across 3520 files — vs ~4s with globs).
+     * Skipped when include_tests=true (exclude_tests=0). */
+    const char *excl = exclude_tests
+        ? " -g '!**/tests/**' -g '!**/test/**' -g '!**/__tests__/**'"
+          " -g '!**/obj/**' -g '!**/bin/**' -g '!**/node_modules/**' -g '!**/coverlet/**'"
+        : "";
     if (scoped) {
         /* file_pattern (a glob) is intentionally NOT applied here: GNU grep's
          * --include only filters during a recursive (-r) walk, and this branch
@@ -3985,12 +4150,12 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
         /* Real recursive walk (no pre-built file list) — here grep's --include
          * DID actively filter, so rg's -g is the correct equivalent. */
         snprintf(cmd, cmd_sz,
-                 "rg -Hn --no-heading --hidden %s -g '%s' -f '%s' '%s' 2>/dev/null",
-                 rg_flag, file_pattern, tmpfile, root_path);
+                 "rg -Hn --no-heading --hidden%s %s -g '%s' -f '%s' '%s' 2>/dev/null",
+                 excl, rg_flag, file_pattern, tmpfile, root_path);
     } else {
         snprintf(cmd, cmd_sz,
-                 "rg -Hn --no-heading --hidden %s -f '%s' '%s' 2>/dev/null",
-                 rg_flag, tmpfile, root_path);
+                 "rg -Hn --no-heading --hidden%s %s -f '%s' '%s' 2>/dev/null",
+                 excl, rg_flag, tmpfile, root_path);
     }
 #endif
 }
@@ -4657,18 +4822,22 @@ static char *handle_search_code(cg_mcp_server_t *srv, const char *args) {
     enum { GREP_MAX_MATCHES = 500 };
     int grep_limit = GREP_MAX_MATCHES;
 
-    /* Scope grep to indexed files only — avoids scanning bundled/generated code.
-     * Query the graph for distinct file paths, write them to a temp file,
-     * then use xargs to pass them to grep. Falls back to recursive grep if
-     * no indexed files found (project not fully indexed). */
+    /* Recursive rg (respecting .gitignore) with directory-exclusion globs —
+     * NOT the old scoped xargs-explicit filelist. Measured on compliance-api
+     * (9GB, 3520 indexed files / 42MB): the xargs approach stat/opened every
+     * indexed file individually and took ~27s, while recursive rg with the same
+     * test/build exclusions covers the same source in ~4s. rg's own .gitignore
+     * handling already skips bundled/generated output, so scoping to indexed
+     * files bought correctness we now get from ignore rules + globs, at a
+     * fraction of the latency. write_scoped_filelist/cg_search_path_is_test are
+     * retained (unused) for reference. */
     char filelist[CG_SZ_256];
     snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
     bool scoped = false;
 
-    scoped = write_scoped_filelist(srv, project, root_path, filelist, include_tests);
-
     char cmd[CG_SZ_4K];
-    build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist, root_path);
+    build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist, root_path,
+                   !include_tests);
 
     FILE *fp = cg_popen(cmd, "r");
     if (!fp) {

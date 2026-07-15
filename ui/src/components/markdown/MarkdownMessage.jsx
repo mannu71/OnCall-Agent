@@ -5,6 +5,68 @@ import { cleanLlmText } from './markdownUtils.js';
 
 export { cleanLlmText };
 
+const _codeBlockClass =
+  "block bg-slate-50 dark:bg-white/[0.04] border border-slate-200 dark:border-white/10 " +
+  "text-slate-800 dark:text-slate-200 rounded p-3 text-xs font-mono overflow-auto whitespace-pre-wrap";
+
+// A block of HTML the agent emitted is worth rendering, not just showing as
+// source (e.g. the "Frontend Design" skill outputs a full self-contained slide
+// deck). Detect an HTML code fence / document and offer a Preview⇄Code toggle;
+// the preview runs in a sandboxed iframe (allow-scripts, NO allow-same-origin —
+// self-contained decks with JS nav work, but the frame can't touch the app).
+function looksLikeHtml(lang, text) {
+  if (lang === 'html' || lang === 'xml') return true;
+  const head = text.slice(0, 400).toLowerCase();
+  return /<!doctype html|<html[\s>]|<body[\s>]|<div class="slide"|<section[\s>]/.test(head);
+}
+
+function CodeBlock({ className, children }) {
+  const text = String(children ?? '');
+  const lang = (className || '').match(/language-(\w+)/)?.[1] || '';
+  const isHtml = looksLikeHtml(lang, text);
+  const isFullDoc = /<!doctype html|<html[\s>]/i.test(text.slice(0, 400));
+  // Full documents default to the rendered preview; HTML fragments default to
+  // code (with a preview available) so short snippets in explanations stay code.
+  const [view, setView] = React.useState(isFullDoc ? 'preview' : 'code');
+
+  const codeEl = <code className={_codeBlockClass}>{children}</code>;
+  if (!isHtml) return codeEl;
+
+  const openInTab = () => {
+    try {
+      const blob = new Blob([text], { type: 'text/html' });
+      window.open(URL.createObjectURL(blob), '_blank', 'noopener');
+    } catch { /* no-op */ }
+  };
+  const tabBtn = (v, label) => (
+    <button type="button" onClick={() => setView(v)}
+      className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors ${
+        view === v
+          ? 'bg-slate-200 dark:bg-white/15 text-slate-900 dark:text-slate-100'
+          : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'}`}>
+      {label}
+    </button>
+  );
+
+  return (
+    <div className="mb-3 rounded border border-slate-200 dark:border-white/10 overflow-hidden">
+      <div className="flex items-center gap-1 px-2 py-1 bg-slate-100 dark:bg-white/[0.06] border-b border-slate-200 dark:border-white/10">
+        {tabBtn('preview', 'Preview')}
+        {tabBtn('code', 'Code')}
+        <span className="ml-auto text-[10px] uppercase tracking-wide text-slate-400">HTML</span>
+        <button type="button" onClick={openInTab}
+          className="text-[11px] font-medium text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200">
+          Open ↗
+        </button>
+      </div>
+      {view === 'preview'
+        ? <iframe title="HTML preview" srcDoc={text} sandbox="allow-scripts allow-popups"
+            className="w-full bg-white" style={{ height: '70vh', border: 'none' }} />
+        : <div className="p-0">{codeEl}</div>}
+    </div>
+  );
+}
+
 /**
  * Shared react-markdown component overrides — Tailwind-styled, no prose plugin.
  * Used by the Dashboard execution detail and the Agent Chat answers so reports,
@@ -35,12 +97,14 @@ export const mdComponents = {
   code: ({node, inline, className, children, ...p}) => {
     const text = String(children ?? '');
     const isBlock = /language-/.test(className || '') || text.includes('\n');
-    return isBlock
-      ? <code className="block bg-slate-50 dark:bg-white/[0.04] border border-slate-200 dark:border-white/10 text-slate-800 dark:text-slate-200 rounded p-3 text-xs font-mono overflow-auto whitespace-pre-wrap" {...p}>{children}</code>
-      : <code className="bg-slate-100 dark:bg-white/10 text-slate-800 dark:text-slate-200 px-1 py-0.5 rounded text-xs font-mono" {...p}>{children}</code>;
+    if (isBlock) return <CodeBlock className={className} {...p}>{children}</CodeBlock>;
+    return <code className="bg-slate-100 dark:bg-white/10 text-slate-800 dark:text-slate-200 px-1 py-0.5 rounded text-xs font-mono" {...p}>{children}</code>;
   },
+  // Render block code's wrapper as a div (not <pre>) so CodeBlock's preview
+  // toolbar/iframe aren't nested inside a <pre> (invalid HTML). The inner
+  // <code className="block …"> keeps all the monospace/whitespace styling.
   // eslint-disable-next-line no-unused-vars
-  pre: ({node, ...p}) => <pre className="mb-3" {...p} />,
+  pre: ({node, children, ...p}) => <div className="mb-3" {...p}>{children}</div>,
   // eslint-disable-next-line no-unused-vars
   table: ({node, ...p}) => <div className="overflow-x-auto mb-4"><table className="min-w-full text-sm border-collapse border border-slate-200 dark:border-white/10" {...p} /></div>,
   // eslint-disable-next-line no-unused-vars

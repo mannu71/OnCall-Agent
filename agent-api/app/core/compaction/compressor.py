@@ -146,6 +146,23 @@ async def compress_text(
                 content = messages[1].get("content", text)
                 compressed_text = content if isinstance(content, str) else text
 
+            # Guard: the sidecar's CCR ("content reference") transform replaces
+            # spans with opaque `<ccr:hash,type,size>` handles and returns the
+            # resolution map SEPARATELY in `ccr_hashes`. We only forward the
+            # content, so those handles reach the model with no way to resolve
+            # them — the model then loops trying to "dereference" them and burns
+            # its whole budget. Never hand back CCR-referenced content: fall back
+            # to the original text (which is then capped as usual). Non-CCR
+            # compression is unaffected.
+            if (data.get("ccr_hashes") or []) or "<ccr:" in compressed_text:
+                logger.warning(
+                    "Compression: sidecar returned CCR reference(s) the model "
+                    "cannot resolve; discarding compressed output and using the "
+                    "original text (%d chars)",
+                    len(text),
+                )
+                return CompressionResult(text=text, compressed=False)
+
             tokens_before = data.get("tokens_before", 0)
             tokens_after = data.get("tokens_after", 0)
 

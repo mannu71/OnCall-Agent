@@ -48,6 +48,11 @@ def compose_system_prompt(
     has_db_tools = any(
         getattr(t, "name", "").startswith("db_") for t in tools
     )
+    # Deterministic given the bound tools (same cache-safety basis as
+    # has_db_tools) — drives the static "# Skills" section below. No skill
+    # NAMES appear in the prompt; the per-turn listing (in the user query)
+    # carries those, so the cachePoint prefix stays stable.
+    has_skill_tool = any(getattr(t, "name", "") == "skill" for t in tools)
 
     # ── Resolve active capabilities (composable; see app.harness.capabilities) ──
     # The investigation trio is derived from the runtime flags so existing
@@ -131,16 +136,41 @@ def compose_system_prompt(
         )
 
     # § Using your tools — shared steering: prefer the specific tool, reuse work.
-    system_parts.append(
-        "# Using your tools\n"
+    _tool_bullets = [
+        "# Using your tools",
         "- Prefer the most specific tool over a generic one, and fetch only what the question "
-        "needs — never read whole files or dump an entire schema when a targeted lookup will do.\n"
+        "needs — never read whole files or dump an entire schema when a targeted lookup will do.",
         "- When you reach a useful conclusion or resolution worth reusing, call save_playbook to "
-        "record it so future runs can benefit from it.\n"
-        "- If the memory-context block at the start of the query lists 'Suggested skills' that match "
-        "the current issue, follow that skill's runbook steps before improvising manual tool calls "
-        "— this reuses a proven procedure and is faster."
-    )
+        "record it so future runs can benefit from it.",
+    ]
+    # Legacy RAG-injection steering — only when that fallback is active; the
+    # skill-tool path (below) supersedes it. Gated on a stable flag so the
+    # cache prefix stays deterministic per run (re-baseline evals on change).
+    try:
+        from app.config import settings as _skill_settings
+        _rag_on = bool(getattr(_skill_settings, "skill_rag_selection_enabled", False))
+    except Exception:  # noqa: BLE001
+        _rag_on = False
+    if _rag_on:
+        _tool_bullets.append(
+            "- If the memory-context block at the start of the query lists 'Suggested skills' that "
+            "match the current issue, follow that skill's runbook steps before improvising manual "
+            "tool calls — this reuses a proven procedure and is faster."
+        )
+    system_parts.append("\n".join(_tool_bullets))
+
+    # § Skills — two-stage disclosure. Static (no skill names), so cache-safe.
+    if has_skill_tool:
+        system_parts.append(
+            "# Skills\n"
+            "- Some tasks have a matching skill — a proven, reusable runbook. The user turn "
+            "lists the available skills under 'Available skills' (name + when to use).\n"
+            "- When a skill matches the request, calling the `skill` tool to load it BEFORE any "
+            "other work is a blocking requirement — then follow its steps, using your other tools "
+            "as it directs. Prefer the skill over improvising your own procedure.\n"
+            "- Never mention a skill without invoking it. A user message starting with "
+            "'/<skill-name>' is a request to invoke that skill."
+        )
 
     # ── Capability sections (registry-driven; stable order) ──────────────
     # Each active capability contributes its system-prompt section in registry

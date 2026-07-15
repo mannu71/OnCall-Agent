@@ -441,7 +441,7 @@ class SemanticMemoryService:
             if llm_fn is not None:
                 raw = await llm_fn(prompt)
             else:
-                from app.crawler.call_llm import call_llm
+                from app.core.llm.call_llm import call_llm
                 raw, _, _, _ = await call_llm(prompt, tier="search", use_cache=False)
         except Exception as e:  # noqa: BLE001
             logger.warning("semantic_memory: audit LLM failed (%s)", e)

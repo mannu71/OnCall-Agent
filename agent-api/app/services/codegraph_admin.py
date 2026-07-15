@@ -432,7 +432,7 @@ async def get_layout(
             tool_timeout=60,
         )
         if result.get("isError"):
-            from app.crawler.background_indexer import _content_text
+            from app.services.codegraph_indexer import _content_text
             return {"error": _content_text(result)}
 
         # NOTE: _content_text truncates to 500 chars (fine for short error
@@ -486,7 +486,7 @@ async def reindex_project(project: str) -> Dict[str, Any]:
             tool_timeout=0,
         )
         if result.get("isError"):
-            from app.crawler.background_indexer import _content_text
+            from app.services.codegraph_indexer import _content_text
             return {"error": _content_text(result), "reindexed": False}
         return {"reindexed": True, "project": project}
     except Exception as exc:  # noqa: BLE001

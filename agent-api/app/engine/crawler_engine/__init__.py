@@ -1,4 +1,8 @@
-"""crawler_engine — unified graph engine package.
+"""crawler_engine — generic graph engine package.
+
+NOTE: despite the package name, this is the app's generic DAG engine, NOT the
+deleted Python code crawler. It is used by ``visual_workflow_executor`` and
+``dynamic_loader`` to run ReactFlow user-built workflows.
 
 Exports two surfaces:
 
@@ -9,8 +13,8 @@ Exports two surfaces:
    ``BaseNode`` is aliased to ``GraphNode`` for backwards compatibility with
    any code that previously imported it from ``app.engine.pocketflow``.
 
-2. **Async/sync flow framework** (used by crawler flows — simple sequential
-   DAGs with ``>>`` chaining and automatic retries):
+2. **Async/sync flow framework** (simple sequential DAGs with ``>>`` chaining
+   and automatic retries):
        AsyncNode, AsyncFlow, AsyncBatchNode, AsyncParallelBatchNode,
        AsyncBatchFlow, AsyncParallelBatchFlow,
        Node, BatchNode, Flow, BatchFlow

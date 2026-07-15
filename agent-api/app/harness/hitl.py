@@ -18,35 +18,34 @@ async def make_checkpointer() -> Any:
     always provide one (single-worker deployment → in-memory state is fine).
     """
     try:
-        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-        from app.config import settings
+        # Prefer the process-wide pooled saver set up at startup by
+        # runtime.init_persistence(). Building a fresh AsyncPostgresSaver here via
+        # from_conn_string() is a bug: in langgraph-checkpoint-postgres>=3.1.0 that
+        # is an async context manager, so calling .setup() on it raises and we
+        # silently fall through to InMemorySaver on every run.
+        from app.harness.runtime import get_saver
 
-        # psycopg connection string (not +asyncpg variant)
-        db_url = settings.database_url
-        if "+asyncpg" in db_url:
-            db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
-
-        checkpointer = AsyncPostgresSaver.from_conn_string(db_url)
-        await checkpointer.setup()
-        return checkpointer
+        saver = get_saver()
+        if saver is not None:
+            return saver
     except Exception as exc:
         logger.warning(
-            "ReactStrategy: AsyncPostgresSaver unavailable (%s) — falling back to in-memory "
-            "checkpointer", exc,
+            "ReactStrategy: shared AsyncPostgresSaver unavailable (%s) — falling back to "
+            "in-memory checkpointer", exc,
         )
+    try:
+        from langgraph.checkpoint.memory import InMemorySaver
+        return InMemorySaver()
+    except Exception:  # pragma: no cover — very old langgraph
         try:
-            from langgraph.checkpoint.memory import InMemorySaver
-            return InMemorySaver()
-        except Exception:  # pragma: no cover — very old langgraph
-            try:
-                from langgraph.checkpoint.memory import MemorySaver
-                return MemorySaver()
-            except Exception as mem_exc:  # noqa: BLE001
-                logger.warning(
-                    "ReactStrategy: in-memory checkpointer also unavailable (%s) — "
-                    "running without checkpointer", mem_exc,
-                )
-                return None
+            from langgraph.checkpoint.memory import MemorySaver
+            return MemorySaver()
+        except Exception as mem_exc:  # noqa: BLE001
+            logger.warning(
+                "ReactStrategy: in-memory checkpointer also unavailable (%s) — "
+                "running without checkpointer", mem_exc,
+            )
+            return None
 
 # ------------------------------------------------------------------
 # HITL pause helper

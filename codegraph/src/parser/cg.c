@@ -14,6 +14,8 @@
 #include "lsp/rust_lsp.h"
 #include "preprocessor.h"
 #include "base/compat.h"
+#include "base/log.h"        // cg_log_error — grammar-ABI mismatch visibility
+#include "walker/discover.h" // cg_language_name
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
 #include "base/constants.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
@@ -232,7 +234,20 @@ static TSParser *get_thread_parser(const TSLanguage *ts_lang, CGLanguage lang) {
         tl_parser_lang = CG_LANG_COUNT;
     }
     if (tl_parser_lang != lang) {
-        ts_parser_set_language(tl_parser, ts_lang);
+        /* A grammar in languages.so built for a different tree-sitter ABI makes
+         * set_language fail; the parser then has no (or a stale) language and
+         * ts_parse yields an empty tree → SILENT zero-symbol extraction for the
+         * whole language. Detect it, log once per language, and return NULL so
+         * the caller records a parse error rather than dropping symbols quietly. */
+        if (!ts_parser_set_language(tl_parser, ts_lang)) {
+            static bool warned[CG_LANG_COUNT];
+            if (lang >= 0 && lang < CG_LANG_COUNT && !warned[lang]) {
+                warned[lang] = true;
+                cg_log_error("parser.grammar_abi_mismatch", "language", cg_language_name(lang));
+            }
+            tl_parser_lang = CG_LANG_COUNT; /* force a re-set next call; don't cache a broken state */
+            return NULL;
+        }
         tl_parser_lang = lang;
     }
     return tl_parser;

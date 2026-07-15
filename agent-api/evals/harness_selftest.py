@@ -115,7 +115,9 @@ def test_tool_exposure() -> None:
             self.name = n
             self.description = d
 
-    core = [T("cloudwatch_search_logs"), T("crawler_find"), T("fs_write"), T("write_todos")]
+    # codegraph_ is a core family prefix (see tool_disclosure._DEFAULT_KEEP_PREFIXES);
+    # the older crawler_ name was renamed to codegraph_ in the code-intelligence pass.
+    core = [T("cloudwatch_search_logs"), T("codegraph_find"), T("fs_write"), T("write_todos")]
     _words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
               "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
               "quebec", "romeo", "sierra", "tango"]
@@ -1643,6 +1645,39 @@ async def test_edit_tools() -> None:
     check("create_file gated ask", evaluate("create_file") == "ask")
     check("create_file auto_allow→allow", evaluate("create_file", mode="auto_allow") == "allow")
 
+    # Dynamic MCP-tool classification: we can't enumerate user-added server tool
+    # names, so mutation is inferred from the generic verb heuristic / server
+    # annotations, NOT a hardcoded name list.
+    from app.harness.tool_permissions import classify_tool_mutation, _looks_like_mutation
+
+    # verb heuristic on names the suffix globs miss
+    check("mcp create verb → ask", evaluate("ado__wit_create_work_item") == "ask")
+    check("mcp add-comment verb → ask", evaluate("ado__wit_add_work_item_comment") == "ask")
+    check("mcp read tool → allow", evaluate("cloudwatch__describe_log_groups") == "allow")
+    check("mcp get tool → allow", evaluate("ado__wit_get_work_item") == "allow")
+    check("crawler_search → allow", evaluate("crawler_search") == "allow")
+    check("_looks_like_mutation create", _looks_like_mutation("x__wit_create_work_item"))
+    check("_looks_like_mutation not on describe", not _looks_like_mutation("cw__describe_log_groups"))
+
+    # explicit MCP annotations are authoritative and override the name heuristic
+    class _FakeTool:
+        def __init__(self, name, read_only_hint=None, destructive_hint=None):
+            self.name = name
+            self.read_only_hint = read_only_hint
+            self.destructive_hint = destructive_hint
+
+    # a "create"-named tool the server marks read-only → not a mutation
+    ro = _FakeTool("srv__create_report_view", read_only_hint=True)
+    check("annotation readOnly wins over verb", classify_tool_mutation(ro) is False)
+    check("annotation readOnly → allow", evaluate(ro.name, mutates=classify_tool_mutation(ro)) == "allow")
+    # a benignly-named tool the server marks destructive → mutation
+    dh = _FakeTool("srv__process_batch", destructive_hint=True)
+    check("annotation destructive → True", classify_tool_mutation(dh) is True)
+    check("annotation destructive → ask", evaluate(dh.name, mutates=classify_tool_mutation(dh)) == "ask")
+    # unknown tool, no annotation, no verb → unknown (None) → allow (fail-open read)
+    unk = _FakeTool("srv__foobar")
+    check("unknown tool → None", classify_tool_mutation(unk) is None)
+
     root = tempfile.mkdtemp(prefix="harness_edit_")
     _orig_root = settings.repos_base_path
     settings.repos_base_path = root
@@ -2224,6 +2259,24 @@ def test_policy_engine() -> None:
           all(p in eff_add for p in DEFAULT_ASK_PATTERNS), str(eff_add))
     check("policy adds os-tool gate on top of defaults", "terminal" in eff_add)
 
+    # ── supervise_tools policy type carries risk tiers ─────────────────────────
+    sup = policy.resolve([
+        {"type": "supervise_tools", "params": {"low": ["fs_write*"], "high": ["edit_file"]}},
+    ])
+    check("supervise_tools low tier", sup.low_risk_patterns == ("fs_write*",))
+    check("supervise_tools high tier", sup.high_risk_patterns == ("edit_file",))
+    # platform defaults seed tiers from settings when a policy didn't set them
+    sup_def = policy.resolve_with_platform_defaults(None)
+    check("supervise_tools tiers default from settings",
+          "pin_fact" in sup_def.low_risk_patterns and "run_command" in sup_def.high_risk_patterns,
+          f"low={sup_def.low_risk_patterns} high={sup_def.high_risk_patterns}")
+    # a policy that sets tiers wins over the default
+    sup_over = policy.resolve_with_platform_defaults([
+        {"type": "supervise_tools", "params": {"low": ["only_this"]}},
+    ])
+    check("supervise_tools policy tiers win over default",
+          sup_over.low_risk_patterns == ("only_this",))
+
     # ── apply_to_tools gates ask tools and force-denies deny patterns ──────────
     from langchain_core.tools import StructuredTool
 
@@ -2645,6 +2698,86 @@ def test_seed_skill_library() -> None:
     for name in ("log-error-triage", "cloudwatch-alarm-drilldown", "service-restart-checklist"):
         check(f"seed skill '{name}' loads", name in loaded, str(sorted(loaded)))
         check(f"seed skill '{name}' resolves via slash", m.resolve_command("/" + name) is not None)
+
+
+async def test_skill_tool_wiring() -> None:
+    """Two-stage skill disclosure: listing, pinned skill tool, slash expand,
+    $ARGUMENTS, scoping, and flag defaults. DB-free."""
+    from pathlib import Path
+    from app.config import settings
+    from app.core.skills.manager import SkillManager
+    from app.harness.tool_disclosure import _ALWAYS_KEEP_NAMES
+    from app.harness.skill_tools import build_skill_tool, expand_slash_command
+
+    _SEEDS = ("log-error-triage", "cloudwatch-alarm-drilldown", "service-restart-checklist")
+
+    # Flag defaults: skill tool ON, legacy RAG fallback OFF.
+    check("flag skill_tool_enabled default True", settings.skill_tool_enabled is True)
+    check("flag skill_rag_selection_enabled default False",
+          settings.skill_rag_selection_enabled is False)
+
+    # skill tool is pinned so progressive disclosure never defers it.
+    check("'skill' pinned in _ALWAYS_KEEP_NAMES", "skill" in _ALWAYS_KEEP_NAMES)
+
+    m = SkillManager(skills_dir=Path("data/skills"))
+    m.scan_skills()
+
+    # Listing: compact, within budget, contains every seed name.
+    listing = m.build_listing(char_budget=8000, entry_cap=250)
+    check("listing within budget", len(listing) <= 8000, str(len(listing)))
+    for name in _SEEDS:
+        check(f"listing lists '{name}'", name in listing)
+
+    # Listing scoping: only the allowed skill is listed.
+    scoped = m.build_listing(allowed={"log-error-triage"})
+    check("scoped listing keeps allowed", "log-error-triage" in scoped)
+    check("scoped listing drops others", "service-restart-checklist" not in scoped)
+
+    # build_listing per-entry cap holds.
+    capped = m.build_listing(entry_cap=40)
+    check("listing entry cap holds",
+          all(len(ln) <= 40 for ln in capped.splitlines() if ln.strip()), capped)
+
+    # Skill tool: happy path returns the framed runbook body.
+    tool = build_skill_tool(allowed_skills=None, execution_id="selftest", invoked_sink=[])
+    check("skill tool named 'skill'", getattr(tool, "name", "") == "skill")
+    out = await tool.ainvoke({"skill": "log-error-triage", "args": ""})
+    check("skill tool frames body", "<skill_instructions" in out and "Loaded skill" in out, out[:120])
+    check("skill tool body carries runbook", "Protocol" in out)
+
+    # Leading slash tolerated + invoked_sink records the load.
+    sink: list = []
+    tool2 = build_skill_tool(allowed_skills=None, invoked_sink=sink)
+    out2 = await tool2.ainvoke({"skill": "/log-error-triage"})
+    check("skill tool tolerates leading slash", "Loaded skill" in out2)
+    check("skill tool records invocation in sink", sink == ["log-error-triage"], str(sink))
+
+    # Unknown skill → error string listing available names (no raise).
+    out3 = await tool.ainvoke({"skill": "does-not-exist"})
+    check("skill tool unknown → error", out3.startswith("[skill error]") and "log-error-triage" in out3)
+
+    # Scoping: a real skill outside the agent's allow-set is rejected.
+    tool_scoped = build_skill_tool(allowed_skills={"cloudwatch-alarm-drilldown"})
+    out4 = await tool_scoped.ainvoke({"skill": "log-error-triage"})
+    check("skill tool enforces scoping", out4.startswith("[skill error]") and "not available" in out4)
+
+    # Slash expansion: body + args, and unknown/non-slash passthrough.
+    exp = expand_slash_command("/log-error-triage payments 500s", None)
+    check("slash expands to (query, name)", exp is not None and exp[1] == "log-error-triage")
+    check("slash expansion carries body", "Protocol" in exp[0])
+    check("slash expansion carries args", "payments 500s" in exp[0])
+    check("slash unknown name passthrough", expand_slash_command("/nope do a thing", None) is None)
+    check("non-slash passthrough", expand_slash_command("why are errors spiking?", None) is None)
+    check("slash respects scoping",
+          expand_slash_command("/log-error-triage x", {"other-skill"}) is None)
+
+    # $ARGUMENTS substitution: when the body has the placeholder, args go inline
+    # (no separate "## User Request" section).
+    from app.core.skills.manager import Skill
+    _sk = Skill(name="argtest", description="d", content="Do: $ARGUMENTS now",
+                skill_dir=Path("."), config_vars={})
+    msg = m.build_invocation_message(_sk, user_instruction="the-work")
+    check("$ARGUMENTS substituted inline", "Do: the-work now" in msg and "## User Request" not in msg)
 
 
 # ── conversational-intent gate (greetings skip the pre-scan) ──────────────────
@@ -3590,6 +3723,89 @@ async def test_subagent_compiled_cache() -> None:
         sf._COMPILED_CHILD_CACHE.clear()
 
 
+async def test_subagent_model_precedence() -> None:
+    """Child LLM precedence:
+    global override > per-def model > inherit parent (default) > 'subagent' role.
+
+    Regression guard for the reported bug: an unpinned child with a parent LLM
+    now INHERITS it and no longer lets a stale 'subagent' gateway-role
+    assignment silently override the workflow's chosen model."""
+    from app.config import settings
+    from app.harness import subagent_factory as sf
+    import app.harness.engine as engine_mod
+    import app.workflow.llm_config as llm_config_mod
+    import app.workflow.strategies.react.llm_factory as llmf
+    from app.infrastructure.persistence import model_role_repository
+
+    captured: Dict[str, Any] = {}
+
+    async def _fake_run_once(spec, llm, tools, q, **kw):
+        captured["llm"] = llm
+        return {"final_answer": "ok", "messages": [], "tool_calls": []}
+
+    async def _fake_resolve_by_name(name):
+        return {"provider": "bedrock", "model": name}
+
+    async def _fake_resolve_for_role(role):
+        return {"provider": "bedrock", "model": "role-model"}
+
+    role_calls = {"n": 0}
+
+    async def _fake_role_get(role):
+        role_calls["n"] += 1
+        return "role-config"
+
+    orig_run = engine_mod.run_agent_once
+    orig_resolve = llm_config_mod.resolve_llm_config_by_name
+    orig_role_resolve = llm_config_mod.resolve_llm_config_for_role
+    orig_role_get = model_role_repository.get
+    orig_bl = llmf.build_llm
+    orig_override = settings.subagent_model_override
+
+    engine_mod.run_agent_once = _fake_run_once
+    llm_config_mod.resolve_llm_config_by_name = _fake_resolve_by_name
+    llm_config_mod.resolve_llm_config_for_role = _fake_resolve_for_role
+    model_role_repository.get = _fake_role_get
+    llmf.build_llm = lambda cfg: f"llm:{cfg['model']}"
+    settings.subagent_model_override = None
+
+    _kw = dict(
+        sub_tools=[], agent_config={"engine": "native"}, role_prompt=None,
+        capabilities=[], output_schema=None, depth_remaining=1,
+        parent_execution_id="p", timeout_s=0, output_max=4000, task="t",
+    )
+    try:
+        # 1. Per-def model wins; the role is never consulted.
+        role_calls["n"] = 0
+        captured.clear()
+        await sf._run_child(llm="parent-llm", name="c1", model_name="cheap-model", **_kw)
+        check("subagent precedence: per-def model used", captured.get("llm") == "llm:cheap-model")
+        check("subagent precedence: per-def skips role lookup", role_calls["n"] == 0)
+
+        # 2. Unpinned child inherits the PARENT llm even when a role is assigned.
+        role_calls["n"] = 0
+        captured.clear()
+        await sf._run_child(llm="parent-llm", name="c2", model_name=None, **_kw)
+        check("subagent precedence: unpinned child inherits parent (role does NOT override)",
+              captured.get("llm") == "parent-llm")
+        check("subagent precedence: role not consulted when a parent LLM exists",
+              role_calls["n"] == 0)
+
+        # 3. Global override beats a per-def model.
+        settings.subagent_model_override = "forced-model"
+        captured.clear()
+        await sf._run_child(llm="parent-llm", name="c3", model_name="cheap-model", **_kw)
+        check("subagent precedence: global override beats per-def",
+              captured.get("llm") == "llm:forced-model")
+    finally:
+        engine_mod.run_agent_once = orig_run
+        llm_config_mod.resolve_llm_config_by_name = orig_resolve
+        llm_config_mod.resolve_llm_config_for_role = orig_role_resolve
+        model_role_repository.get = orig_role_get
+        llmf.build_llm = orig_bl
+        settings.subagent_model_override = orig_override
+
+
 async def test_delegation_phase_b() -> None:
     """Phase B delegation: config bounds, BLOCKED_TOOLS safety, parallel/async tools."""
     from app.harness import subagent_factory as sf
@@ -3680,8 +3896,8 @@ async def test_delegation_phase_b() -> None:
                                        subagent_defs=[]) is None)
 
     # ── 3b. delegate descriptions surface each specialist's ACTUAL tools + a
-    #    route-by-capability steer (mirrors claude-code-main formatAgentLine),
-    #    so the parent keeps direct-tool work (e.g. CloudWatch) on itself and
+    #    route-by-capability steer, so the parent keeps direct-tool work
+    #    (e.g. CloudWatch) on itself and
     #    doesn't misroute to a name-mismatched squad. Reproduces the workflow-13
     #    "CloudWatch Squad" that was scoped to code/DB tools, no cloudwatch. ────
     _misnamed = [{"name": "cloudwatch-squad", "description": "",
@@ -3777,10 +3993,10 @@ async def test_delegation_phase_b() -> None:
 
     # ── 7. unified subagent-def schema: disallowedTools / max_turns /
     #    permission_mode / model="inherit" all thread through _run_child ──────
-    crawler_tool = _FakeTool("crawler_find_symbol")
+    crawler_tool = _FakeTool("codegraph__find_symbol")
     defs_full = [{
         "name": "scoped-spec", "description": "scoped specialist",
-        "tools": ["crawler_*", "cloudwatch_*"],
+        "tools": ["codegraph__*", "cloudwatch_*"],
         "disallowedTools": ["cloudwatch_scan"],
         "model": "inherit",
         "max_turns": 4,
@@ -3792,7 +4008,7 @@ async def test_delegation_phase_b() -> None:
     )[0]
     check("unified schema builds delegate_to_scoped_spec", scoped_tool.name == "delegate_to_scoped_spec")
     has_ca, has_cw = sf._infer_child_context_flags([crawler_tool])
-    check("has_code_analyzer inferred from crawler_* tools", has_ca is True and has_cw is False)
+    check("has_code_analyzer inferred from codegraph__* tools", has_ca is True and has_cw is False)
 
     # ── 8. _combine_context: metamemory handoff prepended to explicit context ──
     from app.core.vfs import vfs_write as _vw2, vfs_drop_session as _vd2
@@ -4381,6 +4597,313 @@ def test_code_semantic() -> None:
     check("code_semantic: default is the fast arctic tier", DEFAULT_MODEL_KEY == "snowflake-arctic-embed-s")
 
 
+async def test_phase0_substrate() -> None:
+    """Phase 0 substrate fixes: delegation-bounds fallback parity + the
+    make_checkpointer prefers-shared-saver repair."""
+    # (1) The subagent_factory no-settings fallback must equal the config default,
+    # so DB-free delegation doesn't silently under-block child mutations.
+    from app.config import DEFAULT_DELEGATION_BLOCKED_TOOLS
+    from app.harness import subagent_factory as _sf
+
+    default_patterns = [p.strip() for p in DEFAULT_DELEGATION_BLOCKED_TOOLS.split(",") if p.strip()]
+    # agent_config={} with settings present resolves via settings; force the
+    # no-settings branch by temporarily nulling the cached settings getter.
+    _orig = _sf._get_settings
+    try:
+        _sf._get_settings = lambda: None  # type: ignore
+        _, _, _, _, blocked = _sf._delegation_bounds({})
+    finally:
+        _sf._get_settings = _orig  # type: ignore
+    check("delegation fallback == config default", blocked == default_patterns,
+          f"{blocked} != {default_patterns}")
+    for must in ("fs_append", "fs_upsert", "fs_prune", "wiki_*"):
+        check(f"delegation blocks {must}", must in blocked)
+
+    # (2) make_checkpointer returns the shared pooled saver when present, and
+    # never crashes to None when it isn't (falls back to in-memory).
+    from app.harness import hitl as _hitl
+    from app.harness import runtime as _rt
+
+    _sentinel = object()
+    _orig_saver = _rt._saver
+    try:
+        _rt._saver = _sentinel  # type: ignore
+        got = await _hitl.make_checkpointer()
+        check("make_checkpointer prefers shared saver", got is _sentinel)
+        _rt._saver = None  # type: ignore
+        fallback = await _hitl.make_checkpointer()
+        check("make_checkpointer falls back (not None)", fallback is not None)
+    finally:
+        _rt._saver = _orig_saver  # type: ignore
+
+
+async def test_phase1_action_approval() -> None:
+    """Phase 1: the shared request_action_approval primitive — approve / deny /
+    timeout / no-channel, and that the card carries the supervisor fields."""
+    import asyncio as _aio
+    from app.harness.tool_permissions import request_action_approval
+
+    class _FakePort:
+        def __init__(self):
+            # Non-empty: the primitive treats an empty runtime as "no channel"
+            # (production runtimes always carry event_queue etc.).
+            self.runtime: dict = {"event_queue": None}
+            self.published: list = []
+
+        def get_runtime(self, _eid):
+            return self.runtime
+
+        async def publish_hitl_pause(self, _eid, data):
+            self.published.append(data)
+
+    async def _resolve_soon(port, payload):
+        for _ in range(200):
+            if port.runtime.get("tool_approvals"):
+                break
+            await _aio.sleep(0.005)
+        _rid, fut = next(iter(port.runtime["tool_approvals"].items()))
+        if not fut.done():
+            fut.set_result(payload)
+
+    # approve — card carries risk_tier / supervisor fields
+    port = _FakePort()
+    t = _aio.create_task(_resolve_soon(port, {"approved": True, "reason": "ok", "decided_by": "operator"}))
+    approved, reason, decided_by = await request_action_approval(
+        "exec1", port, "edit_file", {"file": "x"},
+        risk_tier="high", supervisor_verdict="escalate", supervisor_reasoning="risky",
+    )
+    await t
+    check("action approve", approved is True and decided_by == "operator", f"{approved}/{decided_by}")
+    check("card carries risk_tier", bool(port.published) and port.published[0].get("risk_tier") == "high")
+    check("card carries supervisor verdict", port.published[0].get("supervisor_verdict") == "escalate")
+
+    # deny
+    port2 = _FakePort()
+    t2 = _aio.create_task(_resolve_soon(port2, {"approved": False, "reason": "no", "decided_by": "operator"}))
+    denied, reason2, _ = await request_action_approval("exec2", port2, "edit_file", {"file": "y"})
+    await t2
+    check("action deny", denied is False and reason2 == "no", f"{denied}/{reason2}")
+
+    # timeout → blocked
+    port3 = _FakePort()
+    to_ok, _to_reason, _ = await request_action_approval("exec3", port3, "edit_file", {"file": "z"}, timeout_s=0.05)
+    check("action timeout → blocked", to_ok is False)
+
+    # no approval channel → fail-safe blocked
+    class _NoPort:
+        def get_runtime(self, _eid):
+            return {}
+
+        async def publish_hitl_pause(self, _eid, _data):
+            pass
+
+    nc_ok, _nc_reason, _ = await request_action_approval("exec4", _NoPort(), "wiki_publish", {})
+    check("action no-channel → blocked", nc_ok is False)
+
+
+async def test_phase2_action_supervisor() -> None:
+    """Phase 2: Action Supervisor review + tier classification + shadow-mode
+    integration through the approval primitive."""
+    import asyncio as _aio
+    import importlib
+    # The app.core.llm package re-exports call_llm, so `import ... as _cl` would
+    # bind the function (name collision). Grab the real submodule to monkeypatch.
+    _cl = importlib.import_module("app.core.llm.call_llm")
+    from app.config import settings as _s
+    from app.core.supervision import action_supervisor as _sup
+    from app.harness.tool_permissions import request_action_approval
+
+    # tier classification from the settings CSV defaults
+    check("tier low: pin_fact", _sup.classify_risk_tier("pin_fact") == "low")
+    check("tier high: edit_file", _sup.classify_risk_tier("edit_file") == "high")
+    check("tier high: unknown → high (fail toward human)",
+          _sup.classify_risk_tier("some_unknown_write") == "high")
+
+    _orig_call = _cl.call_llm
+
+    async def _fake_ok(_prompt, **_k):
+        return ('{"decision":"approve","reasoning":"routine scratch write"}', 0, 0, False)
+
+    async def _fake_err(_prompt, **_k):
+        raise RuntimeError("boom")
+
+    # review parses the verdict and stamps the tier
+    _cl.call_llm = _fake_ok
+    v = await _sup.review("pin_fact", {"content": "x"})
+    check("review approve parsed", v.decision == "approve" and v.risk_tier == "low", str(v))
+    # any error → escalate (never silently approve)
+    _cl.call_llm = _fake_err
+    v2 = await _sup.review("edit_file", {"file": "y"})
+    check("review error → escalate", v2.decision == "escalate" and v2.risk_tier == "high", str(v2))
+
+    # shadow-mode integration: when enabled, the primitive auto-reviews and the
+    # card carries the verdict, but the human still decides.
+    class _FakePort:
+        def __init__(self):
+            self.runtime = {"event_queue": None}
+            self.published: list = []
+
+        def get_runtime(self, _eid):
+            return self.runtime
+
+        async def publish_hitl_pause(self, _eid, data):
+            self.published.append(data)
+
+    async def _approve_soon(port):
+        for _ in range(200):
+            if port.runtime.get("tool_approvals"):
+                break
+            await _aio.sleep(0.005)
+        _rid, fut = next(iter(port.runtime["tool_approvals"].items()))
+        if not fut.done():
+            fut.set_result({"approved": True, "reason": "ok", "decided_by": "operator"})
+
+    _prev_enabled = getattr(_s, "action_supervisor_enabled", False)
+    _prev_shadow = getattr(_s, "action_supervisor_shadow_mode", True)
+    _s.action_supervisor_enabled = True
+    _s.action_supervisor_shadow_mode = True
+    _cl.call_llm = _fake_ok
+    try:
+        port = _FakePort()
+        t = _aio.create_task(_approve_soon(port))
+        approved, _reason, decided_by = await request_action_approval(
+            "e-shadow", port, "pin_fact", {"content": "x"},
+        )
+        await t
+        # shadow mode: human decided (operator), not the supervisor
+        check("shadow: human decides", approved is True and decided_by == "operator")
+        check("shadow: card carries supervisor verdict",
+              bool(port.published) and port.published[0].get("supervisor_verdict") == "approve",
+              str(port.published[:1]))
+        check("shadow: card carries risk tier", port.published[0].get("risk_tier") == "low")
+    finally:
+        _s.action_supervisor_enabled = _prev_enabled
+        _s.action_supervisor_shadow_mode = _prev_shadow
+        _cl.call_llm = _orig_call
+
+
+async def test_phase3_tiered_enforcement() -> None:
+    """Phase 3: with enforcement on (shadow off), the Supervisor auto-decides
+    LOW-risk actions (no card), while HIGH-risk actions still reach the human."""
+    import asyncio as _aio
+    import importlib
+    _cl = importlib.import_module("app.core.llm.call_llm")
+    from app.config import settings as _s
+    from app.harness.tool_permissions import request_action_approval, evaluate
+
+    # fs_* mutations + pin_fact now route through the gate (added in Phase 3).
+    check("pin_fact gated ask", evaluate("pin_fact") == "ask")
+    check("fs_append gated ask", evaluate("fs_append") == "ask")
+    check("fs_upsert gated ask", evaluate("fs_upsert") == "ask")
+    check("fs_prune gated ask", evaluate("fs_prune") == "ask")
+
+    class _FakePort:
+        def __init__(self):
+            self.runtime = {"event_queue": None}
+            self.published = []
+            self.supervisor_events = []
+
+        def get_runtime(self, _eid):
+            return self.runtime
+
+        async def publish_hitl_pause(self, _eid, data):
+            self.published.append(data)
+
+        async def publish_supervisor_decision(self, _eid, data):
+            self.supervisor_events.append(data)
+
+    _orig = _cl.call_llm
+    _prev_enabled = getattr(_s, "action_supervisor_enabled", False)
+    _prev_shadow = getattr(_s, "action_supervisor_shadow_mode", True)
+    _s.action_supervisor_enabled = True
+    _s.action_supervisor_shadow_mode = False  # enforcement ON
+    try:
+        # LOW-risk approve → auto-resolved by supervisor, no human card
+        async def _ok(_p, **_k):
+            return ('{"decision":"approve","reasoning":"routine"}', 0, 0, False)
+        _cl.call_llm = _ok
+        port = _FakePort()
+        approved, _r, decided_by = await request_action_approval(
+            "e-low-ok", port, "pin_fact", {"content": "x"},
+        )
+        check("low approve → supervisor decides", approved is True and decided_by == "supervisor")
+        check("low approve → no human card", port.published == [])
+        check("low approve → supervisor_decision event", len(port.supervisor_events) == 1)
+
+        # LOW-risk deny → auto-blocked, no card
+        async def _deny(_p, **_k):
+            return ('{"decision":"deny","reasoning":"out of scope"}', 0, 0, False)
+        _cl.call_llm = _deny
+        port2 = _FakePort()
+        d_ok, d_reason, d_by = await request_action_approval(
+            "e-low-deny", port2, "fs_append", {"path": "/x"},
+        )
+        check("low deny → supervisor blocks", d_ok is False and d_by == "supervisor")
+        check("low deny → no human card", port2.published == [])
+
+        # HIGH-risk approve → still escalates to a human card (advisory only)
+        _cl.call_llm = _ok
+        port3 = _FakePort()
+
+        async def _human_approve(port):
+            for _ in range(200):
+                if port.runtime.get("tool_approvals"):
+                    break
+                await _aio.sleep(0.005)
+            _rid, fut = next(iter(port.runtime["tool_approvals"].items()))
+            if not fut.done():
+                fut.set_result({"approved": True, "reason": "ok", "decided_by": "operator"})
+        t = _aio.create_task(_human_approve(port3))
+        h_ok, _hr, h_by = await request_action_approval(
+            "e-high", port3, "edit_file", {"file": "y"},
+        )
+        await t
+        check("high → human card raised", len(port3.published) == 1)
+        check("high → human decides (not supervisor)", h_ok is True and h_by == "operator")
+        check("high card carries advisory verdict",
+              port3.published[0].get("supervisor_verdict") == "approve"
+              and port3.published[0].get("risk_tier") == "high")
+    finally:
+        _s.action_supervisor_enabled = _prev_enabled
+        _s.action_supervisor_shadow_mode = _prev_shadow
+        _cl.call_llm = _orig
+
+
+async def test_phase4_supervised_autolearn() -> None:
+    """Phase 4: self-improvement skill drafts route through the Action Supervisor
+    — deny/escalate skip the draft, approve lets it through; disabled = unchanged."""
+    import importlib
+    from app.config import settings as _s
+    from app.core.improvement import apply as _ap
+    _cl = importlib.import_module("app.core.llm.call_llm")
+
+    prop = {"kind": "skill", "status": "draft",
+            "suggestion": "do X when Y happens", "rationale": "recurring pattern"}
+    _orig = _cl.call_llm
+    _prev = getattr(_s, "action_supervisor_enabled", False)
+
+    # supervisor OFF → gate is a no-op (unchanged behaviour)
+    _s.action_supervisor_enabled = False
+    check("autolearn gate off → allow", await _ap._supervise_skill_write(prop) is True)
+
+    _s.action_supervisor_enabled = True
+    try:
+        async def _deny(_p, **_k):
+            return ('{"decision":"deny","reasoning":"out of scope"}', 0, 0, False)
+        _cl.call_llm = _deny
+        check("autolearn deny → gate blocks", await _ap._supervise_skill_write(prop) is False)
+        # _apply_skill_proposal must skip (return False) without writing on deny
+        check("autolearn deny → apply skips", await _ap._apply_skill_proposal(prop) is False)
+
+        async def _ok(_p, **_k):
+            return ('{"decision":"approve","reasoning":"safe draft"}', 0, 0, False)
+        _cl.call_llm = _ok
+        check("autolearn approve → gate allows", await _ap._supervise_skill_write(prop) is True)
+    finally:
+        _s.action_supervisor_enabled = _prev
+        _cl.call_llm = _orig
+
+
 async def _main() -> int:
     print("=== Agent Harness self-test ===")
     test_import_order_no_cycles()
@@ -4389,6 +4912,11 @@ async def _main() -> int:
     test_tool_exposure()
     test_boto_context_overflow_classifier()
     test_engine_resolution()
+    await test_phase0_substrate()
+    await test_phase1_action_approval()
+    await test_phase2_action_supervisor()
+    await test_phase3_tiered_enforcement()
+    await test_phase4_supervised_autolearn()
     await test_engine_native_dispatch()
     await test_turn_loop_happy_path()
     await test_turn_loop_tool_call_then_complete()
@@ -4451,6 +4979,7 @@ async def _main() -> int:
     test_fact_extractor()
     test_memory_audit_logic()
     test_seed_skill_library()
+    await test_skill_tool_wiring()
     test_conversational_intent()
     test_cloudwatch_prescan_gate()
     await test_tool_assembler_degrade_not_abort()
@@ -4466,6 +4995,7 @@ async def _main() -> int:
     await test_delegate_batch_budget_economy()
     # ── Phase 5: delegated children route through the engine flag ──
     await test_subagent_engine_routing()
+    await test_subagent_model_precedence()
     # ── LangGraph perf knobs: durability/max_concurrency + stream_mode v2 ──
     await test_agent_durability_and_max_concurrency()
     await test_stream_mode_v2()

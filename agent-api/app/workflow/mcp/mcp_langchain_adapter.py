@@ -25,6 +25,35 @@ logger = logging.getLogger(__name__)
 
 _BEDROCK_TOOL_NAME_LIMIT = 64
 
+# Timestamp arg keys the CloudWatch tools accept; a literal "now" here trips the
+# server's datetime.fromisoformat(). Normalized to a real ISO-8601 value.
+_CW_TIME_KEYS = ("start_time", "end_time", "startTime", "endTime", "start", "end")
+
+
+def _normalize_cloudwatch_args(kwargs: Dict[str, Any]) -> None:
+    """In-place fix of common model mistakes in CloudWatch tool arguments.
+
+    1. ``dimensions``: SDK-style ``{"Name": .., "Value": ..}`` → the server's
+       expected ``{"name": .., "value": ..}`` (other keys left untouched).
+    2. Time args set to the literal ``"now"`` → current UTC ISO-8601 timestamp
+       (the server calls ``datetime.fromisoformat`` and rejects ``"now"``).
+    Best-effort and defensive: any unexpected shape is left as-is.
+    """
+    dims = kwargs.get("dimensions")
+    if isinstance(dims, list):
+        for d in dims:
+            if isinstance(d, dict):
+                if "Name" in d and "name" not in d:
+                    d["name"] = d.pop("Name")
+                if "Value" in d and "value" not in d:
+                    d["value"] = d.pop("Value")
+
+    for key in _CW_TIME_KEYS:
+        val = kwargs.get(key)
+        if isinstance(val, str) and val.strip().lower() == "now":
+            from datetime import datetime, timezone
+            kwargs[key] = datetime.now(timezone.utc).isoformat()
+
 
 def _safe_tool_name(server_id: str, tool_name: str) -> str:
     """Return a Bedrock-safe composite tool name (≤64 chars).
@@ -156,6 +185,12 @@ class MCPToolWrapper(BaseTool):
     mcp_manager: Any  # MCPClientManager — typed as Any to avoid circular imports
     args_schema: Optional[Type[BaseModel]] = None
     tool_timeout: Optional[float] = None  # seconds; None = use manager default
+    # MCP ToolAnnotations, when the server declares them. The permission gate
+    # (app.harness.tool_permissions.classify_tool_mutation) reads these as the
+    # authoritative mutate/read-only signal, so any user-added server is gated
+    # correctly without hardcoding its tool names. None = server didn't declare.
+    read_only_hint: Optional[bool] = None
+    destructive_hint: Optional[bool] = None
     # True when this tool came from a node with an explicit tool filter set — an
     # operator's deliberate allowlist. The relevance router must NOT prune these
     # (the user already chose them); see app.harness.tool_router.filter_tools.
@@ -198,6 +233,17 @@ class MCPToolWrapper(BaseTool):
         if self.project_aliases and "project" in clean_kwargs:
             _p = clean_kwargs["project"]
             clean_kwargs["project"] = self.project_aliases.get(_p, _p)
+
+        # CloudWatch arg normalization: the model tends to pass AWS-SDK-style
+        # values the awslabs cloudwatch-mcp-server rejects — dimensions as
+        # ``{"Name": .., "Value": ..}`` (the server wants lowercase name/value)
+        # and the literal ``"now"`` for a timestamp (the server does
+        # datetime.fromisoformat() → "Invalid isoformat string: 'now'"). Fix them
+        # here so a well-intentioned call doesn't waste a turn on a validation
+        # error. Gated on the ``cloudwatch__`` name prefix so no other server is
+        # touched.
+        if self.name.startswith("cloudwatch__"):
+            _normalize_cloudwatch_args(clean_kwargs)
 
         result = await self.mcp_manager.execute_tool(
             server_id=self.server_id,
@@ -315,13 +361,27 @@ def build_langchain_tools(
             )
             input_schema = mcp_tool_obj.get("inputSchema") if mcp_tool_obj else None
             args_schema = _build_input_schema(input_schema)
+            read_only_hint = mcp_tool_obj.get("readOnlyHint") if mcp_tool_obj else None
+            destructive_hint = mcp_tool_obj.get("destructiveHint") if mcp_tool_obj else None
 
-            composite_name = _safe_tool_name(server_id, tool_name)
-            if composite_name != f"{server_id}__{tool_name}":
+            # Agent-facing name follows the ``{server}__{tool}`` convention (the
+            # same one codegraph tools and subagent tool globs use, e.g.
+            # ``cloudwatch__*``). server_id here is the internal connection key
+            # ``{node_id}__{server}`` (e.g. ``mcp_server_1784...__cloudwatch``);
+            # naming tools with that full key produced ``mcp_server_1784...__
+            # cloudwatch__describe_log_groups``, which a ``cloudwatch__*`` squad
+            # glob can never match — so CloudWatch tools silently failed to scope
+            # onto the subagent (and, worse, weren't stripped from the parent).
+            # Strip the node_id prefix for the display name; routing still uses
+            # the unchanged server_id/tool_name fields on the wrapper. Also keeps
+            # names well under Bedrock's 64-char cap.
+            display_server = server_id.split("__", 1)[1] if "__" in server_id else server_id
+            composite_name = _safe_tool_name(display_server, tool_name)
+            if composite_name != f"{display_server}__{tool_name}":
                 logger.warning(
                     "build_langchain_tools: tool name truncated to fit Bedrock 64-char limit "
                     "'%s' → '%s'",
-                    f"{server_id}__{tool_name}", composite_name,
+                    f"{display_server}__{tool_name}", composite_name,
                 )
             tool = MCPToolWrapper(
                 name=composite_name,
@@ -332,6 +392,8 @@ def build_langchain_tools(
                 args_schema=args_schema,
                 tool_timeout=tool_timeout,
                 router_pinned=_server_pinned,
+                read_only_hint=read_only_hint,
+                destructive_hint=destructive_hint,
             )
             langchain_tools.append(tool)
 
@@ -370,9 +432,16 @@ def _get_tool_metadata(mcp_manager: Any, server_id: str, tool_name: str) -> Opti
     server_tools = tool_objects.get(server_id, {})
     if tool_name in server_tools:
         tool_obj = server_tools[tool_name]
+        # MCP ToolAnnotations (readOnlyHint / destructiveHint) are the
+        # server-declared, authoritative signal for whether a tool mutates
+        # state. Surface them so the permission gate can classify user-added
+        # servers dynamically instead of guessing from the tool name.
+        annotations = getattr(tool_obj, "annotations", None)
         return {
             "description": getattr(tool_obj, "description", ""),
             "inputSchema": getattr(tool_obj, "inputSchema", None),
+            "readOnlyHint": getattr(annotations, "readOnlyHint", None) if annotations else None,
+            "destructiveHint": getattr(annotations, "destructiveHint", None) if annotations else None,
         }
     logger.debug(
         "MCP: no cached metadata for tool '%s' on server '%s' — "

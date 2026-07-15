@@ -1,17 +1,20 @@
-"""LLM call wrapper for crawler flows.
+"""Shared DB-resolved LLM call wrapper.
 
 Resolves the model and transport from the DB-configured LLM (Settings page),
 exactly the same way the ReAct workflow strategy does.  Falls back to the
 CRAWLER_MODEL / PROVIDER_TRANSPORT env vars only when no DB config exists.
 
 Wraps the project's existing transport layer (Anthropic/Bedrock) with:
-  - Postgres prompt cache (app.crawler.cache)
-  - Per-node token accounting for the flow_runs trace
+  - Postgres prompt cache (app.core.llm.cache)
   - A fixed low-temperature setting appropriate for structured extraction
+
+Used across the app (graders, supervision, memory extraction, session
+summaries, semantic memory) — the model is chosen via the "crawler" gateway
+role, kept for backward compatibility with existing role assignments.
 
 Usage::
 
-    from app.crawler.call_llm import call_llm
+    from app.core.llm.call_llm import call_llm
 
     response, tokens_in, tokens_out, was_cached = await call_llm(prompt="...")
 """
@@ -23,7 +26,7 @@ from typing import Any, Dict, Optional, Tuple
 from app.config import settings
 
 from app.core.transport.provider import TransportMessage
-from app.crawler.cache import get_cached, put_cached
+from app.core.llm.cache import get_cached, put_cached
 
 logger = logging.getLogger(__name__)
 
@@ -51,24 +54,19 @@ def _apply_inference_profile(model: str, region: str) -> str:
     return f"us.{model}"
 
 
-def _select_model_for_tier(
-    cfg: Dict[str, Any], tier: str, explicit: Optional[str]
-) -> str:
-    """Pick the model ID for a crawler call given its *tier*.
+def _select_model(cfg: Dict[str, Any], explicit: Optional[str]) -> str:
+    """Pick the model ID for a call.
 
-    Precedence: an explicit per-call ``model_id`` wins; then the tier-specific
-    opt-in setting (``crawler_index_model`` for indexing, ``crawler_model_override``
-    for search flows); otherwise the DB-resolved model (already profile-remapped
-    in ``_resolve_llm_config``). Both tier settings default to None, so the DB
-    model is used until an operator opts a tier into a cheaper model — and has
+    Precedence: an explicit per-call ``model_id`` wins; then the opt-in
+    ``crawler_model_override`` setting; otherwise the DB-resolved model (already
+    profile-remapped in ``_resolve_llm_config``). The override defaults to None,
+    so the DB model is used until an operator opts into a cheaper model — and has
     confirmed that model/inference-profile is enabled in their account. Non-DB
     choices get the same Bedrock inference-profile remap.
     """
     if explicit:
         chosen = explicit
-    elif tier == "index" and settings.crawler_index_model:
-        chosen = settings.crawler_index_model
-    elif tier != "index" and settings.crawler_model_override:
+    elif settings.crawler_model_override:
         chosen = settings.crawler_model_override
     else:
         return cfg["model"]
@@ -233,20 +231,19 @@ async def call_llm(
 
     Args:
         prompt:     The full prompt text.
-        model_id:   Override model identifier. When omitted the model is chosen
-                    by *tier* (see _select_model_for_tier).
+        model_id:   Override model identifier. When omitted the model follows
+                    ``crawler_model_override`` else the DB-resolved model.
         use_cache:  Whether to check/populate the Postgres prompt cache.
         max_tokens: Maximum tokens in the response.
-        tier:       Cost tier — "index" (background indexing, defaults to the
-                    cheap crawler_index_model) or "search" (semantic/find/trace/
-                    investigate, follows crawler_model_override else DB model).
+        tier:       Accepted for backward compatibility; no longer affects model
+                    selection.
 
     Returns:
         (response_text, tokens_in, tokens_out, was_cached)
         where *was_cached* is True when the response came from the prompt cache.
     """
     cfg   = await _resolve_llm_config()
-    model = _select_model_for_tier(cfg, tier, model_id)
+    model = _select_model(cfg, model_id)
 
     if use_cache:
         cached = await get_cached(prompt, model)

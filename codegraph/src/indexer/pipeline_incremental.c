@@ -652,10 +652,11 @@ static void dump_and_persist(cg_gbuf_t *gbuf, const char *db_path, const char *p
          * rebuild from the nodes table here.  See the full-dump path in
          * pipeline.c for the matching logic. */
         cg_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+        /* camel-split BOTH name and qualified_name (see pipeline.c for rationale). */
         if (cg_store_exec(hash_store,
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, cg_camel_split(name), qualified_name, label, file_path "
-                           "FROM nodes;") != CG_STORE_OK) {
+                           "SELECT id, cg_camel_split(name), cg_camel_split(qualified_name), label, "
+                           "file_path FROM nodes;") != CG_STORE_OK) {
             cg_store_exec(hash_store,
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
                            "SELECT id, name, qualified_name, label, file_path FROM nodes;");

@@ -914,10 +914,13 @@ static int dump_and_persist_hashes(cg_pipeline_t *p, const cg_file_info_t *files
          * Falls back to plain names if cg_camel_split is unavailable (which
          * shouldn't happen because we always register it, but we stay defensive). */
         cg_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+        /* camel-split BOTH name and qualified_name so dotted/nested identifiers
+         * (e.g. Foo.BatchRequest) match camelCase subtoken queries. unicode61
+         * already splits the dots; cg_camel_split adds the intra-segment split. */
         if (cg_store_exec(hash_store,
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, cg_camel_split(name), qualified_name, label, file_path "
-                           "FROM nodes;") != CG_STORE_OK) {
+                           "SELECT id, cg_camel_split(name), cg_camel_split(qualified_name), label, "
+                           "file_path FROM nodes;") != CG_STORE_OK) {
             cg_store_exec(hash_store,
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
                            "SELECT id, name, qualified_name, label, file_path FROM nodes;");

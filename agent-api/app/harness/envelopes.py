@@ -7,7 +7,7 @@ Two contracts, one rendering rule:
     (capped) payload, with an explicit truncation marker and a recovery hint on
     error. This is the single place a *uniform* output cap lives, so the gap
     where CloudWatch / DB / MCP tool outputs were uncapped (only the code
-    analyzer capped, via ``code_analyzer_tools._cap``) is closed by construction.
+    analyzer capped, via its own tool ``_cap`` helper) is closed by construction.
 
   * :class:`NodeOutput` — what a workflow node hands back to the executor. A
     typed envelope over the loose ``{"status": ..., "output": ...}`` dicts the

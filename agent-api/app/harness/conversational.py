@@ -4,7 +4,7 @@ When a turn is purely conversational (a greeting, a thank-you, or a "what can yo
 do / what tools are available" meta-question — see
 ``app.core.intent.is_conversational``), it needs no logs, no code search, and no
 DB. Routing it through the full agent build is wasteful: the model would still
-receive the full system prompt PLUS every bound tool schema (crawler, DB-schema,
+receive the full system prompt PLUS every bound tool schema (codegraph, DB-schema,
 vfs, planning, edit, delegate). That measured ~28K input tokens for a one-word "Hi".
 
 This module answers such turns with a SINGLE model call against a tiny,
@@ -23,7 +23,8 @@ from app.core.redact import redact
 
 
 def _capability_lines(
-    *, has_cloudwatch: bool, has_code_analyzer: bool, has_db: bool
+    *, has_cloudwatch: bool, has_code_analyzer: bool, has_db: bool,
+    skill_names: Optional[List[str]] = None,
 ) -> List[str]:
     """Bullet list of what the agent can actually do, given the wired nodes."""
     lines: List[str] = []
@@ -40,19 +41,29 @@ def _capability_lines(
         lines.append(
             "- Look up database schemas and run read-only queries against the connected databases."
         )
+    if skill_names:
+        # Cap the enumerated names so a large library doesn't bloat the prompt.
+        _shown = ", ".join(skill_names[:12])
+        _more = "" if len(skill_names) <= 12 else f", and {len(skill_names) - 12} more"
+        lines.append(
+            "- Apply reusable skills / runbooks for common procedures "
+            f"(e.g. {_shown}{_more})."
+        )
     if not lines:
         lines.append("- Answer engineering and operational questions.")
     return lines
 
 
 def _build_system_prompt(
-    *, has_cloudwatch: bool, has_code_analyzer: bool, has_db: bool
+    *, has_cloudwatch: bool, has_code_analyzer: bool, has_db: bool,
+    skill_names: Optional[List[str]] = None,
 ) -> str:
     caps = "\n".join(
         _capability_lines(
             has_cloudwatch=has_cloudwatch,
             has_code_analyzer=has_code_analyzer,
             has_db=has_db,
+            skill_names=skill_names,
         )
     )
     return (
@@ -76,6 +87,7 @@ async def conversational_reply(
     stream_callback: Any,
     execution_id: Optional[str],
     logger_instance: Any,
+    skill_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Answer a conversational turn with one tool-less model call.
 
@@ -90,6 +102,7 @@ async def conversational_reply(
         has_cloudwatch=has_cloudwatch,
         has_code_analyzer=has_code_analyzer,
         has_db=has_db,
+        skill_names=skill_names,
     )
 
     # Privacy boundary: swap PII for placeholders before the model sees the query;

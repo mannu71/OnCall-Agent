@@ -232,6 +232,19 @@ async def discover_log_groups_endpoint(
     )
 
 
+@router.get("/aws-profiles")
+async def list_aws_profiles_endpoint() -> Dict[str, Any]:
+    """List AWS profiles from the shared credentials/config files with expiry state.
+
+    Powers the CloudWatch node's profile dropdown so operators pick a *valid*
+    profile at the node level instead of blindly typing one. Offline — no STS
+    calls; expiry comes from each profile's recorded ``aws_expiration``.
+    """
+    from app.core.aws_credentials import list_aws_profiles
+    profiles = list_aws_profiles()
+    return {"profiles": profiles, "count": len(profiles)}
+
+
 @router.post("/metrics")
 async def query_metrics(request: MetricDataRequest) -> Dict[str, Any]:
     """Query CloudWatch Metrics using GetMetricData."""

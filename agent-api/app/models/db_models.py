@@ -393,6 +393,11 @@ class ToolApprovalModel(Base):
     reason = Column(Text)
     created_at = Column(DateTime(timezone=True), default=_utcnow)
     decided_at = Column(DateTime(timezone=True))
+    # Action Supervisor (migration 033): risk classification + advisory/decisive
+    # verdict recorded alongside the human decision above.
+    risk_tier = Column(String(10))            # low|high
+    supervisor_verdict = Column(String(20))   # approve|deny|escalate
+    supervisor_reasoning = Column(Text)
 
     __table_args__ = (
         UniqueConstraint("execution_id", "request_id", name="uq_tool_approvals_request"),

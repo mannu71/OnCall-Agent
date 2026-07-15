@@ -2,8 +2,11 @@
 
 Skills are ``SKILL.md`` markdown files (YAML frontmatter + body) discovered on
 disk. There is NO database and no separate "executable" skill store — a skill is
-reusable guidance the agent follows, auto-selected per query (RAG) or invoked by
-slash-command. See :mod:`app.core.skills.manager`.
+reusable guidance the agent follows. Two-stage disclosure: every turn the model
+sees a compact listing of available skills and loads a skill's full runbook on
+demand via the ``skill`` tool; a user ``/skill-name`` message expands it
+deterministically. A legacy RAG-injection fallback also exists. See
+:mod:`app.core.skills.manager`.
 """
 
 from pathlib import Path

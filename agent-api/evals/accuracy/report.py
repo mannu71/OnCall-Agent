@@ -24,7 +24,7 @@ def _fail_rows(rows: List[Dict[str, Any]], objective_only: bool = False) -> List
 
 
 def render(agg: Dict[str, Any]) -> str:
-    c = agg["crawler"]
+    c = agg["codegraph"]
     w = agg["cloudwatch"]
     today = _dt.date.today().isoformat()
     lines: List[str] = []

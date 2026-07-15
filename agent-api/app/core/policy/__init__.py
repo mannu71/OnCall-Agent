@@ -90,9 +90,14 @@ def resolve_with_platform_defaults(config: Optional[List[dict]]) -> ResolvedPoli
     from app.config import settings
     from app.harness.tool_permissions import DEFAULT_ASK_PATTERNS
 
+    def _csv(v: str) -> tuple:
+        return tuple(p.strip() for p in (v or "").split(",") if p.strip())
+
     return resolve(config).with_defaults(
         default_ask_patterns=DEFAULT_ASK_PATTERNS,
         default_output_cap_chars=settings.tool_output_max_chars,
+        default_low_risk_patterns=_csv(getattr(settings, "action_supervisor_low_risk_patterns", "")),
+        default_high_risk_patterns=_csv(getattr(settings, "action_supervisor_high_risk_patterns", "")),
     )
 
 

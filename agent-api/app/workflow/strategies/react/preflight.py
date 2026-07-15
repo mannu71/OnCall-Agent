@@ -10,7 +10,7 @@ auto-learn, trajectory save, structured output, and PII rehydration live in
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 from app.config import settings
@@ -20,25 +20,49 @@ from app.core.redact import redact
 from app.harness.context_builder import build_recall_query, seed_context_blocks
 from app.harness.spec import AgentSpec
 from app.harness.spec_factory import build_agent_spec, resolve_profile_fields
-from app.harness.tool_assembler import add_extension_tools, assemble_base_tools
+from app.harness.tool_assembler import (
+    add_extension_tools,
+    assemble_base_tools,
+    verify_backends_before_llm,
+)
 from app.workflow.execution_port import ExecutionPort
 from app.harness.hitl import make_checkpointer
 from app.workflow.strategies.react.llm_factory import build_llm
 from app.workflow.strategies.react.streaming import StreamCallback
-from app.workflow.llm_config import resolve_llm_config_for_consumer_port
 from app.workflow.strategies.react.workflow_config import (
+    connect_agent_mcp_nodes,
+    wired_mcp_server_names,
     extract_agent_config,
     extract_cloudwatch_config,
     extract_code_analyzer_config,
     extract_subagents_config,
     extract_tools_config,
-    find_code_analyzer_node_id,
     has_memory_node,
     resolve_default_tools_config,
     resolve_llm_config_for_workflow,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _conversational_skill_names(allowed: Optional[set]) -> List[str]:
+    """Invocable skill names (scoped) for the conversational capability prompt.
+
+    Best-effort — a "what can you do?" turn should never fail on skill lookup.
+    """
+    try:
+        from app.config import settings
+        if not getattr(settings, "skill_tool_enabled", True):
+            return []
+        from app.core.skills import get_default_skill_manager
+        return [
+            s["name"]
+            for s in get_default_skill_manager().list_skills()
+            if not s.get("disable_model_invocation")
+            and (not allowed or s["name"] in allowed)
+        ]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 @dataclass
@@ -59,6 +83,11 @@ class RunPlan:
     selected_skills: List[str]
     code_analyzer_config: Dict[str, Any]
     conversation_history: Optional[List[Dict[str, Any]]] = None
+    # Skills actually invoked this run — via a user /slash-command (recorded at
+    # build time) and/or the model's ``skill`` tool (appended live during the
+    # run through the tool's mutable sink). Deduped into ``selected_skills`` for
+    # the UI badge by the finalizer.
+    invoked_skills: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -115,6 +144,41 @@ async def build_run_plan(
     except Exception as _prof_err:  # noqa: BLE001
         logger.warning("ReactStrategy: profile merge skipped (%s)", _prof_err)
 
+    # Per-agent skill scoping (Skills picker on the Agent node). Empty = no
+    # scoping; every invocable skill is listed/available (backward-compatible).
+    try:
+        _agent_skills = resolve_profile_fields(agent_config).get("skills") or []
+    except Exception:  # noqa: BLE001 — scoping must never block a run
+        _agent_skills = []
+    _allowed_skills = set(_agent_skills) or None
+
+    # Skills invoked this run: a user /slash-command (recorded here) and/or the
+    # model's ``skill`` tool (appended live via the tool's mutable sink below).
+    _invoked_skills: List[str] = []
+    _skill_slash_matched = False
+
+    # Deterministic slash-command expansion: a user message that starts with
+    # "/<skill-name> [args]" is expanded into that skill's runbook up front —
+    # BEFORE the conversational fast-path, since an explicit slash command is a
+    # request, never small talk. No-op when disabled or nothing matches.
+    if getattr(settings, "skill_slash_commands_enabled", True):
+        try:
+            from app.harness.skill_tools import expand_slash_command
+            _slash = expand_slash_command(user_query, _allowed_skills)
+            if _slash:
+                user_query, _slash_name = _slash
+                _invoked_skills.append(_slash_name)
+                _skill_slash_matched = True
+                logger_instance.info(
+                    "ReactStrategy: expanded /%s slash-command into its runbook",
+                    _slash_name, extra={"execution_id": execution_id},
+                )
+        except Exception as _slash_err:  # noqa: BLE001 — never block a run
+            logger_instance.warning(
+                "ReactStrategy: slash-command expansion skipped (%s)",
+                redact(str(_slash_err)), extra={"execution_id": execution_id},
+            )
+
     llm_config = await resolve_llm_config_for_workflow(workflow)
 
     # Tag the stream callback with the main agent's resolved model so the chat
@@ -125,35 +189,6 @@ async def build_run_plan(
             setattr(stream_callback, "model_name", llm_config.get("model") or "")
         except Exception:  # noqa: BLE001
             pass
-
-    # Node-level gateway: resolve the model wired to the Code Crawler
-    # node's dedicated ``lm`` port. Optional — when unwired it defaults
-    # to the agent's MAIN model so the whole workflow runs on one model
-    # unless a cheaper one is wired.
-    #
-    # Note: subagents no longer have a wired-port model option. Named
-    # subagent defs carry their own per-def ``model`` field (a strictly
-    # more granular mechanism than one global per-workflow port); the
-    # subagent_factory LLM-resolution chain is per-def model → global
-    # "subagent" role → parent LLM.
-    crawler_model_id: Optional[str] = llm_config.get("model")
-    try:
-        ca_node_id = find_code_analyzer_node_id(workflow)
-        if ca_node_id:
-            _cw = await resolve_llm_config_for_consumer_port(
-                workflow, ca_node_id, "lm"
-            )
-            if _cw and _cw.get("model"):
-                crawler_model_id = _cw.get("model")
-                logger.info(
-                    "ReactStrategy: crawler model from Code Crawler node = %s",
-                    crawler_model_id,
-                )
-    except Exception as exc:  # noqa: BLE001 — never break on resolution
-        logger.warning(
-            "ReactStrategy: crawler port resolution failed (%s)",
-            exc,
-        )
 
     tools_config = extract_tools_config(workflow)
     if tools_config:
@@ -181,7 +216,7 @@ async def build_run_plan(
     # call against a tiny capability-aware prompt. Any failure falls through
     # to the full path so a real query is never dropped.
     from app.core.intent import is_conversational
-    if is_conversational(user_query):
+    if is_conversational(user_query) and not _skill_slash_matched:
         try:
             from app.harness.conversational import conversational_reply
             privacy.bind_session(execution_id)
@@ -192,6 +227,7 @@ async def build_run_plan(
                 has_cloudwatch=bool(cloudwatch_config),
                 has_code_analyzer=bool(code_analyzer_config),
                 has_db=bool(context.get("db_server_map")),
+                skill_names=_conversational_skill_names(_allowed_skills),
                 stream_callback=stream_callback,
                 execution_id=execution_id,
                 logger_instance=logger_instance,
@@ -261,15 +297,10 @@ async def build_run_plan(
                 redact(str(_ref_err)), extra={"execution_id": execution_id},
             )
 
-    # Per-agent skill scoping (Skills picker on the Agent node). Empty
-    # = no scoping, global auto-select applies (backward-compatible).
-    try:
-        _agent_skills = resolve_profile_fields(agent_config).get("skills") or []
-    except Exception:  # noqa: BLE001 — scoping must never block a run
-        _agent_skills = []
-
-    # Prepend a knowledge-base recall block (similar past issues /
-    # patterns / skills) so the agent starts with institutional memory.
+    # Prepend a knowledge-base recall block (similar past issues / patterns) and
+    # the per-turn skill listing so the agent starts with institutional memory
+    # and knows which skills it can load. Skill scoping (``_allowed_skills``) was
+    # resolved above alongside slash-command expansion.
     _has_history = bool(conversation_history or (context.get("inputs") or {}).get("history"))
     augmented_query, recall_hits, selected_skills = await build_recall_query(
         user_query=user_query,
@@ -278,9 +309,29 @@ async def build_run_plan(
         execution_id=execution_id,
         code_analyzer_config=code_analyzer_config,
         memory_enabled=has_memory_node(workflow),
-        allowed_skills=_agent_skills or None,
+        allowed_skills=list(_allowed_skills) if _allowed_skills else None,
         has_history=_has_history,
     )
+
+    # MCP barrier: connect every agent-reachable ``mcp_server`` node (including
+    # those contained in a ``subagent_window``, which the edge-ordered scheduler
+    # runs concurrently with the agent) BEFORE we snapshot the tool set below.
+    # Without this, a slow-cold-starting server like CloudWatch loses the race
+    # and its tools are silently absent — subagent globs (``cloudwatch__*``)
+    # match nothing and the capability vanishes for the turn. Failures come back
+    # as server names so we can tell the agent what's missing instead of letting
+    # it discover the gap by claiming it has no such tool.
+    _mcp_barrier_failed: List[str] = []
+    if mcp_manager:
+        try:
+            _mcp_barrier_failed = await connect_agent_mcp_nodes(
+                workflow, mcp_manager, execution_id=execution_id,
+            )
+        except Exception as _bar_err:  # noqa: BLE001 — never block a run on the barrier
+            logger_instance.warning(
+                "ReactStrategy: MCP pre-connect barrier failed (non-fatal): %s",
+                redact(str(_bar_err)), extra={"execution_id": execution_id},
+            )
 
     # Assemble the base action space (MCP + CloudWatch + crawler + DB
     # schema tools, pruned by the relevance router) via the harness.
@@ -299,9 +350,25 @@ async def build_run_plan(
         db_server_map=context.get("db_server_map") or {},
         user_query=user_query,
         logger_instance=logger_instance,
-        crawler_model_id=crawler_model_id,
         llm_config=llm_config,
     )
+
+    # Hard credential/connection gate — runs BEFORE any LLM call. Directive:
+    # never invoke the model when a wired backend can't be verified. Unlike the
+    # graceful-degrade path in assemble_base_tools (which continues with whatever
+    # built), this aborts with a deterministic message so the model is never
+    # asked to work against — or narrate a failure of — an unverified backend
+    # (which is how an expired AWS session produced a hallucinated "refresh your
+    # creds" essay instead of a clean, cheap short-circuit). Reuses the
+    # _expired_creds_msg short-circuit envelope below.
+    if not _expired_creds_msg:
+        _expired_creds_msg = await verify_backends_before_llm(
+            wired_mcp_servers=wired_mcp_server_names(workflow),
+            cloudwatch_config=cloudwatch_config,
+            mcp_barrier_failed=_mcp_barrier_failed,
+            execution_id=execution_id,
+            logger_instance=logger_instance,
+        )
 
     if _expired_creds_msg:
         return EarlyReturn({
@@ -319,6 +386,17 @@ async def build_run_plan(
             "output_tokens": 0,
             "total_tokens": 0,
         })
+
+    # Fail loud on a genuinely-dead MCP server: with the barrier above, a
+    # reachable server that STILL isn't connected here failed for real (TLS,
+    # expired creds, crashed subprocess) — not a cold-start race. Fold it into
+    # the degrade notice so the agent says so explicitly rather than shipping an
+    # answer that pretends the capability was never wired.
+    if _mcp_barrier_failed:
+        _degraded = list(_degraded or []) + [
+            "The following MCP server(s) could not be reached this turn and their "
+            "tools are unavailable: " + ", ".join(sorted(set(_mcp_barrier_failed))) + "."
+        ]
 
     if _degraded:
         # Tell the agent what's missing and why, up front — instead of
@@ -350,6 +428,27 @@ async def build_run_plan(
     augmented_query = privacy.pseudonymize(augmented_query, execution_id)
 
     llm = build_llm(llm_config)
+
+    # Bind the model-invoked ``skill`` tool (stage two of skill disclosure).
+    # Added BEFORE add_extension_tools so subagent snapshots inherit it and
+    # pseudonymization wraps it; it is pinned in tool_disclosure so it is never
+    # deferred. The mutable ``_invoked_skills`` sink records which skills the
+    # model actually loads, for the post-run UI badge.
+    if getattr(settings, "skill_tool_enabled", True):
+        try:
+            from app.harness.skill_tools import build_skill_tool
+            tools = list(tools) + [build_skill_tool(
+                allowed_skills=_allowed_skills,
+                execution_id=execution_id,
+                logger_instance=logger_instance,
+                invoked_sink=_invoked_skills,
+            )]
+        except Exception as _skill_tool_err:  # noqa: BLE001 — never block a run
+            logger_instance.warning(
+                "ReactStrategy: skill tool binding skipped (%s)",
+                redact(str(_skill_tool_err)), extra={"execution_id": execution_id},
+            )
+
     # LLM-dependent extension tools (depth-1 delegate + gated edit),
     # added via the harness so it owns the complete action space.
     tools = add_extension_tools(
@@ -419,6 +518,7 @@ async def build_run_plan(
         selected_skills=selected_skills,
         code_analyzer_config=code_analyzer_config,
         conversation_history=conversation_history,
+        invoked_skills=_invoked_skills,
     )
 
 

@@ -19,6 +19,12 @@ opt-in toggles, and callable via ``load_overlay()`` on demand.
 Infrastructure/security/startup-only flags (API auth, secrets manager, OTEL,
 startup indexing recovery, supervisor HITL) are intentionally NOT exposed here —
 they must stay environment-controlled.
+
+Likewise the numeric tuning knobs and experimental/performance toggles (LangGraph
+runtime, self-improvement & governance, code-semantic indexing, chat tool-replay
+limits, skill budgets) are NOT surfaced: they are code-baked at their best
+defaults in ``Settings`` and overridable only via their environment variables.
+Only the handful of flags an operator genuinely flips live in ``FLAG_CATALOG``.
 """
 from __future__ import annotations
 
@@ -35,6 +41,16 @@ _DB_PREFIX = "flag:"
 # Declarative catalog. ``key`` matches a ``Settings`` attribute exactly; ``type``
 # drives coercion + the UI control. Grouped for display. Keep this list as the
 # single source of truth — the API and UI both render from it.
+#
+# This is deliberately a SHORT list of the flags an operator actually flips. The
+# many numeric tuning knobs (compression sizes/timeouts, skill budgets, chat
+# tool-replay limits, code-semantic indexing knobs, Bedrock pool size) and the
+# experimental / performance toggles (LangGraph runtime, self-improvement &
+# governance) are NOT exposed here: they are code-baked at their best defaults in
+# ``app.config.Settings`` and remain overridable only via their environment
+# variables (same pattern as ``code_semantic_enabled``, which is forced on in
+# config and never surfaced). To re-expose one, re-add its ``{key, type, group,
+# label, help}`` entry below — nothing in the API or UI needs to change.
 FLAG_CATALOG: List[Dict[str, Any]] = [
     # ── Tool-output compression ──
     {"key": "compression_enabled", "type": "bool", "group": "Compression",
@@ -42,19 +58,7 @@ FLAG_CATALOG: List[Dict[str, Any]] = [
      "help": "Send large MCP tool results through the compression sidecar before they enter context."},
     {"key": "compression_all_tools", "type": "bool", "group": "Compression",
      "label": "Compress all tool output",
-     "help": "Extend compression to non-MCP tools (CloudWatch, DB, crawler). Biggest win for log-heavy runs."},
-    {"key": "compression_min_chars", "type": "int", "group": "Compression",
-     "label": "Min chars to compress",
-     "help": "Outputs below this size skip compression (they gain little and add latency)."},
-    {"key": "compression_timeout_ms", "type": "int", "group": "Compression",
-     "label": "Sidecar timeout (ms)",
-     "help": "Hard timeout for one compress call; on expiry it falls back to truncation."},
-    {"key": "compression_max_retries", "type": "int", "group": "Compression",
-     "label": "Sidecar retries",
-     "help": "Retries on transient sidecar errors. Keep low — the truncation fallback is always correct."},
-    {"key": "compression_model_hint", "type": "str", "group": "Compression",
-     "label": "Tokenizer model hint",
-     "help": "Model id the sidecar uses to pick a tokenizer. Leave blank for the neutral default."},
+     "help": "Extend compression to non-MCP tools (CloudWatch, DB, Code Crawler). Biggest win for log-heavy runs."},
 
     # ── Memory & learning ──
     {"key": "semantic_memory_enabled", "type": "bool", "group": "Memory & learning",
@@ -69,101 +73,33 @@ FLAG_CATALOG: List[Dict[str, Any]] = [
     {"key": "pinned_facts_enabled", "type": "bool", "group": "Memory & learning",
      "label": "Pinned facts",
      "help": "Inject the operator-pinned facts memory tier into context."},
-    {"key": "metamemory_enabled", "type": "bool", "group": "Memory & learning",
-     "label": "Metamemory summary",
-     "help": "Let the agent maintain a context summary that supersedes LLM compaction."},
-    {"key": "context_references_enabled", "type": "bool", "group": "Memory & learning",
-     "label": "Context references",
-     "help": "Attach node-driven context references to the run."},
 
     # ── Agent behaviour ──
     {"key": "agent_planning_enabled", "type": "bool", "group": "Agent behaviour",
      "label": "Plan → execute → verify",
      "help": "Add the planning discipline and planning tools to the system prompt."},
-    {"key": "skill_rag_selection_enabled", "type": "bool", "group": "Agent behaviour",
-     "label": "RAG skill selection",
-     "help": "Select relevant skills via retrieval instead of always injecting all."},
     {"key": "pii_pseudonymization_enabled", "type": "bool", "group": "Agent behaviour",
      "label": "PII pseudonymization",
      "help": "Pseudonymize PII in flagship/KYC flows before it reaches the model."},
-    {"key": "vfs_session_persistence_enabled", "type": "bool", "group": "Agent behaviour",
-     "label": "Persist virtual filesystem",
-     "help": "Keep the agent's virtual filesystem across turns in a session."},
-
-    # ── Delegation / subagents ──
-    {"key": "delegation_child_timeout_seconds", "type": "int", "group": "Delegation & subagents",
-     "label": "Subagent time budget (s)",
-     "help": "Max wall-clock a delegated subagent runs before it's cut off. Raise it if subagents time out on slow tools (e.g. codegraph on a large repo)."},
-    {"key": "delegation_max_concurrent", "type": "int", "group": "Delegation & subagents",
-     "label": "Max parallel subagents",
-     "help": "How many subagents run at once for delegate_parallel/batch. Lower it (e.g. 1) to avoid duplicate slow work."},
 
     # ── Reliability ──
     {"key": "routing_fallback_enabled", "type": "bool", "group": "Reliability",
      "label": "Model routing fallback",
      "help": "On Bedrock errors, fall back across credential/region/model chains."},
 
-    # ── LangGraph runtime (performance) ──
-    {"key": "agent_durability", "type": "str", "group": "LangGraph runtime",
-     "label": "Checkpoint durability",
-     "help": "How often a LangGraph run checkpoints to Postgres. 'async' (default) writes each superstep in the background; 'exit' writes only once at the end — cuts per-turn I/O for runs that never resume; 'sync' blocks each write. HITL runs are auto-clamped to 'async'. Valid: sync | async | exit."},
-    {"key": "agent_max_concurrency", "type": "int", "group": "LangGraph runtime",
-     "label": "Max superstep concurrency",
-     "help": "Cap on concurrent tasks within a superstep (parallel tool calls / Send fan-out). 0 = unbounded (default). Set >0 to bound fan-out against Bedrock rate limits."},
-    {"key": "checkpoint_shallow", "type": "bool", "group": "LangGraph runtime",
-     "label": "Shallow checkpointer",
-     "help": "Keep only the latest checkpoint per thread (drops time-travel history). HITL pause/resume still works. Takes effect on next restart (checkpointer is built at startup)."},
-    {"key": "bedrock_max_pool_connections", "type": "int", "group": "LangGraph runtime",
-     "label": "Bedrock HTTP pool size",
-     "help": "botocore connection-pool size for the shared Bedrock client (default 10). Raise (e.g. 50) for wide parallel tool / delegate_parallel fan-out. Takes effect on next LLM build."},
-    {"key": "bedrock_latency_optimized", "type": "bool", "group": "LangGraph runtime",
-     "label": "Bedrock latency-optimized",
-     "help": "Request Bedrock latency-optimized inference (performance_config). Support is model/region-dependent — leave off unless your model/region supports it. Takes effect on next LLM build."},
-    {"key": "agent_stream_mode_enabled", "type": "bool", "group": "LangGraph runtime",
-     "label": "Lightweight streaming (stream_mode)",
-     "help": "Use astream(stream_mode) instead of astream_events(v2) for token/tool streaming. Also returns complete final state (incl. tool results). Behaviour-preserving; eval-gated."},
-    {"key": "subagent_compiled_cache_enabled", "type": "bool", "group": "LangGraph runtime",
-     "label": "Cache compiled subagents",
-     "help": "Reuse a compiled child agent across delegate calls instead of rebuilding it each time. Only children with an explicit per-def model are cached. Speeds up repeated / parallel delegation to the same specialist."},
-
-    # ── Self-improvement & governance ──
-    {"key": "self_improvement_enabled", "type": "bool", "group": "Self-improvement & governance",
-     "label": "Self-improvement analyzer",
-     "help": "Compute hill-climbing improvement signals from run history."},
-    {"key": "hillclimb_apply_enabled", "type": "bool", "group": "Self-improvement & governance",
-     "label": "Apply improvement proposals",
-     "help": "Allow accepted improvement proposals to be applied automatically."},
-    {"key": "governance_conversion_enabled", "type": "bool", "group": "Self-improvement & governance",
-     "label": "Recurring-failure governance",
-     "help": "Convert recurring tool failures into governance/eval proposals."},
-    {"key": "token_economy_enabled", "type": "bool", "group": "Self-improvement & governance",
-     "label": "Token economy (delegation budgets)",
-     "help": "Grant per-branch token budgets to delegated subagents."},
-
-    # ── Chat history & telemetry ──
-    {"key": "chat_tool_history_max_tokens", "type": "int", "group": "Chat history & telemetry",
-     "label": "Chat tool-replay budget (tokens)",
-     "help": "How many tokens of prior tool activity to replay on a follow-up question."},
-    {"key": "chat_tool_history_max_executions", "type": "int", "group": "Chat history & telemetry",
-     "label": "Chat tool-replay executions",
-     "help": "Max prior tool executions replayed on a follow-up question."},
-    {"key": "step_events_enabled", "type": "bool", "group": "Chat history & telemetry",
-     "label": "Per-step telemetry events",
-     "help": "Record per-turn/per-tool step events (batched at run end)."},
-
-    # ── Code semantic search (ONNX embeddings) ──
-    # The feature is always on and always uses snowflake-arctic-embed-s with its
-    # model files vendored locally, so the enable toggle, model picker, and
-    # download switch are intentionally NOT exposed — only the tuning knobs are.
-    {"key": "code_semantic_body_max_chars", "type": "int", "group": "Code semantic search",
-     "label": "Source body chars embedded",
-     "help": "How much of each function's real source is folded into its embedding (0 = name/signature only). Biggest accuracy lever; higher = slower index."},
-    {"key": "code_semantic_test_penalty", "type": "float", "group": "Code semantic search",
-     "label": "Test result penalty",
-     "help": "Score multiplier for test files when the query isn't about tests (1.0 = no penalty). De-prioritizes tests without hiding them."},
-    {"key": "code_semantic_batch_size", "type": "int", "group": "Code semantic search",
-     "label": "Embedding batch size",
-     "help": "Texts per ONNX forward pass during indexing. Higher = faster but more memory."},
+    # ── Supervision (Action Supervisor write-gate) ──
+    {"key": "action_supervisor_enabled", "type": "bool", "group": "Supervision",
+     "label": "Action Supervisor",
+     "help": "Review every intercepted write-class action (edits, run_command, "
+             "playbook/KB writes, MCP mutations, wiki publish) before it runs."},
+    {"key": "action_supervisor_shadow_mode", "type": "bool", "group": "Supervision",
+     "label": "Shadow mode",
+     "help": "Review and record the verdict as advice, but the human/timeout "
+             "still decides. Turn off to let the Supervisor auto-decide low-risk "
+             "actions. Calibrate in shadow first."},
+    {"key": "wiki_publish_approval_enabled", "type": "bool", "group": "Supervision",
+     "label": "Gate wiki publish",
+     "help": "Route the wiki-publish output node through the approval gate."},
 ]
 
 _CATALOG_BY_KEY = {spec["key"]: spec for spec in FLAG_CATALOG}

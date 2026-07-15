@@ -13,6 +13,37 @@ from . import register
 logger = logging.getLogger(__name__)
 
 
+def resolve_ado_pat(pat: str = "", token_var: str = "") -> Optional[str]:
+    """Resolve an Azure DevOps PAT with the standard precedence used across the
+    Wiki node: explicit node value → env var → global stored credential.
+
+    Args:
+        pat: Explicit PAT from node config (highest priority).
+        token_var: Name of an env var to read the PAT from (e.g. ADO_WIKI_PAT).
+
+    Returns:
+        The resolved PAT, or None if none is configured.
+    """
+    pat = (pat or "").strip()
+    if pat:
+        return pat
+
+    token_var = (token_var or "ADO_WIKI_PAT").strip()
+    env_pat = os.environ.get(token_var, "") if token_var else ""
+    if env_pat:
+        return env_pat
+
+    config_path = os.environ.get(
+        "AZURE_CONFIG_PATH",
+        os.path.join(os.path.dirname(__file__), "../../../../config/azure_devops_credentials.json")
+    )
+    try:
+        return ConfigManager(config_path=config_path).get_pat()
+    except Exception as e:
+        logger.error(f"Failed to initialize ConfigManager: {e}")
+        return None
+
+
 def parse_wiki_url(url: str) -> tuple:
     """Parse Azure DevOps Wiki URL to extract organization, project, and wiki_id."""
     if not url:
@@ -112,6 +143,70 @@ def to_table(text: str) -> str:
     separator_line = "| --- |"
     rows = [f"| {line} |" for line in lines]
     return "\n".join([header_line, separator_line] + rows)
+
+
+_SEP_CELL = re.compile(r':?-{3,}:?')
+
+
+def _split_row(line: str) -> List[str]:
+    """Split a markdown table row `| a | b |` into cell values. [] if not a row."""
+    s = line.strip()
+    if not s.startswith('|'):
+        return []
+    return [c.strip() for c in s.strip('|').split('|')]
+
+
+def _is_separator_row(cells: List[str]) -> bool:
+    """True if every cell looks like `---`, `:---`, `---:`, or `:---:`."""
+    return bool(cells) and all(_SEP_CELL.fullmatch(c) for c in cells)
+
+
+def _find_last_table(lines: List[str]):
+    """Return (header_idx, end_idx) of the last markdown table (end exclusive),
+    or None. A table is a run of `|`-prefixed lines whose 2nd line is a
+    separator row. Non-table `|`-blocks are skipped and scanning continues up."""
+    i = len(lines) - 1
+    while i >= 0:
+        if lines[i].strip().startswith('|'):
+            end = i + 1
+            start = i
+            while start >= 0 and lines[start].strip().startswith('|'):
+                start -= 1
+            start += 1
+            if end - start >= 2 and _is_separator_row(_split_row(lines[start + 1])):
+                return start, end
+            # A `|`-block without a separator row is not a real table; keep going.
+            i = start - 1
+        else:
+            i -= 1
+    return None
+
+
+def merge_markdown_tables(existing_content: str, new_content: str) -> Optional[str]:
+    """Append the new content's table data rows into the existing content's
+    last markdown table, when their headers match (case/whitespace-insensitive).
+
+    Returns the merged markdown, or None to signal the caller should fall back
+    to the standard separator + run-header block append (headers differ, either
+    side has no table, or the new table has no data rows). Any trailing prose
+    after the existing table is preserved.
+    """
+    ex_lines = existing_content.splitlines()
+    new_lines = new_content.splitlines()
+    ex_tbl = _find_last_table(ex_lines)
+    new_tbl = _find_last_table(new_lines)
+    if not ex_tbl or not new_tbl:
+        return None
+    ex_headers = [h.lower() for h in _split_row(ex_lines[ex_tbl[0]])]
+    new_headers = [h.lower() for h in _split_row(new_lines[new_tbl[0]])]
+    if not ex_headers or ex_headers != new_headers:
+        return None
+    # Data rows = everything after header + separator, up to the table end.
+    new_rows = new_lines[new_tbl[0] + 2:new_tbl[1]]
+    if not new_rows:
+        return None
+    merged = ex_lines[:ex_tbl[1]] + new_rows + ex_lines[ex_tbl[1]:]
+    return "\n".join(merged)
 
 
 def format_orchestrator_results(results: List[Dict[str, Any]], format_opt: str, selected_queries: Optional[List[str]] = None) -> str:
@@ -239,7 +334,8 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
     wiki_url = node_data.get('wikiUrl', '').strip()
     page_path = node_data.get('pagePath', '').strip()
     project = node_data.get('project', '').strip()
-    write_mode = node_data.get('writeMode', 'Overwrite').strip()
+    organization_param = node_data.get('organization', '').strip()
+    write_mode = node_data.get('writeMode', 'Append').strip() or 'Append'
 
     if platform != 'Azure DevOps Wiki':
         return {
@@ -249,8 +345,9 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
 
     # Parse organization and project from wikiUrl
     parsed_org, parsed_project, parsed_wiki_id = parse_wiki_url(wiki_url)
-    
-    organization = parsed_org
+
+    # Explicit Organization/Project node fields take precedence over the URL.
+    organization = organization_param or parsed_org
     if not organization:
         # Default or fallback organization can be read from config
         logger.warning("Could not parse organization from Wiki URL. Using standard defaults.")
@@ -335,28 +432,47 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
         formatted_content = f"# {page_title}\n\n{formatted_content}"
 
     # 4. Retrieve PAT token: priority is node properties PAT, then env var, then global PAT
-    pat = node_data.get('pat', '').strip()
-    if not pat:
-        token_var = node_data.get('tokenVar', 'ADO_WIKI_PAT').strip()
-        pat = os.environ.get(token_var, '') if token_var else ''
-
-    if not pat:
-        config_path = os.environ.get(
-            "AZURE_CONFIG_PATH",
-            os.path.join(os.path.dirname(__file__), "../../../../config/azure_devops_credentials.json")
-        )
-        try:
-            config_manager = ConfigManager(config_path=config_path)
-            pat = config_manager.get_pat()
-        except Exception as e:
-            logger.error(f"Failed to initialize ConfigManager: {e}")
-            pat = None
+    pat = resolve_ado_pat(node_data.get('pat', ''), node_data.get('tokenVar', 'ADO_WIKI_PAT'))
 
     if not pat:
         return {
             "status": "failed",
             "error": "No Azure DevOps PAT configured. Please configure credentials on the node properties or in settings."
         }
+
+    # 4b. Supervisor/human gate — wiki publish is a write-class external action
+    # that bypasses the tool-layer ask-gate (it's an output-node handler, not an
+    # agent tool). When enabled, route it through the same approval primitive so
+    # it can be reviewed like any other high-risk write. Denied/timeout → skip.
+    try:
+        from app.config import settings as _settings
+        if getattr(_settings, "wiki_publish_approval_enabled", False) and execution_id and executor:
+            from app.harness.tool_permissions import request_action_approval
+            _port = executor.get_execution_port()
+            _summary = (
+                f"Approve publishing to Azure DevOps wiki page '{page_path}' "
+                f"({organization}/{project}, mode: {write_mode})?"
+            )
+            approved, reason, _decided_by = await request_action_approval(
+                execution_id, _port, "wiki_publish",
+                {
+                    "page_path": page_path,
+                    "organization": organization,
+                    "project": project,
+                    "write_mode": write_mode,
+                },
+                _summary,
+                risk_tier="high",
+            )
+            if not approved:
+                logger.info("wiki: publish to '%s' not approved — skipping", page_path)
+                return {
+                    "status": "skipped",
+                    "error": reason or "Wiki publish was not approved.",
+                    "page_path": page_path,
+                }
+    except Exception as _gate_exc:  # noqa: BLE001 — never let the gate crash the node
+        logger.warning("wiki: approval gate error (%s) — proceeding without gate", _gate_exc)
 
     # 5. Initialize client and create/update the page
     try:
@@ -423,7 +539,18 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
                     run_header = f"### Run Execution: {timestamp}"
                     
                     if write_mode == "Append":
-                        formatted_content = existing_content + f"\n\n---\n\n{run_header}\n\n" + body_only
+                        # Smart table merge: if this run produced a plain Table and
+                        # the existing page's last table has the same columns, add
+                        # only the new data rows to it (no separator / run header).
+                        # Orchestrator reports carry multiple tables, so skip them.
+                        merged = None
+                        if format_opt == 'Table' and not is_structured_results:
+                            merged = merge_markdown_tables(existing_content, body_only)
+                        if merged is not None:
+                            formatted_content = merged
+                            logger.info("Smart table append: merged new rows into existing table")
+                        else:
+                            formatted_content = existing_content + f"\n\n---\n\n{run_header}\n\n" + body_only
                     elif write_mode == "Prepend":
                         existing_body = existing_content
                         if existing_content.lstrip().startswith(title_prefix):

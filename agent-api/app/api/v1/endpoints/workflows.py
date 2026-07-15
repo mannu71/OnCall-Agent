@@ -554,41 +554,25 @@ async def update_workflow(
             workflow_dict[field] = existing_workflow[field]
     
     # ── Detect codeAnalyzer repos that need indexing ─────────────────────
-    # Split by backend: crawler repos index into repo_abstractions; codegraph
-    # repos index into the native engine. A node carries exactly one backend.
-    repos_to_index = await _extract_unindexed_repos(workflow_dict)
+    # codegraph repos index into the native engine (incremental, self-deduping).
     codegraph_repos = _extract_codegraph_repos(workflow_dict)
-    if repos_to_index or codegraph_repos:
+    if codegraph_repos:
         # Disable the workflow while background indexing runs so it cannot
         # be executed with un-indexed repos.
         workflow_dict["enabled"] = False
         workflow_dict["indexing_status"] = "indexing"
         logger.info(
-            "[UPDATE] workflow='%s' indexing: crawler=%s codegraph=%s — disabling and firing indexer(s)",
-            workflow_name, repos_to_index, codegraph_repos,
+            "[UPDATE] workflow='%s' indexing: codegraph=%s — disabling and firing indexer",
+            workflow_name, codegraph_repos,
         )
 
     # Pass original workflow_name for rename detection
     saved_workflow = await workflow_repo.save(workflow_dict, original_name=workflow_name)
     await workflow_scheduler.reload_workflows()
 
-    if repos_to_index:
-        # Resolve the model the workflow's LLM node targets so the indexer
-        # uses the same model the user just configured (not the global default).
-        indexer_model_id = await _resolve_workflow_model_id(workflow_dict)
-        # Fire-and-forget: does not block the HTTP response
-        from app.crawler.background_indexer import index_workflow_repos
-        task = asyncio.create_task(
-            index_workflow_repos(saved_workflow["name"], repos_to_index, model_id=indexer_model_id)
-        )
-        visual_executor.background_tasks.add(task)
-        task.add_done_callback(visual_executor.background_tasks.discard)
-
     if codegraph_repos:
-        # codegraph indexes via its own in-process engine. (If a workflow mixes
-        # both backends, each re-enables on completion — benign for the rare
-        # mixed case; nodes normally share one backend.)
-        from app.crawler.background_indexer import index_workflow_repos_codegraph
+        # codegraph indexes via its own in-process engine.
+        from app.services.codegraph_indexer import index_workflow_repos_codegraph
         cg_task = asyncio.create_task(
             index_workflow_repos_codegraph(saved_workflow["name"], codegraph_repos)
         )
@@ -598,110 +582,25 @@ async def update_workflow(
     return WorkflowResponse(**saved_workflow)
 
 
-async def _extract_unindexed_repos(workflow_dict: dict) -> list:
-    """Return crawler-backend repo names not yet in repo_abstractions.
-
-    Only considers code-analyzer nodes whose backend is ``code_crawler`` —
-    codegraph-backend repos index via :func:`_extract_codegraph_repos`. Accepts
-    both node dialects (``codeAnalyzer`` with ``data.repos`` list and
-    ``code_search_tool`` with ``params.repos`` string) via the shared parser.
-    """
-    from app.services.crawler_service import crawler_service
-    from app.workflow.code_analyzer_config import (
-        CODE_ANALYZER_NODE_TYPES,
-        read_code_analyzer_backend,
-        read_code_analyzer_repos,
-    )
-
-    repo_names: list = []
-    for node in workflow_dict.get("nodes") or []:
-        if node.get("type") in CODE_ANALYZER_NODE_TYPES and \
-                read_code_analyzer_backend(node) == "code_crawler":
-            for r in read_code_analyzer_repos(node):
-                if r["name"]:
-                    repo_names.append(r["name"])
-
-    return await crawler_service.filter_unindexed_repos(repo_names)
-
-
 def _extract_codegraph_repos(workflow_dict: dict) -> list:
-    """Return deduped repo names from codegraph-backend code-analyzer nodes.
+    """Return deduped repo names from code-analyzer nodes.
 
-    codegraph tracks its own index, so we don't filter against repo_abstractions;
+    codegraph tracks its own index, so we don't filter against a Postgres table;
     ``index_repository`` is incremental and dedupes unchanged files on its side.
     """
     from app.workflow.code_analyzer_config import (
         CODE_ANALYZER_NODE_TYPES,
-        read_code_analyzer_backend,
         read_code_analyzer_repos,
     )
 
     repo_names: list = []
     for node in workflow_dict.get("nodes") or []:
-        if node.get("type") in CODE_ANALYZER_NODE_TYPES and \
-                read_code_analyzer_backend(node) == "codegraph":
+        if node.get("type") in CODE_ANALYZER_NODE_TYPES:
             for r in read_code_analyzer_repos(node):
                 if r["name"]:
                     repo_names.append(r["name"])
 
     return list(dict.fromkeys(repo_names))
-
-
-async def _resolve_workflow_model_id(workflow_dict: dict) -> "Optional[str]":
-    """Return the Bedrock model ID (with cross-region prefix) for the workflow's LLM node.
-
-    Looks at the workflow's ``llm`` node to find which LLM config it references,
-    then looks that config up in the DB and applies the same inference-profile
-    remapping that ReactStrategy._build_llm() uses (prepend eu./us./ap.).
-
-    Falls back to None when no llm node is found or the config cannot be
-    resolved — call_llm will then use the first entry from llm_configs as usual.
-    """
-    from app.infrastructure.persistence import llm_config_repository
-
-    # Find the llm node
-    llm_node = next(
-        (n for n in (workflow_dict.get("nodes") or []) if n.get("type") == "llm"),
-        None,
-    )
-    if not llm_node:
-        return None
-
-    data = llm_node.get("data") or {}
-    config_name = data.get("configName") or data.get("llmConfigId") or data.get("model")
-    if not config_name:
-        return None
-
-    try:
-        db_configs = await llm_config_repository.list_all()
-        cfg = db_configs.get(config_name) or next(iter(db_configs.values()), None)
-        if not cfg:
-            return None
-
-        model  = cfg.get("model", "")
-        region = cfg.get("region", "us-east-1")
-
-        # Apply cross-region inference profile prefix (same logic as ReactStrategy)
-        _PROFILE_PREFIXES  = ("us.", "eu.", "ap.")
-        _NEEDS_PROFILE_FOR = ("anthropic.", "amazon.", "meta.", "mistral.")
-        if (model and
-                not any(model.startswith(p) for p in _PROFILE_PREFIXES) and
-                any(model.startswith(p) for p in _NEEDS_PROFILE_FOR)):
-            if region.startswith("eu-"):
-                model = f"eu.{model}"
-            elif region.startswith("ap-"):
-                model = f"ap.{model}"
-            else:
-                model = f"us.{model}"
-
-        logger.info(
-            "_resolve_workflow_model_id: workflow='%s' llm_node config='%s' → model=%s",
-            workflow_dict.get("name"), config_name, model,
-        )
-        return model or None
-    except Exception as exc:
-        logger.warning("_resolve_workflow_model_id: failed (%s), indexer will use default", exc)
-        return None
 
 
 async def _cleanup_active_executions(workflow_name: str) -> None:

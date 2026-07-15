@@ -7,7 +7,6 @@ from app.api.v1.endpoints import (
     certificates,
     code_analyzer,
     codegraph,
-    crawler,
     curator,
     executions,
     gateway,
@@ -24,6 +23,7 @@ from app.api.v1.endpoints import (
     skills,
     tools,
     trajectories,
+    wiki,
     workflows,
 )
 
@@ -40,7 +40,6 @@ api_router.include_router(model_keys.router)
 api_router.include_router(insights.router)
 api_router.include_router(curator.router)
 api_router.include_router(code_analyzer.router)
-api_router.include_router(crawler.router)
 api_router.include_router(codegraph.router)
 api_router.include_router(trajectories.router)
 api_router.include_router(settings.router)
@@ -52,3 +51,4 @@ api_router.include_router(sessions.router)
 api_router.include_router(agent_profiles.router)
 api_router.include_router(improvement.router)
 api_router.include_router(skills.router)
+api_router.include_router(wiki.router)

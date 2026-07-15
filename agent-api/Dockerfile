@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
 # ─────────────────────────────────────────────────────────────────────────────
 # Multi-target build. Two runtime images, same app code:
-#   runtime-full (default) — core + crawler + openai deps, plus Node/npm for
-#                            npx-based stdio MCP servers. Identical to before.
-#   runtime-slim           — core deps only, no Node/npm, no tree-sitter wheels.
+#   runtime-full (default) — core + semantic + openai deps, plus Node/npm for
+#                            npx-based stdio MCP servers, and the codegraph engine.
+#   runtime-slim           — core deps only, no Node/npm, no semantic-search deps.
 #                            ~40-50% smaller. For deployments that don't launch
-#                            npx MCP servers or use the code crawler.
+#                            npx MCP servers or use the Code Crawler.
 #
 # Build context must be the repo root (docker-compose.yml sets context: .).
 # That lets these cg-* stages COPY from codegraph/ without a pre-build step.
@@ -70,19 +70,19 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --trusted-host files.pythonhosted.org \
     -r requirements-core.txt
 
-# ── Stage 1b — builder-full: add the crawler + openai extras on top of core ─────
+# ── Stage 1b — builder-full: add the semantic + openai extras on top of core ────
 FROM builder-core AS builder-full
 
-COPY agent-api/requirements-crawler.txt .
+COPY agent-api/requirements-semantic.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
     --timeout 180 --retries 10 \
     --trusted-host pypi.org \
     --trusted-host files.pythonhosted.org \
-    -r requirements-crawler.txt "langchain-openai>=1.1.0"
+    -r requirements-semantic.txt "langchain-openai>=1.1.0"
 
 # ── Stage 2 — runtime-base: common runtime (no venv, no Node) ───────────────────
-# ripgrep powers the crawler's generic code-grep tool (small; kept in both).
+# ripgrep powers the repo_grep code-grep tool (small; kept in both).
 FROM python:3.12-slim AS runtime-base
 
 WORKDIR /app
@@ -96,10 +96,10 @@ ENV AWS_DEFAULT_REGION=eu-west-1 \
     PATH="/opt/venv/bin:$PATH" \
     CODEGRAPH_DB=/app/data/codegraph.db
 
-# ripgrep powers the crawler's code-grep tool; git backs codegraph's
+# ripgrep powers the repo_grep code-grep tool; git backs codegraph's
 # detect_changes / symbol_history. libtree-sitter is only needed by codegraph's
 # AST backend, which ships in runtime-full — so it's installed there, keeping
-# runtime-slim (no codegraph, no tree-sitter wheels) minimal.
+# runtime-slim (no codegraph) minimal.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -163,8 +163,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     > /root/.config/uv/uv.toml
 
 # libtree-sitter runtime for codegraph's AST backend (grammar bundle copied
-# below). Installed here rather than runtime-base so runtime-slim, which ships
-# neither codegraph nor the tree-sitter wheels, does not carry it.
+# below). Installed here rather than runtime-base so runtime-slim, which does not
+# ship codegraph, does not carry it.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \

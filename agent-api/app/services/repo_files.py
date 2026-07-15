@@ -1,8 +1,9 @@
-"""Local file crawler for code repositories.
+"""Local filesystem access for code repositories.
 
 Walks a directory under REPOS_BASE_PATH, applies include/exclude glob
 patterns, honours .gitignore via pathspec, and returns a flat list of
-(relative_path, content) tuples.
+(relative_path, content) tuples. Backs the generic ``repo_grep`` /
+``repo_read_file`` / ``repo_list_files`` agent tools.
 
 Directory pruning strategy (three layers, applied in order):
   1. Universal base set  — VCS dirs, IDE metadata, always noise.

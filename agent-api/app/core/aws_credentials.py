@@ -7,8 +7,11 @@ the CloudWatch node executor and the Bedrock LLM resolver can call
 """
 from __future__ import annotations
 
+import configparser
 import logging
-from typing import Any, Dict, Optional, Tuple
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -68,3 +71,104 @@ async def resolve_aws_credentials(
         logger.warning("resolve_aws_credentials: could not load from model_keys: %s", exc)
 
     return credentials, aws_region
+
+
+def _aws_config_paths() -> Tuple[str, str]:
+    """Return the (credentials, config) file paths honouring AWS env overrides."""
+    cred_path = os.environ.get("AWS_SHARED_CREDENTIALS_FILE") or os.path.expanduser(
+        os.path.join("~", ".aws", "credentials")
+    )
+    config_path = os.environ.get("AWS_CONFIG_FILE") or os.path.expanduser(
+        os.path.join("~", ".aws", "config")
+    )
+    return cred_path, config_path
+
+
+def _parse_expiration(raw: Optional[str]) -> Tuple[Optional[str], Optional[bool]]:
+    """Parse an ``aws_expiration`` timestamp into ``(iso, expired)``.
+
+    Returns ``(None, None)`` when no expiration is recorded (e.g. long-lived IAM
+    keys) — "expired" is genuinely unknown in that case, never assumed False.
+    """
+    if not raw:
+        return None, None
+    val = raw.strip()
+    try:
+        # Normalise trailing Z to an explicit UTC offset for fromisoformat.
+        iso = val.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat(), dt <= datetime.now(timezone.utc)
+    except (ValueError, TypeError):
+        return val, None
+
+
+def list_aws_profiles() -> List[Dict[str, Any]]:
+    """Enumerate AWS profiles from the shared credentials/config files.
+
+    Reads ``~/.aws/credentials`` (sections are bare profile names) and
+    ``~/.aws/config`` (sections are ``[profile <name>]``, or ``[default]``),
+    honouring ``AWS_SHARED_CREDENTIALS_FILE`` / ``AWS_CONFIG_FILE``. For each
+    profile it reports the region and the temporary-credential expiry state
+    (parsed from the non-standard ``aws_expiration`` key written by SSO/STS
+    refresh flows). No network calls are made — this is a cheap, offline probe
+    so the node-config dropdown can show valid-vs-expired at a glance.
+
+    Returns a list of ``{name, region, has_credentials, expiration, expired}``
+    dicts sorted valid-first, then by name. ``expired`` is ``None`` (unknown)
+    for long-lived keys with no recorded expiry.
+    """
+    cred_path, config_path = _aws_config_paths()
+    profiles: Dict[str, Dict[str, Any]] = {}
+
+    def _ensure(name: str) -> Dict[str, Any]:
+        return profiles.setdefault(
+            name,
+            {
+                "name": name,
+                "region": None,
+                "has_credentials": False,
+                "expiration": None,
+                "expired": None,
+            },
+        )
+
+    # 1) credentials file — sections are bare profile names, carry keys/expiry.
+    if os.path.isfile(cred_path):
+        try:
+            cp = configparser.RawConfigParser()
+            cp.read(cred_path)
+            for section in cp.sections():
+                entry = _ensure(section)
+                if cp.has_option(section, "aws_access_key_id"):
+                    entry["has_credentials"] = True
+                if cp.has_option(section, "region"):
+                    entry["region"] = cp.get(section, "region")
+                if cp.has_option(section, "aws_expiration"):
+                    iso, expired = _parse_expiration(cp.get(section, "aws_expiration"))
+                    entry["expiration"], entry["expired"] = iso, expired
+        except configparser.Error as exc:
+            logger.warning("list_aws_profiles: could not parse credentials file: %s", exc)
+
+    # 2) config file — sections are "[profile name]" (or bare "[default]"); may
+    # supply a region for profiles whose creds live in the credentials file.
+    if os.path.isfile(config_path):
+        try:
+            cp = configparser.RawConfigParser()
+            cp.read(config_path)
+            for section in cp.sections():
+                name = section[len("profile "):] if section.startswith("profile ") else section
+                entry = _ensure(name)
+                if not entry["region"] and cp.has_option(section, "region"):
+                    entry["region"] = cp.get(section, "region")
+        except configparser.Error as exc:
+            logger.warning("list_aws_profiles: could not parse config file: %s", exc)
+
+    # Sort: valid first (expired is False), then unknown, then expired; name tiebreak.
+    def _rank(p: Dict[str, Any]) -> Tuple[int, str]:
+        expired = p.get("expired")
+        bucket = 0 if expired is False else (1 if expired is None else 2)
+        return bucket, p.get("name", "")
+
+    return sorted(profiles.values(), key=_rank)

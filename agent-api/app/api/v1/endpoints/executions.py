@@ -26,6 +26,10 @@ class HITLApproveRequest(BaseModel):
     request_id: str
     approved: bool = True
     reason: Optional[str] = None
+    decided_by: Optional[str] = None
+    """Who made the call — defaults to "operator" (human via UI). The Action
+    Supervisor sets "supervisor" when it auto-resolves. Recorded in the audit
+    trail so supervisor vs human decisions stay distinguishable."""
 
 
 class HITLApproveResponse(BaseModel):
@@ -228,6 +232,8 @@ async def approve_hitl_request(
         "request_id": body.request_id,
         "approved": body.approved,
         "reason": body.reason,
+        # Human via UI unless the caller (e.g. the Action Supervisor) says otherwise.
+        "decided_by": body.decided_by or "operator",
     }
     # Route to the exact gate that published this request_id. With several
     # ask-tool calls pending at once, this guarantees the right one unblocks
@@ -280,6 +286,20 @@ async def list_tool_approvals(execution_id: str) -> Dict[str, Any]:
 
     records = await tool_approval_repository.list_for_execution(execution_id)
     return {"execution_id": execution_id, "approvals": records}
+
+
+@router.get("/approvals/recent")
+async def list_recent_tool_approvals(limit: int = 50) -> Dict[str, Any]:
+    """Cross-execution supervision audit trail (newest first).
+
+    Surfaces every approve / deny / timeout across executions — including the
+    Action Supervisor's own auto-decisions (``decided_by='supervisor'``) and its
+    advisory verdicts on human-decided cards — for a single audit view.
+    """
+    from app.infrastructure.persistence import tool_approval_repository
+
+    records = await tool_approval_repository.list_recent(limit)
+    return {"approvals": records, "count": len(records)}
 
 
 @router.get("/{execution_id}/history")

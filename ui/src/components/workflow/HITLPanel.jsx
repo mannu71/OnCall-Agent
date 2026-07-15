@@ -113,15 +113,24 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
             suggestions: Array.isArray(data.suggestions) ? data.suggestions : [],
             toolName,
             toolParams,
+            // Action Supervisor advisory (present when the supervisor is enabled).
+            riskTier: data.risk_tier || null,
+            supervisorVerdict: data.supervisor_verdict || null,
+            supervisorReasoning: data.supervisor_reasoning || null,
         };
         setHitlRequest(newRequest);
         setDecision(null);
         setError(null);
         autoHandledRef.current = false;
 
-        // Auto-handle based on per-tool permission level
+        // Auto-handle based on per-tool permission level. A high-risk action
+        // (Action Supervisor tier) must never be silently always-allowed from a
+        // saved client preference — a human has to see it. 'deny' still applies.
         if (toolName) {
-            const perm = getPermission(toolName);
+            let perm = getPermission(toolName);
+            if (perm === 'always_allow' && newRequest.riskTier === 'high') {
+                perm = 'ask';
+            }
             if (perm === 'always_allow') {
                 autoHandledRef.current = true;
                 setDecision('approved');
@@ -308,6 +317,26 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
                     </div>
                 )}
 
+                {/* Action Supervisor advisory verdict */}
+                {hitlRequest.supervisorVerdict && (
+                    <div className={`mt-2 rounded border p-2 text-[11px] ${
+                        hitlRequest.riskTier === 'high'
+                            ? 'border-amber-400 bg-amber-50'
+                            : 'border-blue-300 bg-blue-50'
+                    }`}>
+                        <div className="flex items-center gap-1.5 font-semibold">
+                            <span className="uppercase tracking-wide">
+                                {hitlRequest.riskTier === 'high' ? 'High risk' : 'Low risk'}
+                            </span>
+                            <span className="text-muted-foreground">·</span>
+                            <span>Supervisor: {hitlRequest.supervisorVerdict}</span>
+                        </div>
+                        {hitlRequest.supervisorReasoning && (
+                            <div className="mt-0.5 text-muted-foreground">{hitlRequest.supervisorReasoning}</div>
+                        )}
+                    </div>
+                )}
+
                 {/* Per-tool permission config */}
                 {hitlRequest.toolName && (
                     <div>
@@ -328,12 +357,18 @@ const HITLPanel = ({ events, executionId, onDecision }) => {
                                     { level: 'deny',         label: 'Always deny',  Icon: ShieldBan,   cls: 'text-red-600 border-red-400' },
                                 ].map(({ level, label, Icon, cls }) => {
                                     const active = getPermission(hitlRequest.toolName) === level;
+                                    // High-risk actions can't be blanket "always allowed" — a
+                                    // human must review each one (the Action Supervisor tier).
+                                    const blocked = level === 'always_allow' && hitlRequest.riskTier === 'high';
                                     return (
                                         <button
                                             key={level}
+                                            disabled={blocked}
+                                            title={blocked ? 'High-risk actions require review each time' : undefined}
                                             className={`flex items-center gap-1 text-xs px-2 py-1 rounded border transition-colors
-                                                ${active ? `${cls} bg-opacity-10 font-semibold` : 'border-muted text-muted-foreground hover:border-foreground'}`}
-                                            onClick={() => setPermission(hitlRequest.toolName, level)}
+                                                ${blocked ? 'border-muted text-muted-foreground/40 cursor-not-allowed'
+                                                    : active ? `${cls} bg-opacity-10 font-semibold` : 'border-muted text-muted-foreground hover:border-foreground'}`}
+                                            onClick={() => !blocked && setPermission(hitlRequest.toolName, level)}
                                         >
                                             <Icon className="w-3 h-3" />
                                             {label}

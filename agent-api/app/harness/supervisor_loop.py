@@ -1,5 +1,12 @@
 """Bounded supervisor retry loop — the harness's core orchestration primitive.
 
+This is the **quality** supervisor: it runs *after* an agent turn completes,
+scores the final answer, and decides retry / HITL / escalate. It is distinct
+from the **Action Supervisor** (:mod:`app.core.supervision.action_supervisor`),
+which reviews individual write-class actions *before* they execute via the
+ask-gate. The two are complementary — one gates the answer, the other gates the
+actions — and both feed the same approval/trajectory audit trail.
+
 Extracted verbatim (behaviour-preserving) from ``ReactStrategy.execute`` so the
 "run agent → score → retry/HITL/escalate, under hard bounds" loop is reusable by
 any strategy and unit-testable in isolation.

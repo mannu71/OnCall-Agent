@@ -12,15 +12,16 @@ integration, code-intelligence indexing, and real-time SSE monitoring.
   `app/workflow/executor/handlers/`.
 - **ReAct investigations** — LangGraph agents with supervisor quality gates,
   HITL pauses, steer notes, and knowledge-base recall.
-- **Code intelligence** — crawler `indexFlow` builds a knowledge graph
-  (tree-sitter) plus LLM-generated repo overviews; semantic search and symbol
-  lookup power the code-analyzer nodes.
+- **Code intelligence** — the Code Crawler (the native **codegraph** C engine,
+  driven in-process over stdio) builds a structural/graph index; semantic search,
+  symbol lookup, and graph traversal power the code-analyzer nodes, alongside the
+  generic `repo_grep`/`repo_read_file`/`repo_list_files` file tools.
 - **MCP tools** — database, CloudWatch, and custom MCP servers wired through
   `MCPClientManager`.
 - **Scheduling** — APScheduler runs cron workflows; heartbeat monitor maps
   CloudWatch alarms to investigation workflows.
-- **Persistence** — PostgreSQL for workflows, executions, skills, KG tables,
-  and vector embeddings (pgvector).
+- **Persistence** — PostgreSQL for workflows, executions, memory, and vector
+  embeddings (pgvector). The Code Crawler keeps its own SQLite store per project.
 
 Legacy **YAML task lists** (shell / python / nested workflow) still run through
 `TaskExecutor` for backward compatibility. Python scripts execute in an isolated
@@ -37,7 +38,7 @@ subprocess, not via in-process `exec()`.
 | Agents | LangGraph, LangChain (Bedrock / OpenAI / Anthropic / …) |
 | Data | PostgreSQL + asyncpg, SQL migrations in `migrations/` |
 | Vectors | pgvector via `EmbeddingService` |
-| Code crawl | tree-sitter KG + PocketFlow-style `AsyncFlow` DAG |
+| Code Crawler | native codegraph C engine (MCP over stdio) + `repo_*` file tools |
 | Streaming | Server-Sent Events (executions, scheduler, log watch) |
 | UI pairing | React editor in `../ui` (Langflow-style node editor) |
 
@@ -50,10 +51,10 @@ agent-api/
 ├── app/
 │   ├── api/v1/endpoints/     # REST + SSE routes
 │   ├── core/                 # scheduler, heartbeat, executor, settings consumers
-│   ├── crawler/              # index/search flows and nodes
-│   ├── engine/crawler_engine/# AsyncFlow / AsyncNode framework
+│   ├── core/llm/             # shared DB-resolved call_llm + prompt cache
+│   ├── engine/crawler_engine/# generic AsyncFlow / AsyncNode DAG framework
 │   ├── infrastructure/persistence/  # canonical repositories
-│   ├── services/             # visual executor, crawler, log watch, KB
+│   ├── services/             # visual executor, codegraph indexer, log watch, KB
 │   └── workflow/             # strategies, handlers, routing, LLM config
 ├── migrations/               # numbered SQL (run in order)
 ├── tests/                    # pytest suite
@@ -135,17 +136,18 @@ without coupling strategies to the executor singleton.
 
 ---
 
-## Code indexing (`indexFlow`)
+## Code indexing (Code Crawler / codegraph)
 
-Pipeline (see `app/crawler/flows/index_flow.py`):
+The Code Crawler is the native **codegraph** C engine (`/usr/local/bin/codegraph`),
+driven in-process over stdio (`codegraph serve`) — never a registered MCP server
+row (see `app/workflow/tools/codegraph_tools.py`). It keeps its own per-project
+SQLite store under `~/.cache/codegraph`; nothing is written to Postgres.
 
-1. **FetchRepo** — walks the repo; stores paths only (not full file bodies).
-2. **KG nodes** — incremental SHA diff, parallel AST parse, graph persist.
-3. **LLM nodes** — abstractions + relationships (best-effort; KG works even if
-   LLM refuses).
-4. **PersistOverview** — writes `repo_abstractions`.
-
-Trigger via crawler API or `CrawlerService.index_repo()`.
+Repos on a code-analyzer node are indexed incrementally (`mode="fast"`) on
+workflow save by `app/services/codegraph_indexer.py`, which fires the engine's
+`index_repository` tool per repo and re-enables the workflow on completion.
+`recover_interrupted_indexing` (called on startup) re-fires any index left
+mid-run by a restart.
 
 ---
 

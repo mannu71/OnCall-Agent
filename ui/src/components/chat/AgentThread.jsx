@@ -11,6 +11,24 @@ function safeJson(v) {
   }
 }
 
+/**
+ * Compact a model identifier for the timeline chip. Bedrock ids arrive as a
+ * cross-region inference profile (e.g. `us.anthropic.claude-sonnet-4-5-20250929-v1:0`);
+ * strip the region + provider prefixes and the trailing date/version so the
+ * chip reads `claude-sonnet-4-5`. A per-def llm_config NAME (what an explicit
+ * subagent model resolves to) has none of those markers, so it passes through
+ * essentially unchanged.
+ */
+function shortModel(m) {
+  if (!m) return '';
+  let s = String(m);
+  s = s.replace(/^(us|eu|ap|apac)\./i, '');   // region inference-profile prefix
+  s = s.replace(/^[a-z0-9-]+\./i, '');          // provider prefix (anthropic., amazon., …)
+  s = s.replace(/-\d{8}-v\d+(?::\d+)?$/i, '');   // trailing -YYYYMMDD-vN[:N]
+  s = s.replace(/-v\d+(?::\d+)?$/i, '');          // or bare -vN[:N]
+  return s || String(m);
+}
+
 /** One node on the timeline — collapsible tool call with args + result. */
 function ThreadNode({ step }) {
   const [open, setOpen] = useState(false);
@@ -65,10 +83,11 @@ function ThreadNode({ step }) {
         })()}
         {step.model && (
           <span
-            className="hidden sm:inline shrink-0 max-w-[130px] truncate text-[9px] text-slate-400 font-mono"
+            className="shrink-0 max-w-[150px] truncate inline-flex items-center gap-1 rounded px-1 py-px text-[9px] font-mono text-slate-500 dark:text-slate-400 bg-slate-100/70 dark:bg-white/[0.06]"
             title={`Model: ${step.model}`}
           >
-            {step.model}
+            <span className="opacity-50">◆</span>
+            {shortModel(step.model)}
           </span>
         )}
         <span className="ml-auto flex items-center gap-1.5 shrink-0">

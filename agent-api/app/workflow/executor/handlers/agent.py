@@ -3,7 +3,6 @@ import logging
 from typing import Any, Dict
 
 from app.services.mcp_client_manager import MCPClientManager
-from app.workflow.executor.code_correlation import correlate_anomalies_to_code
 from app.workflow.executor.streaming import _AgentStreamCallback
 
 from . import register
@@ -125,8 +124,6 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
                 'code_analysis_type':   value.get('code_analysis_type'),
                 'repos_indexed':        value.get('repos_indexed'),
                 'repos_config':         value.get('repos_config'),
-                'pre_summary':          value.get('pre_summary'),
-                'project_brief':        value.get('project_brief'),
                 'output':               value.get('output'),
                 'codegraph_repo_paths': value.get('codegraph_repo_paths'),
             }
@@ -155,29 +152,6 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
             "Agent node: injecting %d upstream Vector Memory result(s) into context",
             len(mem_results),
         )
-
-    # ------------------------------------------------------------------
-    # Anomaly-code correlation: when both CW and Code Analyzer results are
-    # present, cross-reference anomaly messages with code chunk names and
-    # inject the correlation into strategy_context for the agent's initial
-    # context block.
-    # ------------------------------------------------------------------
-    if cw_results and code_results:
-        try:
-            log_group_to_repo = {}
-            for _, cv in code_results.items():
-                for repo_cfg in (cv.get('repos_config') or []):
-                    for lg in (repo_cfg.get('logGroups') or []):
-                        log_group_to_repo[lg] = repo_cfg.get('name', '')
-            if log_group_to_repo:
-                strategy_context['anomaly_code_correlation'] = \
-                    await correlate_anomalies_to_code(
-                        cw_results=cw_results,
-                        code_results=code_results,
-                        log_group_to_repo=log_group_to_repo,
-                    )
-        except Exception as _corr_exc:
-            logger.debug("Anomaly-code correlation skipped: %s", _corr_exc)
 
     try:
         react_strategy = ReactStrategy()

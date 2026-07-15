@@ -5,37 +5,57 @@
  * (that language simply will not parse). */
 #include <stdlib.h>
 #include <stddef.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #endif
 #include "tree_sitter/api.h"
+#include "base/log.h"
 
+/* Open the prebuilt grammar library once. CG_TS_SO overrides the path on both
+ * platforms; the default is Linux's install path or a DLL next to the binary on
+ * Windows (the Windows loader searches the app directory first). A load failure
+ * disables EVERY language, so it is logged once at error level rather than
+ * silently no-op'ing all parsing. */
 static void *cg_ts_handle(void) {
-#ifndef _WIN32
-    static void *h = NULL; static int tried = 0;
+    static void *h = NULL;
+    static int tried = 0;
     if (!tried) {
         tried = 1;
         const char *p = getenv("CG_TS_SO");
-        if (!p || !*p) p = "/opt/codegraph/languages.so";
+#ifdef _WIN32
+        if (!p || !*p) {
+            p = "languages.dll";
+        }
+        h = (void *)LoadLibraryA(p);
+#else
+        if (!p || !*p) {
+            p = "/opt/codegraph/languages.so";
+        }
         h = dlopen(p, RTLD_NOW | RTLD_GLOBAL);
+#endif
+        if (!h) {
+            cg_log_error("grammar.load_failed", "path", p,
+                         "detail", "no languages will parse; set CG_TS_SO");
+        }
     }
     return h;
-#else
-    return NULL;
-#endif
 }
 
 typedef const TSLanguage *(*cg_ts_fn)(void);
 
 static const TSLanguage *cg_resolve(const char *sym) {
-#ifndef _WIN32
     void *h = cg_ts_handle();
-    if (!h) return NULL;
-    cg_ts_fn fn = (cg_ts_fn)dlsym(h, sym);
-    return fn ? fn() : NULL;
+    if (!h) {
+        return NULL;
+    }
+#ifdef _WIN32
+    cg_ts_fn fn = (cg_ts_fn)(void (*)(void))GetProcAddress((HMODULE)h, sym);
 #else
-    (void)sym; return NULL;
+    cg_ts_fn fn = (cg_ts_fn)dlsym(h, sym);
 #endif
+    return fn ? fn() : NULL;
 }
 
 const TSLanguage *tree_sitter_COBOL(void) { return cg_resolve("tree_sitter_COBOL"); }

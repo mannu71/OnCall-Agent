@@ -1,9 +1,9 @@
-"""Orchestrate both suites, aggregate per-metric accuracy, and emit the report.
+"""Orchestrate the suites, aggregate per-metric accuracy, and emit the report.
 
 Headline "objective accuracy" is built only from deterministic checks
-(crawler find/body/trace; CloudWatch schema + ID-grounding). Severity and
-judge-faithfulness are reported as secondary/semantic signals, not folded into
-the headline.
+(Code Crawler/codegraph find/body/trace; CloudWatch schema + ID-grounding).
+Severity and judge-faithfulness are reported as secondary/semantic signals, not
+folded into the headline.
 
 Run:  python -m evals.accuracy.runner --report
 """
@@ -14,7 +14,7 @@ import asyncio
 from typing import Any, Dict, List
 
 from evals.accuracy import _bootstrap  # noqa: F401
-from evals.accuracy.run_crawler import run_crawler_suite
+from evals.accuracy.run_codegraph import run_codegraph_suite
 from evals.accuracy.run_cloudwatch import run_cloudwatch_suite
 from evals.accuracy.run_trajectory import run_trajectory_suite
 from evals.accuracy.run_lookup import run_lookup_suite
@@ -27,7 +27,7 @@ def _mean(rows: List[Dict[str, Any]]) -> float:
 
 
 def aggregate(
-    crawler: List[Dict[str, Any]],
+    codegraph: List[Dict[str, Any]],
     cloud: List[Dict[str, Any]],
     trajectory: List[Dict[str, Any]] | None = None,
     lookup: List[Dict[str, Any]] | None = None,
@@ -38,7 +38,7 @@ def aggregate(
 
     by_op = {}
     for op in ("find", "body", "trace"):
-        rows = [r for r in crawler if r["op"] == op]
+        rows = [r for r in codegraph if r["op"] == op]
         by_op[op] = {"mean": _mean(rows), "n": len(rows),
                      "passed": sum(1 for r in rows if r["score"] >= 0.999)}
 
@@ -60,12 +60,12 @@ def aggregate(
     lookup = lookup or []
 
     return {
-        "crawler": {
-            "objective_accuracy": _mean(crawler),
-            "n": len(crawler),
-            "passed": sum(1 for r in crawler if r["score"] >= 0.999),
+        "codegraph": {
+            "objective_accuracy": _mean(codegraph),
+            "n": len(codegraph),
+            "passed": sum(1 for r in codegraph if r["score"] >= 0.999),
             "by_op": by_op,
-            "rows": crawler,
+            "rows": codegraph,
         },
         "cloudwatch": {
             "objective_accuracy": _mean(cw_obj),
@@ -94,19 +94,19 @@ def aggregate(
 
 
 async def run_all() -> Dict[str, Any]:
-    crawler = await run_crawler_suite()
+    codegraph = await run_codegraph_suite()
     cloud = await run_cloudwatch_suite()
     trajectory = await run_trajectory_suite()
     lookup = await run_lookup_suite()
-    return aggregate(crawler, cloud, trajectory, lookup)
+    return aggregate(codegraph, cloud, trajectory, lookup)
 
 
 def _print_summary(agg: Dict[str, Any]) -> None:
-    c = agg["crawler"]
+    c = agg["codegraph"]
     w = agg["cloudwatch"]
     print("\n==================== ACCURACY SUMMARY ====================")
     print(f"CodeCrawler  objective accuracy : {c['objective_accuracy']*100:6.2f}%  "
-          f"({c['passed']}/{c['n']} cases)")
+          f"({c['passed']}/{c['n']} cases)")  # codegraph engine
     for op, s in c["by_op"].items():
         print(f"    - {op:<6}: {s['mean']*100:6.2f}%  ({s['passed']}/{s['n']})")
     print(f"CloudWatch   objective accuracy : {w['objective_accuracy']*100:6.2f}%  "

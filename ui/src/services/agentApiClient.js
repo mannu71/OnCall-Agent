@@ -690,6 +690,27 @@ export const agentApiClient = {
     },
 
     /**
+     * List AWS profiles from the host's shared credentials/config files, with
+     * per-profile expiry state. Powers the CloudWatch node's profile dropdown so
+     * an operator picks a *valid* profile at the node level. Offline on the
+     * backend (no STS calls) — expiry comes from each profile's aws_expiration.
+     *
+     * Returns:
+     *   { count: number,
+     *     profiles: [{
+     *       name: string,
+     *       region: string|null,
+     *       has_credentials: boolean,   // cached creds present (vs SSO-needs-login)
+     *       expiration: string|null,    // ISO8601, or null for long-lived keys
+     *       expired: boolean|null,      // null = unknown (no recorded expiry)
+     *     }] }
+     */
+    async listAwsProfiles() {
+        const response = await client.get('/api/v1/log-watch/aws-profiles');
+        return response.data;
+    },
+
+    /**
      * List repositories discovered under REPOS_BASE_PATH (the read-only
      * docker volume mount from the host's repo root). Used by the
      * Configure CodeAnalyzer Node UI to populate a discovery picker.
@@ -724,25 +745,27 @@ export const agentApiClient = {
     },
 
     /**
-     * List repositories that have already been indexed by the crawler
-     * (stored in the ``repo_abstractions`` table).
+     * List the Azure DevOps wikis available for an org/project, so the Wiki
+     * output node can populate a picker instead of making the user paste a URL.
      *
-     * Returns:
-     *   {
-     *     count: number,
-     *     repos: [{
-     *       repo_name: string,
-     *       files_indexed: number,
-     *       model_id: string | null,
-     *       generated_at: string | null,   // ISO-8601
-     *     }]
-     *   }
-     *
-     * Used by the "Code Analyzer" node config panel to let users select from
-     * repos that are already crawled without needing REPOS_BASE_PATH mounted.
+     * Returns: { wikis: [{ id, name, type, url }] }  (url = canonical Wiki URL)
      */
-    async listCrawlerRepos() {
-        const response = await client.get('/api/v1/crawler/repos');
+    async listWikis({ organization, project, pat = '', tokenVar = 'ADO_WIKI_PAT' }) {
+        const response = await client.post('/api/v1/wiki/wikis', {
+            organization, project, pat, tokenVar,
+        });
+        return response.data;
+    },
+
+    /** List Azure DevOps organizations available to the PAT. → { organizations: [{name, id}] } */
+    async listAdoOrganizations({ pat = '', tokenVar = 'ADO_WIKI_PAT' } = {}) {
+        const response = await client.post('/api/v1/wiki/organizations', { pat, tokenVar });
+        return response.data;
+    },
+
+    /** List projects in an ADO organization. → { projects: [{name, id}] } */
+    async listAdoProjects({ organization, pat = '', tokenVar = 'ADO_WIKI_PAT' }) {
+        const response = await client.post('/api/v1/wiki/projects', { organization, pat, tokenVar });
         return response.data;
     },
 
@@ -811,34 +834,10 @@ export const agentApiClient = {
         return response.data;
     },
 
-    /**
-     * Force a full rebuild of a repository index (bypasses the skip-if-unchanged
-     * SHA check). Returns the refreshed repo overview.
-     */
-    async reindexRepo(repo) {
-        const response = await client.post(
-            `/api/v1/crawler/index/${encodeURIComponent(repo)}`,
-            { force: true }
-        );
-        return response.data;
-    },
-
-    /**
-     * Delete the entire index for a repository (knowledge graph + abstractions).
-     * Idempotent on the server: deleting an un-indexed repo is a no-op.
-     */
-    async deleteIndex(repo) {
-        const response = await client.delete(
-            `/api/v1/crawler/index/${encodeURIComponent(repo)}`
-        );
-        return response.data;
-    },
-
-    // ==================== codegraph backend (alt code-intel store) ============
-    // The Codebase Explorer can manage repos indexed by the codegraph engine,
-    // whose graph lives in a separate store reachable only via these endpoints
-    // (it speaks MCP, not REST, to the agent). Shapes mirror the crawler methods
-    // above so the Explorer renders both backends with one code path.
+    // ==================== Code Crawler (codegraph store) ======================
+    // The Codebase Explorer manages repos indexed by the codegraph engine, whose
+    // graph lives in its own store reachable only via these endpoints (it speaks
+    // MCP, not REST, to the agent).
 
     async listCodegraphRepos() {
         const response = await client.get('/api/v1/codegraph/repos');
@@ -904,131 +903,6 @@ export const agentApiClient = {
             }
         );
         return response.data; // { nodes: [...], edges: [...], total_nodes }
-    },
-
-    // ==================== Project Intelligence (read-only) ====================
-
-    /**
-     * Fetch the project brief + architecture overview for an indexed repo.
-     * Returns the brief payload (e.g. { brief, architecture, domain_model }) or
-     * an { error } shape when no intelligence has been generated yet.
-     */
-    async getRepoBrief(repo) {
-        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/brief`);
-        return response.data;
-    },
-
-    /**
-     * Fetch the coding standards (naming, layout, frameworks, error_handling)
-     * inferred for an indexed repo.
-     */
-    async getRepoStandards(repo) {
-        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/standards`);
-        return response.data;
-    },
-
-    /**
-     * Fetch module docs for a repo. Without `path` returns the module list
-     * (path + responsibility); with `path` returns that module's detail
-     * (key_components / data_flow / depends_on).
-     */
-    async getRepoDocs(repo, path) {
-        const params = path ? { path } : undefined;
-        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/docs`, { params });
-        return response.data;
-    },
-
-    /**
-     * Locate where a feature lives in a repo. `query` is optional.
-     */
-    async getRepoFeature(repo, query) {
-        const params = query ? { query } : undefined;
-        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/feature`, { params });
-        return response.data;
-    },
-
-    // ==================== Knowledge Graph & Codebase Explorer ====================
-
-    /**
-     * List all indexed files in a repository with parse stats.
-     */
-    async getRepoFiles(repo, language = null, withErrorsOnly = false, limit = 200) {
-        const params = { limit };
-        if (language) params.language = language;
-        if (withErrorsOnly) params.with_errors_only = withErrorsOnly;
-        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/files`, { params });
-        return response.data;
-    },
-
-    /**
-     * Fetch all nodes and edges defined in a specific file.
-     */
-    async getFileNodes(repo, filePath) {
-        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/nodes`, {
-            params: { file_path: filePath }
-        });
-        return response.data;
-    },
-
-    /**
-     * Fetch metadata for a single knowledge graph node.
-     */
-    async getKGNode(repo, qualifiedName) {
-        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/node`, {
-            params: { qualified_name: qualifiedName }
-        });
-        return response.data;
-    },
-
-    /**
-     * Find callers of a symbol transitively up to a depth.
-     */
-    async getKGCallers(repo, symbol, depth = 2) {
-        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/callers`, {
-            params: { symbol, depth }
-        });
-        return response.data;
-    },
-
-    /**
-     * Find callees of a symbol transitively up to a depth.
-     */
-    async getKGCallees(repo, symbol, depth = 2) {
-        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/callees`, {
-            params: { symbol, depth }
-        });
-        return response.data;
-    },
-
-    /**
-     * Perform impact analysis on a symbol.
-     */
-    async getKGImpact(repo, symbol) {
-        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/impact`, {
-            params: { symbol }
-        });
-        return response.data;
-    },
-
-    /**
-     * Find references to a symbol grouped by relation kind.
-     */
-    async getKGReferences(repo, symbol, limit = 20) {
-        const response = await client.get(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/references`, {
-            params: { symbol, limit }
-        });
-        return response.data;
-    },
-
-    /**
-     * Compute a deterministic impact tree for a list of modified files or symbols.
-     */
-    async getKGDiffImpact(repo, files = [], symbols = []) {
-        const response = await client.post(`/api/v1/crawler/repos/${encodeURIComponent(repo)}/diff-impact`, {
-            files,
-            symbols
-        });
-        return response.data;
     },
 };
 

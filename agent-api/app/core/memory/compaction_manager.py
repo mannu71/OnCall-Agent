@@ -163,9 +163,9 @@ class ContextCompactionManager:
             (window_size - reserve_tokens) * compaction_threshold_fraction
         )
         # Cheap deterministic tier (drop stale tool results, no LLM call) tried
-        # BEFORE the expensive LLM-summary tier — mirrors claude-code-main's
-        # microcompact vs full-compact split. Fires earlier (lower fraction)
-        # than the hard threshold so the common case never needs a summary call.
+        # BEFORE the expensive LLM-summary tier — a microcompact vs full-compact
+        # split. Fires earlier (lower fraction) than the hard threshold so the
+        # common case never needs a summary call.
         self._microcompact_threshold = int(
             (window_size - reserve_tokens) * microcompact_threshold_fraction
         )
@@ -319,7 +319,7 @@ class ContextCompactionManager:
         if self._summarization_model:
             return self._summarization_model
         try:
-            from app.crawler.call_llm import _resolve_llm_config
+            from app.core.llm.call_llm import _resolve_llm_config
             cfg = await _resolve_llm_config()
             self._summarization_model = cfg["model"]
         except Exception as exc:  # noqa: BLE001 — never break compaction

@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE runtime dependencies — everything needed to run an agent (LLM + tools +
 # chat + persistence + CloudWatch). Optional feature deps live in sibling files:
-#   requirements-crawler.txt  — tree-sitter parsers (code crawler / KG)
+#   requirements-semantic.txt  — ONNX code-embedding semantic search
 # and the `openai` extra (langchain-openai) is added only by requirements.txt.
 # Keep this list as the minimal footprint; pyproject.toml is the source of truth.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -21,7 +21,7 @@ pydantic-settings>=2.3.4
 # YAML Processing
 pyyaml>=6.0.1
 
-# Gitignore-aware file crawling (used by code crawler walk; pure-python, tiny)
+# Gitignore-aware file walking (used by the repo_files walk; pure-python, tiny)
 pathspec>=0.11.0
 
 # SSE Support

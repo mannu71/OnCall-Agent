@@ -1,9 +1,9 @@
 """Skills API — manage file-based markdown (``SKILL.md``) skills.
 
 Skills are markdown files with YAML frontmatter (``SkillManager``). They are
-reusable guidance the agent auto-selects per query (RAG) or is invoked by
-slash-command. There is no database: these endpoints view, create, edit, and
-delete the ``SKILL.md`` files on disk.
+reusable runbooks the agent loads on demand via the ``skill`` tool, or that a
+user invokes by typing ``/skill-name`` in chat. There is no database: these
+endpoints view, create, edit, and delete the ``SKILL.md`` files on disk.
 """
 import logging
 from typing import Any, Dict

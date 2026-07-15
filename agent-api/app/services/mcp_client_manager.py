@@ -150,12 +150,28 @@ class MCPClientManager:
         # parallel tool calls in one turn; without this they corrupt the session
         # and all hang to timeout.
         self._call_locks: Dict[str, asyncio.Lock] = {}
+        # Per-server CONNECT lock. Distinct from _call_locks: the same server
+        # can be connected by two paths in one run — the standalone mcp_server
+        # node handler AND the agent's pre-build barrier (see
+        # connect_agent_mcp_nodes). connect_server is otherwise unguarded, so
+        # two concurrent calls during the (multi-second) cold start would spawn
+        # two subprocesses and clobber self.connections. This lock coalesces
+        # them onto one connection — the analog of the reference client's
+        # memoized connectToServer.
+        self._connect_locks: Dict[str, asyncio.Lock] = {}
 
     def _get_call_lock(self, server_id: str) -> "asyncio.Lock":
         lock = self._call_locks.get(server_id)
         if lock is None:
             lock = asyncio.Lock()
             self._call_locks[server_id] = lock
+        return lock
+
+    def _get_connect_lock(self, server_id: str) -> "asyncio.Lock":
+        lock = self._connect_locks.get(server_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._connect_locks[server_id] = lock
         return lock
 
     def set_tool_filter(self, server_id: str, patterns: List[str]) -> None:
@@ -204,7 +220,24 @@ class MCPClientManager:
         
         Returns:
             True if connection successful
+
+        Idempotent and concurrency-safe: a per-server lock serializes connects
+        for the same ``server_id``, and an already-live connection short-circuits
+        to ``True`` without spawning a second subprocess. This lets the agent's
+        pre-build MCP barrier and the standalone mcp_server node handler both
+        request the same connection in one run without racing.
         """
+        async with self._get_connect_lock(server_id):
+            # Coalesce: another path (barrier or node handler) already brought
+            # this server up while we waited for the lock. self.connections is
+            # only populated AFTER list_tools succeeds, so this is a true
+            # readiness signal, not a mid-connect placeholder.
+            if server_id in self.connections:
+                return True
+            return await self._connect_server_guarded(server_id, config)
+
+    async def _connect_server_guarded(self, server_id: str, config: Dict[str, Any]) -> bool:
+        """connect + initialize + list_tools under the caller's connect lock."""
         try:
             return await asyncio.wait_for(
                 self._connect_server_inner(server_id, config),

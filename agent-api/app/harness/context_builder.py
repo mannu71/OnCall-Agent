@@ -48,14 +48,17 @@ async def build_recall_query(
     Prepends, in priority order under a per-turn token budget: (a') a follow-up
     directive (when ``has_history``), (a) always-injected pinned facts, (b)
     bank-scoped learned semantic memory (when enabled), (c) the KB recall block
-    (issues/patterns/skills), and (d) RAG-auto-selected markdown skills.
-    ``selected_skills`` is the list of auto-selected skill names (for the UI
-    badge). Every leg is best-effort — a failure never blocks the run.
+    (issues/patterns), and (d) a skill block — either a model-facing LISTING of
+    available skills (primary, ``skill_tool_enabled``) or, as a legacy fallback
+    (``skill_rag_selection_enabled``), the single best-matching skill's full
+    body. ``selected_skills`` carries the RAG-auto-selected skill names for the
+    UI badge in fallback mode; it is empty in listing mode (invocations are
+    recorded during the run instead). Every leg is best-effort.
 
     ``allowed_skills``: when non-empty (an agent has skills explicitly picked on
-    its node), both the DB-skill recall and the markdown auto-select are
-    restricted to that set by name. ``None``/empty = no scoping — the global
-    skill library applies (backward-compatible default).
+    its node), the skill listing / auto-select is restricted to that set by
+    name. ``None``/empty = no scoping — the global skill library applies
+    (backward-compatible default).
 
     ``has_history``: True when the chat turn carries prior conversation history
     (``execute_agent``'s ``conversation_history`` replay is non-empty). Prepends
@@ -178,10 +181,40 @@ async def build_recall_query(
         if _block:
             blocks.append(_block)
 
-    # ── (c) RAG-auto-selected markdown skills ────────────────────────────────
+    # ── (c) Skills ───────────────────────────────────────────────────────────
+    # Primary path: a compact model-facing LISTING (name + description) so the
+    # agent knows which skills it can load via the ``skill`` tool. Legacy
+    # fallback (behind ``skill_rag_selection_enabled``): inject the single
+    # best-matching skill's full body. If both flags are on the listing wins.
     selected_skills: list[str] = []
+    skill_block: str = ""
+    _skill_tool_on = bool(getattr(settings, "skill_tool_enabled", True))
+    _skill_rag_on = bool(getattr(settings, "skill_rag_selection_enabled", False))
+    if _skill_tool_on and _skill_rag_on:
+        logger_instance.warning(
+            "ReactStrategy: both skill_tool_enabled and skill_rag_selection_enabled "
+            "are on — using the skill listing and skipping RAG body injection.",
+            extra={"execution_id": execution_id},
+        )
     try:
-        if getattr(settings, "skill_rag_selection_enabled", True):
+        if _skill_tool_on:
+            from app.core.skills import get_default_skill_manager
+            _mgr = get_default_skill_manager()
+            _listing = _mgr.build_listing(
+                allowed=_allowed_set,
+                char_budget=int(getattr(settings, "skill_listing_char_budget", 8000)),
+                entry_cap=int(getattr(settings, "skill_listing_entry_chars", 250)),
+            )
+            if _listing:
+                skill_block = (
+                    "# Available skills\n"
+                    "These are proven runbooks you can load. When one matches the task, "
+                    "call the `skill` tool (skill=\"<name>\") to load and follow it BEFORE "
+                    "doing other work — this is a blocking requirement. A user message that "
+                    "starts with `/<name> [args]` also means invoke that skill.\n"
+                    + _listing
+                )
+        elif _skill_rag_on:
             from app.core.skills import get_default_skill_manager
             _mgr = get_default_skill_manager()
             _hits = _mgr.select_for_query(
@@ -189,10 +222,27 @@ async def build_recall_query(
             )
             if _hits:
                 selected_skills = [s.name for s in _hits]
-                lines = ["## Suggested skills (auto-selected for this query)"]
-                for s in _hits:
-                    lines.append(f"- **{s.name}** — {s.description} (follow this runbook's steps)")
-                blocks.append("\n".join(lines))
+                # Inject the FULL runbook body of the BEST-matching skill (capped)
+                # — not just its description — so the agent can actually follow its
+                # steps. Weaker secondary matches get a one-line pointer only, so a
+                # marginally-relevant skill never dumps its whole body as noise.
+                # Given its own slot below (outside the memory budget) so a large
+                # runbook isn't starved by pinned/semantic/KB blocks.
+                _cap = int(getattr(settings, "skill_body_inject_chars", 8000))
+                _top = _hits[0]
+                _body = (getattr(_top, "content", "") or "").strip()
+                if len(_body) > _cap:
+                    _body = _body[:_cap].rstrip() + "\n\n…(runbook truncated — continues on disk)"
+                _hdr = f"## Skill: {_top.name}"
+                if getattr(_top, "description", ""):
+                    _hdr += f"\n_{_top.description}_"
+                _sections = [f"{_hdr}\n\n{_body}"]
+                for s in _hits[1:]:
+                    _sections.append(f"## Also possibly relevant: {s.name} — {s.description}")
+                skill_block = (
+                    "# Applicable skill — follow this runbook for the task\n\n"
+                    + "\n\n---\n\n".join(_sections)
+                )
                 recall_hits += len(_hits)
     except Exception as _skill_err:  # noqa: BLE001 — skill recall is best-effort
         logger_instance.warning(
@@ -205,6 +255,10 @@ async def build_recall_query(
         blocks, user_query,
         budget_tokens=getattr(settings, "memory_turn_token_budget", 800),
     )
+    # Skills get their own slot ABOVE the memory blocks — the runbook is the
+    # actionable instruction set, so it must survive even when memory is full.
+    if skill_block:
+        augmented_query = f"{skill_block}\n\n---\n\n{augmented_query}"
     return augmented_query, recall_hits, selected_skills
 
 
@@ -265,11 +319,6 @@ def seed_context_blocks(
     code_analyzer_context = context.get("code_analyzer_context")
     if code_analyzer_context:
         block = cap_context_block("Pre-computed Code Analysis", code_analyzer_context)
-        augmented_query = f"{block}{augmented_query}"
-
-    anomaly_correlation = context.get("anomaly_code_correlation")
-    if anomaly_correlation:
-        block = cap_context_block("Anomaly-Code Correlation", anomaly_correlation)
         augmented_query = f"{block}{augmented_query}"
 
     vector_memory_context = context.get("vector_memory_context")

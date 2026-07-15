@@ -1,4 +1,4 @@
-"""Postgres-backed LLM prompt cache for crawler flows.
+"""Postgres-backed LLM prompt cache.
 
 Cache key: sha256(model_id + "\\0" + prompt_text)
 This ensures cache entries are isolated per model — no cross-model
@@ -6,7 +6,7 @@ collisions even when the same prompt is sent to different models.
 
 Usage::
 
-    from app.crawler.cache import get_cached, put_cached
+    from app.core.llm.cache import get_cached, put_cached
 
     hit = await get_cached(prompt, model_id)
     if hit is None:
@@ -106,7 +106,7 @@ async def put_cached(
 
 
 async def cache_stats() -> dict:
-    """Return a summary dict for the /crawler/cache/stats endpoint."""
+    """Return a summary dict describing the prompt cache."""
     from app.core.database import AsyncSessionLocal
 
     try:

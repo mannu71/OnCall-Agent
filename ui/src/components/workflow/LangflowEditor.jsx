@@ -237,8 +237,9 @@ function layoutSubagentMembers(nodes, winId, { shrink = false } = {}) {
 // is derived from the tool nodes inside its window. The globs must match the
 // tool names the backend actually binds:
 //   • cloudwatch_tool  → cloudwatch_*
-//   • code_search_tool → crawler_* (Code Crawler) OR codegraph__* (codegraph
-//     backend — tools are MCP-composite named codegraph__<tool>)
+//   • code_search_tool → codegraph__* + repo_* (Code Crawler is the codegraph
+//     engine — graph tools are MCP-composite named codegraph__<tool>; the
+//     generic file tools are repo_grep/repo_read_file/repo_list_files)
 //   • mcp_server       → <serverName>__* per selected server (MCP composite
 //     naming {server_id}__{tool}; params.servers is a comma-joined list)
 // Unknown node types fall back to '*' (full inherit) until their exact tool-name
@@ -247,7 +248,7 @@ function toolGlobsForNode(node) {
   const t = node?.type;
   if (t === 'cloudwatch_tool') return ['cloudwatch_*'];
   if (t === 'code_search_tool') {
-    return [node?.params?.backend === 'codegraph' ? 'codegraph__*' : 'crawler_*'];
+    return ['codegraph__*', 'repo_*'];
   }
   if (t === 'mcp_server') {
     const servers = String(node?.params?.servers || '')
@@ -264,7 +265,11 @@ function toolGlobsForNode(node) {
 // Used by both WfNode (rendering) and layoutSubagentMembers (height/stacking)
 // so the two never disagree about how tall a contained node's card is.
 function visibleSlotsFor(node) {
-  const slots = slotsForNode(NODE_TYPES, node);
+  // `advanced` slots live only in the right-panel's collapsible Advanced group,
+  // never on the canvas card. Safe to drop here because advanced slots are only
+  // editable kinds (field/select), never ports — dropping a port would break
+  // handlePosition/edge anchoring, which relies on this list.
+  const slots = slotsForNode(NODE_TYPES, node).filter(s => !s.advanced);
   if (!node.parentId) return slots;
   return slots.filter(s => !(s.kind === 'port-out' && s.portType === 'tool'));
 }
@@ -298,20 +303,37 @@ function buildExportedWorkflow(nodes, edges, enabled) {
   if (!windows.length) return { nodes, edges, enabled };
 
   const defs = windows
-    .map(win => {
+    .flatMap(win => {
       const members = nodes.filter(n => n.parentId === win.id);
-      const tools = Array.from(new Set(members.flatMap(m => toolGlobsForNode(m))));
-      let model;
+      const baseName = (win.params?.name || win.name || '').trim();
+      const desc = win.params?.description || '';
+      // A subagent runs a SINGLE model. When a window's tools are wired to
+      // different models (e.g. CloudWatch→Sonnet, Code Search→Haiku), collapsing
+      // to one model silently ran everything on the first tool's model. Instead,
+      // group each member's tools by the model wired to it and emit one
+      // specialist per distinct model — each scoped to exactly the tools wired
+      // to it. '' = no model wired → that group inherits the parent's model.
+      const byModel = new Map(); // modelName -> Set(tool globs)
       for (const m of members) {
-        model = resolveModelForNode(m.id, nodes, edges);
-        if (model) break;
+        const model = resolveModelForNode(m.id, nodes, edges) || '';
+        if (!byModel.has(model)) byModel.set(model, new Set());
+        const globs = byModel.get(model);
+        toolGlobsForNode(m).forEach(g => globs.add(g));
       }
-      return {
-        name: (win.params?.name || win.name || '').trim(),
-        description: win.params?.description || '',
-        tools: tools.length ? tools : ['*'],
+      const groups = Array.from(byModel.entries());
+      if (!groups.length) {
+        // Empty window — preserve prior behavior (one inherit-all specialist).
+        return [{ name: baseName, description: desc, tools: ['*'] }];
+      }
+      const split = groups.length > 1;
+      return groups.map(([model, globs]) => ({
+        // Suffix with the model only when the window actually splits, so a
+        // single-model window keeps its plain name (and delegate_to_<name> id).
+        name: split && model ? `${baseName} (${model})` : baseName,
+        description: desc,
+        tools: globs.size ? Array.from(globs) : ['*'],
         ...(model ? { model } : {}),
-      };
+      }));
     })
     .filter(d => d.name);
   if (!defs.length) return { nodes, edges, enabled };
@@ -383,7 +405,8 @@ function rowHeight(slot) {
   if (slot.kind === 'tz-info')                                 return FIELD_H;
   if (slot.kind === 'textarea')                                return TEXTAREA_H;
   if (slot.kind === 'select' || slot.kind === 'llm-select' ||
-      slot.kind === 'db-select' || slot.kind === 'mcp-select' || slot.kind === 'repo-select') return SELECT_H;
+      slot.kind === 'db-select' || slot.kind === 'mcp-select' || slot.kind === 'repo-select' ||
+      slot.kind === 'aws-profile-select') return SELECT_H;
   if (slot.kind === 'weekday-select')                          return WEEKDAY_H;
   if (slot.kind === 'file-select')                             return FIELD_H;
   if (slot.kind === 'toggle')                                  return TOGGLE_H;
@@ -608,7 +631,7 @@ function SlotRow({ slot, value, gtz }) {
       </div>
     );
   }
-  if (slot.kind === 'select') {
+  if (slot.kind === 'select' || slot.kind === 'aws-profile-select') {
     return (
       <div style={{ padding: '6px 12px 4px', height: SELECT_H, boxSizing: 'border-box' }}>
         <div style={{ fontSize: 10.5, color: '#64748b', fontWeight: 600,
@@ -617,7 +640,8 @@ function SlotRow({ slot, value, gtz }) {
                       alignItems: 'center', justifyContent: 'space-between',
                       background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6,
                       fontSize: 12, color: value ? '#0f172a' : '#94a3b8' }}>
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1,
+                         fontFamily: slot.kind === 'aws-profile-select' ? "'JetBrains Mono', monospace" : 'inherit' }}>
             {value || '—'}
           </span>
           <Icon name="chevronDown" size={12} color="#94a3b8" />
@@ -1881,6 +1905,99 @@ function formatStoredBytes(bytes) {
   return `${v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
 }
 
+// AWS profile picker — populated dropdown of the host's ~/.aws profiles with
+// per-profile expiry status, so an operator selects a *valid* profile at the
+// node level instead of blindly typing one (the old free-text field). The value
+// stored is just the profile name (what the backend passes to boto3.Session).
+function awsProfileStatus(p) {
+  // → { label, color } describing a profile's credential state for display.
+  if (!p) return { label: '', color: '#64748b' };
+  if (p.expired === true)  return { label: 'expired',        color: '#dc2626' };
+  if (p.expired === false) return { label: 'valid',          color: '#16a34a' };
+  if (p.has_credentials)   return { label: 'no expiry',      color: '#64748b' };
+  return { label: 'SSO · needs login', color: '#d97706' };
+}
+function AwsProfileSelect({ value, onChange }) {
+  const [profiles, setProfiles] = React.useState([]);
+  const [loading, setLoading]   = React.useState(false);
+  const [error, setError]       = React.useState(null);
+
+  const load = React.useCallback(() => {
+    setLoading(true); setError(null);
+    agentApiClient.listAwsProfiles()
+      .then(data => setProfiles(Array.isArray(data?.profiles) ? data.profiles : []))
+      .catch(err => setError(err?.message || 'Failed to load AWS profiles'))
+      .finally(() => setLoading(false));
+  }, []);
+
+  React.useEffect(() => { load(); }, [load]);
+
+  const current = value || '';
+  // A saved value that isn't in the discovered list stays selectable (e.g. a
+  // profile from a different host, or one added after the last refresh).
+  const knownNames = profiles.map(p => p.name);
+  const hasCustom = current && !knownNames.includes(current);
+  const selected = profiles.find(p => p.name === current);
+  const status = selected ? awsProfileStatus(selected) : null;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <div style={{ position: 'relative', flex: 1 }}>
+          <select value={current} onChange={e => onChange?.(e.target.value)}
+            style={{ width: '100%', boxSizing: 'border-box', border: '1px solid #e2e8f0',
+                     borderRadius: 6, padding: '6px 24px 6px 9px', outline: 'none',
+                     background: '#fafbfc', fontSize: 12, cursor: 'pointer',
+                     color: current ? '#0f172a' : '#94a3b8', appearance: 'none',
+                     WebkitAppearance: 'none', fontFamily: "'JetBrains Mono', monospace" }}>
+            <option value="">— default credential chain —</option>
+            {hasCustom && <option value={current}>{current} (custom)</option>}
+            {profiles.map(p => {
+              const s = awsProfileStatus(p);
+              return <option key={p.name} value={p.name}>{p.name} — {s.label}</option>;
+            })}
+          </select>
+          <span style={{ position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)',
+                         pointerEvents: 'none', display: 'flex', alignItems: 'center' }}>
+            <Icon name="chevronDown" size={13} color="#94a3b8" />
+          </span>
+        </div>
+        <button onClick={load} disabled={loading} title="Refresh profiles"
+          style={{ padding: '5px 8px', background: loading ? '#f1f5f9' : '#fff',
+                   border: '1px solid #e2e8f0', borderRadius: 6,
+                   cursor: loading ? 'wait' : 'pointer', fontSize: 11, color: '#475569',
+                   whiteSpace: 'nowrap' }}>
+          {loading ? '…' : '↻'}
+        </button>
+      </div>
+      {error && (
+        <div style={{ fontSize: 10.5, color: '#dc2626' }}>⚠ {error}</div>
+      )}
+      {!error && status && (
+        <div style={{ fontSize: 10.5, display: 'flex', alignItems: 'center', gap: 5 }}>
+          <span style={{ width: 6, height: 6, borderRadius: 999, background: status.color }} />
+          <span style={{ color: status.color, fontWeight: 600 }}>{status.label}</span>
+          {selected?.expiration && (
+            <span style={{ color: '#94a3b8' }}>
+              · expires {new Date(selected.expiration).toLocaleString()}
+            </span>
+          )}
+          {selected?.region && (
+            <span style={{ color: '#94a3b8', fontFamily: "'JetBrains Mono', monospace" }}>
+              · {selected.region}
+            </span>
+          )}
+        </div>
+      )}
+      {!error && !status && !current && (
+        <div style={{ fontSize: 10.5, color: '#94a3b8' }}>
+          Empty = default chain (env / instance role / [default] profile).
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Chip editor component for logs/list configurations
 function ChipEditor({ value, onChange, action, actionContext }) {
   const [inputValue, setInputValue] = React.useState('');
@@ -2477,10 +2594,11 @@ function SkillsPicker({ value, onChange, skillCatalog }) {
     () => (value ? String(value).split(',').map(s => s.trim()).filter(Boolean) : []),
     [value],
   );
-  // Skills are file-based markdown (SKILL.md). Selecting any chip scopes the
-  // agent to "only these"; an empty selection means auto-select over the whole
-  // library (see build_recall_query).
-  const fsSkills = skillCatalog?.filesystem || [];
+  // Skills are file-based markdown (SKILL.md). The picker lists only USER-authored
+  // custom skills (origin === 'user'); bundled/global skills are hidden here since
+  // they auto-select over the whole library anyway (see build_recall_query).
+  // Selecting any chip scopes the agent to "only these"; empty = auto-select.
+  const fsSkills = (skillCatalog?.filesystem || []).filter(s => s?.origin === 'user');
   const toggle = (name) => {
     const next = selected.includes(name) ? selected.filter(n => n !== name) : [...selected, name];
     onChange(next.join(', '));
@@ -2511,12 +2629,14 @@ function SkillsPicker({ value, onChange, skillCatalog }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '6px 12px' }}>
       <div style={labelStyle}>
         Skills <span style={{ fontWeight: 400, textTransform: 'none', color: '#94a3b8' }}>
-          (optional — none selected = auto-select from the global library)
+          (optional — pick your custom skills; bundled skills auto-select globally)
         </span>
       </div>
       {fsSkills.length > 0
         ? renderGroup(fsSkills, '#7c3aed')
-        : <span style={{ fontSize: 10, color: '#94a3b8' }}>No skills available yet</span>}
+        : <span style={{ fontSize: 10, color: '#94a3b8' }}>
+            No custom skills yet — add them on the Skills page. Bundled skills are auto-selected automatically.
+          </span>}
     </div>
   );
 }
@@ -2802,6 +2922,7 @@ function MultiRepoSelect({ value, onChange }) {
   const isToggle    = slotKind === 'toggle';
   const isSegment   = slotKind === 'segment';
   const isChips        = slotKind === 'chips';
+  const isAwsProfile   = slotKind === 'aws-profile-select';
   const isSubagentsEd  = slotKind === 'subagents-editor';
   const isSkillsPicker = slotKind === 'skills-picker';
   const isMono         = isCode || k === 'cron' || k === 'url';
@@ -2818,12 +2939,12 @@ function MultiRepoSelect({ value, onChange }) {
                        letterSpacing: '0.04em', textTransform: 'uppercase' }}>{displayLabel}</span>
       </div>
       <div style={{ padding: isCode ? '9px 11px'
-                          : (isWeekday || isFilePick || isToggle || isChips || isSegment || isSubagentsEd || isSkillsPicker) ? '0'
+                          : (isWeekday || isFilePick || isToggle || isChips || isSegment || isSubagentsEd || isSkillsPicker || isAwsProfile) ? '0'
                           : '7px 11px',
                     background: isCode ? '#0f172a'
-                                : (isWeekday || isFilePick || isToggle || isChips || isSegment || isSubagentsEd || isSkillsPicker) ? 'transparent'
+                                : (isWeekday || isFilePick || isToggle || isChips || isSegment || isSubagentsEd || isSkillsPicker || isAwsProfile) ? 'transparent'
                                 : '#fafbfc',
-                    border: (isWeekday || isFilePick || isToggle || isChips || isSegment || isSubagentsEd || isSkillsPicker) ? 'none'
+                    border: (isWeekday || isFilePick || isToggle || isChips || isSegment || isSubagentsEd || isSkillsPicker || isAwsProfile) ? 'none'
                             : `1px solid ${isCode ? '#1e293b' : '#e2e8f0'}`,
                     borderRadius: 7 }}>
         {slotKind === 'routes-editor'
@@ -3062,6 +3183,9 @@ function MultiRepoSelect({ value, onChange }) {
               onChange={val => onChange?.(k, val)}
               action={slotAction}
               actionContext={allParams || {}} />
+          : isAwsProfile
+          ? <AwsProfileSelect value={String(v ?? '')}
+              onChange={val => onChange?.(k, val)} />
           : isSubagentsEd
           ? <SubagentsEditor value={v} onChange={val => onChange?.(k, val)}
               llmOptions={llmOptions} toolCatalog={toolCatalog} profileCatalog={profileCatalog} />
@@ -3128,6 +3252,77 @@ function PortRowR({ slot }) {
   );
 }
 
+// Reusable "load from Azure DevOps" picker used by the Wiki node to populate
+// Organization, Project and Wiki from the PAT instead of typing them.
+//   load()      -> async () => array of items
+//   itemLabel   -> (item) => primary text
+//   itemTag     -> (item) => optional muted suffix (e.g. wiki type)
+//   itemValue   -> (item) => value written to the param on pick
+//   canLoad     -> gate; when false the button is disabled and `hint` shows
+function AdoPicker({ noun, load, itemLabel, itemTag, itemValue, onPick, canLoad = true, hint }) {
+  const [open, setOpen]       = useState(false);
+  const [items, setItems]     = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr]         = useState(null);
+
+  const run = async () => {
+    setLoading(true); setErr(null);
+    try {
+      const list = await load();
+      setItems(Array.isArray(list) ? list : []);
+      setOpen(true);
+    } catch (e) {
+      // This API's error handler returns { error, message }; FastAPI validation
+      // returns { detail }. Prefer whichever carries the human-readable reason.
+      const d = e?.response?.data;
+      setErr(d?.message || d?.detail || e?.message || `Failed to load ${noun}`);
+      setItems([]);
+      setOpen(true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 6 }}>
+      <button type="button" disabled={!canLoad || loading}
+        onClick={() => (open ? setOpen(false) : run())}
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 6,
+                 background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 7,
+                 padding: '5px 10px', cursor: canLoad && !loading ? 'pointer' : 'not-allowed',
+                 fontSize: 11, fontWeight: 600, color: canLoad ? '#334155' : '#94a3b8' }}>
+        {loading ? 'Loading…' : (open ? `Hide ${noun}` : `Load ${noun}`)}
+      </button>
+      {!canLoad && hint && (
+        <div style={{ marginTop: 4, fontSize: 10.5, color: '#94a3b8' }}>{hint}</div>
+      )}
+      {open && err && (
+        <div style={{ marginTop: 6, fontSize: 11, color: '#b91c1c' }}>{err}</div>
+      )}
+      {open && !err && !loading && items.length === 0 && (
+        <div style={{ marginTop: 6, fontSize: 11, color: '#94a3b8' }}>No {noun} found.</div>
+      )}
+      {open && items.length > 0 && (
+        <div style={{ marginTop: 6, border: '1px solid #e2e8f0', borderRadius: 7,
+                      maxHeight: 220, overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
+          {items.map((it, i) => (
+            <button type="button" key={itemValue(it) || i}
+              onClick={() => { onPick(itemValue(it)); setOpen(false); }}
+              style={{ textAlign: 'left', background: '#fff', border: 'none',
+                       borderBottom: '1px solid #f1f5f9', padding: '7px 10px',
+                       cursor: 'pointer', fontSize: 12, color: '#0f172a' }}>
+              <span style={{ fontWeight: 600 }}>{itemLabel(it)}</span>
+              {itemTag && itemTag(it) && (
+                <span style={{ marginLeft: 6, fontSize: 10, color: '#94a3b8' }}>{itemTag(it)}</span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpServers, toolCatalog, profileCatalog, skillCatalog, workflowName, edges, nodes, latestExecution }) {
   const def = NODE_TYPES[node.type];
   if (!def) return null;
@@ -3135,7 +3330,19 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpS
   const [editingName, setEditingName] = useState(false);
   const [nameVal, setNameVal] = useState(node.name);
   const [lastExecStatus, setLastExecStatus] = useState(null);
+  const [advOpen, setAdvOpen] = useState(false);
   useEffect(() => { setNameVal(node.name); }, [node.id, node.name]);
+
+  // Auto-expand the Advanced group when any advanced param diverges from its
+  // default (e.g. a PAT or Project was set), so a configured value is never hidden.
+  useEffect(() => {
+    const adv = (NODE_TYPES[node.type]?.slots || []).filter(s => s.advanced);
+    const defs = NODE_DEFAULTS[node.type] || {};
+    setAdvOpen(adv.some(s => {
+      const v = String((node.params || {})[s.id] ?? '');
+      return v !== '' && v !== String(defs[s.id] ?? '');
+    }));
+  }, [node.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { isWorkflowRunning } = useWorkflowStatus();
   const isRunning = workflowName ? isWorkflowRunning(workflowName) : false;
@@ -3247,7 +3454,7 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpS
         <SHdr>{def.desc}</SHdr>
 
         {(() => {
-          const EDITABLE_KINDS = new Set(['field', 'select', 'segment', 'textarea', 'llm-select', 'db-select', 'mcp-select', 'repo-select', 'weekday-select', 'file-select', 'toggle', 'chips', 'routes-editor', 'subagents-editor', 'skills-picker']);
+          const EDITABLE_KINDS = new Set(['field', 'select', 'segment', 'textarea', 'llm-select', 'db-select', 'mcp-select', 'repo-select', 'weekday-select', 'file-select', 'toggle', 'chips', 'routes-editor', 'subagents-editor', 'skills-picker', 'aws-profile-select']);
           const currentParams = node.params || {};
           const editableSlots = (def.slots || []).filter(s => {
             if (!EDITABLE_KINDS.has(s.kind)) return false;
@@ -3264,41 +3471,119 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpS
           const dbOptions  = Object.keys(dbServers || {});
           const mcpOptions = Object.keys(allMcpServers || {});
 
+          const nodeDefaults = NODE_DEFAULTS[node.type] || {};
+          const mainSlots = editableSlots.filter(s => !s.advanced);
+          const advSlots  = editableSlots.filter(s => s.advanced);
+
+          const renderSlot = (slot) => {
+            const selectOptions =
+              slot.kind === 'llm-select'  ? llmOptions :
+              slot.kind === 'db-select'   ? dbOptions  :
+              slot.kind === 'mcp-select'  ? mcpOptions :
+              slot.kind === 'select'      ? (slot.options || []) :
+              slot.kind === 'segment'     ? (slot.options || []) :
+              null;
+            // For selects, fall back to the node default so pre-existing
+            // workflows missing a param (e.g. writeMode) show the default
+            // instead of "— select —".
+            const isSelectKind = slot.kind === 'select' || slot.kind === 'segment';
+            const v = (node.params || {})[slot.id]
+              ?? (isSelectKind ? (nodeDefaults[slot.id] ?? '') : '');
+            const row = (
+              <ParamRow k={slot.id} label={slot.label}
+                v={v}
+                slotKind={slot.kind} onChange={updateParam}
+                selectOptions={selectOptions}
+                slotAccept={slot.accept}
+                slotAction={slot.action}
+                allParams={node.params || {}}
+                nodes={nodes}
+                updateMultipleParams={updateMultipleParams}
+                slotPlaceholder={slot.placeholder}
+                llmOptions={llmOptions}
+                toolCatalog={toolCatalog}
+                profileCatalog={profileCatalog}
+                skillCatalog={skillCatalog}
+                onFileChange={slot.kind === 'file-select'
+                  ? (name, content) => onUpdateNode?.(node.id, {
+                      params: { ...(node.params || {}), [slot.id]: name, sqlContent: content },
+                    })
+                  : undefined} />
+            );
+            // Wiki node: offer PAT-driven pickers under Organization, Project
+            // and Wiki URL so users can select instead of typing/pasting.
+            if (node.type === 'wiki') {
+              const p = node.params || {};
+              const pat = p.pat || '';
+              const tokenVar = p.tokenVar || 'ADO_WIKI_PAT';
+              const org = (p.organization || '').trim();
+              const project = (p.project || '').trim();
+              if (slot.id === 'organization') {
+                return (
+                  <div key={slot.id}>
+                    {row}
+                    <AdoPicker noun="organizations"
+                      load={async () => (await agentApiClient.listAdoOrganizations({ pat, tokenVar })).organizations}
+                      itemLabel={(o) => o.name} itemValue={(o) => o.name}
+                      onPick={(v) => updateParam('organization', v)} />
+                  </div>
+                );
+              }
+              if (slot.id === 'project') {
+                return (
+                  <div key={slot.id}>
+                    {row}
+                    <AdoPicker noun="projects"
+                      canLoad={!!org} hint="Enter Organization to list projects."
+                      load={async () => (await agentApiClient.listAdoProjects({ organization: org, pat, tokenVar })).projects}
+                      itemLabel={(pr) => pr.name} itemValue={(pr) => pr.name}
+                      onPick={(v) => updateParam('project', v)} />
+                  </div>
+                );
+              }
+              if (slot.id === 'wikiUrl') {
+                return (
+                  <div key={slot.id}>
+                    {row}
+                    <AdoPicker noun="wikis"
+                      canLoad={!!(org && project)} hint="Enter Organization and Project to list wikis."
+                      load={async () => (await agentApiClient.listWikis({ organization: org, project, pat, tokenVar })).wikis}
+                      itemLabel={(w) => w.name || w.id} itemTag={(w) => w.type} itemValue={(w) => w.url}
+                      onPick={(v) => updateParam('wikiUrl', v)} />
+                  </div>
+                );
+              }
+            }
+            return <div key={slot.id}>{row}</div>;
+          };
+
           return (
             <>
               <SHdr style={{ marginTop: 18 }}>Parameters</SHdr>
               <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {editableSlots.map(slot => {
-                  const selectOptions =
-                    slot.kind === 'llm-select'  ? llmOptions :
-                    slot.kind === 'db-select'   ? dbOptions  :
-                    slot.kind === 'mcp-select'  ? mcpOptions :
-                    slot.kind === 'select'      ? (slot.options || []) :
-                    slot.kind === 'segment'     ? (slot.options || []) :
-                    null;
-                  return (
-                    <ParamRow key={slot.id} k={slot.id} label={slot.label}
-                      v={(node.params || {})[slot.id] ?? ''}
-                      slotKind={slot.kind} onChange={updateParam}
-                      selectOptions={selectOptions}
-                      slotAccept={slot.accept}
-                      slotAction={slot.action}
-                      allParams={node.params || {}}
-                      nodes={nodes}
-                      updateMultipleParams={updateMultipleParams}
-                      slotPlaceholder={slot.placeholder}
-                      llmOptions={llmOptions}
-                      toolCatalog={toolCatalog}
-                      profileCatalog={profileCatalog}
-                      skillCatalog={skillCatalog}
-                      onFileChange={slot.kind === 'file-select'
-                        ? (name, content) => onUpdateNode?.(node.id, {
-                            params: { ...(node.params || {}), [slot.id]: name, sqlContent: content },
-                          })
-                        : undefined} />
-                  );
-                })}
+                {mainSlots.map(renderSlot)}
               </div>
+              {advSlots.length > 0 && (
+                <>
+                  <button type="button" onClick={() => setAdvOpen(o => !o)}
+                    style={{ marginTop: 14, display: 'flex', alignItems: 'center', gap: 6,
+                             background: 'none', border: 'none', padding: 0, cursor: 'pointer',
+                             fontSize: 10.5, fontWeight: 700, color: '#64748b',
+                             letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+                    <span style={{ display: 'inline-flex',
+                                   transform: advOpen ? 'rotate(0deg)' : 'rotate(-90deg)',
+                                   transition: 'transform 120ms' }}>
+                      <Icon name="chevronDown" size={12} color="#64748b" />
+                    </span>
+                    Advanced
+                  </button>
+                  {advOpen && (
+                    <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 12 }}>
+                      {advSlots.map(renderSlot)}
+                    </div>
+                  )}
+                </>
+              )}
             </>
           );
         })()}

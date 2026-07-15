@@ -9,7 +9,7 @@ Two layers:
     concrete, approvable improvement proposals. Proposals are returned as DRAFTS;
     applying them is a separate, human-driven step.
 
-DB-configured model only (``app.crawler.call_llm`` resolves it) — never hardcoded.
+DB-configured model only (``app.core.llm.call_llm`` resolves it) — never hardcoded.
 """
 from __future__ import annotations
 
@@ -287,7 +287,7 @@ def _event_heuristic_proposals(event_signals: Dict[str, Any]) -> List[Dict[str, 
 
 async def _llm_proposals(profile: Optional[str], signals: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Ask the DB-configured LLM to turn signals into concrete proposals (drafts)."""
-    from app.crawler.call_llm import call_llm
+    from app.core.llm.call_llm import call_llm
 
     prompt = (
         "You are an agent-quality analyst. Given these aggregate signals from recent runs of an "

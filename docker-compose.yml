@@ -43,6 +43,10 @@ services:
       - ~/.aws:/root/.aws:ro
       - ${REPOS_HOST_PATH:-./agent-api/data/indexed_repos}:/app/data/indexed_repos
       - ./agent-api/data/codegraph-cache:/root/.cache/codegraph
+      # Corporate TLS-inspecting proxy (e.g. Netskope) CA bundle. Read-only.
+      # Defaults to /dev/null when NETSKOPE_CERT_PATH is unset, so this mount is
+      # a harmless no-op on machines without an SSL-inspecting proxy.
+      - ${NETSKOPE_CERT_PATH:-/dev/null}:/etc/ssl/certs/corp-ca.pem:ro
     environment:
       - API_HOST=0.0.0.0
       - API_PORT=8000
@@ -50,10 +54,23 @@ services:
       - MAX_CONCURRENT_WORKFLOWS=5
       - LOG_LEVEL=INFO
       - AWS_SSL_VERIFY=false
+      # Point boto3, requests, and stdlib ssl at the corporate CA bundle so the
+      # CloudWatch MCP subprocess (a separate process that ignores AWS_SSL_VERIFY)
+      # trusts the proxy-re-signed chain. The bundle is a full combined chain
+      # (corporate + public roots), so this is proper verification, not a bypass.
+      # `:+` expands to empty when NETSKOPE_CERT_PATH is unset -> libraries fall
+      # back to their default CA store on non-corporate machines.
+      - AWS_CA_BUNDLE=${NETSKOPE_CERT_PATH:+/etc/ssl/certs/corp-ca.pem}
+      - REQUESTS_CA_BUNDLE=${NETSKOPE_CERT_PATH:+/etc/ssl/certs/corp-ca.pem}
+      - SSL_CERT_FILE=${NETSKOPE_CERT_PATH:+/etc/ssl/certs/corp-ca.pem}
+      - NODE_EXTRA_CA_CERTS=${NETSKOPE_CERT_PATH:+/etc/ssl/certs/corp-ca.pem}
       - DATABASE_URL=postgresql://kycuser:kycpassword@postgres:5432/kycagent
       - REPOS_BASE_PATH=/app/data/indexed_repos
       - CODEGRAPH_CACHE_DIR=/root/.cache/codegraph
-      - CODEGRAPH_SEARCH_TIMEOUT=120
+      # Per-call cap for the slow search_code grep. Kept well under the delegated
+      # subagent budget (240s) so one slow grep can't time out a code-db
+      # investigation before it falls back to the fast indexed tools.
+      - CODEGRAPH_SEARCH_TIMEOUT=45
       # 256MB — up from the 64MB engine default (cg_store_resolve_mmap_size,
       # store.c:308) so the whole ~100MB compliance-api store fits in the
       # mmap window for cold reads. Cheap, safe: just raises a read-cache

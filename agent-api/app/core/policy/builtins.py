@@ -95,6 +95,24 @@ class _OutputCap:
 
 
 @dataclass
+class _SuperviseTools:
+    """Assign Action Supervisor risk tiers to tool-name patterns.
+
+    ``low`` patterns may be auto-decided by the Supervisor LLM; ``high`` patterns
+    always escalate to a human (the Supervisor verdict is shown as advisory).
+    Adds to the platform-default tiers rather than replacing them.
+    """
+
+    low: Tuple[str, ...] = ()
+    high: Tuple[str, ...] = ()
+    name: str = "supervise_tools"
+
+    def contribute(self, builder: _ResolveBuilder) -> None:
+        builder.add_low_risk(*self.low)
+        builder.add_high_risk(*self.high)
+
+
+@dataclass
 class _LoopGuardrails:
     hard_stop: bool = False
     exact_failure_block_after: int = 5
@@ -142,6 +160,10 @@ def max_tool_calls_per_session(limit: int) -> Policy:
 
 def output_cap(max_chars: int) -> Policy:
     return _OutputCap(max_chars=max_chars)
+
+
+def supervise_tools(low: List[str] | None = None, high: List[str] | None = None) -> Policy:
+    return _SuperviseTools(low=tuple(low or ()), high=tuple(high or ()))
 
 
 def loop_guardrails(

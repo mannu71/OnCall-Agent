@@ -14,12 +14,12 @@ model decides what it needs.
 
 Design rules:
 
-* Core/special tools (CloudWatch, code-crawler, DB-schema, playbook, planning,
-  filesystem, delegate, edit, …) are NEVER deferred — they stay directly bound.
-  Only open-ended MCP tools are candidates for disclosure.
+* Core/special tools (CloudWatch, Code Crawler/codegraph, DB-schema, playbook,
+  planning, filesystem, delegate, edit, …) are NEVER deferred — they stay
+  directly bound. Only open-ended MCP tools are candidates for disclosure.
 * Threshold gate: if the deferrable tools would cost less than a cutoff
   (~20K tokens of schema, matching the quality cliff), this is a no-op and the
-  tools pass through unchanged. So existing CloudWatch/crawler workflows — and
+  tools pass through unchanged. So existing CloudWatch/codegraph workflows — and
   the accuracy evals — are untouched; only big MCP servers trigger disclosure.
 * The catalog is rebuilt from the live tool list every assembly (no session
   drift).
@@ -39,7 +39,9 @@ from typing import Any, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 # Tool name prefixes for the agent's core families — never deferred.
-_DEFAULT_KEEP_PREFIXES = "cloudwatch_,code_,crawler_,db_,database_,sql_"
+# ``codegraph_`` matches the codegraph__<tool> prefix; ``repo_`` the generic
+# repo_grep/repo_read_file/repo_list_files file tools.
+_DEFAULT_KEEP_PREFIXES = "cloudwatch_,code_,codegraph_,repo_,db_,database_,sql_"
 # Bridge + agent-writable tool names that must always stay directly bound.
 _ALWAYS_KEEP_NAMES = {
     "search_tools", "call_tool",
@@ -48,6 +50,7 @@ _ALWAYS_KEEP_NAMES = {
     "write_todos", "update_todo", "run_command",
     "fs_write", "fs_read", "fs_ls", "fs_grep",
     "fs_append", "fs_upsert", "fs_prune",
+    "skill",
 }
 # char/4 token heuristic for schema size estimation. This is intentionally
 # approximate — the gate activates on a soft cliff (20K tokens), not a hard

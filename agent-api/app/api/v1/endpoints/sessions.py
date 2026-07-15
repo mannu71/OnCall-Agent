@@ -172,7 +172,7 @@ async def compact_session(
         "3-8 bullet points, no preamble.\n\n" + transcript[:20000]
     )
     try:
-        from app.crawler.call_llm import call_llm
+        from app.core.llm.call_llm import call_llm
         summary, _, _, _ = await call_llm(prompt, tier="search", use_cache=False)
     except Exception as exc:  # noqa: BLE001 — degrade gracefully, never 500 the UI
         logger.warning("compact_session: LLM summarize failed (%s)", exc)

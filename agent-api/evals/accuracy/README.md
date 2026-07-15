@@ -8,10 +8,10 @@ reported separately).
 
 | Feature | Objective (headline) | Semantic (reported) |
 |---|---|---|
-| CodeCrawler | `find`/`body`/`trace` vs an **AST-derived oracle** over the fixture repo — exact `(symbol, file, line, kind)` + intra-repo call edges | — |
+| Code Crawler (codegraph) | `find`/`body`/`trace` vs an **AST-derived oracle** over the fixture repo — exact `(symbol, file, line, kind)` + intra-repo call edges | — |
 | CloudWatch | structured **schema validity** + **ID-grounding** (no fabricated correlation/trace/request IDs) over injected evidence bundles | severity match, judge faithfulness |
 
-Ground truth for CodeCrawler is generated from `fixtures/sample_repo/` by `build_crawler_cases.py` via Python `ast`, so it is correct by construction.
+Ground truth for the Code Crawler suite is generated from `fixtures/sample_repo/` by `build_crawler_cases.py` via Python `ast`, so it is correct by construction.
 CloudWatch cases inject recorded synthetic evidence (`fixtures/cloudwatch_evidence/*.json`) straight into the real `analyze_cloudwatch_with_llm`, so the LLM runs but no live AWS fetch is needed (reproducible).
 
 ## Running (inside the agent-api container)
@@ -44,8 +44,8 @@ Reports are written to `reports/accuracy_report_<date>.md`.
 
 - `graders.py` — deterministic scorers (pure, no LLM)
 - `judge.py` — Bedrock LLM-as-judge (faithfulness only)
-- `build_crawler_cases.py` — AST oracle -> crawler ground truth
-- `run_crawler.py` / `run_cloudwatch.py` — suite runners
+- `build_crawler_cases.py` — AST oracle -> Code Crawler ground truth + fixture sync
+- `run_codegraph.py` / `run_cloudwatch.py` / `run_trajectory.py` / `run_lookup.py` — suite runners
 - `runner.py` — orchestrate + aggregate + `--report`
 - `report.py` — markdown report
 - `selftest.py` — harness self-validation

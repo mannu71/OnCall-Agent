@@ -57,9 +57,11 @@ class ExecutionPort:
             ),
         }
         # Pass through tool-approval context so the UI can show what's being
-        # approved (tool name + args) for a pre-tool-execution gate.
-        for _k in ("type", "tool", "args"):
-            if _k in interrupt_data:
+        # approved (tool name + args) for a pre-tool-execution gate, plus the
+        # Action Supervisor's risk classification + advisory verdict when present.
+        for _k in ("type", "tool", "args", "risk_tier",
+                   "supervisor_verdict", "supervisor_reasoning"):
+            if interrupt_data.get(_k) is not None:
                 payload[_k] = interrupt_data[_k]
 
         if self._publish is not None:
@@ -74,6 +76,21 @@ class ExecutionPort:
 
             event = WorkflowEvent(event_type=EventType.HITL_PAUSE, data=payload)
             await queue.put(event.to_sse())
+
+    async def publish_supervisor_decision(
+        self,
+        execution_id: Optional[str],
+        data: Dict[str, Any],
+    ) -> None:
+        """Emit a non-blocking ``supervisor_decision`` event when the Action
+        Supervisor auto-decided a low-risk action (no human card was raised).
+        Telemetry only — best-effort, never blocks the gate."""
+        if not execution_id or self._publish is None:
+            return
+        try:
+            await self._publish(execution_id, "supervisor_decision", dict(data))
+        except Exception:  # noqa: BLE001 — telemetry must never break a run
+            pass
 
     async def publish_token_usage(
         self,

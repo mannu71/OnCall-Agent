@@ -57,7 +57,13 @@ async def finalize(
     llm = plan.llm
     spec = plan.spec
     code_analyzer_config = plan.code_analyzer_config
-    selected_skills = plan.selected_skills
+    # Skills to surface on the UI badge: RAG-selected names (legacy fallback
+    # mode) plus skills actually invoked this run — the model's ``skill`` tool
+    # and any user /slash-command (``plan.invoked_skills`` was mutated live by
+    # the skill tool's sink). Deduped, order-preserving.
+    selected_skills = list(
+        dict.fromkeys((plan.selected_skills or []) + (plan.invoked_skills or []))
+    )
     recall_hits = plan.recall_hits
 
     # Synthesis-as-floor: if the agent's own answer is empty/refusal/

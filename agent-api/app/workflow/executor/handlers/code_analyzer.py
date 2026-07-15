@@ -1,5 +1,4 @@
-"""Code Analyzer node handler — validates indexed repos and optional pre-summary search."""
-import asyncio
+"""Code Analyzer node handler — validates codegraph-indexed repos."""
 import logging
 import os
 import re
@@ -7,7 +6,6 @@ from typing import Any, Dict
 
 from app.config import settings
 from app.core.security import check_path, PathJailError
-from app.services.crawler_service import crawler_service
 from app.workflow.code_analyzer_config import read_code_analyzer_repos
 
 from . import register
@@ -30,11 +28,8 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
         class InjectionError(Exception):
             pass
 
-    node_data = node.get('data', {})
-    node_params = node.get('params', {})
     # Accept both dialects: data.repos (list) and params.repos (string).
     repos = read_code_analyzer_repos(node)
-    pre_summary = node_data.get('preSummary', node_params.get('preSummary', False))
     repos_base_path = settings.repos_base_path
 
     if not repos:
@@ -89,88 +84,25 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
 
     repo_names = [repo.get("name", "") for repo in repos if repo.get("name")]
 
-    from app.workflow.code_analyzer_config import read_code_analyzer_backend
-    backend = read_code_analyzer_backend(node)
-
-    if backend == "codegraph":
-        # codegraph manages its own index state; the agent calls index_repository
-        # on first use. Skip the crawler repo_abstractions check entirely.
-        all_indexed = repo_names
-        unindexed = []
-    else:
-        unindexed = await crawler_service.filter_unindexed_repos(repo_names)
-        all_indexed = [name for name in repo_names if name not in unindexed]
-
-    if unindexed:
-        return {
-            'status': 'not_indexed',
-            'error': (
-                f"Repos not yet indexed: {unindexed}. "
-                "Re-save the workflow to trigger background indexing."
-            ),
-            'code_analysis_type': 'pre_summary',
-        }
-
-    pre_summary_results: Dict[str, Any] = {}
-    # Skip the deterministic pre-summary search for an interactive chat turn —
-    # the agent already has live code-search/codegraph tools bound and can
-    # search on demand exactly when the query needs it (same reasoning as the
-    # CloudWatch pre-scan gate; see is_chat_turn's docstring in cloudwatch.py).
-    # A scheduled/manual run (no chat session) still gets it, since there's no
-    # agent follow-up loop there to fall back on.
-    from app.workflow.executor.handlers.cloudwatch import is_chat_turn
-    if pre_summary and all_indexed and not is_chat_turn(context):
-        inputs = context.get('inputs', {})
-        search_query = (
-            inputs.get('service_name')
-            or inputs.get('error_signature')
-            or inputs.get('component')
-            or inputs.get('user_query', '')[:200]
-        )
-        if search_query:
-            # crawler_service is already imported at module scope; re-importing
-            # here would make it a function-local name and shadow the earlier
-            # use above (UnboundLocalError).
-            search_concurrency = settings.code_analyzer_search_concurrency
-            search_sem = asyncio.Semaphore(search_concurrency)
-
-            async def _search_repo(repo_name: str) -> tuple[str, Any]:
-                async with search_sem:
-                    try:
-                        hits = await crawler_service.search_semantic(
-                            query=search_query, repo=repo_name, limit=5,
-                        )
-                        return repo_name, hits
-                    except Exception as se:
-                        logger.debug(
-                            "codeAnalyzer pre-summary search failed for %s: %s",
-                            repo_name, se,
-                        )
-                        return repo_name, None
-
-            search_results = await asyncio.gather(
-                *[_search_repo(rn) for rn in all_indexed]
-            )
-            for repo_name, hits in search_results:
-                if hits is not None:
-                    pre_summary_results[repo_name] = hits
-
-    # Project intelligence auto-context: give the agent the per-repo brief +
-    # coding standards at run start so it understands the project and writes code
-    # that fits, without needing a tool call first. Best-effort and compact
-    # (capped per repo); deeper detail is fetched on demand via the crawler tools.
-    project_briefs: Dict[str, Any] = {}
-    if all_indexed:
-        async def _ctx(repo_name: str) -> tuple[str, Any]:
-            try:
-                return repo_name, await crawler_service.get_project_context(repo_name)
-            except Exception as ce:  # noqa: BLE001
-                logger.debug("codeAnalyzer project-context failed for %s: %s", repo_name, ce)
-                return repo_name, None
-
-        for repo_name, ctx in await asyncio.gather(*[_ctx(rn) for rn in all_indexed]):
-            if ctx is not None:
-                project_briefs[repo_name] = ctx
+    # Verify each repo actually has a POPULATED codegraph index before claiming
+    # it's pre-indexed (a failed/empty background index must not steer the agent
+    # as "ready"). Conservative: if the cache can't be read we fall back to the
+    # assume-ready behavior, so this only ever ADDS a correct "index this first"
+    # signal. We never hard-block — codegraph can self-index on demand (see
+    # steering below).
+    needs_index = []
+    from app.services import codegraph_admin
+    try:
+        _projects = codegraph_admin.list_projects()
+        _list_ok = True
+    except Exception:  # noqa: BLE001
+        _projects, _list_ok = [], False
+    if _list_ok:
+        _ready = {p.get("repo_name") for p in _projects if (p.get("files_indexed") or 0) > 0}
+        needs_index = [n for n in repo_names if n not in _ready]
+        if needs_index:
+            logger.info("code_analyzer: codegraph repos need indexing first: %s", needs_index)
+    all_indexed = [n for n in repo_names if n not in needs_index]
 
     result: Dict[str, Any] = {
         'status': 'success',
@@ -178,45 +110,53 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
         'code_analysis_type': 'pre_summary',
         'repos_indexed': all_indexed,
         'repos_config': repos,
-        'pre_summary': pre_summary_results or None,
-        'project_brief': project_briefs or None,
     }
 
-    if backend == "codegraph":
-        # codegraph projects are PRE-INDEXED on workflow save (background, fast
-        # mode). Internally the engine keys each project by its full indexed path
-        # with '/' -> '-' (deliberate — avoids basename collisions across repos at
-        # different paths; see cg_project_name's docstring). The agent should
-        # never see that internal name: it always passes the SHORT repo name, and
-        # every codegraph tool call rewrites it to the canonical name before
-        # hitting the MCP server (app.workflow.mcp.mcp_langchain_adapter
-        # MCPToolWrapper.project_aliases, wired in
-        # app.workflow.tools.codegraph_tools.build_codegraph_tools).
-        from app.workflow.tools.codegraph_tools import cg_project_name
+    # codegraph projects are PRE-INDEXED on workflow save (background, fast mode).
+    # Internally the engine keys each project by its full indexed path with
+    # '/' -> '-' (deliberate — avoids basename collisions across repos at
+    # different paths; see cg_project_name's docstring). The agent should never
+    # see that internal name: it always passes the SHORT repo name, and every
+    # codegraph tool call rewrites it to the canonical name before hitting the
+    # MCP server (app.workflow.mcp.mcp_langchain_adapter MCPToolWrapper.
+    # project_aliases, wired in
+    # app.workflow.tools.codegraph_tools.build_codegraph_tools).
+    from app.workflow.tools.codegraph_tools import cg_project_name
 
-        result['codegraph_repo_paths'] = {
-            short_name: os.path.join(repos_base_path, short_name)
-            for short_name in all_indexed
-        }
-        result['codegraph_project_aliases'] = {
-            short_name: cg_project_name(short_name)
-            for short_name in all_indexed
-        }
-        _names = ", ".join(f'"{n}"' for n in all_indexed)
-        _example_name = all_indexed[0] if all_indexed else "<repo name>"
-        result['output'] = (
-            f'Repos pre-indexed in codegraph (project names: {_names}). '
-            f'Query the GRAPH tools first — they are sub-second and ~500 tokens '
-            f'each: prefer search_graph / find_symbol / query_graph / '
-            f'search_semantic / trace_path / get_code_snippet, always with '
-            f'project="<repo name>" (e.g. project="{_example_name}"). '
-            f'AVOID search_code for discovery — it greps source files and is far '
-            f'slower and more token-heavy (~80K). Use search_code ONLY as a '
-            f'last-resort literal-text fallback, and always scope it with '
-            f'path_filter (e.g. path_filter="src/") or file_pattern. '
-            f'Do NOT re-index; only if a tool reports the project is missing, '
-            f'call index_repository once with '
-            f'repo_path="{repos_base_path}/<repo name>" and mode="fast".'
+    # Paths/aliases for ALL repos (including any not-yet-indexed) so the agent
+    # can index the missing ones on demand.
+    result['codegraph_repo_paths'] = {
+        short_name: os.path.join(repos_base_path, short_name)
+        for short_name in repo_names
+    }
+    result['codegraph_project_aliases'] = {
+        short_name: cg_project_name(short_name)
+        for short_name in repo_names
+    }
+    _names = ", ".join(f'"{n}"' for n in all_indexed) if all_indexed else "(none yet)"
+    _example_name = all_indexed[0] if all_indexed else (repo_names[0] if repo_names else "<repo name>")
+    _index_first = ""
+    if needs_index:
+        _need = ", ".join(f'"{n}"' for n in needs_index)
+        _index_first = (
+            f'NOT yet indexed: {_need} — before querying these, call '
+            f'index_repository once each with repo_path="{repos_base_path}/<repo name>" '
+            f'and mode="fast". '
         )
+    result['output'] = (
+        f'Repos pre-indexed in Code Crawler (project names: {_names}). '
+        f'{_index_first}'
+        f'Query the GRAPH tools first — they are sub-second and ~500 tokens '
+        f'each: prefer search_graph / find_symbol / query_graph / '
+        f'search_semantic / trace_path / get_code_snippet, always with '
+        f'project="<repo name>" (e.g. project="{_example_name}"). '
+        f'AVOID search_code for discovery — it greps source files and is far '
+        f'slower and more token-heavy (~80K). Use search_code ONLY as a '
+        f'last-resort literal-text fallback, and always scope it with '
+        f'path_filter (e.g. path_filter="src/") or file_pattern. '
+        f'For already-indexed repos do NOT re-index; only if a tool reports the '
+        f'project is missing, call index_repository once with '
+        f'repo_path="{repos_base_path}/<repo name>" and mode="fast".'
+    )
 
     return result

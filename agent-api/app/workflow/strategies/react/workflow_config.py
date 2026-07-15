@@ -174,6 +174,104 @@ def get_connected_node_ids(
 
     return connected
 
+async def connect_agent_mcp_nodes(
+    workflow: Dict[str, Any],
+    mcp_manager: Any,
+    *,
+    execution_id: Optional[str] = None,
+) -> List[str]:
+    """Pre-connect every ``mcp_server`` node reachable from the agent BEFORE the
+    agent snapshots its tool set. Returns server names that failed to connect.
+
+    Why this exists: an ``mcp_server`` node contained in a ``subagent_window``
+    (e.g. a CloudWatch server scoped to a squad member) runs as its OWN executor
+    node, concurrently with the ``agent`` node — the BFS scheduler orders by
+    edges, and ``parentId`` containment is not an edge, so nothing forces that
+    MCP connection to finish before the agent builds. CloudWatch's server has a
+    ~7s cold start (uvx package resolve + metric-metadata load); when the agent
+    wins that race it snapshots tools while the connection is still in flight,
+    subagent tool globs like ``cloudwatch__*`` resolve to NOTHING, and the whole
+    log/metric capability silently vanishes for the turn (the agent then claims
+    it "has no log tools"). Awaiting the connection here removes the race.
+
+    Idempotent with the standalone mcp_server node handler: ``connect_server`` is
+    lock-guarded and coalesces, so whichever path connects first wins and the
+    other returns immediately. Mirrors the reference client awaiting the whole
+    MCP batch before turn 1.
+    """
+    from app.infrastructure.persistence import mcp_config_repository
+
+    nodes = workflow.get("nodes", [])
+    mcp_node_ids = set(get_connected_node_ids(workflow, "mcp_server"))
+    if not mcp_node_ids:
+        return []
+
+    failed: List[str] = []
+    for node in nodes:
+        if node.get("id") not in mcp_node_ids or node.get("type") != "mcp_server":
+            continue
+        params = node.get("params", {}) or {}
+        server_names = [s.strip() for s in (params.get("servers", "") or "").split(",") if s.strip()]
+        tool_patterns = [p.strip() for p in (params.get("tools", "") or "").split(",") if p.strip()]
+
+        for server_name in server_names:
+            conn_key = f"{node.get('id')}__{server_name}"
+            if mcp_manager.is_connected(conn_key):
+                continue
+            db_config = await mcp_config_repository.get_by_name(server_name)
+            if not db_config:
+                logger.warning(
+                    "MCP barrier: server '%s' not found in settings — skipping",
+                    server_name,
+                )
+                failed.append(server_name)
+                continue
+            mcp_config = {
+                "command": db_config.get("command", ""),
+                "args": db_config.get("args", []),
+                "env": db_config.get("env", {}),
+            }
+            ok = await mcp_manager.connect_server(conn_key, mcp_config)
+            if ok:
+                if tool_patterns:
+                    mcp_manager.set_tool_filter(conn_key, tool_patterns)
+                logger.info(
+                    "MCP barrier: pre-connected '%s' as '%s' before agent build",
+                    server_name, conn_key,
+                    extra={"execution_id": execution_id},
+                )
+            else:
+                failed.append(server_name)
+                logger.warning(
+                    "MCP barrier: failed to pre-connect '%s' (%s)",
+                    server_name,
+                    mcp_manager.last_errors.get(conn_key, "connection failed"),
+                    extra={"execution_id": execution_id},
+                )
+    return failed
+
+
+def wired_mcp_server_names(workflow: Dict[str, Any]) -> List[str]:
+    """Server names of every agent-reachable ``mcp_server`` node (deduped).
+
+    Generic — no server type is special-cased. Used by the pre-LLM backend gate
+    to know which MCP servers are in play, so it can verify each one regardless
+    of what the user wired (CloudWatch, a database, ADO, a custom server, …).
+    """
+    reachable = set(get_connected_node_ids(workflow, "mcp_server"))
+    names: List[str] = []
+    seen: set = set()
+    for n in workflow.get("nodes", []):
+        if n.get("id") not in reachable or n.get("type") != "mcp_server":
+            continue
+        for s in str((n.get("params") or {}).get("servers", "")).split(","):
+            s = s.strip()
+            if s and s not in seen:
+                seen.add(s)
+                names.append(s)
+    return names
+
+
 def extract_tools_config(workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Extract tool node configurations from workflow.
 

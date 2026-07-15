@@ -111,7 +111,7 @@ async def lifespan(app: FastAPI):
             # Reap background jobs left 'running' by a previous process, then re-fire
             # any workflows still stuck mid-index so they self-heal.
             from app.services.background_jobs import background_job_store
-            from app.crawler.background_indexer import recover_interrupted_indexing
+            from app.services.codegraph_indexer import recover_interrupted_indexing
 
             await background_job_store.reap_orphans()
             await recover_interrupted_indexing()

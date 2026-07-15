@@ -1,20 +1,33 @@
-"""Derive CodeCrawler ground truth from the fixture repo via Python ``ast``.
+"""Derive Code Crawler ground truth from the fixture repo via Python ``ast``.
 
 The expected (symbol -> file, line, kind) and intra-repo call edges are
 computed directly from the fixture source, so the ground truth is correct by
-construction and "100%" means the crawler matches the AST exactly.
+construction and "100%" means the engine matches the AST exactly. Backend-
+agnostic: consumed by the codegraph accuracy suite (run_codegraph).
 """
 from __future__ import annotations
 
 import ast
 import json
 import os
+import shutil
+import tempfile
 from typing import Any, Dict, List
 
 HERE = os.path.dirname(__file__)
 SAMPLE_REPO_DIR = os.path.join(HERE, "fixtures", "sample_repo")
-DATASET_PATH = os.path.join(HERE, "datasets", "crawler_cases.jsonl")
+DATASET_PATH = os.path.join(HERE, "datasets", "code_cases.jsonl")
 DEFAULT_REPO_NAME = "eval-fixture-repo"
+
+
+def _sync_fixture_repo() -> str:
+    """Copy the fixture into a writable repos dir; return that dir (repos_base_path)."""
+    base = os.getenv("EVAL_REPOS_DIR") or os.path.join(tempfile.gettempdir(), "eval_repos")
+    target = os.path.join(base, DEFAULT_REPO_NAME)
+    if os.path.isdir(target):
+        shutil.rmtree(target, ignore_errors=True)
+    shutil.copytree(SAMPLE_REPO_DIR, target)
+    return base
 
 
 def _defs_in_file(path: str, rel: str) -> List[Dict[str, Any]]:

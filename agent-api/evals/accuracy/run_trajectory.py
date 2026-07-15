@@ -1,6 +1,6 @@
 """Agent-trajectory eval — run the REAL ReAct agent and grade what it DID.
 
-The crawler/CloudWatch suites grade tools in isolation. This suite closes the
+The codegraph/CloudWatch suites grade tools in isolation. This suite closes the
 gap that actually leaks real-world accuracy: given a question and a set of
 attached tools, does the agent reach for the right tool family, follow the
 locate→read→trace / drill-don't-rescan protocol, and state a correct,
@@ -9,8 +9,8 @@ ID-grounded answer?
 Hermetic setup:
   * CloudWatch is faked at the data layer (``fakes_cloudwatch.patched_cloudwatch``)
     so the real tool code runs over recorded fixtures — no live AWS.
-  * The crawler runs FOR REAL against ``fixtures/sample_repo`` (reusing
-    ``run_crawler._ensure_indexed``).
+  * The generic repo file tools run FOR REAL against ``fixtures/sample_repo``
+    (synced via ``build_crawler_cases._sync_fixture_repo`` — no indexing needed).
   * The agent LLM is real Bedrock (same judge-calibrated path as the other
     suites); ``temperature`` is pinned low for repeatability.
 
@@ -146,11 +146,14 @@ async def _attempt(case: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
 
         code_cfg: Optional[Dict[str, Any]] = None
         if case.get("crawler"):
-            from evals.accuracy.run_crawler import _ensure_indexed
-            from app.workflow.tools.code_analyzer_tools import build_crawler_tools
-            await _ensure_indexed()
+            # Generic repo file tools work on the raw fixture with no indexing or
+            # Bedrock — enough to exercise the code trajectory (grep/read/list).
+            from evals.accuracy.build_crawler_cases import _sync_fixture_repo
+            from app.workflow.tools.repo_file_tools import build_repo_file_tools
+            from app.config import settings
+            settings.repos_base_path = _sync_fixture_repo()
             code_cfg = {"repos": [{"name": DEFAULT_REPO_NAME}]}
-            tools += build_crawler_tools(repos=code_cfg["repos"])
+            tools += build_repo_file_tools(repos=code_cfg["repos"])
 
         llm = await _build_agent_llm()
 

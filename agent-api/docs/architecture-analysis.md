@@ -75,7 +75,7 @@ flowchart TB
 
 1. **Early exit** — `is_conversational()` skips tool assembly for greetings / capability questions.
 2. **Context augmentation** — KB recall, seeded CloudWatch/code blocks, PII pseudonymization.
-3. **Base tools** — MCP, CloudWatch, crawler/codegraph, DB schema, progressive disclosure.
+3. **Base tools** — MCP, CloudWatch, Code Crawler (codegraph) + repo file tools, DB schema, progressive disclosure.
 4. **Extension tools** — delegate, edit, planning, VFS, named subagents, sandbox, verify.
 5. **Spec assembly** — `build_agent_spec()` → `build_agent_from_spec()` → `react_agent.build_agent()`.
 6. **Run** — `run_supervised()` wraps `execute_agent()` with supervisor retries and LLM failover.
@@ -260,7 +260,7 @@ All three share unified LLM resolution (per-def `model` → `"inherit"` sentinel
 + per-def `disallowedTools` + the global blocked-tools floor, with unmatched globs logged
 rather than silently dropped), and a unified result envelope with a text-fallback finalizer.
 Depth stays hardcoded at 1 for all three. `has_code_analyzer`/`has_cloudwatch` are now
-inferred per-child from its actual scoped tool set, so a crawler-scoped specialist gets the
+inferred per-child from its actual scoped tool set, so a codegraph-scoped specialist gets the
 same code-aware system-prompt guidance a top-level agent would.
 
 ---
@@ -404,7 +404,7 @@ configured, so a misconfiguration can't silently lock every route with no way in
 
 ### 19. Silent feature degradation
 
-Nearly every optional capability (CloudWatch, crawler, disclosure, VFS, sandbox) is
+Nearly every optional capability (CloudWatch, Code Crawler, disclosure, VFS, sandbox) is
 wrapped in broad `except Exception` with warnings. Good for availability, but
 **misconfiguration is invisible** — e.g., sandbox enabled with no backend logs at info
 and silently skips.

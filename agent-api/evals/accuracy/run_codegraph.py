@@ -1,11 +1,9 @@
-"""Run the SAME crawler case set against the codegraph engine and grade it.
+"""Run the Code Crawler case set against the codegraph engine and grade it.
 
-This is the codegraph half of the A/B harness. It reuses the AST-derived ground
-truth (``build_crawler_cases.derive_crawler_cases``) and the deterministic
-graders (``graders.grade_find / grade_body / grade_trace``) unchanged — the only
-work here is driving codegraph and normalizing its tool output into the shapes
-the graders expect. Same truth + same graders ⇒ scores directly comparable to
-``run_crawler.run_crawler_suite``.
+Reuses the AST-derived ground truth (``build_crawler_cases.derive_crawler_cases``)
+and the deterministic graders (``graders.grade_find / grade_body / grade_trace``)
+unchanged — the only work here is driving codegraph and normalizing its tool
+output into the shapes the graders expect.
 
 codegraph is driven in-process exactly as it ships: an inline-config stdio MCP
 session (``codegraph serve``), never a registered ``mcp_servers`` row.
@@ -24,9 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from evals.accuracy import _bootstrap  # noqa: F401
 from evals.accuracy import graders
 from evals.accuracy.build_crawler_cases import (
-    DEFAULT_REPO_NAME, SAMPLE_REPO_DIR, derive_crawler_cases,
+    DEFAULT_REPO_NAME, SAMPLE_REPO_DIR, derive_crawler_cases, _sync_fixture_repo,
 )
-from evals.accuracy.run_crawler import _sync_fixture_repo
 
 
 def _result_text(result: Dict[str, Any]) -> str:
@@ -113,7 +110,9 @@ async def _index_and_project(manager: Any, server_id: str) -> Tuple[str, Optiona
     res = await manager.execute_tool(
         server_id=server_id,
         tool_name="index_repository",
-        arguments={"repo_path": repo_path, "mode": "full"},
+        # "fast" matches production (background_indexer always indexes fast); the
+        # eval used to index "full", validating a mode prod never runs.
+        arguments={"repo_path": repo_path, "mode": "fast"},
         tool_timeout=0,
     )
     if res.get("isError"):

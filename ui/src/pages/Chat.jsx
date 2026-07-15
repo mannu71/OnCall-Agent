@@ -199,8 +199,8 @@ function Chat() {
   // persisted session on resume, incremented locally as each turn completes.
   const [sessionTokens, setSessionTokens] = useState({ input: 0, output: 0, cacheRead: 0, cacheCreation: 0 });
   // Context-window fullness for the LATEST turn (not cumulative) — how full
-  // the model's context window is right now. Mirrors claude-code-main's
-  // context bar: current-turn fullness, color-coded as it fills.
+  // the model's context window is right now: current-turn fullness,
+  // color-coded as it fills.
   const [contextUsage, setContextUsage] = useState({ pct: 0, used: 0, window: 0 });
   // A single model turn can emit SEVERAL gated tool calls (e.g. multiple
   // edit_file), each needing its own approval. Track them as a FIFO queue and
@@ -621,13 +621,13 @@ function Chat() {
         engine: engineMode,
         signal: controller.signal,
         onToken,
-        onToolCall: (name, args, agent) => {
-          onStepCall(name, args, agent);
+        onToolCall: (name, args, agent, model) => {
+          onStepCall(name, args, agent, model);
           const who = agent && agent !== 'agent' ? `[${agent}] ` : '';
           pushTrace('tool', `${who}Calling ${name}…`); pushStatus(`${who}Calling ${name}…`);
         },
-        onToolResult: (name, res, failed, agent) => {
-          onStepResult(name, res, failed, agent);
+        onToolResult: (name, res, failed, agent, model) => {
+          onStepResult(name, res, failed, agent, model);
           const who = agent && agent !== 'agent' ? `[${agent}] ` : '';
           pushTrace('tool', failed ? `${who}${name} failed` : `${who}${name} returned`);
         },
@@ -852,12 +852,12 @@ function Chat() {
 
     const handle = agentApiClient.reattachAgentStream(agent.name, {
       onToken,
-      onToolCall: (name, args, who) => {
-        onStepCall(name, args, who);
+      onToolCall: (name, args, who, model) => {
+        onStepCall(name, args, who, model);
         const label = who && who !== 'agent' ? `[${who}] ` : '';
         pushStatus(`${label}Calling ${name}…`);
       },
-      onToolResult: (name, res, failed, who) => onStepResult(name, res, failed, who),
+      onToolResult: (name, res, failed, who, model) => onStepResult(name, res, failed, who, model),
       onStatus: (msg) => pushStatus(msg),
       onTokens: (t) => {
         lastActivityRef.current = Date.now();
@@ -1251,9 +1251,9 @@ function Chat() {
                 </Button>
 
                 {/* Context-window fullness (this turn) + session-cumulative
-                    tokens. Mirrors claude-code-main's status line: current-turn
-                    fullness, color-coded, NOT the session total (tracked
-                    separately — finalized on the session, not per-workflow-run). */}
+                    tokens: current-turn fullness, color-coded, NOT the session
+                    total (tracked separately — finalized on the session, not
+                    per-workflow-run). */}
                 {contextUsage.window > 0 && (
                   <ContextRing contextUsage={contextUsage} sessionTokens={sessionTokens} />
                 )}

@@ -22,6 +22,17 @@ def parse_env_bool(value: Any, *, default: bool = True) -> bool:
     return str(value).lower() not in ("false", "0", "no", "off")
 
 
+# CSV of fnmatch patterns always stripped from delegated child tool sets. Shared
+# with app.harness.subagent_factory so its no-settings fallback (DB-free tests)
+# can't drift from this default. Children are investigate/read-only by default;
+# the parent orchestrator owns all mutations — fs_write*/fs_append/fs_upsert/
+# fs_prune together cover every VFS mutation (metamemory files included).
+DEFAULT_DELEGATION_BLOCKED_TOOLS = (
+    "delegate_*,apply_fix,edit_file,fs_write*,fs_append,fs_upsert,fs_prune,"
+    "run_command,write_todos,send_*,wiki_*"
+)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AWS Secrets Manager loader
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,7 +116,7 @@ class Settings(BaseSettings):
     # sandbox, CloudWatch auto-escalation/drilldown, startup indexing recovery)
     # for a minimal footprint. Any explicit env var always wins. 'full' = today.
     app_profile: str = Field(default="full", validation_alias="APP_PROFILE")
-    # Re-fire interrupted repo-indexing jobs on startup (crawler). Off under lite.
+    # Re-fire interrupted codegraph repo-indexing jobs on startup. Off under lite.
     startup_indexing_recovery_enabled: bool = Field(
         default=True, validation_alias="STARTUP_INDEXING_RECOVERY_ENABLED"
     )
@@ -180,16 +191,20 @@ class Settings(BaseSettings):
     # single broad grep from exhausting an agent run's time/iteration budget — the
     # agent gets a recoverable tool error and falls back to the graph tools. A
     # timeout no longer forces an MCP reconnect (the session survives it safely —
-    # see mcp_client_manager.execute_tool), so this only needs to be generous
-    # enough that a normal grep over a large repo (e.g. the 9GB compliance-api)
-    # rarely trips it; 120s (matches the container's CODEGRAPH_SEARCH_TIMEOUT env).
+    # see mcp_client_manager.execute_tool).
+    #
+    # 45s (was 120s): this cap MUST stay well below the delegated-subagent budget
+    # (delegation_child_timeout_seconds, 240s) — at 120s a single slow grep ate
+    # two-thirds of a code-investigation subagent's wall clock and timed it out
+    # before it could fall back to the fast indexed tools. search_code is already
+    # steered to be a last resort (see build_codegraph_tools), so failing fast and
+    # falling back costs little; a genuinely huge grep just returns a recoverable
+    # timeout sooner.
     codegraph_search_timeout_seconds: float = Field(
-        default=120.0,
+        default=45.0,
         validation_alias="CODEGRAPH_SEARCH_TIMEOUT",
     )
     code_analyzer_list_cache_ttl_seconds: float = 60.0
-    code_analyzer_search_concurrency: int = 3
-    background_index_concurrency: int = 2
     index_parse_concurrency: int = 4
     index_file_read_concurrency: int = 8
     # Bounded DB schema lookup tools (db_list_tables / db_describe_table / db_search_columns)
@@ -243,7 +258,6 @@ class Settings(BaseSettings):
     embedding_dimensions: int = Field(
         default=1024, validation_alias="EMBEDDING_DIMENSIONS"
     )
-    code_correlation_concurrency: int = 5
 
     # ── ONNX code-embedding semantic search ──────────────────────────────────
     # A Bedrock-independent embedding path for concept-level code search (fills
@@ -285,10 +299,12 @@ class Settings(BaseSettings):
     # Max chars of a symbol's real source body folded into its embedding text
     # (0 = header-only). Embedding the body is the main accuracy lever, but longer
     # text = proportionally slower indexing, so this is the primary index-cost
-    # knob. 600 ≈ ~15-20 lines — the signature + opening (most of the signal) —
-    # and indexes ~3x faster than the fuller 2000.
+    # knob. 2000 ≈ ~50 lines — enough of the body for real retrieval signal past
+    # the signature; the embedder's 512-token cap bounds the upper end anyway, and
+    # background indexing absorbs the extra build cost. Was 600 (signature-only),
+    # which made long functions retrievable only by their opening lines.
     code_semantic_body_max_chars: int = Field(
-        default=600, validation_alias="CODE_SEMANTIC_BODY_MAX_CHARS"
+        default=2000, validation_alias="CODE_SEMANTIC_BODY_MAX_CHARS"
     )
     # Score multiplier applied to test/build-output entities when the query does
     # NOT express test intent — de-prioritizes tests without hiding them (mirrors
@@ -299,46 +315,17 @@ class Settings(BaseSettings):
 
     # Agent / tools / output limits
     provider_transport: str = "anthropic"
+    # Default model id for the shared DB-resolved LLM utility (app.core.llm.
+    # call_llm) — used as the env fallback when no DB LLM config exists, and as a
+    # last-resort model for compaction summaries. Backs graders, supervision, and
+    # memory extraction. Override via CRAWLER_MODEL (name kept for compatibility
+    # with the "crawler" gateway role).
     crawler_model: str = "anthropic.claude-3-5-haiku-20241022-v1:0"
-    # Model tiering for crawler LLM flows (see app/crawler/call_llm.py).
-    # Background indexing (ExtractAbstractions / AnalyzeRelationships) is the most
-    # tolerant of a smaller model. Opt-in only: when set, indexing uses this
-    # model (e.g. a Haiku inference profile) instead of the DB-configured agent
-    # model. Leave unset to keep the DB model — set it only after confirming the
-    # model/inference-profile is enabled in your Bedrock account, since an
-    # invalid ID fails the indexing LLM call. Override via CRAWLER_INDEX_MODEL.
-    crawler_index_model: Optional[str] = Field(
-        default=None, validation_alias="CRAWLER_INDEX_MODEL"
-    )
-    # Opt-in override for the *search* crawler flows (semantic/find/trace/
-    # investigate). When set, these flows use this model instead of the
-    # DB-configured agent model — pricier flows can be moved to a cheaper tier
-    # once the accuracy harness confirms recall holds. None = keep DB model.
+    # Opt-in override for the shared call_llm utility. When set, it uses this
+    # model instead of the DB-configured model — callers can be moved to a
+    # cheaper tier once accuracy holds. None = keep DB model.
     crawler_model_override: Optional[str] = Field(
         default=None, validation_alias="CRAWLER_MODEL_OVERRIDE"
-    )
-    # Total context-char cap for the search crawler flows' LLM prompt. The KG
-    # fast path (QueryKGForHits / QueryKGForSymbol) short-circuits most queries;
-    # the LLM path is the fallback, so a tighter cap halves its dominant token
-    # cost with minimal recall risk. Override via CRAWLER_SEARCH_CONTEXT_MAX_CHARS.
-    crawler_search_context_max_chars: int = Field(
-        default=80_000, validation_alias="CRAWLER_SEARCH_CONTEXT_MAX_CHARS"
-    )
-    # Max chars of raw alert text sent to the investigateAlertFlow ParseAlert
-    # node — defensive cap so a pathological alert can't blow the prompt budget.
-    crawler_alert_max_chars: int = Field(
-        default=10_000, validation_alias="CRAWLER_ALERT_MAX_CHARS"
-    )
-    # Snippet extraction for the search crawler flows: instead of sending whole
-    # file bodies to the LLM, send line-numbered windows around lexical matches
-    # of the query terms (±crawler_snippet_window lines). Cuts per-file tokens
-    # 5–10× while keeping the lines the model needs to cite. Disable to fall back
-    # to full-file truncation if recall regresses. Override via env.
-    crawler_snippet_extraction: bool = Field(
-        default=True, validation_alias="CRAWLER_SNIPPET_EXTRACTION"
-    )
-    crawler_snippet_window: int = Field(
-        default=40, validation_alias="CRAWLER_SNIPPET_WINDOW"
     )
     # ReAct loop bound. LangGraph counts a "step" as one node transition; each
     # ReAct iteration is ~2 steps (agent + tool node), so 25 ≈ 12 iterations.
@@ -374,12 +361,11 @@ class Settings(BaseSettings):
     # that truncated half-thought returned as the final answer. 8192 leaves room
     # for reasoning + a tool call in one turn. Override via AGENT_MAX_OUTPUT_TOKENS.
     agent_max_output_tokens: int = Field(default=8192, validation_alias="AGENT_MAX_OUTPUT_TOKENS")
-    code_analyzer_output_max_chars: int = 8000
     mcp_tool_output_max_chars: int = 8000
     # Universal safety-net ceiling for ANY single tool result that lacks its own
     # cap (db/edit/playbook StructuredTools). Larger than the per-family 8 KB
-    # caps so it only catches truly unbounded outputs; matches claude-code's
-    # DEFAULT_MAX_RESULT_SIZE_CHARS. Set to 0 to disable. Override via env.
+    # caps so it only catches truly unbounded outputs. Set to 0 to disable.
+    # Override via env.
     tool_output_max_chars: int = Field(default=50000, validation_alias="TOOL_OUTPUT_MAX_CHARS")
     # When AgentSpec.filesystem is on, a StructuredTool result longer than this
     # is offloaded to the session VFS (app.harness.tool_offload) and replaced
@@ -424,25 +410,38 @@ class Settings(BaseSettings):
     # botocore HTTP connection-pool size for the shared Bedrock runtime client.
     # Botocore's default is 10; one client serves parallel tool supersteps +
     # delegate_parallel children, so at 10 concurrent LLM calls queue on the
-    # pool. Raise (e.g. 50) when running wide fan-outs. Override via env.
-    bedrock_max_pool_connections: int = Field(default=10, validation_alias="BEDROCK_MAX_POOL_CONNECTIONS")
+    # pool. Baked at 20 to give headroom for parallel tool fan-out plus the
+    # delegation_max_concurrent (=3) children without queueing. Raise further
+    # (e.g. 50) for very wide fan-outs. Override via env.
+    bedrock_max_pool_connections: int = Field(default=20, validation_alias="BEDROCK_MAX_POOL_CONNECTIONS")
     # Opt into Bedrock latency-optimized inference (performance_config={"latency":
     # "optimized"}). Support is model/region-dependent, so this is off by default
     # and left per-deployment opt-in. Override via env.
     bedrock_latency_optimized: bool = Field(default=False, validation_alias="BEDROCK_LATENCY_OPTIMIZED")
-    # Streaming path for a LangGraph agent run. Off (default) uses the legacy
-    # astream_events(v2) event loop. On switches to the lighter
-    # astream(stream_mode=["messages","updates"]) loop (execute_agent_stream_v2),
-    # which also returns complete final state (incl. ToolMessages) and drops the
-    # duplicate full-agent re-run fallback. Eval-gated before flipping default.
-    agent_stream_mode_enabled: bool = Field(default=False, validation_alias="AGENT_STREAM_MODE_ENABLED")
+    # Streaming path for a LangGraph agent run. Baked ON (default) to use the
+    # lighter astream(stream_mode=["messages","updates"]) loop
+    # (execute_agent_stream_v2), which also returns complete final state (incl.
+    # ToolMessages) and drops the duplicate full-agent re-run fallback. Set to
+    # False via env to fall back to the legacy astream_events(v2) event loop.
+    agent_stream_mode_enabled: bool = Field(default=True, validation_alias="AGENT_STREAM_MODE_ENABLED")
     # Cache the compiled child agent across delegate calls instead of rebuilding
     # it (LLM resolution + create_react_agent) on every delegation. Scoped to
     # children with an EXPLICIT per-def model (a fixed DB llm_config) so the
     # baked LLM is stable across runs — children that inherit the parent LLM are
     # never cached (the parent's fallback chain can swap model/region/creds
-    # mid-run). LangGraph-engine children only. Off by default; eval-gated.
-    subagent_compiled_cache_enabled: bool = Field(default=False, validation_alias="SUBAGENT_COMPILED_CACHE_ENABLED")
+    # mid-run). LangGraph-engine children only. Baked ON (default) for the
+    # repeated/parallel-delegation speedup; set False via env to disable.
+    subagent_compiled_cache_enabled: bool = Field(default=True, validation_alias="SUBAGENT_COMPILED_CACHE_ENABLED")
+    # Explicit global operator override for EVERY delegated subagent's model —
+    # the deliberate "force all subagents onto one model" hammer. A DB
+    # llm_config name.
+    # Outranks a subagent def's own ``model`` and the inherited parent LLM alike.
+    # Deliberately off (None) by default: with no override set, an unpinned child
+    # inherits the parent's model, so the workflow's Language Model node wins —
+    # NOT a silently-assigned "subagent" gateway role.
+    subagent_model_override: Optional[str] = Field(
+        default=None, validation_alias="SUBAGENT_MODEL_OVERRIDE"
+    )
     # Step-level trajectory events (app.harness.step_recorder, migration 030's
     # trajectory_events table). Off by default: a no-op recorder is used, zero
     # extra DB writes. When on, the native turn loop records one event per
@@ -605,11 +604,39 @@ class Settings(BaseSettings):
         default=True, validation_alias="AGENT_PLANNING_ENABLED"
     )
 
-    # ── RAG-selected skills ──────────────────────────────────────────────────
-    # Auto-select relevant skills per query (reusing semantic recall) instead of
-    # requiring an explicit /slash-command invocation.
+    # ── Skill disclosure (two-stage: listing + model-invoked tool) ───────────
+    # Primary skill mechanism. Every non-conversational turn gets a compact
+    # listing of available skills (name + description); the model loads a
+    # skill's full runbook on demand via the ``skill`` tool. A user message
+    # starting with ``/<skill-name>`` deterministically expands that skill.
+    skill_tool_enabled: bool = Field(
+        default=True, validation_alias="SKILL_TOOL_ENABLED"
+    )
+    # Deterministic ``/<skill-name> [args]`` slash-command expansion in chat.
+    skill_slash_commands_enabled: bool = Field(
+        default=True, validation_alias="SKILL_SLASH_COMMANDS_ENABLED"
+    )
+    # Total char budget for the per-turn skill listing block (~1% of a typical
+    # context window). The listing shrinks entry descriptions to fit.
+    skill_listing_char_budget: int = Field(
+        default=8000, validation_alias="SKILL_LISTING_CHAR_BUDGET"
+    )
+    # Per-entry char cap in the listing (one skill's name + description line).
+    skill_listing_entry_chars: int = Field(
+        default=250, validation_alias="SKILL_LISTING_ENTRY_CHARS"
+    )
+    # Cap on the full runbook body injected when a skill is loaded (by the
+    # ``skill`` tool or by RAG fallback). Longer bodies are truncated.
+    skill_body_inject_chars: int = Field(
+        default=8000, validation_alias="SKILL_BODY_INJECT_CHARS"
+    )
+
+    # ── RAG-selected skills (legacy fallback) ────────────────────────────────
+    # Auto-select and inject the single best-matching skill's full body per
+    # query (lexical overlap). Superseded by the skill-tool listing above; kept
+    # as a fallback and default OFF. If both are on, the listing wins.
     skill_rag_selection_enabled: bool = Field(
-        default=True, validation_alias="SKILL_RAG_SELECTION_ENABLED"
+        default=False, validation_alias="SKILL_RAG_SELECTION_ENABLED"
     )
     skill_rag_k: int = Field(default=2, validation_alias="SKILL_RAG_K")
 
@@ -626,8 +653,14 @@ class Settings(BaseSettings):
     delegation_max_concurrent: int = Field(
         default=3, validation_alias="DELEGATION_MAX_CONCURRENT"
     )
+    # 240s (was 180s): a code/DB-investigation subagent legitimately chains
+    # several codegraph + SQL calls; 180s cut it short once even one search hit
+    # the old 120s per-call cap. Kept BELOW agent_invoke_timeout_seconds (300s,
+    # the inner non-streaming cap) so this wait_for fires first and the child's
+    # timeout-recovery envelope (partial result, "tools available but slow") is
+    # returned cleanly instead of the inner invoke being killed mid-flight.
     delegation_child_timeout_seconds: float = Field(
-        default=180.0, validation_alias="DELEGATION_CHILD_TIMEOUT_SECONDS"
+        default=240.0, validation_alias="DELEGATION_CHILD_TIMEOUT_SECONDS"
     )
     delegation_output_max_chars: int = Field(
         default=8000, validation_alias="DELEGATION_OUTPUT_MAX_CHARS"
@@ -637,10 +670,7 @@ class Settings(BaseSettings):
     # fs_write*/fs_append/fs_upsert/fs_prune together cover every VFS mutation
     # (metamemory files included) — children keep fs_read/fs_ls/fs_grep only.
     delegation_blocked_tools: str = Field(
-        default=(
-            "delegate_*,apply_fix,edit_file,fs_write*,fs_append,fs_upsert,fs_prune,"
-            "run_command,write_todos,send_*,wiki_*"
-        ),
+        default=DEFAULT_DELEGATION_BLOCKED_TOOLS,
         validation_alias="DELEGATION_BLOCKED_TOOLS",
     )
 
@@ -874,6 +904,28 @@ class Settings(BaseSettings):
     # Independent of max_retries/token_budget — guarantees the loop terminates.
     supervisor_wall_clock_seconds: float = 900.0
 
+    # ── Action Supervisor (pre-execution write gate) ──────────────────────────
+    # Distinct from the post-run quality Supervisor above: this reviews each
+    # intercepted write-class action BEFORE it runs. Default off; ships in
+    # shadow mode first (review + record verdict, but the human/timeout still
+    # decides) so the reviewer can be calibrated against real decisions.
+    action_supervisor_enabled: bool = False
+    action_supervisor_shadow_mode: bool = True
+    action_supervisor_timeout_seconds: float = 20.0
+    # Risk tiers (CSV fnmatch patterns). Low-risk → the Supervisor LLM decides;
+    # high-risk → escalates to a human (Supervisor verdict shown as advisory).
+    # Anything gated-but-untier'd is treated as high (fail toward the human).
+    action_supervisor_low_risk_patterns: str = (
+        "fs_write*,fs_append,fs_upsert,fs_prune,save_playbook,patch_playbook,"
+        "pin_fact,write_todos"
+    )
+    action_supervisor_high_risk_patterns: str = (
+        "edit_file,create_file,apply_patch,run_command,run_verify,"
+        "delegate_investigation,wiki_publish,skill_write"
+    )
+    # Gate the wiki-publish output-node handler through the approval primitive.
+    wiki_publish_approval_enabled: bool = False
+
     # Semantic router
     router_query_max_chars: int = 2000
     router_classify_max_output: int = 32
@@ -909,6 +961,9 @@ class Settings(BaseSettings):
         "memory_audit_enabled",
         "self_improvement_enabled",
         "hillclimb_apply_enabled",
+        "action_supervisor_enabled",
+        "action_supervisor_shadow_mode",
+        "wiki_publish_approval_enabled",
         mode="before",
     )
     @classmethod

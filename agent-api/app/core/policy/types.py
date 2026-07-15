@@ -64,6 +64,12 @@ class ResolvedPolicy:
     deny_patterns: Tuple[str, ...] = ()
     allow_patterns: Tuple[str, ...] = ()  # force-allow, wins over ask (not deny)
 
+    # Action Supervisor risk tiers (fnmatch patterns). low → the Supervisor LLM
+    # may auto-decide; high → escalate to a human (Supervisor verdict advisory).
+    # Empty → fall back to the platform defaults / global settings CSVs.
+    low_risk_patterns: Tuple[str, ...] = ()
+    high_risk_patterns: Tuple[str, ...] = ()
+
     # Universal tool-result cap (chars). None → use platform default.
     output_cap_chars: Optional[int] = None
 
@@ -87,6 +93,8 @@ class ResolvedPolicy:
         *,
         default_ask_patterns: Tuple[str, ...],
         default_output_cap_chars: int,
+        default_low_risk_patterns: Tuple[str, ...] = (),
+        default_high_risk_patterns: Tuple[str, ...] = (),
     ) -> "ResolvedPolicy":
         """Merge platform defaults so an empty set is a no-op and policies are additive.
 
@@ -108,6 +116,10 @@ class ResolvedPolicy:
                 if self.output_cap_chars is not None
                 else default_output_cap_chars
             ),
+            # Tiers are a straight fallback: a policy that set them wins, else the
+            # platform defaults apply. (Not additive — tiers are a partition.)
+            low_risk_patterns=self.low_risk_patterns or default_low_risk_patterns,
+            high_risk_patterns=self.high_risk_patterns or default_high_risk_patterns,
         )
 
 
@@ -118,6 +130,8 @@ class _ResolveBuilder:
     ask_patterns: List[str] = field(default_factory=list)
     deny_patterns: List[str] = field(default_factory=list)
     allow_patterns: List[str] = field(default_factory=list)
+    low_risk_patterns: List[str] = field(default_factory=list)
+    high_risk_patterns: List[str] = field(default_factory=list)
     output_cap_chars: Optional[int] = None
     budget_cost_usd: Optional[float] = None
     ask_cost_thresholds_usd: List[float] = field(default_factory=list)
@@ -139,11 +153,23 @@ class _ResolveBuilder:
             if p not in self.allow_patterns:
                 self.allow_patterns.append(p)
 
+    def add_low_risk(self, *patterns: str) -> None:
+        for p in patterns:
+            if p not in self.low_risk_patterns:
+                self.low_risk_patterns.append(p)
+
+    def add_high_risk(self, *patterns: str) -> None:
+        for p in patterns:
+            if p not in self.high_risk_patterns:
+                self.high_risk_patterns.append(p)
+
     def finish(self) -> ResolvedPolicy:
         return ResolvedPolicy(
             ask_patterns=tuple(self.ask_patterns),
             deny_patterns=tuple(self.deny_patterns),
             allow_patterns=tuple(self.allow_patterns),
+            low_risk_patterns=tuple(self.low_risk_patterns),
+            high_risk_patterns=tuple(self.high_risk_patterns),
             output_cap_chars=self.output_cap_chars,
             budget_cost_usd=self.budget_cost_usd,
             ask_cost_thresholds_usd=tuple(sorted(self.ask_cost_thresholds_usd)),
