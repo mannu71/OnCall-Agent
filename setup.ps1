@@ -4,18 +4,23 @@
   First-time setup for OnCall Agent (Windows PowerShell).
 
 .DESCRIPTION
-  Checks prerequisites, starts PostgreSQL via Docker, applies migrations,
-  creates a Python virtual environment, installs dependencies, and writes
-  local .env files.
+  One command takes a fresh clone to a running stack: checks prerequisites,
+  writes local .env files, starts PostgreSQL via Docker, applies the migration,
+  builds and starts the full container stack, and waits for the API to be healthy.
+  A local Python venv and UI npm install are only done when -DevSetup is passed
+  (a container-only user needs neither).
 
 .PARAMETER SkipDocker
-  Skip starting PostgreSQL (use when you manage the database yourself).
+  Skip starting PostgreSQL (use when you manage the database yourself). Note:
+  migrations are applied by the Docker runner against the database container, so
+  under -SkipDocker you must apply agent-api/migrations/001_schema.sql yourself.
 
 .PARAMETER SkipMigrations
   Skip applying SQL migrations.
 
-.PARAMETER SkipDeps
-  Skip Python and npm dependency installation.
+.PARAMETER DevSetup
+  Additionally set up local development: create the Python virtual environment,
+  install backend requirements, and run the UI npm install. Off by default.
 
 .PARAMETER Reset
   Recreate the containers from scratch (down + up --build) WITHOUT touching the
@@ -28,7 +33,7 @@
 param(
     [switch]$SkipDocker,
     [switch]$SkipMigrations,
-    [switch]$SkipDeps,
+    [switch]$DevSetup,
     [switch]$Reset,
     [switch]$WipeData
 )
@@ -207,6 +212,29 @@ function Wait-PostgresHealthy {
     Write-Fail "PostgreSQL did not become healthy in time. Check: docker logs $DbContainer"
 }
 
+function Wait-ApiHealthy {
+    param([int]$Port)
+
+    $url = "http://localhost:$Port/api/v1/health"
+    Write-Host "    Waiting for the API to become healthy ($url)..."
+    for ($attempt = 1; $attempt -le 45; $attempt++) {
+        try {
+            $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 3
+            if ($resp.StatusCode -eq 200) {
+                Write-Ok "API is healthy"
+                return $true
+            }
+        }
+        catch {
+            # Not up yet - keep polling.
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    Write-Warn "API did not report healthy in time. Check: docker logs kyc-agent-api"
+    return $false
+}
+
 function Get-AppliedMigrations {
     # Applied filenames as a string array; empty if the table is absent or empty.
     $out = "SELECT filename FROM schema_migrations;" |
@@ -235,20 +263,20 @@ function Invoke-MigrationsViaDocker {
 
     $applied = Get-AppliedMigrations
 
-    # Pre-existing install that predates tracking: if core tables are present but
-    # nothing is recorded, record the current files as applied instead of
-    # replaying old migrations against a live schema.
-    if ($applied.Count -eq 0) {
+    # Squash baseline: the migration history was squashed into 001_schema.sql,
+    # which matches every existing install's live schema. If a core table is
+    # present but 001_schema.sql is not recorded - whether the install predates
+    # tracking entirely, or recorded the old pre-squash migration filenames -
+    # stamp 001_schema.sql as applied WITHOUT executing it (the objects already
+    # exist). A fresh volume has no core table, so it falls through and runs it.
+    if ($applied -notcontains '001_schema.sql') {
         $coreExists = "SELECT to_regclass('public.workflows') IS NOT NULL;" |
             docker exec -i $DbContainer psql -tA -U kycuser -d kycagent 2>$null
         if ($LASTEXITCODE -eq 0 -and (($coreExists -join '').Trim() -eq 't')) {
-            Write-Warn "Existing schema found without migration tracking - recording current migrations as applied (not replaying them)."
-            foreach ($file in $migrationFiles) {
-                "INSERT INTO schema_migrations (filename) VALUES ('$($file.Name)') ON CONFLICT DO NOTHING;" |
-                    docker exec -i $DbContainer psql -v ON_ERROR_STOP=1 -U kycuser -d kycagent | Out-Null
-            }
-            Write-Ok "Recorded $($migrationFiles.Count) existing migration(s)"
-            return
+            Write-Warn "Existing schema found - stamping 001_schema.sql as applied (not replaying it)."
+            "INSERT INTO schema_migrations (filename) VALUES ('001_schema.sql') ON CONFLICT DO NOTHING;" |
+                docker exec -i $DbContainer psql -v ON_ERROR_STOP=1 -U kycuser -d kycagent | Out-Null
+            $applied = Get-AppliedMigrations
         }
     }
 
@@ -466,17 +494,10 @@ if (-not $SkipDocker) {
 
 if (-not $SkipMigrations) {
     if ($SkipDocker) {
-        Write-Step "Applying database migrations (local psql)"
-        Push-Location $AgentApi
-        try {
-            & cmd /c "run-migration.bat"
-            if ($LASTEXITCODE -ne 0) {
-                Write-Fail "Migration script failed. Ensure PostgreSQL is running and psql is installed."
-            }
-        }
-        finally {
-            Pop-Location
-        }
+        # The migration runner applies SQL via the Docker DB container - the single
+        # migration mechanism. With -SkipDocker there's no container to target, so
+        # the operator applies the squashed baseline against their own database.
+        Write-Warn "SkipDocker: apply agent-api/migrations/001_schema.sql to your database manually (the Docker migration runner is skipped)."
     }
     else {
         Write-Step "Applying database migrations (via Docker)"
@@ -506,9 +527,12 @@ if (-not $SkipDocker) {
         Write-Fail "Docker build failed."
     }
     Write-Ok "Full stack is running"
+
+    Write-Step "Waiting for the API to become healthy"
+    Wait-ApiHealthy -Port (Get-EffectivePort "API_HOST_PORT") | Out-Null
 }
 
-if (-not $SkipDeps) {
+if ($DevSetup) {
     Write-Step "Installing Python dependencies"
     if (-not (Test-Path $VenvDir)) {
         Invoke-External -ExeAndArgs ($pythonCommand + @("-m", "venv", "venv")) -WorkingDirectory $AgentApi
@@ -538,13 +562,14 @@ if (-not $SkipDocker) {
     Write-Host "       API health:    http://localhost:$apiPort/api/v1/health"
     Write-Host ""
     Write-Host "  Prefer local dev instead (backend + Vite UI, with hot reload)?"
-    Write-Host "  1. Stop the containerized agent-api/ui: docker compose stop agent-api ui"
-    Write-Host "  2. Edit agent-api/.env if you need AWS profile or provider settings"
-    Write-Host "  3. Start the backend:"
+    Write-Host "  1. Install local dev deps (venv + npm), if you haven't: .\setup.ps1 -DevSetup"
+    Write-Host "  2. Stop the containerized agent-api/ui: docker compose stop agent-api ui"
+    Write-Host "  3. Edit agent-api/.env if you need AWS profile or provider settings"
+    Write-Host "  4. Start the backend:"
     Write-Host "       cd agent-api"
     Write-Host "       .\venv\Scripts\activate"
     Write-Host "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000"
-    Write-Host "  4. Start the UI (new terminal):"
+    Write-Host "  5. Start the UI (new terminal):"
     Write-Host "       cd ui"
     Write-Host "       npm run dev   # http://localhost:45173"
 }
@@ -554,12 +579,13 @@ else {
     Write-Host "       docker compose up --build -d"
     Write-Host "       Open http://localhost:$uiPort"
     Write-Host "  Option B - Local dev (backend + Vite UI):"
-    Write-Host "  1. Edit agent-api/.env if you need AWS profile or provider settings"
-    Write-Host "  2. Start the backend:"
+    Write-Host "  1. Install local dev deps (venv + npm), if you haven't: .\setup.ps1 -DevSetup"
+    Write-Host "  2. Edit agent-api/.env if you need AWS profile or provider settings"
+    Write-Host "  3. Start the backend:"
     Write-Host "       cd agent-api"
     Write-Host "       .\venv\Scripts\activate"
     Write-Host "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000"
-    Write-Host "  3. Start the UI (new terminal):"
+    Write-Host "  4. Start the UI (new terminal):"
     Write-Host "       cd ui"
     Write-Host "       npm run dev   # http://localhost:45173"
     Write-Host ""

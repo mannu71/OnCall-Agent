@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # First-time setup for OnCall Agent (Linux / macOS).
 #
+# One command takes a fresh clone to a running stack: prerequisites, .env files,
+# PostgreSQL, the migration, the full container stack, and an API health wait.
+# A local Python venv and UI npm install are only done with --dev.
+#
 # Usage:
 #   ./setup.sh
-#   ./setup.sh --skip-docker
+#   ./setup.sh --skip-docker      # you manage the database yourself
 #   ./setup.sh --skip-migrations
-#   ./setup.sh --skip-deps
+#   ./setup.sh --dev              # also set up local dev deps (venv + npm)
 
 set -euo pipefail
 
@@ -18,15 +22,15 @@ REPOS_PATH="$(dirname "${ROOT}")"
 
 SKIP_DOCKER=0
 SKIP_MIGRATIONS=0
-SKIP_DEPS=0
+DEV_SETUP=0
 
 for arg in "$@"; do
   case "$arg" in
     --skip-docker) SKIP_DOCKER=1 ;;
     --skip-migrations) SKIP_MIGRATIONS=1 ;;
-    --skip-deps) SKIP_DEPS=1 ;;
+    --dev) DEV_SETUP=1 ;;
     -h|--help)
-      echo "Usage: ./setup.sh [--skip-docker] [--skip-migrations] [--skip-deps]"
+      echo "Usage: ./setup.sh [--skip-docker] [--skip-migrations] [--dev]"
       exit 0
       ;;
     *)
@@ -111,6 +115,30 @@ wait_for_postgres() {
   fail "PostgreSQL did not become healthy in time. Check: docker logs $DB_CONTAINER"
 }
 
+wait_for_api() {
+  local port="$1"
+  local url="http://localhost:${port}/api/v1/health"
+  echo "    Waiting for the API to become healthy (${url})..."
+  local getter=""
+  if command -v curl >/dev/null 2>&1; then
+    getter="curl -fsS -o /dev/null --max-time 3"
+  elif command -v wget >/dev/null 2>&1; then
+    getter="wget -q -O /dev/null -T 3"
+  else
+    warn "Neither curl nor wget found; skipping API health wait."
+    return 0
+  fi
+  for _ in $(seq 1 45); do
+    if $getter "$url" >/dev/null 2>&1; then
+      ok "API is healthy"
+      return 0
+    fi
+    sleep 2
+  done
+  warn "API did not report healthy in time. Check: docker logs kyc-agent-api"
+  return 0
+}
+
 psql_exec() {
   # Run SQL (from stdin) in the DB container, stopping on the first error.
   docker exec -i "$DB_CONTAINER" psql -v ON_ERROR_STOP=1 -U kycuser -d kycagent "$@"
@@ -135,19 +163,20 @@ run_migrations_docker() {
   local applied
   applied="$(echo "SELECT filename FROM schema_migrations;" | psql_exec -tA 2>/dev/null || true)"
 
-  # Pre-existing install predating tracking: record current files as applied
-  # (don't replay old migrations against a live schema).
-  if [[ -z "$applied" ]]; then
+  # Squash baseline: the migration history was squashed into 001_schema.sql,
+  # which matches every existing install's live schema. If a core table is
+  # present but 001_schema.sql is not recorded — whether the install predates
+  # tracking entirely, or recorded the old pre-squash migration filenames —
+  # stamp 001_schema.sql as applied WITHOUT executing it (the objects already
+  # exist). A fresh volume has no core table, so it falls through and runs it.
+  if ! grep -qxF '001_schema.sql' <<< "$applied"; then
     local core
     core="$(echo "SELECT to_regclass('public.workflows') IS NOT NULL;" | psql_exec -tA 2>/dev/null | tr -d '[:space:]')"
     if [[ "$core" == "t" ]]; then
-      warn "Existing schema found without migration tracking — recording current migrations as applied (not replaying them)."
-      for file in "${sorted_files[@]}"; do
-        echo "INSERT INTO schema_migrations (filename) VALUES ('$(basename "$file")') ON CONFLICT DO NOTHING;" \
-          | psql_exec >/dev/null
-      done
-      ok "Recorded ${#sorted_files[@]} existing migration(s)"
-      return
+      warn "Existing schema found — stamping 001_schema.sql as applied (not replaying it)."
+      echo "INSERT INTO schema_migrations (filename) VALUES ('001_schema.sql') ON CONFLICT DO NOTHING;" \
+        | psql_exec >/dev/null
+      applied="$(echo "SELECT filename FROM schema_migrations;" | psql_exec -tA 2>/dev/null || true)"
     fi
   fi
 
@@ -220,8 +249,10 @@ fi
 
 if [[ "$SKIP_MIGRATIONS" -eq 0 ]]; then
   if [[ "$SKIP_DOCKER" -eq 1 ]]; then
-    step "Applying database migrations (local psql)"
-    (cd "$AGENT_API" && chmod +x run-migration.sh && ./run-migration.sh)
+    # The migration runner applies SQL via the Docker DB container - the single
+    # migration mechanism. With --skip-docker there's no container to target, so
+    # the operator applies the squashed baseline against their own database.
+    warn "skip-docker: apply agent-api/migrations/001_schema.sql to your database manually (the Docker migration runner is skipped)."
   else
     step "Applying database migrations (via Docker)"
     run_migrations_docker
@@ -236,9 +267,12 @@ if [[ "$SKIP_DOCKER" -eq 0 ]]; then
     (cd "$ROOT" && docker-compose -f docker-compose.yml up --build -d)
   fi
   ok "Full stack is running"
+
+  step "Waiting for the API to become healthy"
+  wait_for_api "${API_HOST_PORT:-48000}"
 fi
 
-if [[ "$SKIP_DEPS" -eq 0 ]]; then
+if [[ "$DEV_SETUP" -eq 1 ]]; then
   step "Installing Python dependencies"
   if [[ ! -d "$VENV_DIR" ]]; then
     (cd "$AGENT_API" && "$PYTHON_BIN" -m venv venv)
@@ -265,13 +299,14 @@ if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   echo "       API health:    http://localhost:${API_PORT}/api/v1/health"
   echo ""
   echo "  Prefer local dev instead (backend + Vite UI, with hot reload)?"
-  echo "  1. Stop the containerized agent-api/ui: docker compose stop agent-api ui"
-  echo "  2. Edit agent-api/.env if you need AWS profile or provider settings"
-  echo "  3. Start the backend:"
+  echo "  1. Install local dev deps (venv + npm), if you haven't: ./setup.sh --dev"
+  echo "  2. Stop the containerized agent-api/ui: docker compose stop agent-api ui"
+  echo "  3. Edit agent-api/.env if you need AWS profile or provider settings"
+  echo "  4. Start the backend:"
   echo "       cd agent-api"
   echo "       source venv/bin/activate"
   echo "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000"
-  echo "  4. Start the UI (new terminal):"
+  echo "  5. Start the UI (new terminal):"
   echo "       cd ui"
   echo "       npm run dev   # http://localhost:45173"
 else
@@ -280,12 +315,13 @@ else
   echo "       docker compose up --build -d"
   echo "       Open http://localhost:${UI_PORT}"
   echo "  Option B — Local dev (backend + Vite UI):"
-  echo "  1. Edit agent-api/.env if you need AWS profile or provider settings"
-  echo "  2. Start the backend:"
+  echo "  1. Install local dev deps (venv + npm), if you haven't: ./setup.sh --dev"
+  echo "  2. Edit agent-api/.env if you need AWS profile or provider settings"
+  echo "  3. Start the backend:"
   echo "       cd agent-api"
   echo "       source venv/bin/activate"
   echo "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000"
-  echo "  3. Start the UI (new terminal):"
+  echo "  4. Start the UI (new terminal):"
   echo "       cd ui"
   echo "       npm run dev   # http://localhost:45173"
   echo ""
