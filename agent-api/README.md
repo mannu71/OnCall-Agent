@@ -50,16 +50,27 @@ subprocess, not via in-process `exec()`.
 agent-api/
 ├── app/
 │   ├── api/v1/endpoints/     # REST + SSE routes
-│   ├── core/                 # scheduler, heartbeat, executor, settings consumers
-│   ├── core/llm/             # shared DB-resolved call_llm + prompt cache
-│   ├── engine/crawler_engine/# generic AsyncFlow / AsyncNode DAG framework
+│   ├── core/                 # cross-cutting building blocks, grouped into
+│   │                         #   intent-named subpackages (see below)
+│   ├── harness/              # long-running agent harness (turn loop, tools)
 │   ├── infrastructure/persistence/  # canonical repositories
 │   ├── services/             # visual executor, codegraph indexer, log watch, KB
-│   └── workflow/             # strategies, handlers, routing, LLM config
-├── migrations/               # numbered SQL (run in order)
+│   └── workflow/             # strategies, handlers, routing, LLM config,
+│       └── graph_engine/     #   generic AsyncFlow / AsyncNode DAG framework
+├── migrations/               # 001_schema.sql (squashed baseline) + future 002_*.sql
 ├── tests/                    # pytest suite
 └── pyproject.toml
 ```
+
+`app/core/` is organized into subpackages — `context/` (compaction, tool-output
+sizing, references), `llm/` (call_llm + prompt cache, model metadata/router/
+throttle, token calibration), `aws/`, `concurrency/`, `resilience/`, `runtime/`
+(scheduler, executor, heartbeat, events, timezone), `observability/`, `quality/`
+(supervisor, grader, grounding, intent), plus `memory/`, `privacy/`, `streaming/`,
+`tools/`, `improvement/`, and others. Only `database`, `exceptions`,
+`dependencies`, `logging`, `feature_flags` and `security` stay at the top level.
+Subpackages export nothing from `__init__`; import submodules directly (e.g.
+`from app.core.runtime.scheduler import ...`).
 
 ---
 
@@ -85,15 +96,22 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 48000
 - API docs: http://localhost:48000/docs
 - Health: http://localhost:48000/health
 
-### Database migrations
+### Database schema
 
-Apply SQL files in order:
+The schema is a single squashed baseline, `migrations/001_schema.sql`, generated
+from the fully-migrated database. Apply it once:
 
 ```bash
-for f in migrations/*.sql; do
-  psql "$DATABASE_URL" -f "$f"
-done
+psql "$DATABASE_URL" -f migrations/001_schema.sql
 ```
+
+`setup.ps1` / `setup.sh` apply it via the Docker migration runner and track it in
+a `schema_migrations` table: re-runs are a no-op, and a pre-existing database
+(whose schema already matches) is stamped as applied **without** re-executing.
+
+**Authoring new migrations:** add the next numbered file, `002_*.sql`,
+`003_*.sql`, … — one forward change per file. Applied by re-running setup (the
+runner applies any tracked-as-unapplied files in filename order).
 
 `init_db()` verifies connectivity only — it does **not** call `create_all`.
 
@@ -177,5 +195,4 @@ execution port, index streaming, and handler registry behaviour.
 
 - Root README: `../README.md`
 - UI: `../ui/README.md`
-- Memory subsystem: `app/core/memory/README.md`
 - Streaming callbacks: `app/core/streaming/README.md`

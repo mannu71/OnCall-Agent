@@ -11,10 +11,9 @@ See also: [Agent harness](agent-harness.md) for the agent runtime in detail.
 
 ![System architecture overview](diagrams/system-overview.svg)
 
-The platform ships as three separate Docker containers, wired together by
-[`docker-compose.yml`](../docker-compose.yml) (full stack) or the per-service
-compose files in [`agent-api/`](../agent-api/docker-compose.yml) and
-[`ui/`](../ui/docker-compose.yml):
+The platform ships as separate Docker containers, wired together by the single
+[`docker-compose.yml`](../docker-compose.yml) at the repo root (the only compose
+file — there are no per-service compose files):
 
 | Unit | Container | Tech | Role |
 |------|-----------|------|------|
@@ -37,7 +36,7 @@ still requires operator approval through the harness permission gate.
 | API v1 | `app/api/v1/endpoints` | HTTP surface: `workflows`, `executions`, `jobs`, `gateway`, `tools`, plus log-watch, crawler, settings, model/MCP config |
 | Workflow engine | `app/workflow`, `app/services/visual_workflow_executor.py` | Resolves the visual node graph and runs nodes (decides *what* runs) |
 | Agent harness | `app/harness` | Builds and runs a supervised ReAct agent for agent nodes (decides *how* an agent node runs) |
-| Code crawler | `app/crawler`, `app/engine/crawler_engine` | Background indexing, knowledge-graph + semantic search over indexed repos |
+| Code intelligence | `app/services/codegraph_indexer.py`, `app/workflow/graph_engine` | Background indexing (native codegraph engine) + the generic DAG framework |
 | Core runtime | `app/core` | Cross-cutting: scheduler, Bedrock transport, distributed locks, caching, circuit breaker, retries, rate-limit tracking, redaction, telemetry |
 
 ### Storage and coordination
@@ -80,8 +79,25 @@ PostgreSQL does triple duty:
 - The harness extraction (phases 0–4) gives the repo a clean three-altitude split:
   **orchestration** (workflow engine — what runs), **agency** (harness — how an agent
   node runs), and **capability** (tools/services — the work). Most code paths respect it.
-- There are two crawler entry points — the standalone `app/engine/crawler_engine` and the
-  `app/crawler` flows — bridged by `app/services/crawler_service.py`. This is the area
-  with the most overlapping responsibility if consolidation is ever wanted.
+- Code intelligence is the native **codegraph** C engine driven in-process over stdio;
+  the generic DAG framework it feeds lives in `app/workflow/graph_engine`. (The old
+  Python `app/crawler` package was removed.)
 - Cross-cutting concerns live in `app/core` rather than being scattered through the
-  services layer, which keeps the services thin.
+  services layer, which keeps the services thin. They are grouped into intent-named
+  subpackages (`context/`, `llm/`, `aws/`, `concurrency/`, `resilience/`, `runtime/`,
+  `observability/`, `quality/`, …) — see the repo-root README's "Repository layout".
+
+## Known caveats
+
+A few structural overlaps are known and tracked (previously enumerated in a
+now-removed analysis note; git history preserves the full list):
+
+- **Dual tool-filtering** — the `tool_disclosure` `search_tools`/`call_tool` bridge is
+  preferred, but the legacy keyword top-K `tool_router` still exists.
+- **Dual planning models** — profile `planning: true` (`write_todos`/`update_todo`) vs
+  the markdown plan instructions used by `agent_mode == "multi"`.
+- **Tool registry is discovery-only** — the startup catalog documents a
+  resolve-from-registry intent that live runs don't yet use; tools are still built
+  per-execution in `tool_assembler`.
+- **Governance spread across layers** — policy expansion, pseudonymization wrapping and
+  policy-engine tool wrapping live partly in strategy and partly in the harness.

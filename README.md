@@ -6,24 +6,25 @@ A web application for building and running AI-powered on-call investigation work
 
 ```
 kyc-protect-oncall-agent/
-├── docker-compose.yml      # Full stack: postgres + backend + UI
+├── docker-compose.yml      # The single full-stack definition: postgres + backend + headroom + UI
 ├── agent-api/              # Python FastAPI backend (workflows, agents, MCP, scheduler)
-│   ├── app/                # Application code
-│   ├── migrations/         # PostgreSQL schema migrations (run manually)
-│   ├── docker-compose.yml  # Backend only: postgres + agent-api
-│   ├── run-migration.bat   # Apply migrations (Windows)
-│   ├── run-migration.sh    # Apply migrations (Linux/macOS)
+│   ├── app/                # Application code (see "Repository layout" below)
+│   ├── migrations/         # PostgreSQL schema: 001_schema.sql (+ future 002_*.sql)
 │   └── requirements.txt    # Python dependencies
 ├── ui/                     # React frontend (Docker nginx or Vite dev)
 │   ├── src/                # React app (workflow builder, scheduler, settings)
 │   ├── Dockerfile          # UI container
-│   ├── docker-compose.yml  # UI only (joins backend network)
 │   └── package.json
-├── setup.ps1               # Automated first-time setup (Windows PowerShell)
-├── setup.sh                # Automated first-time setup (Linux / macOS)
+├── docs/                   # Architecture and harness docs
+├── setup.ps1               # One-command setup (Windows PowerShell)
+├── setup.sh                # One-command setup (Linux / macOS)
 ├── setup.bat               # Windows shortcut → setup.ps1
 └── README.md
 ```
+
+The root `docker-compose.yml` is the **only** compose file — it builds and runs
+the whole stack (postgres, agent-api, headroom, ui). There are no per-service
+compose files.
 
 ## Prerequisites
 
@@ -49,7 +50,7 @@ Optional but recommended:
 
 ## Quick setup (recommended)
 
-After cloning the repo, run the setup script from the repository root. It checks prerequisites, creates `.env` files, starts PostgreSQL in Docker, applies migrations, and installs Python + npm dependencies.
+After cloning the repo, run the setup script from the repository root — one command takes a fresh clone to a running stack. It checks prerequisites, creates `.env` files, starts PostgreSQL in Docker, applies the migration, builds and starts the full container stack, and waits for the API health check. A local Python venv and UI `npm install` are only done when you pass `-DevSetup` / `--dev` (a container-only user needs neither).
 
 **Windows:**
 
@@ -78,23 +79,20 @@ chmod +x setup.sh
 
 | Flag | Windows | Linux / macOS | Description |
 |------|---------|---------------|-------------|
-| Skip Docker | `-SkipDocker` | `--skip-docker` | Use your own PostgreSQL instance |
-| Skip migrations | `-SkipMigrations` | `--skip-migrations` | Skip SQL migrations |
-| Skip dependencies | `-SkipDeps` | `--skip-deps` | Skip pip / npm install |
+| Skip Docker | `-SkipDocker` | `--skip-docker` | Use your own PostgreSQL instance (apply `migrations/001_schema.sql` yourself) |
+| Skip migrations | `-SkipMigrations` | `--skip-migrations` | Skip the SQL migration |
+| Dev setup | `-DevSetup` | `--dev` | Also set up local dev: create the Python venv, `pip install`, and UI `npm install`. Off by default. |
 | Reset containers | `-Reset` | _(n/a)_ | Recreate containers from scratch (down + up --build). **Database is preserved.** |
 | Wipe database | `-WipeData` | _(n/a)_ | DESTRUCTIVE — delete the Postgres volume so the DB starts empty (prompts for typed confirmation). The only option that erases data. |
 
-When setup finishes, start the app:
-
-**Full Docker stack:**
+When the script finishes, the full Docker stack is already running at **http://localhost:43000**. To run it again later (or after `-Reset`), from the repo root:
 
 ```bash
-docker build -t codegraph:latest ./codegraph
-docker compose up --build
+docker compose up --build -d
 # Open http://localhost:43000
 ```
 
-**Local development:**
+**Local development** (requires `-DevSetup` / `--dev` first, to create the venv and install UI deps):
 
 ```bash
 # Terminal 1 — backend
@@ -129,11 +127,11 @@ The backend stores workflows, executions, code intelligence, and related data in
 **Option A — Docker (recommended):**
 
 ```bash
-cd agent-api
-docker-compose up -d postgres
+# From the repo root
+docker compose up -d postgres
 ```
 
-This starts a container named `kyc-agent-db` on port **5432** with:
+This starts a container named `kyc-agent-db` (host port **45432**) with:
 
 - User: `kycuser`
 - Password: `kycpassword`
@@ -142,44 +140,21 @@ This starts a container named `kyc-agent-db` on port **5432** with:
 Wait until the container is healthy:
 
 ```bash
-docker-compose ps
+docker compose ps
 ```
 
 **Option B — Local PostgreSQL:** Install PostgreSQL 16+ with pgvector, create the `kycagent` database and `kycuser` role, then point `DATABASE_URL` at your instance (see Step 4).
 
-### Step 3 — Run database migrations
+### Step 3 — Apply the database schema
 
-Migrations are plain SQL files in `agent-api/migrations/`. They must be applied **before** first use; the API does not auto-create tables.
-
-**Windows** (from `agent-api/`):
-
-```powershell
-.\run-migration.bat
-```
-
-**Linux / macOS** (from `agent-api/`):
+The schema is a single squashed baseline, `agent-api/migrations/001_schema.sql`. It must be applied **before** first use; the API does not auto-create tables. `setup.ps1` / `setup.sh` apply it for you via the Docker migration runner and track it in a `schema_migrations` table (re-runs are a no-op, and a pre-existing database is stamped without re-executing). To apply it by hand:
 
 ```bash
-chmod +x run-migration.sh
-./run-migration.sh
+# From agent-api/ — pipe the file into psql in the DB container
+docker exec -i kyc-agent-db psql -v ON_ERROR_STOP=1 -U kycuser -d kycagent < migrations/001_schema.sql
 ```
 
-**Using Docker when `psql` is not installed locally:**
-
-```powershell
-# Windows PowerShell — run from agent-api/
-Get-ChildItem migrations\*.sql | Sort-Object Name | ForEach-Object {
-  Get-Content $_.FullName | docker exec -i kyc-agent-db psql -U kycuser -d kycagent
-}
-```
-
-```bash
-# Linux / macOS — run from agent-api/
-for f in migrations/*.sql; do
-  echo "Running $f..."
-  docker exec -i kyc-agent-db psql -U kycuser -d kycagent < "$f"
-done
-```
+Future schema changes are added as new `002_*.sql`, `003_*.sql`, … files and applied by re-running setup (or by piping each new file in the same way).
 
 ### Step 4 — Configure the backend (optional)
 
@@ -208,7 +183,7 @@ aws configure --profile your-aws-profile
 # or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the environment
 ```
 
-If you use **Docker Compose for the full stack from the repo root**, set `REPOS_HOST_PATH` in a `.env` file at the repo root (or export it in your shell). When using `agent-api/docker-compose.yml` alone, set it in `agent-api/.env` instead.
+Set `REPOS_HOST_PATH` in a `.env` file at the repo root (or export it in your shell) so the full stack can mount your repos.
 
 ### Step 5 — Install backend dependencies
 
@@ -278,12 +253,11 @@ Verify the API is running:
 **Full Docker stack (recommended for deployment):**
 
 ```bash
-# From repo root — builds codegraph, then all three containers
-docker build -t codegraph:latest ./codegraph
+# From repo root — builds and starts all containers
 docker compose up --build
 ```
 
-Open **http://localhost:43000** in your browser. The UI container (`kyc-agent-ui`) proxies `/api` to the backend container (`kyc-agent-api`) over the shared Docker network.
+Open **http://localhost:43000** in your browser. The UI container (`kyc-agent-ui`) proxies `/api` to the backend container (`kyc-agent-api`) over the shared Docker network. (The code-intel engine is built inside `agent-api/Dockerfile`; there is no separate build step.)
 
 **Local UI development (hot reload):**
 
@@ -358,46 +332,28 @@ Add API keys or confirm AWS Bedrock access for the models your workflows use.
 
 ## Run with Docker (full stack)
 
-Build the codegraph engine first (required by the agent-api image), then start all services from the **repo root**:
+The root `docker-compose.yml` is the single stack definition. From the **repo root**:
 
 ```bash
-docker build -t codegraph:latest ./codegraph
-
 # 1. Start database (if not already running)
 docker compose up -d postgres
 
-# 2. Apply migrations (see Step 3)
+# 2. Apply the schema (see Step 3) — setup.ps1 / setup.sh do this for you
 
-# 3. Start postgres + backend + UI (separate containers)
+# 3. Build and start postgres + backend + headroom + UI
 docker compose up --build
 ```
 
-Open the app at **http://localhost:43000**.
+Open the app at **http://localhost:43000**. The code-intel engine is built inside `agent-api/Dockerfile` — there is no separate `docker build` step.
 
-### Run stacks independently
-
-Backend only (postgres + API):
+For local UI development against the Docker backend:
 
 ```bash
-cd agent-api
-docker compose up --build
-```
-
-UI only (requires backend running first to create the `oncall-agent` network):
-
-```bash
-cd ui
-docker compose up --build
-```
-
-For local UI development with a Docker backend only:
-
-```bash
-cd agent-api
+# From repo root — start just the backend services
 docker compose up -d postgres agent-api
 
-cd ../ui
-npm install
+# Then the Vite dev server (needs `--dev` deps installed first)
+cd ui
 npm run dev
 ```
 
@@ -485,8 +441,49 @@ Two things commonly bite fresh setups behind a corporate network:
 
 ---
 
+## Repository layout
+
+Top level:
+
+| Path | What it is |
+|------|-----------|
+| `agent-api/` | Python FastAPI backend (see the package map below) |
+| `ui/` | React frontend (workflow builder, scheduler, settings) |
+| `docs/` | Architecture and agent-harness documentation |
+| `docker-compose.yml` | The single full-stack definition |
+| `setup.ps1` / `setup.sh` | One-command setup |
+
+`agent-api/app/` packages:
+
+| Package | Responsibility |
+|---------|----------------|
+| `api/` | FastAPI routes and dependencies |
+| `harness/` | The long-running agent harness (turn loop, context, tools, planning) |
+| `workflow/` | Workflow execution — strategies, node catalog, and `graph_engine/` (the DAG engine) |
+| `services/` | Application services (log watch, visual workflow executor, Azure config, …) |
+| `mcp/` | MCP client/tooling integration |
+| `models/`, `schemas/` | ORM models and Pydantic schemas |
+| `core/` | Cross-cutting building blocks, grouped into intent-named subpackages |
+
+`agent-api/app/core/` subpackages:
+
+| Subpackage | Contents |
+|-----------|----------|
+| `context/` | Context-window machinery: compaction, tool-output sizing, references |
+| `llm/` | LLM call utility, model metadata/router/throttle, prompt caching, token calibration |
+| `aws/` | AWS credentials + CloudWatch cache/rate-limit + trace ids |
+| `concurrency/` | map/reduce, parallel fan-out, thread pools, locks |
+| `resilience/` | retry, circuit breaker, rate-limit tracking |
+| `runtime/` | scheduler, executor, heartbeat, events, timezone, TTL cache |
+| `observability/` | telemetry, API logging, log filtering, notifications |
+| `quality/` | answer supervision, grading, grounding, intent |
+| `memory/` | durable-fact extraction + memory curator |
+| `privacy/`, `streaming/`, `tools/`, `improvement/`, `transport/`, `policy/`, `sandbox/`, `skills/`, `vfs/`, `knowledge/`, `governance/`, `supervision/`, `code_semantic/` | Focused capability packages |
+
+Foundational modules (`database`, `exceptions`, `dependencies`, `logging`, `feature_flags`, `security`) stay at the `core/` top level. Subpackages have docstring-only `__init__` — import submodules directly (e.g. `from app.core.llm.model_router import ...`).
+
 ## Documentation
 
-- [Agent API README](agent-api/README.md) — API details, migrations, and Docker deployment
+- [Agent API README](agent-api/README.md) — API details, the migration file, and Docker deployment
 - [Eval harness](agent-api/evals/README.md) — `pytest -m eval` regression gate
 - [UI developer guide](ui/AGENTS.md) — frontend architecture and conventions
