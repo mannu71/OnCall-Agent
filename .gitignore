@@ -47,6 +47,12 @@ __pycache__/
 # Test coverage
 coverage/
 .nyc_output/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+
+# Runtime config (generated via the ADO settings UI, not source)
+agent-api/config/azure_devops_credentials.json
 
 # Output and runtime files
 output/
