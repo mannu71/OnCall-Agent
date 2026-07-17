@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict
 
-from app.engine.crawler_engine.workflow_graph import default_registry
+from app.workflow.graph_engine.workflow_graph import default_registry
 
 logger = logging.getLogger(__name__)
 

@@ -177,7 +177,7 @@ def _should_skip_prescan(tool_mode: str, user_query: str, context: Dict[str, Any
         return False
     if is_chat_turn(context):
         return True
-    from app.core.intent import is_conversational
+    from app.core.quality.intent import is_conversational
     return is_conversational(user_query)
 
 
@@ -321,7 +321,7 @@ async def execute_tool_provider(executor, node: Dict[str, Any], context: Dict[st
 
     # Chat fast path: if the user's message contains a correlation / trace id,
     # the pipeline skips the broad triage and traces just that request.
-    from app.core.trace_ids import extract_trace_ids
+    from app.core.aws.trace_ids import extract_trace_ids
     _user_query = (
         (context.get("inputs") or {}).get("user_query")
         or context.get("user_query")

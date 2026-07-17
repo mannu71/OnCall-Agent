@@ -235,7 +235,7 @@ The streaming callbacks integrate with the error classification system to provid
 
 ```python
 from app.core.streaming import LoggingStreamCallback
-from app.core.error_classifier import ClassifiedError, FailoverReason
+from app.core.llm.error_classifier import ClassifiedError, FailoverReason
 
 callback = LoggingStreamCallback()
 

@@ -1,6 +1,6 @@
 """Populate the (previously orphaned) tool registry at application startup.
 
-``app.core.tool_registry.registry`` was fully implemented but never populated —
+``app.core.tools.tool_registry.registry`` was fully implemented but never populated —
 tools were constructed ad hoc inside ``strategy.py`` per execution, and nothing
 could enumerate the catalog. This loader registers a *discovery* catalog:
 
@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List
 
-from app.core.tool_registry import registry
+from app.core.tools.tool_registry import registry
 
 logger = logging.getLogger(__name__)
 

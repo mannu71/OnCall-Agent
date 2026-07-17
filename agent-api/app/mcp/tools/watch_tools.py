@@ -15,7 +15,7 @@ from functools import wraps
 import ssl
 
 from app.config import settings
-from app.core.thread_pools import run_in_aws_pool
+from app.core.concurrency.thread_pools import run_in_aws_pool
 
 # Disable SSL certificate verification when AWS_SSL_VERIFY=false.
 if not settings.aws_ssl_verify:
@@ -311,7 +311,7 @@ class CloudWatchLogWatcher:
             """Run a single Insights query and poll to completion or timeout."""
             # Smooth StartQuery bursts (Phase 3) so a wide fan-out doesn't trip
             # CloudWatch's per-account request-rate limit and throttle the run.
-            from app.core import cloudwatch_ratelimit
+            from app.core.aws import cloudwatch_ratelimit
             await cloudwatch_ratelimit.acquire(
                 self.region, "StartQuery", settings.cloudwatch_ratelimit_startquery_rps,
             )

@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter
 
-from app.core.tool_registry import registry
+from app.core.tools.tool_registry import registry
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tools", tags=["tools"])

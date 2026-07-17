@@ -36,14 +36,19 @@ class Skill:
     skill_dir: Path
     config_vars: Dict[str, Any]
     setup_note: Optional[str] = None
-    # When the skill applies, in the model's own trigger vocabulary. Surfaced
-    # in the per-turn listing so the model can decide whether to load it.
+    # When the skill applies, in the model's own trigger vocabulary. Ranked by
+    # ``search_skills`` and shown in its results so the model can decide
+    # whether to load the skill.
     when_to_use: str = ""
-    # If True the skill is hidden from the model-facing listing and the skill
+    # If True the skill is hidden from the model-facing map, search and skill
     # tool (still invocable by an explicit user /slash-command).
     disable_model_invocation: bool = False
     # Optional hint about the arguments the skill expects (shown to authors).
     argument_hint: str = ""
+    # 'bundled' for a git-shipped seed skill, 'user' for a user-authored one.
+    # Stamped once at load time (from the source directory) so the per-turn map
+    # and the REST list can sort/label by origin without a filesystem stat.
+    origin: str = "user"
 
 
 class SkillManager:
@@ -54,7 +59,7 @@ class SkillManager:
 
     Supports:
     - Dynamic skill loading from SKILL.md files
-    - A per-turn listing (name + description) for two-stage disclosure
+    - A per-turn map (names only) + query ranking for two-stage disclosure
     - Slash command resolution (/skill-name)
     - Full-body invocation with config-variable and $ARGUMENTS resolution
     """
@@ -68,6 +73,10 @@ class SkillManager:
         self.skills_dir = skills_dir or Path("data/skills")
         self._skills: Dict[str, Skill] = {}
         self._loaded = False
+        # Signature of the on-disk skill set at last scan (mtimes of the source
+        # dirs + each SKILL.md + the disabled marker). Lets ``maybe_rescan``
+        # cheaply detect out-of-band file changes without a full re-parse.
+        self._signature: Optional[tuple] = None
     
     # Bundled seed skills shipped with the app (tracked in git, unlike
     # ``data/`` which is gitignored/dockerignored) — a starter cookbook so a
@@ -127,9 +136,10 @@ class SkillManager:
                     logger.warning(f"Skills directory does not exist: {source_dir}")
                 continue
 
+            origin = "bundled" if source_dir is self._SEED_DIR else "user"
             for skill_file in source_dir.rglob("SKILL.md"):
                 try:
-                    skill = self._load_skill_file(skill_file)
+                    skill = self._load_skill_file(skill_file, origin=origin)
                     if skill:
                         # Persistently-hidden skills (a bundled seed the operator
                         # "deleted") stay gone across restarts. A user-authored
@@ -143,15 +153,67 @@ class SkillManager:
                     logger.error(f"Failed to load skill from {skill_file}: {e}")
 
         self._loaded = True
+        self._signature = self._dir_signature()
         logger.info(f"Loaded {len(self._skills)} skills (seed + {self.skills_dir})")
         return self._skills
-    
-    def _load_skill_file(self, skill_file: Path) -> Optional[Skill]:
+
+    def _dir_signature(self) -> tuple:
+        """A cheap fingerprint of the on-disk skill set (paths + mtimes).
+
+        Walks the same ``SKILL.md`` files ``scan_skills`` would, recording each
+        path and mtime plus the disabled-marker mtime. Comparing two signatures
+        detects added/removed/edited skills without re-reading or re-parsing any
+        file — used by :meth:`maybe_rescan`. Best-effort: any stat error is
+        folded into the signature so it simply forces a rescan.
+        """
+        parts: List[tuple] = []
+        for source_dir in (self._SEED_DIR, self.skills_dir):
+            try:
+                if not source_dir.exists():
+                    continue
+                for skill_file in sorted(source_dir.rglob("SKILL.md")):
+                    try:
+                        parts.append((str(skill_file), skill_file.stat().st_mtime_ns))
+                    except OSError as exc:
+                        parts.append((str(skill_file), repr(exc)))
+            except OSError as exc:
+                parts.append((str(source_dir), repr(exc)))
+        try:
+            dp = self._disabled_path()
+            if dp.exists():
+                parts.append((str(dp), dp.stat().st_mtime_ns))
+        except OSError as exc:
+            parts.append(("<disabled>", repr(exc)))
+        return tuple(parts)
+
+    def maybe_rescan(self) -> bool:
+        """Re-scan only if the on-disk skill set changed since the last scan.
+
+        Cheap (a directory walk + stat per file, no read/parse) so it is safe on
+        API-facing list paths; the agent hot path deliberately does NOT call this
+        (it runs on the cached set, refreshed by API writes or an explicit
+        rescan) to keep per-turn overhead at zero. Returns True if a rescan ran.
+        """
+        if not self._loaded:
+            self.scan_skills()
+            return True
+        if self._dir_signature() != self._signature:
+            logger.info("SkillManager: on-disk skills changed — rescanning")
+            self.scan_skills()
+            return True
+        return False
+
+    def _load_skill_file(
+        self, skill_file: Path, origin: str = "user",
+    ) -> Optional[Skill]:
         """Load a single SKILL.md file.
-        
+
         Args:
             skill_file: Path to SKILL.md file
-            
+            origin: 'bundled' (git-shipped seed) or 'user' (authored under
+                skills_dir). Stamped onto the Skill so origin sorting/labelling
+                never needs a filesystem stat later.
+
         Returns:
             Skill object or None if invalid
         """
@@ -213,17 +275,21 @@ class SkillManager:
             when_to_use=when_to_use,
             disable_model_invocation=disable_model_invocation,
             argument_hint=argument_hint,
+            origin=origin,
         )
     
     def select_for_query(
         self, query: str, k: int = 2, allowed: Optional[Set[str]] = None,
     ) -> List[Skill]:
-        """Return up to *k* skills most relevant to *query* (RAG-style auto-select).
+        """Return up to *k* skills most relevant to *query* — the ``search_skills`` ranker.
 
-        Lexical relevance over each skill's name + description (token overlap,
-        weighted toward the name). Deterministic and dependency-free — no DB or
-        embedding call on the hot path. A future upgrade can swap in the Titan
-        embeddings used by semantic memory; the call site is stable.
+        Stage one of skill disclosure is a names-only map, so this is how the
+        model turns an intent ("triage errors in logs") into the right skill
+        name to load. Lexical relevance over each skill's name, description,
+        ``when_to_use`` and body (token overlap, weighted toward the name).
+        Deterministic and dependency-free — no DB or embedding call on the hot
+        path. A future upgrade can swap in the Titan embeddings used by semantic
+        memory; the call site is stable.
 
         ``allowed``: when given (non-empty), only skills whose name is in this
         set are considered — used for per-agent skill scoping (Skills picker on
@@ -243,14 +309,20 @@ class SkillManager:
         for skill in candidates:
             name_tokens = _tokenize(skill.name.replace("-", " ").replace("_", " "))
             desc_tokens = _tokenize(skill.description)
+            # when_to_use is authored as trigger vocabulary ("when the user asks
+            # about X") — exactly the words a search query uses, so it scores
+            # alongside the description rather than being ignored.
+            wtu_tokens = _tokenize(skill.when_to_use)
             # Body tokens let the skill's own "When this triggers" section drive
             # matching — critical when the frontmatter description is thin or a
             # placeholder (the body carries the real trigger vocabulary).
             body_tokens = _tokenize(skill.content)
-            # Name = strong signal; description = supporting; body = weak but wide.
+            # Name = strong signal; description/when_to_use = supporting; body =
+            # weak but wide.
             score = (
                 2.0 * len(q_tokens & name_tokens)
                 + 1.0 * len(q_tokens & desc_tokens)
+                + 1.0 * len(q_tokens & wtu_tokens)
                 + 0.5 * len(q_tokens & body_tokens)
             )
             if score > 0:
@@ -363,75 +435,64 @@ class SkillManager:
 
         return "\n".join(message_parts)
 
-    def build_listing(
-        self,
-        allowed: Optional[Set[str]] = None,
-        char_budget: int = 8000,
-        entry_cap: int = 250,
-    ) -> str:
-        """Return a compact, model-facing listing of invocable skills.
-
-        One line per skill: ``- <name>: <description>[ - <when_to_use>]``.
-        Each line is capped at ``entry_cap`` chars; if the joined listing
-        exceeds ``char_budget`` the per-entry text is shrunk (seed/bundled
-        skills keep their full text first, so the shipped cookbook is never the
-        casualty), degrading to names-only in the extreme. Skills flagged
-        ``disable_model_invocation`` are excluded — the model cannot invoke
-        them, so listing them is noise.
-
-        ``allowed``: when non-empty, only skills whose name is in this set are
-        listed (per-agent scoping via the Agent node's Skills picker).
-        """
+    def _invocable_skills(self, allowed: Optional[Set[str]] = None) -> List["Skill"]:
+        """Loaded skills the model may invoke, honouring per-agent ``allowed`` scoping."""
         if not self._loaded:
             self.scan_skills()
-
-        skills = [
+        return [
             s for s in self._skills.values()
             if not s.disable_model_invocation
             and (not allowed or s.name in allowed)
         ]
+
+    def model_invocable_names(self, allowed: Optional[Set[str]] = None) -> Set[str]:
+        """Names of skills the model may invoke (``disable_model_invocation`` +
+        ``allowed`` filtered). The candidate set behind ``search_skills``."""
+        return {s.name for s in self._invocable_skills(allowed)}
+
+    def build_map(
+        self,
+        allowed: Optional[Set[str]] = None,
+        char_budget: int = 1500,
+    ) -> str:
+        """Return the model-facing skill MAP: invocable skill names, comma-joined.
+
+        Stage one of skill disclosure — names only (no descriptions), so the
+        per-turn cost stays near zero. The model turns an intent into a name via
+        the ``search_skills`` tool, then loads the runbook with ``skill``.
+        Skills flagged ``disable_model_invocation`` are excluded — the model
+        cannot invoke them, so naming them is noise.
+
+        Over ``char_budget`` the map degrades to a count-only hint (``"<N> skills
+        available"``): the names stop being useful once there are too many to
+        read, but the model must still know the library exists and is
+        searchable. Empty (no invocable skills) → ``""``.
+
+        ``allowed``: when non-empty, only skills whose name is in this set are
+        mapped (per-agent scoping via the Agent node's Skills picker).
+        """
+        skills = self._invocable_skills(allowed)
         if not skills:
             return ""
 
-        # Bundled seed skills first so, under budget pressure, user skills are
-        # the ones trimmed to names-only rather than the curated cookbook.
-        skills.sort(key=lambda s: (self._skill_origin(s) != "bundled", s.name))
+        # Bundled seed skills first, then alphabetical — a stable order so the
+        # block doesn't churn between turns.
+        skills.sort(key=lambda s: (s.origin != "bundled", s.name))
 
-        def _fmt(skill: "Skill", desc_len: int) -> str:
-            desc = (skill.description or "").strip().replace("\n", " ")
-            extra = (skill.when_to_use or "").strip().replace("\n", " ")
-            if extra:
-                desc = f"{desc} - {extra}" if desc else extra
-            if desc_len <= 0:
-                line = f"- {skill.name}"
-            else:
-                if len(desc) > desc_len:
-                    desc = desc[: max(0, desc_len - 1)].rstrip() + "…"
-                line = f"- {skill.name}: {desc}" if desc else f"- {skill.name}"
-            if len(line) > entry_cap:
-                line = line[: entry_cap - 1].rstrip() + "…"
-            return line
+        names = ", ".join(s.name for s in skills)
+        if len(names) > char_budget:
+            return f"{len(skills)} skills available"
+        return names
 
-        # Full-length pass; shrink descriptions uniformly until it fits.
-        for desc_len in (entry_cap, 160, 100, 60, 0):
-            lines = [_fmt(s, desc_len) for s in skills]
-            listing = "\n".join(lines)
-            if len(listing) <= char_budget or desc_len == 0:
-                return listing
-        return listing
-    
     def _skill_origin(self, skill: "Skill") -> str:
         """'bundled' for a git-shipped seed skill, 'user' for a user-authored one.
 
-        Decided by whether the skill's directory lives under the bundled
-        ``_SEED_DIR`` or the user ``skills_dir`` — lets the UI show only custom
-        skills in the per-agent picker while bundled skills auto-select globally.
+        Stamped onto the Skill at load time (from its source directory), so this
+        is a pure field read — no filesystem stat on the per-turn map / REST-list
+        paths. Lets the UI show only custom skills in the per-agent picker while
+        bundled skills auto-select globally.
         """
-        try:
-            seed_root = str(self._SEED_DIR.resolve())
-            return "bundled" if str(skill.skill_dir.resolve()).startswith(seed_root) else "user"
-        except Exception:  # noqa: BLE001 — origin is best-effort metadata
-            return "user"
+        return skill.origin
 
     def list_skills(self) -> List[Dict[str, Any]]:
         """List available skills with descriptions.
@@ -441,7 +502,10 @@ class SkillManager:
             ('bundled' | 'user'), 'when_to_use', 'argument_hint' and
             'disable_model_invocation' keys.
         """
-        # Ensure skills are loaded
+        # Ensure skills are loaded (first use). NB: no maybe_rescan() here — this
+        # is called on the agent's conversational fast-path too, so it must stay
+        # zero-I/O once loaded. The REST list endpoint calls maybe_rescan()
+        # explicitly to surface out-of-band file drops in the UI.
         if not self._loaded:
             self.scan_skills()
 
@@ -519,6 +583,30 @@ class SkillManager:
             skill_file.unlink(missing_ok=True)
             raise ValueError(
                 "Invalid SKILL.md content — requires YAML frontmatter with a 'name' field"
+            )
+
+        # Frontmatter lint: the per-turn map carries names only, so a skill is
+        # found via ``search_skills`` — which ranks the description (+ optional
+        # when_to_use) far above the body. A skill with no description is
+        # therefore near-unfindable noise, so reject it outright. A thin
+        # description or a missing when_to_use still works but triggers poorly,
+        # so warn rather than block (authors/drafters may iterate).
+        if not (loaded.description or "").strip():
+            skill_file.unlink(missing_ok=True)
+            raise ValueError(
+                "Skill 'description' is required and cannot be empty — it is the only "
+                "text the agent sees when deciding whether to use this skill."
+            )
+        if len(loaded.description.strip()) < 20:
+            logger.warning(
+                "SkillManager: skill '%s' has a very short description (%d chars) — "
+                "the agent may not reliably select it; describe when to use it.",
+                loaded.name, len(loaded.description.strip()),
+            )
+        if not (loaded.when_to_use or "").strip():
+            logger.info(
+                "SkillManager: skill '%s' has no 'when_to_use' — consider adding one "
+                "to improve the agent's selection accuracy.", loaded.name,
             )
 
         # Authoring a skill re-enables its name if it was previously hidden

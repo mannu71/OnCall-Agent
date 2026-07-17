@@ -1,7 +1,7 @@
 """Unit tests for resolve_llm_fallback_chain (pure, no DB)."""
 import pytest
 
-from app.core import model_throttle_tracker as throttle
+from app.core.llm import model_throttle_tracker as throttle
 from app.workflow.llm_config import (
     resolve_llm_fallback_chain,
     throttle_target_for,

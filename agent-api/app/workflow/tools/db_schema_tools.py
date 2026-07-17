@@ -30,7 +30,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field as PydanticField
 
 from app.config import settings
-from app.core.ttl_cache import TTLCache
+from app.core.runtime.ttl_cache import TTLCache
 
 logger = logging.getLogger(__name__)
 

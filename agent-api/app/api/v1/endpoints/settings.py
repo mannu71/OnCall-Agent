@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.api.deps import get_llm_config_repo
-from app.core.app_timezone import (
+from app.core.runtime.app_timezone import (
     SETTING_KEY as TZ_SETTING_KEY,
     get_global_timezone_name,
     is_valid_timezone,

@@ -28,7 +28,7 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
-from app.core.supervisor import SupervisorAction
+from app.core.quality.supervisor import SupervisorAction
 from app.harness.helpers import estimate_confidence
 from app.harness.hitl import emit_hitl_pause
 

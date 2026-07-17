@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from app.core.redact import redact
+from app.core.privacy.redact import redact
 from app.workflow.execution_port import ExecutionPort
 from app.workflow.llm_config import LLM_NODE_TYPES
 from app.workflow.strategies.base import BaseStrategy

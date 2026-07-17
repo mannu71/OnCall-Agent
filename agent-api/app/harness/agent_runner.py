@@ -7,9 +7,9 @@ from typing import Any, Dict, Optional
 
 from app.config import settings
 
-from app.core.error_classifier import classify_error
-from app.core.retry import with_retry
-from app.core.telemetry import agent_span, get_current_trace_id
+from app.core.llm.error_classifier import classify_error
+from app.core.resilience.retry import with_retry
+from app.core.observability.telemetry import agent_span, get_current_trace_id
 from app.harness.helpers import compact_input_state, looks_like_midthought
 from app.harness.hitl import emit_hitl_pause
 from app.workflow.strategies.react.streaming import StreamCallback
@@ -281,7 +281,7 @@ async def execute_agent(
           - tool_calls: list — summary of tools invoked
     """
     from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-    from app.core.telemetry import agent_span, get_current_trace_id
+    from app.core.observability.telemetry import agent_span, get_current_trace_id
 
     logger_instance.info("ReactStrategy: invoking agent with query: %.100s", user_query)
 
@@ -311,7 +311,7 @@ async def execute_agent(
     # across container restarts lives in the ``memory_summaries``
     # Postgres table (created in Task #2 DDL).
     try:
-        from app.core.memory.compaction_manager import ContextCompactionManager
+        from app.core.context.compaction_manager import ContextCompactionManager
         from app.core.transport import get_transport
         summarisation_transport = get_transport()
         compaction_mgr = ContextCompactionManager(
@@ -516,7 +516,7 @@ async def execute_agent(
                     extra={"execution_id": execution_id},
                 )
                 from langchain_core.messages import BaseMessage as _BM
-                from app.core.context_compression import compress as _compress
+                from app.core.context.overflow import compress as _compress
 
                 existing_msgs = input_state.get("messages", [])
                 if isinstance(existing_msgs, list) and all(isinstance(m, _BM) for m in existing_msgs):
@@ -737,7 +737,7 @@ async def execute_agent(
     # user didn't supply — a likely fabrication. Never blocks or rewrites the
     # answer; surfaced as result["ungrounded_ids"] for the UI / eval to inspect.
     try:
-        from app.core.grounding import ungrounded_ids, extract_ids
+        from app.core.quality.grounding import ungrounded_ids, extract_ids
         allow = extract_ids(user_query)
         flagged = ungrounded_ids(final_answer or "", parsed.get("evidence_ids") or set(), allow)
         if flagged:
@@ -850,19 +850,19 @@ def _serialize_agent_result(result_state: Dict[str, Any]) -> Dict[str, Any]:
             # Grounding: harvest IDs from the FULL output, before the 2000-char
             # serialization cap, so the guard sees every identifier a tool produced.
             try:
-                from app.core.grounding import extract_ids
+                from app.core.quality.grounding import extract_ids
                 evidence_ids.update(extract_ids(_full))
             except Exception:  # noqa: BLE001 — a telemetry guard must never break a run
                 pass
 
             # Backfill the matching tool_calls_summary entry with real
             # success/failure status (content-based, not name-substring —
-            # see app.core.supervisor._score_tool_health).
+            # see app.core.quality.supervisor._score_tool_health).
             _tcid = getattr(msg, "tool_call_id", "")
             _summary_entry = tool_calls_by_id.get(_tcid)
             if _summary_entry is not None:
                 try:
-                    from app.core.tool_guardrails import classify_tool_failure
+                    from app.core.tools.tool_guardrails import classify_tool_failure
                     _failed, _ = classify_tool_failure(_summary_entry.get("tool", ""), _full)
                     _summary_entry["ok"] = not _failed
                     _summary_entry["status"] = "error" if _failed else "ok"
@@ -928,7 +928,7 @@ async def _instrument_langgraph_result(
     instead of instrumenting each one separately. Best-effort: any failure
     is swallowed by the caller, matching every other telemetry guard here.
     """
-    from app.core.tool_guardrails import classify_tool_failure
+    from app.core.tools.tool_guardrails import classify_tool_failure
     from app.harness.verify_tracking import scan_tool_calls
 
     messages = parsed.get("messages") or []
@@ -1037,7 +1037,7 @@ async def execute_agent_stream(
     ``durability`` (sync|async|exit), when set, is forwarded through
     ``astream_events`` → ``astream`` to control checkpoint frequency.
     """
-    from app.core.tool_guardrails import (
+    from app.core.tools.tool_guardrails import (
         ToolCallGuardrailController,
         toolguard_synthetic_result,
         append_toolguard_guidance,
@@ -1198,7 +1198,7 @@ async def execute_agent_stream(
                 output_str = str(tool_output)
 
                 # ── Guardrail post-check ──────────────────────────────
-                from app.core.tool_guardrails import classify_tool_failure
+                from app.core.tools.tool_guardrails import classify_tool_failure
                 _is_failed, _fail_reason = classify_tool_failure(tool_name, output_str)
                 _gc_post = guardrail.after_call(
                     tool_name, current_tool_args, output_str, failed=_is_failed,
@@ -1294,7 +1294,7 @@ async def execute_agent_stream_v2(
     :func:`execute_agent`.
     """
     from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
-    from app.core.tool_guardrails import (
+    from app.core.tools.tool_guardrails import (
         ToolCallGuardrailController,
         classify_tool_failure,
         append_toolguard_guidance,

@@ -1,12 +1,17 @@
-"""Model-invoked skill loading (stage two of two-stage skill disclosure).
+"""Model-invoked skill search + loading (stage two of skill disclosure).
 
-Stage one is a compact per-turn *listing* of available skills (name +
-description), assembled by ``SkillManager.build_listing`` and injected into the
-user turn by ``context_builder.build_recall_query``. This module owns stage two:
+Stage one is the *skill map* — an ultra-compact names-only index of available
+skills, built by ``SkillManager.build_map`` and injected into the user turn by
+``context_builder.build_recall_query``. Names alone cost near-nothing per turn;
+the model resolves a name into a runbook through this module:
 
+  * :func:`build_skill_search_tool` — a pinned ``search_skills`` tool that ranks
+    the mapped skills against a plain-words query and returns the matches with
+    their descriptions, so the model can pick the right name.
   * :func:`build_skill_tool` — a pinned ``skill`` tool the model calls to load a
-    listed skill's full runbook body into the conversation on demand. The body
-    comes back as the tool result, framed so the agent follows it.
+    mapped skill's full runbook body into the conversation on demand. The body
+    comes back as the tool result, framed so the agent follows it. Calling it
+    directly off the map (skipping the search) is fine for an obvious match.
   * :func:`expand_slash_command` — deterministic ``/<skill-name> [args]``
     expansion for user chat messages, so a typed slash command invokes the
     skill's runbook without waiting on the model to call the tool.
@@ -91,8 +96,9 @@ def build_skill_tool(
     class SkillInput(BaseModel):
         skill: str = Field(
             description=(
-                'The skill name exactly as shown in the "Available skills" list, '
-                'e.g. "log-error-triage". A leading "/" is tolerated.'
+                'The skill name exactly as shown in the "Skill map" block or in '
+                'search_skills results, e.g. "log-error-triage". A leading "/" '
+                "is tolerated."
             )
         )
         args: str = Field(
@@ -116,7 +122,10 @@ def build_skill_tool(
     async def _invoke_skill(skill: str, args: str = "") -> str:
         name = (skill or "").strip().lstrip("/")
         if not name:
-            return "[skill error] No skill name given. Pick one from the Available skills list."
+            return (
+                "[skill error] No skill name given. Pick one from the Skill map, or "
+                "call search_skills to find it."
+            )
         try:
             from app.config import settings
             from app.core.skills import get_default_skill_manager
@@ -137,6 +146,17 @@ def build_skill_tool(
             return (
                 f"[skill error] Skill '{resolved.name}' cannot be invoked by the model "
                 "(it is user-command only)."
+            )
+
+        # Hard re-invocation guard: if this skill was already loaded this turn,
+        # don't re-emit its full (capped-8K) runbook — that's pure token waste and
+        # the model already has the instructions in context. Return a one-line
+        # stub instead. The prompt-only "do not invoke again" directive below is
+        # advisory; this makes it enforced. (invoked_sink is the turn's load log.)
+        if invoked_sink is not None and resolved.name in invoked_sink:
+            return (
+                f"[skill] '{resolved.name}' is already loaded this turn — its "
+                "instructions are above. Continue following them; do not reload it."
             )
 
         body = mgr.build_invocation_message(resolved, user_instruction=args or "")
@@ -169,16 +189,136 @@ def build_skill_tool(
         coroutine=_invoke_skill,
         name="skill",
         description=(
-            "Load a skill — a proven, reusable runbook — and follow it. The available "
-            "skills are listed in the 'Available skills' block of the user message, each "
-            "with a name and when to use it. When a skill matches the user's request this "
-            "is a BLOCKING REQUIREMENT: invoke it with skill=\"<name>\" BEFORE doing any "
-            "other work on the task, then follow the returned instructions step by step. "
-            "Never mention a skill without invoking it. A user message that starts with "
+            "Load a skill — a proven, reusable runbook — and follow it. The skill names "
+            "available to you are in the 'Skill map' block of the user message; use "
+            "search_skills to find the right one when the map's names alone don't make "
+            "it obvious. When a skill matches the user's request this is a BLOCKING "
+            "REQUIREMENT: invoke it with skill=\"<name>\" BEFORE doing any other work on "
+            "the task, then follow the returned instructions step by step. Never mention "
+            "a skill without invoking it. A user message that starts with "
             "'/<skill-name>' is a request to invoke that skill."
         ),
         args_schema=SkillInput,
     )
 
 
-__all__ = ["build_skill_tool", "expand_slash_command"]
+def build_skill_search_tool(
+    *,
+    allowed_skills: Optional[Set[str]] = None,
+    execution_id: Optional[str] = None,
+    logger_instance: Optional[Any] = None,
+) -> Any:
+    """Return the pinned ``search_skills`` tool that finds skills by intent.
+
+    Stage one of disclosure gives the model only skill NAMES (the map); this
+    ranks them against a plain-words query and returns the matches with their
+    descriptions and ``when_to_use`` text, so the model can pick which one to
+    load with ``skill``. Searching is not invoking — there is no invoked-sink
+    here; only an actual ``skill`` load counts as using a skill.
+
+    ``allowed_skills``: when non-empty, only these skill names are searchable
+    (per-agent scoping, same contract as :func:`build_skill_tool`).
+    """
+    from langchain_core.tools import StructuredTool
+    from pydantic import BaseModel, Field
+
+    log = logger_instance or logger
+
+    try:
+        from app.config import settings
+        default_k = int(getattr(settings, "skill_search_k", 5))
+    except Exception:  # noqa: BLE001 — a bad setting must not block tool binding
+        default_k = 5
+    # Clamp to the same [1, 10] range the handler enforces, so the advertised
+    # default never promises more than a query can actually return.
+    default_k = max(1, min(default_k, 10))
+    # Cap on the names dumped in the no-match fallback — the map is budgeted, so
+    # this list must be too, or a large library floods the tool result.
+    _NO_MATCH_NAME_CAP = 25
+
+    class SearchSkillsInput(BaseModel):
+        query: str = Field(
+            description=(
+                "What you are trying to do, in plain words (e.g. 'triage errors in "
+                "logs', 'an alarm is firing and I need to drill into it'). Returns "
+                "the matching skills with their names and when to use them."
+            )
+        )
+        limit: int = Field(
+            default=default_k,
+            description=f"Max number of skills to return (default {default_k}).",
+        )
+
+    async def _search_skills(query: str, limit: int = default_k) -> str:
+        try:
+            k = max(1, min(int(limit), 10))
+        except (TypeError, ValueError):
+            k = default_k
+        try:
+            from app.core.skills import get_default_skill_manager
+            # No maybe_rescan(): this is the agent hot path, so it runs on the
+            # cached skill set (refreshed by API writes) — same contract as the
+            # ``skill`` tool and the map.
+            mgr = get_default_skill_manager()
+            effective = mgr.model_invocable_names(allowed_skills)
+            # An EMPTY effective set means nothing is invocable — but
+            # select_for_query reads a falsy ``allowed`` as "no scoping" and
+            # would search everything, surfacing skills this agent must not see.
+            # Short-circuit to the no-match fallback instead.
+            hits = (
+                mgr.select_for_query((query or "").strip(), k=k, allowed=effective)
+                if effective else []
+            )
+        except Exception as exc:  # noqa: BLE001 — surface, don't crash the loop
+            log.warning(
+                "skill_tools: skill search failed for %r (%s)", query, exc,
+                extra={"execution_id": execution_id},
+            )
+            return f"[search_skills error] Skill search failed: {exc}"
+
+        if not hits:
+            ordered = sorted(effective)
+            if not ordered:
+                avail = " No skills are available."
+            else:
+                shown = ", ".join(ordered[:_NO_MATCH_NAME_CAP])
+                extra = len(ordered) - _NO_MATCH_NAME_CAP
+                if extra > 0:
+                    shown += f" (+{extra} more)"
+                avail = f" Available skills: {shown}."
+            return (
+                f"No skills matched '{query}'.{avail} Try broader words, or proceed "
+                "without a skill — not every task has one."
+            )
+
+        lines = [f"{len(hits)} matching skill(s) for '{query}':", ""]
+        for s in hits:
+            desc = (s.description or "").strip().replace("\n", " ")
+            if len(desc) > 200:
+                desc = desc[:200] + "…"
+            lines.append(f"• {s.name} — {desc}")
+            wtu = (s.when_to_use or "").strip().replace("\n", " ")
+            if wtu:
+                lines.append(f"    when: {wtu}")
+        lines.append("")
+        lines.append(
+            'Load one with skill(skill="<name>") and follow its instructions before '
+            "doing other work on the task."
+        )
+        return "\n".join(lines)
+
+    return StructuredTool.from_function(
+        coroutine=_search_skills,
+        name="search_skills",
+        description=(
+            "Find the skill that fits the task. The 'Skill map' block of the user "
+            "message lists the skill names available to you but not what they do — "
+            "search here by intent to get the matching names with descriptions, then "
+            "load the right one with the skill tool. Search before concluding no skill "
+            "applies; if a map name is already an obvious match, call skill directly."
+        ),
+        args_schema=SearchSkillsInput,
+    )
+
+
+__all__ = ["build_skill_tool", "build_skill_search_tool", "expand_slash_command"]

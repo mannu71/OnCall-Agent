@@ -3,7 +3,7 @@
   * ``envelopes`` — standardized ``ToolResult`` / ``NodeOutput`` observation
     envelopes with a uniform output cap.
   * ``registry_loader`` — startup population of the (previously orphaned)
-    ``app.core.tool_registry.registry`` with built-in + MCP-discovered tools,
+    ``app.core.tools.tool_registry.registry`` with built-in + MCP-discovered tools,
     exposed via ``GET /api/v1/tools``.
 
 The in-house ``build_agent`` (``app.harness.react_agent``) is the sole agent

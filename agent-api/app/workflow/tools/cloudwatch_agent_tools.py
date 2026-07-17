@@ -376,7 +376,7 @@ def build_cloudwatch_agent_tools(
     Args:
         region: AWS region for all CloudWatch calls.
         credentials: Pre-resolved credentials dict (from
-            :func:`app.core.aws_credentials.resolve_aws_credentials`).
+            :func:`app.core.aws.aws_credentials.resolve_aws_credentials`).
         log_groups: Optional default log groups from the node config.  If
             provided they are mentioned in the tool descriptions to guide the
             agent, but the agent is still free to specify different groups.

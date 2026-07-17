@@ -3,7 +3,7 @@
 Two behaviour-preserving primitives extracted from ``ReactStrategy.execute``:
 
   * :func:`build_recall_query` — prepend a knowledge-base recall block (similar
-    past issues / patterns / executable skills) to the user query so the agent
+    past issues / patterns) and the skill map to the user query so the agent
     starts with institutional memory. Best-effort: a KB failure never blocks the
     run.
   * :func:`seed_context_blocks` — prepend any pre-computed analysis the executor
@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict, Optional, Tuple
 
-from app.core.redact import redact
+from app.core.privacy.redact import redact
 
 
 def repos_from_code_analyzer(code_analyzer_config: Optional[Dict[str, Any]]) -> list:
@@ -32,6 +32,31 @@ def repos_from_code_analyzer(code_analyzer_config: Optional[Dict[str, Any]]) -> 
     return names
 
 
+def build_skill_map_block(skill_map: str) -> str:
+    """Wrap a ``SkillManager.build_map`` result as the model-facing ``# Skill map``.
+
+    Stage one of skill disclosure. Split out from :func:`build_recall_query` so
+    the trajectory eval injects the identical block rather than a lookalike.
+    Empty map → ``""`` (no block).
+    """
+    if not skill_map:
+        return ""
+    # Deliberately terse: the protocol (load before other work, never mention a
+    # skill without invoking it) already lives in the cached system prompt's
+    # "# Skills" section and in both tool descriptions. Repeating it here would
+    # be paid on every turn — the exact cost this map exists to remove.
+    # NB: emphasis here does NOT substitute for that section winning on order —
+    # adding a blocking-requirement clause to this block was measured and did not
+    # stop the agent skipping a matching skill; placing "# Skills" AFTER the
+    # capability sections in agent_builder is what actually binds it.
+    return (
+        "# Skill map\n"
+        f"Proven runbooks you can load, by name: {skill_map}\n"
+        "Call `search_skills(query)` to find the right one, then "
+        "`skill(skill=\"<name>\")` to load it; `/<name>` invokes directly."
+    )
+
+
 async def build_recall_query(
     *,
     user_query: str,
@@ -40,24 +65,22 @@ async def build_recall_query(
     execution_id: Optional[str],
     code_analyzer_config: Optional[Dict[str, Any]] = None,
     memory_enabled: bool = False,
+    memory_types: Optional[frozenset] = None,
     allowed_skills: Optional[list] = None,
     has_history: bool = False,
-) -> Tuple[str, int, list]:
-    """Return ``(augmented_query, recall_hits, selected_skills)`` with blocks prepended.
+) -> Tuple[str, int]:
+    """Return ``(augmented_query, recall_hits)`` with blocks prepended.
 
     Prepends, in priority order under a per-turn token budget: (a') a follow-up
     directive (when ``has_history``), (a) always-injected pinned facts, (b)
     bank-scoped learned semantic memory (when enabled), (c) the KB recall block
-    (issues/patterns), and (d) a skill block — either a model-facing LISTING of
-    available skills (primary, ``skill_tool_enabled``) or, as a legacy fallback
-    (``skill_rag_selection_enabled``), the single best-matching skill's full
-    body. ``selected_skills`` carries the RAG-auto-selected skill names for the
-    UI badge in fallback mode; it is empty in listing mode (invocations are
-    recorded during the run instead). Every leg is best-effort.
+    (issues/patterns), and (d) the skill map — the names of the skills the agent
+    can load (``skill_tool_enabled``), which it resolves via ``search_skills``
+    and loads with the ``skill`` tool. Every leg is best-effort.
 
     ``allowed_skills``: when non-empty (an agent has skills explicitly picked on
-    its node), the skill listing / auto-select is restricted to that set by
-    name. ``None``/empty = no scoping — the global skill library applies
+    its node), the skill map / search is restricted to that set by name.
+    ``None``/empty = no scoping — the global skill library applies
     (backward-compatible default).
 
     ``has_history``: True when the chat turn carries prior conversation history
@@ -68,20 +91,40 @@ async def build_recall_query(
     pre-scan skip in the CloudWatch node handlers (``is_chat_turn`` — any chat
     turn now lets the agent route CloudWatch tool calls itself instead of a
     keyword-gated deterministic re-scan).
+
+    ``memory_types``: the active memory tiers (subset of ``semantic``/``pinned``/
+    ``kb``) resolved from the wired Memory node. When ``None`` (legacy/non-graph
+    callers) the prior behavior is preserved: pinned + KB always inject, semantic
+    injects on ``memory_enabled`` or the global flag. When a set is given — the
+    graph-driven path — each tier injects ONLY if selected, so an agent with no
+    Memory node (empty set) gets no memory injection at all (strict gating).
     """
     # Query-aware gate: a purely conversational turn (e.g. "Hi", "thanks") needs
     # no institutional memory — skip the pinned/semantic/KB/skill recalls (several
     # DB + vector lookups) entirely. Mirrors the CloudWatch tool-binding skip in
     # ``tool_assembler``. Guarded on ``not cloudwatch_config`` so a CW-configured
     # node's behaviour is never altered.
-    from app.core.intent import is_conversational
+    from app.core.quality.intent import is_conversational
     if not cloudwatch_config and is_conversational(user_query):
-        return user_query, 0, []
+        return user_query, 0
 
     _allowed_set = set(allowed_skills) if allowed_skills else None
     from app.config import settings
     recall_hits = 0
     repos = repos_from_code_analyzer(code_analyzer_config)
+
+    # Resolve which memory tiers are active this turn. ``memory_types is None``
+    # is the legacy contract (pinned+KB always, semantic on flag/enabled); a set
+    # is the strict graph-driven contract (only the selected tiers inject).
+    if memory_types is None:
+        _pinned_on = True
+        _semantic_on = bool(memory_enabled or settings.semantic_memory_enabled)
+        _kb_on = True
+    else:
+        _types = set(memory_types)
+        _pinned_on = "pinned" in _types
+        _semantic_on = "semantic" in _types
+        _kb_on = "kb" in _types
     # Memory blocks in priority order: pinned (always) > learned semantic > KB.
     # Assembled under a per-turn token budget below.
     blocks: list[str] = []
@@ -97,7 +140,7 @@ async def build_recall_query(
     # ── (a) Pinned facts — always injected, NOT similarity-gated ─────────────
     async def _recall_pinned() -> Tuple[Optional[str], int]:
         try:
-            if getattr(settings, "pinned_facts_enabled", True):
+            if _pinned_on and getattr(settings, "pinned_facts_enabled", True):
                 from app.services.semantic_memory import semantic_memory, format_pinned_block
                 _pinned = await semantic_memory.list_pinned(repo=repos or None)
                 _pinned_block = format_pinned_block(_pinned)
@@ -117,7 +160,7 @@ async def build_recall_query(
     # non-graph callers; default off so memory is purely node-driven per workflow.
     async def _recall_semantic() -> Tuple[Optional[str], int]:
         try:
-            if memory_enabled or settings.semantic_memory_enabled:
+            if _semantic_on:
                 from app.services.semantic_memory import semantic_memory, format_recall_block
                 _mem = await semantic_memory.recall(user_query, repo=repos or None)
                 _mem_block = format_recall_block(_mem)
@@ -133,6 +176,8 @@ async def build_recall_query(
 
     # ── (c) KB recall (known issues / similar patterns) ──────────────────────
     async def _recall_kb() -> Tuple[Optional[str], int]:
+        if not _kb_on:
+            return None, 0
         try:
             from app.services.knowledge_base import knowledge_base as _kb
             from app.harness.helpers import build_recall_context
@@ -156,7 +201,32 @@ async def build_recall_query(
                             _patterns.append(_p)
                             seen.add(_p.get("id"))
             hits = len(_issues) + len(_patterns)
-            recall_block = build_recall_context(_issues, _patterns)
+            recall_block = build_recall_context(_issues, _patterns) or ""
+
+            # OKF knowledge bundle: auto-learn writes durable knowledge as OKF
+            # docs indexed into the ``kb`` memory bank. Surface those too (hybrid
+            # recall), merged under the legacy KB hits. A separate corpus from
+            # repo/global learned facts, so it uses its own bank.
+            try:
+                from app.config import settings as _settings
+                if getattr(_settings, "knowledge_bundle_enabled", True):
+                    from app.services.semantic_memory import (
+                        semantic_memory as _sm, format_recall_block as _fmt,
+                    )
+                    _kb_hits = await _sm.recall(user_query, bank="kb")
+                    if _kb_hits:
+                        _okf_block = _fmt(_kb_hits).replace(
+                            "## Learned memory (from past investigations)",
+                            "## Knowledge base (curated)",
+                        )
+                        recall_block = f"{recall_block}\n\n{_okf_block}".strip()
+                        hits += len(_kb_hits)
+            except Exception as _okf_err:  # noqa: BLE001 — bundle recall is best-effort
+                logger_instance.debug(
+                    "ReactStrategy: OKF bundle recall skipped (%s)", redact(str(_okf_err)),
+                    extra={"execution_id": execution_id},
+                )
+
             return (recall_block or None), hits
         except Exception as _recall_err:  # noqa: BLE001 — recall is best-effort
             logger_instance.warning(
@@ -181,72 +251,23 @@ async def build_recall_query(
         if _block:
             blocks.append(_block)
 
-    # ── (c) Skills ───────────────────────────────────────────────────────────
-    # Primary path: a compact model-facing LISTING (name + description) so the
-    # agent knows which skills it can load via the ``skill`` tool. Legacy
-    # fallback (behind ``skill_rag_selection_enabled``): inject the single
-    # best-matching skill's full body. If both flags are on the listing wins.
-    selected_skills: list[str] = []
+    # ── (d) Skill map ────────────────────────────────────────────────────────
+    # Stage one of skill disclosure: the NAMES of the skills this agent can
+    # load, and nothing else. Descriptions cost ~2K tokens every turn to answer
+    # a question the model can ask on demand instead — so it resolves a name via
+    # the ``search_skills`` tool and loads the runbook with ``skill``.
     skill_block: str = ""
-    _skill_tool_on = bool(getattr(settings, "skill_tool_enabled", True))
-    _skill_rag_on = bool(getattr(settings, "skill_rag_selection_enabled", False))
-    if _skill_tool_on and _skill_rag_on:
-        logger_instance.warning(
-            "ReactStrategy: both skill_tool_enabled and skill_rag_selection_enabled "
-            "are on — using the skill listing and skipping RAG body injection.",
-            extra={"execution_id": execution_id},
-        )
     try:
-        if _skill_tool_on:
+        if bool(getattr(settings, "skill_tool_enabled", True)):
             from app.core.skills import get_default_skill_manager
             _mgr = get_default_skill_manager()
-            _listing = _mgr.build_listing(
+            skill_block = build_skill_map_block(_mgr.build_map(
                 allowed=_allowed_set,
-                char_budget=int(getattr(settings, "skill_listing_char_budget", 8000)),
-                entry_cap=int(getattr(settings, "skill_listing_entry_chars", 250)),
-            )
-            if _listing:
-                skill_block = (
-                    "# Available skills\n"
-                    "These are proven runbooks you can load. When one matches the task, "
-                    "call the `skill` tool (skill=\"<name>\") to load and follow it BEFORE "
-                    "doing other work — this is a blocking requirement. A user message that "
-                    "starts with `/<name> [args]` also means invoke that skill.\n"
-                    + _listing
-                )
-        elif _skill_rag_on:
-            from app.core.skills import get_default_skill_manager
-            _mgr = get_default_skill_manager()
-            _hits = _mgr.select_for_query(
-                user_query, k=getattr(settings, "skill_rag_k", 2), allowed=_allowed_set,
-            )
-            if _hits:
-                selected_skills = [s.name for s in _hits]
-                # Inject the FULL runbook body of the BEST-matching skill (capped)
-                # — not just its description — so the agent can actually follow its
-                # steps. Weaker secondary matches get a one-line pointer only, so a
-                # marginally-relevant skill never dumps its whole body as noise.
-                # Given its own slot below (outside the memory budget) so a large
-                # runbook isn't starved by pinned/semantic/KB blocks.
-                _cap = int(getattr(settings, "skill_body_inject_chars", 8000))
-                _top = _hits[0]
-                _body = (getattr(_top, "content", "") or "").strip()
-                if len(_body) > _cap:
-                    _body = _body[:_cap].rstrip() + "\n\n…(runbook truncated — continues on disk)"
-                _hdr = f"## Skill: {_top.name}"
-                if getattr(_top, "description", ""):
-                    _hdr += f"\n_{_top.description}_"
-                _sections = [f"{_hdr}\n\n{_body}"]
-                for s in _hits[1:]:
-                    _sections.append(f"## Also possibly relevant: {s.name} — {s.description}")
-                skill_block = (
-                    "# Applicable skill — follow this runbook for the task\n\n"
-                    + "\n\n---\n\n".join(_sections)
-                )
-                recall_hits += len(_hits)
-    except Exception as _skill_err:  # noqa: BLE001 — skill recall is best-effort
+                char_budget=int(getattr(settings, "skill_map_char_budget", 1500)),
+            ))
+    except Exception as _skill_err:  # noqa: BLE001 — the map is best-effort
         logger_instance.warning(
-            "ReactStrategy: skill auto-selection failed (non-fatal): %s",
+            "ReactStrategy: skill map build failed (non-fatal): %s",
             redact(str(_skill_err)),
             extra={"execution_id": execution_id},
         )
@@ -255,11 +276,12 @@ async def build_recall_query(
         blocks, user_query,
         budget_tokens=getattr(settings, "memory_turn_token_budget", 800),
     )
-    # Skills get their own slot ABOVE the memory blocks — the runbook is the
-    # actionable instruction set, so it must survive even when memory is full.
+    # The map gets its own slot ABOVE the memory blocks — a skill is the
+    # actionable procedure for the task, so the agent must see it exists even
+    # when the memory budget is full.
     if skill_block:
         augmented_query = f"{skill_block}\n\n---\n\n{augmented_query}"
-    return augmented_query, recall_hits, selected_skills
+    return augmented_query, recall_hits
 
 
 def _assemble_within_budget(blocks: list, user_query: str, *, budget_tokens: int) -> str:

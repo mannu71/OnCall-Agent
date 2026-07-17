@@ -19,8 +19,8 @@ from typing import Dict, List, Any, Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from app.core.redact import redact as _redact_credentials
-from app.core.retry import with_retry
+from app.core.privacy.redact import redact as _redact_credentials
+from app.core.resilience.retry import with_retry
 from app.core.security import check_ssrf, SSRFError, scan_injection, InjectionError
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ CERTS_DIR = '/app/data/certs'
 # sees the output, preventing key material leaking into trajectory logs or
 # the model's context window.
 #
-# Credential patterns are consolidated in app.core.redact (imported above as
+# Credential patterns are consolidated in app.core.privacy.redact (imported above as
 # _redact_credentials) so they are maintained in one place. Pseudonymization
 # of PII is applied as a second pass below via the active session vault.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -424,7 +424,7 @@ class MCPClientManager:
                         tool_name, server_id, timeout_secs or 0)
             logger.debug("Arguments: %s", arguments)
 
-            from app.core.telemetry import tool_span
+            from app.core.observability.telemetry import tool_span
 
             async def _call_tool():
                 # Always read session fresh — if reconnect replaced it we use the new one.

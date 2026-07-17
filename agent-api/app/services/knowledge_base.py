@@ -86,7 +86,7 @@ class EmbeddingService:
         import boto3
         from botocore.config import Config as BotocoreConfig
         from app.config import settings
-        from app.core.aws_credentials import resolve_aws_credentials
+        from app.core.aws.aws_credentials import resolve_aws_credentials
 
         creds, region = await resolve_aws_credentials(
             aws_profile=settings.aws_profile,
@@ -126,7 +126,7 @@ class EmbeddingService:
         Returns:
             Embedding vector (1024 dimensions for Titan V2)
         """
-        from app.core.thread_pools import run_in_aws_pool
+        from app.core.concurrency.thread_pools import run_in_aws_pool
 
         max_tokens = 8000
         if len(text) > max_tokens:

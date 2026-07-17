@@ -7,7 +7,7 @@ from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.core.sse import SSE_HEADERS
+from app.core.streaming.sse import SSE_HEADERS
 from app.services.log_watch_service import log_watch_service
 
 router = APIRouter(prefix="/log-watch", tags=["Log Watch Analyzer"])
@@ -240,7 +240,7 @@ async def list_aws_profiles_endpoint() -> Dict[str, Any]:
     profile at the node level instead of blindly typing one. Offline — no STS
     calls; expiry comes from each profile's recorded ``aws_expiration``.
     """
-    from app.core.aws_credentials import list_aws_profiles
+    from app.core.aws.aws_credentials import list_aws_profiles
     profiles = list_aws_profiles()
     return {"profiles": profiles, "count": len(profiles)}
 

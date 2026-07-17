@@ -114,5 +114,5 @@ rather than thrown:
 ## Registry loader
 
 `registry_loader.py` runs at startup and populates the central
-`app.core.tool_registry.registry` with built-in and MCP-discovered tools, exposing the
+`app.core.tools.tool_registry.registry` with built-in and MCP-discovered tools, exposing the
 catalog via `GET /api/v1/tools` so the UI and the router share one source of truth.

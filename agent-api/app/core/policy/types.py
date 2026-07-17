@@ -21,7 +21,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import List, Optional, Protocol, Tuple
 
-from app.core.tool_guardrails import ToolCallGuardrailConfig
+from app.core.tools.tool_guardrails import ToolCallGuardrailConfig
 
 
 class PolicyAction(str, Enum):
@@ -30,7 +30,7 @@ class PolicyAction(str, Enum):
     Mirrors the ``allow | ask | deny`` vocabulary already used by
     ``react.tool_permissions.evaluate``. The richer ``warn | block | halt``
     vocabulary for the loop guardrail lives in
-    :class:`app.core.tool_guardrails.ToolGuardrailDecision` and is reused as-is.
+    :class:`app.core.tools.tool_guardrails.ToolGuardrailDecision` and is reused as-is.
     """
 
     ALLOW = "allow"

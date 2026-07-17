@@ -30,11 +30,29 @@ class FsSkillUpdateBody(BaseModel):
 async def list_skills() -> Dict[str, Any]:
     """List the file-based markdown (SKILL.md) skills."""
     try:
-        fs_skills = get_default_skill_manager().list_skills()
+        manager = get_default_skill_manager()
+        # Cheap signature check so the UI reflects out-of-band file drops (a
+        # SKILL.md added to the volume directly) without a restart. The agent hot
+        # path deliberately runs on the cached set — see SkillManager.maybe_rescan.
+        manager.maybe_rescan()
+        fs_skills = manager.list_skills()
     except Exception as exc:  # noqa: BLE001
         logger.debug("skills: filesystem list failed (%s)", exc)
         fs_skills = []
     return {"success": True, "filesystem": fs_skills}
+
+
+@router.post("/rescan", response_model=Dict[str, Any])
+async def rescan_skills() -> Dict[str, Any]:
+    """Force a re-scan of the skills directory (picks up out-of-band file drops).
+
+    The agent hot path runs on the cached skill set (refreshed by API writes) to
+    keep per-turn overhead at zero, so a SKILL.md added to the volume directly
+    isn't seen until a restart or this explicit rescan.
+    """
+    manager = get_default_skill_manager()
+    manager.scan_skills()
+    return {"success": True, "count": len(manager.list_skills())}
 
 
 @router.get("/fs/{name}", response_model=Dict[str, Any])

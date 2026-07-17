@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Query
 
 from app.models.workflow import HealthResponse
-from app.core.scheduler import workflow_scheduler
+from app.core.runtime.scheduler import workflow_scheduler
 from app.services.execution_state import execution_state
 from app.infrastructure.persistence.workflow_repository import WorkflowRepository
 

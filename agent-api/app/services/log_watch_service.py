@@ -15,9 +15,9 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
 from app.config import settings
-from app.core.aws_credentials import resolve_aws_credentials
-from app.core.retry import with_retry
-from app.core.sse import HEARTBEAT_INTERVAL_SECONDS, STREAM_TIMEOUT_SECONDS
+from app.core.aws.aws_credentials import resolve_aws_credentials
+from app.core.resilience.retry import with_retry
+from app.core.streaming.sse import HEARTBEAT_INTERVAL_SECONDS, STREAM_TIMEOUT_SECONDS
 from app.mcp.tools.alert_tools import (
     acknowledge_alert,
     create_alert,
@@ -482,7 +482,7 @@ class LogWatchService:
         if _ttl <= 0:
             return await _run_dispatch()
 
-        from app.core.cloudwatch_cache import cached_call
+        from app.core.aws.cloudwatch_cache import cached_call
 
         return await cached_call(
             f"analysis:{analysis_type}",
@@ -843,7 +843,7 @@ class LogWatchService:
             summarise_patterns,
         )
 
-        from app.core import cloudwatch_cache
+        from app.core.aws import cloudwatch_cache
 
         depth = (depth or "auto").strip().lower()
         if depth not in ("shallow", "auto", "deep"):

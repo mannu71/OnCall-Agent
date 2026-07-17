@@ -1,7 +1,7 @@
 """Native turn-loop engine — compression pipeline.
 
 Orchestrates WHEN to compact; ``ContextCompactionManager`` (and the shared
-``app.core.memory.compaction.compact()``) stays the HOW (LLM summarize,
+``app.core.context.compaction.compact()``) stays the HOW (LLM summarize,
 deterministic prune, ``memory_summaries`` persistence) — reused unchanged so
 both engines produce equivalent summaries.
 
@@ -29,7 +29,7 @@ def split_preserved_tail(messages: List[Any], keep_recent_tokens: int) -> Tuple[
     Bedrock's INVALID_CHAT_HISTORY check.
     """
     from langchain_core.messages import AIMessage, ToolMessage
-    from app.core.memory.compaction import _msg_token_estimate
+    from app.core.context.compaction import _msg_token_estimate
 
     if not messages:
         return [], []

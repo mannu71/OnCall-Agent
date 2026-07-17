@@ -1,8 +1,8 @@
 """Unit tests for the process-local LLM throttle tracker (deterministic clock)."""
 import pytest
 
-from app.core import model_throttle_tracker as throttle
-from app.core.model_throttle_tracker import ThrottleTarget
+from app.core.llm import model_throttle_tracker as throttle
+from app.core.llm.model_throttle_tracker import ThrottleTarget
 
 
 @pytest.fixture

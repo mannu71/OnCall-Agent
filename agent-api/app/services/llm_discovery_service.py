@@ -14,7 +14,7 @@ import httpx
 from botocore.exceptions import ClientError as BotoClientError
 
 from app.config import settings
-from app.core.thread_pools import run_in_aws_pool
+from app.core.concurrency.thread_pools import run_in_aws_pool
 
 logger = logging.getLogger(__name__)
 

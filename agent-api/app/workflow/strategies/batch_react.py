@@ -47,9 +47,9 @@ from app.workflow.strategies.react.workflow_config import (
     extract_cloudwatch_config,
     resolve_llm_config_for_workflow,
 )
-from app.core.map_reduce import MapReduceEngine, MapReduceConfig, MapResult
-from app.core.parallel_flow import ParallelFlowRunner, ParallelFlowConfig
-from app.core.redact import redact
+from app.core.concurrency.map_reduce import MapReduceEngine, MapReduceConfig, MapResult
+from app.core.concurrency.parallel_flow import ParallelFlowRunner, ParallelFlowConfig
+from app.core.privacy.redact import redact
 
 logger = logging.getLogger(__name__)
 

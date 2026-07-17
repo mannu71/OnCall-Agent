@@ -20,6 +20,7 @@ the UI, evals) cannot tell which engine produced a result.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from app.config import settings
@@ -131,6 +132,19 @@ class TurnLoop:
         self.stream_callback = stream_callback
         self.model_name = model_name
         self.max_turns = max_turns if max_turns is not None else _default_max_turns()
+        # Engine-level run budgets (Phase 1). Per-workflow overrides
+        # (agent_config[key] or its params mirror) win over the global setting,
+        # same coercion pattern executor.py uses for supervisor_enabled.
+        self.run_deadline_seconds = self._resolve_budget_knob(
+            agent_config, "run_deadline_seconds", settings.agent_run_deadline_seconds, float,
+        )
+        self.run_token_budget = self._resolve_budget_knob(
+            agent_config, "run_token_budget", settings.agent_run_token_budget, int,
+        )
+        self.tool_call_timeout = self._resolve_budget_knob(
+            agent_config, "tool_call_timeout_seconds",
+            settings.agent_tool_call_timeout_seconds, float,
+        )
         self.log = logger_instance or logger
         self.retry_predicate = retry_predicate
         self._compaction_session = session_id or execution_id or "native-engine"
@@ -141,11 +155,58 @@ class TurnLoop:
         from app.harness.step_recorder import build_step_recorder
         self._recorder = build_step_recorder(execution_id, model_id=self._compaction_model)
 
+    @staticmethod
+    def _resolve_budget_knob(
+        agent_config: Optional[Dict[str, Any]], key: str, default: Any, cast: Any,
+    ) -> Any:
+        """Per-workflow numeric override for a run-budget knob: agent_config[key]
+        or its ``params`` mirror wins over the global default. Absent/invalid →
+        the global default (so existing workflows are unchanged)."""
+        cfg = agent_config or {}
+        params = cfg.get("params") if isinstance(cfg.get("params"), dict) else {}
+        raw = cfg.get(key)
+        if raw is None:
+            raw = params.get(key)
+        if raw is None:
+            return default
+        try:
+            return cast(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def _run_budget_status(self, state: TurnLoopState) -> tuple:
+        """Fraction of the most-consumed run budget and its StopReason.
+
+        Returns ``(fraction, StopReason)`` for whichever of the wall-clock
+        deadline / token ceiling is closest to exhaustion, or ``(0.0, None)``
+        when no budget is configured."""
+        frac = 0.0
+        reason = None
+        if state.deadline_monotonic is not None and self.run_deadline_seconds > 0:
+            consumed = 1.0 - (state.deadline_monotonic - time.monotonic()) / self.run_deadline_seconds
+            if consumed > frac:
+                frac, reason = consumed, StopReason.DEADLINE
+        if self.run_token_budget > 0:
+            consumed = state.ledger.total_tokens / self.run_token_budget
+            if consumed > frac:
+                frac, reason = consumed, StopReason.TOKEN_BUDGET
+        return frac, reason
+
+    def _effective_tool_timeout(self, state: TurnLoopState) -> Optional[float]:
+        """Per-tool wall-clock cap = min(configured cap, time left on the run
+        deadline). ``None`` when neither is set (unbounded — today's behavior)."""
+        caps: List[float] = []
+        if self.tool_call_timeout and self.tool_call_timeout > 0:
+            caps.append(self.tool_call_timeout)
+        if state.deadline_monotonic is not None:
+            caps.append(max(1.0, state.deadline_monotonic - time.monotonic()))
+        return min(caps) if caps else None
+
     def _build_compression_pipeline(self) -> Any:
         # Construction must never break a run — mirrors _maybe_compact's own
         # exception guard, extended to cover transport/manager setup itself.
         try:
-            from app.core.memory.compaction_manager import ContextCompactionManager
+            from app.core.context.compaction_manager import ContextCompactionManager
             from app.core.transport import get_transport
             from app.harness.engine.compression import CompressionPipeline
 
@@ -213,10 +274,12 @@ class TurnLoop:
             FORCED_SYNTHESIS_NUDGE,
         )
 
-        from app.core.compaction.compressor import start_stats
+        from app.core.context.tool_output import start_stats
         start_stats()  # fresh per-run compression-savings accumulator
 
         state = TurnLoopState(messages=list(initial_messages))
+        if self.run_deadline_seconds and self.run_deadline_seconds > 0:
+            state.deadline_monotonic = time.monotonic() + self.run_deadline_seconds
         system_message = (
             SystemMessage(content=self.action_space.prompt_arg)
             if isinstance(self.action_space.prompt_arg, str)
@@ -247,16 +310,60 @@ class TurnLoop:
                 state.stop_reason = StopReason.MAX_TURNS
                 break
 
+            # ── Engine-level run budgets: wall-clock deadline + token ceiling.
+            # Checked at the top of every turn (before the model call), distinct
+            # from the outer supervisor deadline which is only enforced BETWEEN
+            # agent turns. At ~90% consumed the model gets one graceful
+            # "synthesize now" nudge (mirrors the max-turns rung, shared
+            # budget_nudged flag so it fires once); at 100% an honest partial
+            # stop rather than a mid-thought kill. ──────────────────────────────
+            _budget_frac, _budget_reason = self._run_budget_status(state)
+            if _budget_reason is not None and _budget_frac >= 1.0:
+                self.log.warning(
+                    "engine: run budget exhausted (%s, %.0f%%) — stopping with "
+                    "partial answer (execution_id=%s)",
+                    _budget_reason.value, _budget_frac * 100, self.execution_id,
+                )
+                self._recorder.record_lifecycle(
+                    state.turn_count, "run_budget_exhausted", reason=_budget_reason.value,
+                )
+                state.stop_reason = _budget_reason
+                break
+            if _budget_reason is not None and _budget_frac >= 0.9 and not state.budget_nudged:
+                state.budget_nudged = True
+                self.log.warning(
+                    "engine: run budget at %.0f%% (%s) — nudging for final "
+                    "synthesis (execution_id=%s)",
+                    _budget_frac * 100, _budget_reason.value, self.execution_id,
+                )
+                state.messages = _strip_dangling_tool_calls(state.messages)
+                state.messages.append(HumanMessage(content=recovery.BUDGET_SYNTHESIS_NUDGE))
+                self._recorder.record_lifecycle(
+                    state.turn_count, "run_budget_synthesis_nudge", reason=_budget_reason.value,
+                )
+                _continue_site(state, ContinueReason.TOKEN_BUDGET_CONTINUATION, self.log)
+                continue
+
             model_view = await self._maybe_compact(state.messages)
             request_msgs = sanitize_messages_for_model(model_view)
             full_messages = [system_message] + request_msgs
+
+            # Token-estimate calibration (opt-in): snapshot the pre-call prompt
+            # token counters so we can attribute THIS call's actual prompt tokens
+            # (fresh + cache read/creation = full prompt size) to the chars/4
+            # estimate of full_messages after the call returns.
+            _prev_prompt_tokens = (
+                state.ledger.input_tokens
+                + state.ledger.cache_read_tokens
+                + state.ledger.cache_creation_tokens
+            )
 
             try:
                 ai_msg = await self._call_model(
                     full_messages, state.ledger, state.max_output_tokens_override,
                 )
             except Exception as exc:  # noqa: BLE001 — classify before deciding
-                from app.core.error_classifier import classify_error
+                from app.core.llm.error_classifier import classify_error
                 classified = classify_error(exc)
                 if classified.should_compress and not state.has_attempted_reactive_compact:
                     self.log.warning(
@@ -284,6 +391,24 @@ class TurnLoop:
                 raise
             state.messages.append(ai_msg)
 
+            # Feed the token-estimate calibrator (no-op unless enabled): compare
+            # this call's chars/4 prompt estimate against the provider-reported
+            # actual prompt tokens. Best-effort — never affects the run.
+            try:
+                from app.core.llm import token_calibration as _cal
+                if _cal.is_enabled():
+                    _actual_prompt = (
+                        state.ledger.input_tokens
+                        + state.ledger.cache_read_tokens
+                        + state.ledger.cache_creation_tokens
+                    ) - _prev_prompt_tokens
+                    if _actual_prompt > 0:
+                        from app.core.context.compaction import _msg_token_estimate
+                        _est_prompt = sum(_msg_token_estimate(m) for m in full_messages)
+                        _cal.record(self._compaction_model, _est_prompt, _actual_prompt)
+            except Exception as _cal_err:  # noqa: BLE001 — calibration never breaks a run
+                self.log.debug("engine: token calibration skipped (%s)", _cal_err)
+
             tool_calls = list(getattr(ai_msg, "tool_calls", None) or [])
             stop_reason = _stop_reason_of(ai_msg)
             is_truncated = stop_reason in _TRUNCATED_STOP_REASONS
@@ -308,6 +433,7 @@ class TurnLoop:
                     stream_callback=self.stream_callback,
                     tool_call_count_before=tool_call_running_count,
                     recorder=self._recorder, step_index=state.turn_count,
+                    tool_timeout=self._effective_tool_timeout(state),
                 )
                 tool_call_running_count += len(tool_calls)
                 state.messages.extend(exec_result.tool_messages)
@@ -410,7 +536,7 @@ class TurnLoop:
             " [truncated]" if state.truncated else "",
         )
 
-        from app.core.compaction.compressor import get_stats
+        from app.core.context.tool_output import get_stats
         _cstats = get_stats()
         compression_stats = None
         if _cstats is not None and _cstats.calls:
@@ -459,11 +585,21 @@ class TurnLoop:
             "verify_pending": state.verify_pending,
             "verify_last_passed": state.verify_last_passed,
         }
+        # Engine-level run-budget telemetry (Phase 1) — present only when a
+        # wall-clock or token budget was active this run (deadline defaults on).
+        if (self.run_deadline_seconds and self.run_deadline_seconds > 0) or self.run_token_budget > 0:
+            result["budget"] = {
+                "deadline_seconds": self.run_deadline_seconds if self.run_deadline_seconds > 0 else None,
+                "token_budget": self.run_token_budget if self.run_token_budget > 0 else None,
+                "tokens_used": state.ledger.total_tokens,
+                "budget_nudged": state.budget_nudged,
+                "exhausted": state.stop_reason in (StopReason.DEADLINE, StopReason.TOKEN_BUDGET),
+            }
         if parsed.get("truncated"):
             result["truncated"] = True
 
         try:
-            from app.core.grounding import ungrounded_ids, extract_ids
+            from app.core.quality.grounding import ungrounded_ids, extract_ids
             allow = extract_ids(self._last_user_text(state.messages))
             flagged = ungrounded_ids(
                 result["final_answer"] or "", parsed.get("evidence_ids") or set(), allow,

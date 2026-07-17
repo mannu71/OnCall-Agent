@@ -58,11 +58,11 @@ if not settings.aws_ssl_verify:
 from app.config import settings
 from app.api.v1.api import api_router
 from app.api.middleware import register_exception_handlers, APIKeyAuthMiddleware
-from app.core.scheduler import workflow_scheduler
-from app.core.heartbeat import heartbeat_monitor
+from app.core.runtime.scheduler import workflow_scheduler
+from app.core.runtime.heartbeat import heartbeat_monitor
 from app.core.database import init_db
 from app.core.logging import setup_logging, get_logger
-from app.core.telemetry import setup_telemetry
+from app.core.observability.telemetry import setup_telemetry
 
 # Setup logging first
 setup_logging()
@@ -88,7 +88,7 @@ async def lifespan(app: FastAPI):
     # Load the operator-configured global timezone into the in-process cache so
     # scheduling reflects it without waiting for the first settings write.
     try:
-        from app.core.app_timezone import refresh_global_timezone
+        from app.core.runtime.app_timezone import refresh_global_timezone
 
         tz_name = await refresh_global_timezone()
         logger.info("Global timezone loaded: %s", tz_name)
@@ -147,6 +147,44 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001 — never fail startup on the overlay
         logger.warning(f"Feature-flag overlay load skipped: {e}")
 
+    # One-time: relocate a legacy ``data/skills`` tree under the OKF knowledge
+    # bundle (``data/knowledge/skills``) so skills + KB share one portable bundle.
+    # Idempotent + defensive; must run BEFORE the skill manager scans.
+    try:
+        import asyncio as _asyncio
+        from app.core.knowledge import migrate_legacy_skills
+
+        if await _asyncio.to_thread(migrate_legacy_skills):
+            logger.info("Skills relocated under the knowledge bundle")
+    except Exception as e:  # noqa: BLE001 — never fail startup on migration
+        logger.warning(f"Skills relocation skipped: {e}")
+
+    # Pre-scan the file-based skills once at startup, OFF the event loop, so the
+    # first request coroutine never pays the blocking directory walk + YAML parse
+    # (get_default_skill_manager scans lazily on first use otherwise). Best-effort:
+    # a missing skills dir or bad file must never block startup.
+    try:
+        import asyncio as _asyncio
+        from app.core.skills import get_default_skill_manager
+
+        _mgr = await _asyncio.to_thread(get_default_skill_manager)
+        logger.info("Skills pre-scanned: %d loaded", len(_mgr.list_skills()))
+    except Exception as e:  # noqa: BLE001 — never fail startup on skill scan
+        logger.warning(f"Skill pre-scan skipped: {e}")
+
+    # Index the OKF knowledge bundle into the ``kb`` memory bank so human-authored
+    # / git-shipped knowledge docs are recalled. Idempotent (sha-deduped) and
+    # best-effort — needs the DB, so it runs after DB init and never blocks startup.
+    if settings.knowledge_bundle_enabled:
+        try:
+            from app.core.knowledge import reconcile_kb_index
+
+            _n = await reconcile_kb_index()
+            if _n:
+                logger.info("Knowledge bundle: indexed %d concept(s) into kb bank", _n)
+        except Exception as e:  # noqa: BLE001 — never fail startup on reconcile
+            logger.warning(f"Knowledge bundle reconcile skipped: {e}")
+
     # Surface the isolated-sandbox posture once at startup so a mis-set backend
     # (e.g. SANDBOX_BACKEND=container with no Docker) is visible before any run.
     try:
@@ -175,7 +213,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     try:
-        from app.core.compaction.compressor import close_client as close_compressor_client
+        from app.core.context.tool_output import close_client as close_compressor_client
 
         await close_compressor_client()
     except Exception:

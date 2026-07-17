@@ -10,7 +10,7 @@ import logging
 from typing import Optional, TYPE_CHECKING
 
 from app.config import settings
-from app.core.redact import redact
+from app.core.privacy.redact import redact
 
 logger = logging.getLogger(__name__)
 

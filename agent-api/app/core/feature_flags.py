@@ -3,7 +3,7 @@
 Feature flags are declared in ``app.config.Settings`` and default from environment
 variables. This module lets an operator override them at runtime from the Settings
 UI without a container restart, following the same persist-then-apply pattern used
-for the global timezone (``app.core.app_timezone``):
+for the global timezone (``app.core.runtime.app_timezone``):
 
   * Overrides are stored in the generic ``app_settings`` key/value table under the
     ``flag:`` prefix (migration 011 — no new table needed).
@@ -73,11 +73,25 @@ FLAG_CATALOG: List[Dict[str, Any]] = [
     {"key": "pinned_facts_enabled", "type": "bool", "group": "Memory & learning",
      "label": "Pinned facts",
      "help": "Inject the operator-pinned facts memory tier into context."},
+    {"key": "metamemory_enabled", "type": "bool", "group": "Memory & learning",
+     "label": "Progress ledger (plan/milestones)",
+     "help": "Maintain /plan.txt, /milestones.txt and /context_summary.txt across a run "
+             "and read them back at the start of a follow-up turn, so a resumed "
+             "investigation continues from prior progress. No-op unless the agent "
+             "profile has the filesystem capability."},
+    {"key": "vfs_session_persistence_enabled", "type": "bool", "group": "Memory & learning",
+     "label": "Persist ledger across chat turns",
+     "help": "Carry the progress-ledger files across chat turns via the durable "
+             "scratch store. Requires the Postgres scratch backend; otherwise a no-op."},
 
     # ── Agent behaviour ──
     {"key": "agent_planning_enabled", "type": "bool", "group": "Agent behaviour",
      "label": "Plan → execute → verify",
      "help": "Add the planning discipline and planning tools to the system prompt."},
+    {"key": "todo_evidence_required", "type": "bool", "group": "Agent behaviour",
+     "label": "Verified task completion",
+     "help": "Refuse to mark a plan item completed without cited evidence, and flag a "
+             "run that ends with an incomplete plan as unverified. Needs the planning tools."},
     {"key": "pii_pseudonymization_enabled", "type": "bool", "group": "Agent behaviour",
      "label": "PII pseudonymization",
      "help": "Pseudonymize PII in flagship/KYC flows before it reaches the model."},
@@ -86,6 +100,13 @@ FLAG_CATALOG: List[Dict[str, Any]] = [
     {"key": "routing_fallback_enabled", "type": "bool", "group": "Reliability",
      "label": "Model routing fallback",
      "help": "On Bedrock errors, fall back across credential/region/model chains."},
+
+    # ── Scheduled loops ──
+    {"key": "loop_state_continuity_enabled", "type": "bool", "group": "Scheduled loops",
+     "label": "Carry loop state across fires",
+     "help": "Each cron fire of a workflow resumes its own progress ledger "
+             "(keyed workflow:<name>), so a scheduled loop continues from where the "
+             "last run left off. Needs the progress-ledger prerequisites."},
 
     # ── Supervision (Action Supervisor write-gate) ──
     {"key": "action_supervisor_enabled", "type": "bool", "group": "Supervision",

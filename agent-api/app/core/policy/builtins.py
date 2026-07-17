@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
-from app.core.tool_guardrails import ToolCallGuardrailConfig
+from app.core.tools.tool_guardrails import ToolCallGuardrailConfig
 from app.core.policy.types import Policy, _ResolveBuilder
 
 # OS / shell / filesystem-mutating tools that should require approval. Kept here

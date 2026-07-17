@@ -9,8 +9,13 @@ ID-grounded answer?
 Hermetic setup:
   * CloudWatch is faked at the data layer (``fakes_cloudwatch.patched_cloudwatch``)
     so the real tool code runs over recorded fixtures — no live AWS.
-  * The generic repo file tools run FOR REAL against ``fixtures/sample_repo``
-    (synced via ``build_crawler_cases._sync_fixture_repo`` — no indexing needed).
+  * Code intelligence is the REAL in-process codegraph engine, connected and
+    fixture-indexed ONCE per suite via the same inline-stdio path production uses
+    (``codegraph_tools.build_codegraph_tools``). Code cases therefore run
+    IN-CONTAINER only (the engine binary is baked into the image), like
+    ``run_codegraph`` — on a host without it they fail loud rather than silently
+    grading a different tool set. The generic repo file tools run alongside it
+    against ``fixtures/sample_repo`` (synced via ``_sync_fixture_repo``).
   * The agent LLM is real Bedrock (same judge-calibrated path as the other
     suites); ``temperature`` is pinned low for repeatability.
 
@@ -21,8 +26,10 @@ once and the better-scoring run is kept (``retried`` flagged on its rows).
 
 This deliberately bypasses ``assemble_base_tools`` / the tool router (a hermetic
 run can't do the STS credential pre-flight) — the router is covered by
-``evals.harness_selftest``. We build the same tool families the strategy would
-and drive the same ``build_agent_from_spec`` → ``execute_agent`` path.
+``evals.harness_selftest``. We build the same tool families the strategy would,
+through the same builders it calls (``build_codegraph_tools`` /
+``build_repo_file_tools`` / ``add_extension_tools``), and drive the same
+``build_agent_from_spec`` → ``execute_agent`` path.
 
 Run:  python -m evals.accuracy.run_trajectory
 """
@@ -71,8 +78,15 @@ class ToolTrace:
 
         orig = getattr(tool, "coroutine", None)
         name = getattr(tool, "name", "")
-        if orig is None:  # sync / non-structured tool — leave untouched
-            return tool
+        if orig is None:
+            # No ``.coroutine`` — an MCP-backed BaseTool (codegraph's
+            # MCPToolWrapper) implements ``_arun`` instead. Dispatch through its
+            # own ``ainvoke`` so its calls land in the trace too; without this the
+            # whole codegraph family would be invisible (undercounting
+            # tool_calls_n and dropping its output from the grounding evidence).
+            if not hasattr(tool, "_arun"):
+                return tool  # genuinely sync / non-structured — leave untouched
+            orig = lambda **kw: tool.ainvoke(kw)  # noqa: E731
 
         async def _recorded(*args: Any, **kwargs: Any) -> Any:
             out = await orig(*args, **kwargs)
@@ -102,6 +116,53 @@ def _turns_from_messages(messages: List[Dict[str, Any]]) -> List[List[str]]:
     return turns
 
 
+# ── skill utilization: hermetic skill set + listing injection ─────────────────
+# Skill fixtures shipped with the eval — the same disk source a real deployment
+# would author. Loaded into a hermetic manager per case (below) so the trajectory
+# suite grades whether the agent actually LOADS the right runbook (not just that
+# the tool works — that's harness_selftest.test_skill_tool_wiring).
+SKILLS_FIXTURE_DIR = os.path.join(HERE, "fixtures", "skills")
+
+
+def _install_skill_fixture(invoked_sink: List[str]) -> Tuple[List[Any], List[str], Any]:
+    """Point the shared SkillManager at the eval's skill fixtures and build the
+    pinned ``search_skills`` + ``skill`` tools over it.
+
+    Returns ``(skill_tools, prev_default_mgr, mgr)``: the tools to bind, and the
+    previously-cached default manager so the caller can restore it (skills use a
+    process-wide singleton — mirrors harness_selftest's hermetic override). The
+    ``# Skill map`` block is injected into the query by the caller so the system
+    prompt's ``# Skills`` section (auto-added when the skill tool is bound) and
+    the map both reach the model exactly as in production.
+    """
+    from pathlib import Path
+    import app.core.skills as _skills_pkg
+    from app.core.skills.manager import SkillManager
+    from app.harness.skill_tools import build_skill_search_tool, build_skill_tool
+
+    mgr = SkillManager(skills_dir=Path(SKILLS_FIXTURE_DIR))
+    mgr.scan_skills()
+    prev = _skills_pkg._default_manager
+    _skills_pkg._default_manager = mgr
+
+    tools = [
+        build_skill_search_tool(allowed_skills=None, execution_id="trajectory"),
+        build_skill_tool(
+            allowed_skills=None, execution_id="trajectory", invoked_sink=invoked_sink),
+    ]
+    return tools, prev, mgr
+
+
+def _skill_map_block(mgr: Any) -> str:
+    """The ``# Skill map`` block preflight injects — the production builder itself,
+    so the eval exercises the real stage-1 disclosure and can't drift from it."""
+    from app.config import settings
+    from app.harness.context_builder import build_skill_map_block
+
+    return build_skill_map_block(mgr.build_map(
+        char_budget=int(getattr(settings, "skill_map_char_budget", 1500))))
+
+
 async def _build_agent_llm() -> Any:
     """Build the agent LLM via the app's enriched-config path (DB Bedrock creds)."""
     from app.workflow.llm_config import resolve_llm_config
@@ -124,11 +185,62 @@ def _load_cases() -> List[Dict[str, Any]]:
     return cases
 
 
-async def _attempt(case: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
-    """Run one agent trajectory for *case*; return (rows, tool_call_count)."""
-    from app.harness import build_agent_from_spec, AgentSpec
+def _zero_rows(
+    case: Dict[str, Any],
+    *,
+    engine_name: str,
+    diagnostic: str,
+    stop_reason: str,
+    latency: float = 0.0,
+    tool_calls_n: int = 0,
+    invoked_skills: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """A full zero-scored row set for *case* — the shape a failed attempt returns.
+
+    Used when the run can't happen at all (an exception, or codegraph being
+    unavailable): every objective metric the case would have been graded on
+    scores 0 with the real cause in the diagnostic, so the suite completes and
+    the report is unambiguously red rather than silently short.
+    """
+    metrics = ["tool_selection", "protocol", "final_answer", "grounding"]
+    if (case.get("expected") or {}).get("skill_invocation"):
+        metrics.append("skill_invocation")
+    if case.get("post_check"):
+        metrics.append("post_check")
+    return [{"feature": "trajectory", "id": case["id"], "metric": m, "objective": True,
+             "score": 0.0, "diagnostic": diagnostic, "latency_s": latency,
+             "tool_calls_n": tool_calls_n, "engine": engine_name,
+             "stop_reason": stop_reason, "did_forced_synthesis": False,
+             "truncated": False, "invoked_skills": list(invoked_skills or []),
+             "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            for m in metrics]
+
+
+async def _attempt(
+    case: Dict[str, Any],
+    engine: Optional[str] = None,
+    *,
+    mcp_manager: Any = None,
+    codegraph_err: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Run one agent trajectory for *case*; return (rows, tool_call_count).
+
+    ``engine`` selects the agent loop (``"langgraph"`` | ``"native"`` | None for
+    ``settings.agent_engine``). We drive ``run_agent_once`` — the dual-engine
+    dispatch — rather than ``execute_agent`` directly, so the same case set can
+    be graded against both engines with byte-identical result contracts.
+
+    ``mcp_manager`` / ``codegraph_err``: the suite-level codegraph session (see
+    :func:`run_trajectory_suite`). Keyword-only so existing positional callers
+    (harness_selftest's engine-threading check) keep working. A code case with no
+    working engine fails loud here, before any Bedrock spend.
+    """
+    from app.harness import AgentSpec
     from app.harness.hitl import make_checkpointer
-    from app.harness.agent_runner import execute_agent
+    from app.harness.engine import run_agent_once
+    from app.config import settings as _settings
+
+    engine_name = engine or getattr(_settings, "agent_engine", "langgraph")
 
     trace = ToolTrace()
     recording: Optional[FakeCloudWatchRecording] = None
@@ -136,6 +248,25 @@ async def _attempt(case: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
     if case.get("cw_fixture"):
         recording = FakeCloudWatchRecording.load(case["cw_fixture"])
         cm = patched_cloudwatch(recording)
+
+    # Skill utilization: when a case opts in (``skill_fixture`` or an
+    # ``expected.skill_invocation`` block) bind the pinned ``skill`` tool over the
+    # eval's hermetic skill set and inject the listing, so the agent can load a
+    # runbook. ``invoked_skills`` records which it actually loaded; the hermetic
+    # manager override is restored via ``_restore_skill_default`` before every
+    # return (skills use a process-wide singleton — see _install_skill_fixture).
+    invoked_skills: List[str] = []
+    _skill_wanted = bool(
+        case.get("skill_fixture") or (case.get("expected") or {}).get("skill_invocation"))
+    _skill_prev = None
+    _skill_restored = False
+
+    def _restore_skill_default() -> None:
+        nonlocal _skill_restored
+        if _skill_wanted and not _skill_restored:
+            import app.core.skills as _skills_pkg
+            _skills_pkg._default_manager = _skill_prev
+            _skill_restored = True
 
     with cm:
         tools: List[Any] = []
@@ -146,13 +277,42 @@ async def _attempt(case: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
 
         code_cfg: Optional[Dict[str, Any]] = None
         if case.get("crawler"):
-            # Generic repo file tools work on the raw fixture with no indexing or
-            # Bedrock — enough to exercise the code trajectory (grep/read/list).
+            # Code intel = the real codegraph engine (connected + fixture-indexed
+            # once per suite) plus the generic repo file tools, in the same order
+            # assemble_base_tools binds them in production. The capabilities
+            # prompt this case gets (has_code_analyzer=True) names the
+            # codegraph__* tools explicitly, so binding anything less would grade
+            # an agent told to call tools it doesn't have.
+            # NB: no _restore_skill_default() on these early returns — the skill
+            # fixture is installed further down, so nothing has been overridden
+            # yet and "restoring" would null out the real process-wide manager.
+            if mcp_manager is None or codegraph_err:
+                return _zero_rows(
+                    case, engine_name=engine_name,
+                    diagnostic=f"codegraph unavailable: {codegraph_err or 'no MCP manager'}",
+                    stop_reason="codegraph_unavailable",
+                ), 0
+
             from evals.accuracy.build_crawler_cases import _sync_fixture_repo
+            from app.workflow.tools.codegraph_tools import build_codegraph_tools
             from app.workflow.tools.repo_file_tools import build_repo_file_tools
             from app.config import settings
+            # Re-sync per case so the edit case's mutation never leaks into the
+            # next one. Content-identical at identical paths, so the suite-level
+            # index stays valid. MUST precede build_codegraph_tools: that reads
+            # repos_base_path to alias project= args to codegraph's canonical name.
             settings.repos_base_path = _sync_fixture_repo()
             code_cfg = {"repos": [{"name": DEFAULT_REPO_NAME}]}
+            cg_tools = await build_codegraph_tools(mcp_manager, repos=code_cfg["repos"])
+            if not cg_tools:
+                # build_codegraph_tools degrades to [] rather than raising — for a
+                # code case that means the eval would measure nothing. Fail loud.
+                return _zero_rows(
+                    case, engine_name=engine_name,
+                    diagnostic="codegraph unavailable: engine returned no tools",
+                    stop_reason="codegraph_unavailable",
+                ), 0
+            tools += cg_tools
             tools += build_repo_file_tools(repos=code_cfg["repos"])
 
         llm = await _build_agent_llm()
@@ -163,14 +323,23 @@ async def _attempt(case: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
                 tools=tools, llm=llm, agent_config={}, code_analyzer_config=code_cfg,
                 execution_id=case["id"], logger_instance=logger)
 
+        skill_map_block = ""
+        if _skill_wanted:
+            skill_tools, _skill_prev, _skill_mgr = _install_skill_fixture(invoked_skills)
+            # Binding the skill tool makes agent_builder add the "# Skills" prompt.
+            tools.extend(skill_tools)
+            skill_map_block = _skill_map_block(_skill_mgr)
+
         tools = trace.wrap(tools)
 
+        # Thread the engine through agent_config so resolve_engine honors it
+        # (run_agent_once builds the agent internally for the langgraph branch,
+        # or routes to the native TurnLoop).
         spec = AgentSpec(
-            agent_config={}, has_cloudwatch=bool(case.get("cw_fixture")),
+            agent_config={"engine": engine_name}, has_cloudwatch=bool(case.get("cw_fixture")),
             has_code_analyzer=bool(code_cfg), permission_mode="auto_allow",
             session_id=case["id"])
         checkpointer = await make_checkpointer()
-        agent = build_agent_from_spec(spec, llm, tools, checkpointer=checkpointer)
 
         query = case["question"]
         if case.get("precomputed_block") and recording is not None:
@@ -178,18 +347,29 @@ async def _attempt(case: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
             query, _ = seed_context_blocks(
                 augmented_query=query,
                 context={"cloudwatch_context": {"node": {"output": recording.synthesis}}})
+        # Stage-1 disclosure: the skill map rides above the query, exactly as
+        # preflight.build_run_plan prepends it in production.
+        if skill_map_block:
+            query = f"{skill_map_block}\n\n---\n\n{query}"
 
         t0 = time.time()
         try:
-            result = await execute_agent(
-                agent, query, logger, execution_id=case["id"], thread_id=case["id"])
+            result = await run_agent_once(
+                spec, llm, tools, query,
+                logger_instance=logger, execution_id=case["id"], thread_id=case["id"],
+                checkpointer=checkpointer, engine=engine_name)
         except Exception as exc:  # noqa: BLE001 — a crashed run is a 0, not a stack trace
-            latency = round(time.time() - t0, 3)
-            rows = [{"feature": "trajectory", "id": case["id"], "metric": m, "objective": True,
-                     "score": 0.0, "diagnostic": f"exception: {type(exc).__name__}: {exc}",
-                     "latency_s": latency, "tool_calls_n": len(trace.calls)}
-                    for m in ("tool_selection", "protocol", "final_answer", "grounding")]
+            _restore_skill_default()
+            rows = _zero_rows(
+                case, engine_name=engine_name,
+                diagnostic=f"exception: {type(exc).__name__}: {exc}",
+                stop_reason="exception",
+                latency=round(time.time() - t0, 3),
+                tool_calls_n=len(trace.calls),
+                invoked_skills=invoked_skills,
+            )
             return rows, len(trace.calls)
+    _restore_skill_default()
 
     latency = round(time.time() - t0, 3)
     final = result.get("final_answer") or ""
@@ -205,14 +385,31 @@ async def _attempt(case: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
         ev_parts.append(recording.synthesis)
     grd = graders.grade_id_grounding(final, "\n".join(ev_parts))
 
+    # Free per-case metrics from the (engine-agnostic) result contract — used by
+    # the bake-off report; ignored by runner.aggregate's objective headline.
     common = {"feature": "trajectory", "id": case["id"], "latency_s": latency,
-              "tool_calls_n": len(trace.calls)}
+              "tool_calls_n": len(trace.calls), "engine": engine_name,
+              "stop_reason": result.get("stop_reason"),
+              "did_forced_synthesis": bool(result.get("did_forced_synthesis")),
+              "truncated": bool(result.get("truncated")),
+              "invoked_skills": list(invoked_skills),
+              "input_tokens": result.get("input_tokens") or 0,
+              "output_tokens": result.get("output_tokens") or 0,
+              "total_tokens": result.get("total_tokens") or 0}
     rows: List[Dict[str, Any]] = [
         {**common, "metric": "tool_selection", "objective": True, "score": sel[0], "diagnostic": sel[1]},
         {**common, "metric": "protocol", "objective": True, "score": pro[0], "diagnostic": pro[1]},
         {**common, "metric": "final_answer", "objective": True, "score": ans[0], "diagnostic": ans[1]},
         {**common, "metric": "grounding", "objective": True, "score": grd[0], "diagnostic": grd[1]},
     ]
+
+    # Skill utilization: did the agent load the runbook the case expects? Graded
+    # off the tool's invoked_sink (invoked_skills), captured above.
+    skill_exp = exp.get("skill_invocation")
+    if skill_exp:
+        sk = graders.grade_skill_invocation(invoked_skills, skill_exp)
+        rows.append({**common, "metric": "skill_invocation", "objective": True,
+                     "score": sk[0], "diagnostic": sk[1]})
 
     # Optional disk post-check (the edit-feature case): the change must land.
     pc = case.get("post_check")
@@ -239,12 +436,19 @@ def _objective_sum(rows: List[Dict[str, Any]]) -> float:
     return sum(r["score"] for r in rows if r.get("objective"))
 
 
-async def _run_case(case: Dict[str, Any]) -> List[Dict[str, Any]]:
+async def _run_case(
+    case: Dict[str, Any],
+    engine: Optional[str] = None,
+    *,
+    mcp_manager: Any = None,
+    codegraph_err: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Run a case; retry once and keep the better-scoring run (Bedrock is noisy)."""
-    rows, _ = await _attempt(case)
+    kw = {"mcp_manager": mcp_manager, "codegraph_err": codegraph_err}
+    rows, _ = await _attempt(case, engine, **kw)
     obj = [r for r in rows if r.get("objective")]
     if obj and (_objective_sum(rows) < len(obj)):  # any objective miss → retry once
-        retry_rows, _ = await _attempt(case)
+        retry_rows, _ = await _attempt(case, engine, **kw)
         if _objective_sum(retry_rows) > _objective_sum(rows):
             rows = retry_rows
         for r in rows:
@@ -252,10 +456,55 @@ async def _run_case(case: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
-async def run_trajectory_suite() -> List[Dict[str, Any]]:
+async def _start_codegraph(cases: List[Dict[str, Any]]) -> Tuple[Any, Optional[str]]:
+    """Connect the in-process codegraph engine and index the fixture ONCE.
+
+    Returns ``(manager, error)`` — ``error`` non-None means the code cases can't
+    run (caller fails them loud). Indexing is shared across every code case:
+    the fixture is identical for all of them, and ``_index_and_project`` blocks
+    until the index is built, so no case races a half-built index.
+    """
+    if not any(c.get("crawler") for c in cases):
+        return None, None
+
+    from app.services.mcp_client_manager import MCPClientManager
+    from app.workflow.tools.codegraph_tools import (
+        CODEGRAPH_SERVER_ID, codegraph_inline_config,
+    )
+    from evals.accuracy.run_codegraph import _index_and_project
+
+    manager = MCPClientManager()
+    try:
+        if not await manager.connect_server(CODEGRAPH_SERVER_ID, codegraph_inline_config()):
+            return manager, (
+                "codegraph engine failed to start — the code cases run IN-CONTAINER "
+                "only (the binary is baked into the agent-api image)"
+            )
+        _project, index_err = await _index_and_project(manager, CODEGRAPH_SERVER_ID)
+        return manager, index_err
+    except Exception as exc:  # noqa: BLE001 — a dead engine is a red suite, not a crash
+        return manager, f"{type(exc).__name__}: {exc}"
+
+
+async def run_trajectory_suite(engine: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Run the trajectory suite. ``engine`` selects the agent loop for every case
+    (``None`` → ``settings.agent_engine``); the bake-off passes each engine in turn."""
+    cases = _load_cases()
+    manager, codegraph_err = await _start_codegraph(cases)
+    if codegraph_err:
+        logger.error("trajectory: codegraph unavailable — code cases will fail: %s",
+                     codegraph_err)
     out: List[Dict[str, Any]] = []
-    for case in _load_cases():
-        out.extend(await _run_case(case))
+    try:
+        for case in cases:
+            out.extend(await _run_case(
+                case, engine, mcp_manager=manager, codegraph_err=codegraph_err))
+    finally:
+        if manager is not None:
+            try:
+                await manager.disconnect_all()
+            except Exception:  # noqa: BLE001 — teardown must not mask results
+                logger.warning("trajectory: codegraph disconnect failed", exc_info=True)
     return out
 
 

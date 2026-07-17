@@ -37,7 +37,7 @@ def path_matches(returned: str, expected_rel: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def grade_find(result: Dict[str, Any], expected: Dict[str, Any]) -> Tuple[float, str]:
-    """Score a crawler_find_symbol result against authored ground truth.
+    """Score a find_symbol result against authored ground truth.
 
     Scoring (top-1):
       1.0  file + line + kind all correct
@@ -93,7 +93,7 @@ def _edge_key(frm: str, to: str) -> Tuple[str, str]:
 
 
 def grade_trace(result: Dict[str, Any], expected_edges: List[Dict[str, str]]) -> Tuple[float, str]:
-    """Score crawler_trace_path edges as F1 against an authored edge set.
+    """Score trace_path edges as F1 against an authored edge set.
 
     Edges are compared on (from_leaf, to_leaf) symbol names (module/class
     qualifiers stripped) so the crawler's qualification style doesn't matter.
@@ -264,7 +264,7 @@ def grade_severity(structured: Optional[Dict[str, Any]], expected_sev: str) -> T
 # parallel first move isn't penalised for ordering within the turn.
 
 # A tool-name matcher: an fnmatch glob, with '|' meaning alternation, so
-# "crawler_find_symbol|crawler_investigate_alert" matches either.
+# "codegraph__find_symbol|repo_grep" matches either.
 Pattern = str
 # A turn is the set of tool names in one assistant message; the trajectory is the
 # ordered list of turns. ``Sequence[str]`` (a flat name list) is also accepted.
@@ -402,5 +402,35 @@ def grade_final_answer(answer: str, spec: Dict[str, Any]) -> Tuple[float, str]:
 
     for sub in (spec.get("must_not_contain") or []):
         predicates.append((not _contains(answer, sub), "must_not_contain %r" % sub))
+
+    return _score(predicates)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent skills: did the agent LOAD and use the right skill?
+# ─────────────────────────────────────────────────────────────────────────────
+
+def grade_skill_invocation(loaded_skills: Sequence[str], spec: Dict[str, Any]) -> Tuple[float, str]:
+    """Did the agent invoke the ``skill`` tool for the expected runbook(s)?
+
+    ``loaded_skills`` is the set of skill names the ``skill`` tool actually loaded
+    this run (the tool's ``invoked_sink``). Unlike the plumbing selftest, this
+    grades *utilization*: given a listed skill that matches the query, did the
+    agent choose to load it before working the task?
+
+    Spec keys (all optional; patterns are fnmatch globs, '|' = alternation):
+      * ``must_load``: list of patterns — each must match >=1 loaded skill.
+      * ``must_not_load``: list of patterns — none may match a loaded skill.
+    """
+    loaded = [str(s) for s in (loaded_skills or [])]
+    predicates: List[Tuple[bool, str]] = []
+
+    for p in (spec.get("must_load") or []):
+        ok = any(_name_matches(n, p) for n in loaded)
+        predicates.append((ok, "must_load %r (loaded %s)" % (p, loaded or "∅")))
+
+    for p in (spec.get("must_not_load") or []):
+        hit = [n for n in loaded if _name_matches(n, p)]
+        predicates.append((not hit, "must_not_load %r (loaded %s)" % (p, hit)))
 
     return _score(predicates)

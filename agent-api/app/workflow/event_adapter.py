@@ -20,7 +20,7 @@ import json
 import logging
 from typing import AsyncGenerator
 
-from app.core.sse import HEARTBEAT_INTERVAL_SECONDS, SSE_HEADERS, STREAM_TIMEOUT_SECONDS
+from app.core.streaming.sse import HEARTBEAT_INTERVAL_SECONDS, SSE_HEADERS, STREAM_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 

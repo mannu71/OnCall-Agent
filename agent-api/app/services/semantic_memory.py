@@ -45,8 +45,16 @@ def _normalize_repos(repo: Any) -> Optional[List[str]]:
     return repos or None
 
 
-def _bank_filter(repos: Optional[List[str]]) -> str:
-    """SQL predicate selecting the repo bank(s) ∪ global bank."""
+def _bank_filter(repos: Optional[List[str]], bank: Optional[str] = None) -> str:
+    """SQL predicate selecting the memory bank(s) to recall from.
+
+    Default: the repo bank(s) ∪ the shared global bank. When an explicit *bank*
+    is given (e.g. ``'kb'`` for the OKF knowledge bundle index), recall is scoped
+    to that single bank instead — a separate corpus from repo/global learned
+    facts.
+    """
+    if bank:
+        return "bank = :bank_name"
     if repos:
         return "(bank = 'global' OR (bank = 'repo' AND repo_name = ANY(:repos)))"
     return "bank = 'global'"
@@ -137,12 +145,15 @@ class SemanticMemoryService:
         k: Optional[int] = None,
         threshold: Optional[float] = None,
         mode: Optional[str] = None,
+        bank: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Return up to *k* memories most relevant to *query* (hybrid by default).
 
-        Searches the repo bank ∪ global bank. ``mode`` ('hybrid'|'fts'|'vector')
-        defaults to ``settings.memory_retrieval_mode``. Results are token-bounded
-        by the caller (the provider truncates each ``content``).
+        Searches the repo bank ∪ global bank, or — when *bank* is given — that
+        single bank (e.g. ``'kb'`` for the OKF knowledge bundle). ``mode``
+        ('hybrid'|'fts'|'vector') defaults to ``settings.memory_retrieval_mode``.
+        Results are token-bounded by the caller (the provider truncates each
+        ``content``).
         """
         query = (query or "").strip()
         if not query:
@@ -160,9 +171,9 @@ class SemanticMemoryService:
             async with AsyncSessionLocal() as session:
                 if mode in ("hybrid", "vector"):
                     await self._vector_leg(session, query, repos, threshold, per_leg,
-                                           rows_by_id, rrf)
+                                           rows_by_id, rrf, bank)
                 if mode in ("hybrid", "fts"):
-                    await self._fts_leg(session, query, repos, per_leg, rows_by_id, rrf)
+                    await self._fts_leg(session, query, repos, per_leg, rows_by_id, rrf, bank)
         except Exception as e:  # noqa: BLE001 — recall must never break a run
             logger.warning("semantic_memory: recall failed (%s)", e)
             return []
@@ -180,7 +191,7 @@ class SemanticMemoryService:
         return results
 
     async def _vector_leg(self, session, query, repos, threshold, limit,
-                          rows_by_id, rrf) -> None:
+                          rows_by_id, rrf, bank=None) -> None:
         try:
             emb = await self.embedding_service.generate_embedding(query)
         except Exception as e:  # noqa: BLE001 — degrade to FTS-only
@@ -193,7 +204,7 @@ class SemanticMemoryService:
             SELECT id, content, source, importance, veracity,
                    1 - (embedding <=> CAST(:emb AS vector)) AS score
             FROM semantic_memory
-            WHERE {_bank_filter(repos)}
+            WHERE {_bank_filter(repos, bank)}
               AND embedding IS NOT NULL
               AND 1 - (embedding <=> CAST(:emb AS vector)) > :threshold
             ORDER BY score DESC
@@ -201,14 +212,16 @@ class SemanticMemoryService:
             """
         )
         params = {"emb": str(emb), "threshold": float(threshold), "limit": limit}
-        if repos:
+        if bank:
+            params["bank_name"] = bank
+        elif repos:
             params["repos"] = repos
         result = await session.execute(sql, params)
         for rank, row in enumerate(result, start=1):
             rows_by_id.setdefault(row.id, _row_dict(row))
             rrf[row.id] = rrf.get(row.id, 0.0) + 1.0 / (_RRF_K + rank)
 
-    async def _fts_leg(self, session, query, repos, limit, rows_by_id, rrf) -> None:
+    async def _fts_leg(self, session, query, repos, limit, rows_by_id, rrf, bank=None) -> None:
         # OR-semantics: plainto_tsquery ANDs every term, so a query with any word
         # absent from a memory (e.g. an extra 'traffic') matches nothing. Recall
         # should surface on PARTIAL overlap, ranked by how many terms match — so
@@ -220,14 +233,16 @@ class SemanticMemoryService:
             SELECT id, content, source, importance, veracity,
                    ts_rank(search_vector, {ts}) AS score
             FROM semantic_memory
-            WHERE {_bank_filter(repos)}
+            WHERE {_bank_filter(repos, bank)}
               AND search_vector @@ {ts}
             ORDER BY score DESC
             LIMIT :limit
             """
         )
         params = {"q": query, "limit": limit}
-        if repos:
+        if bank:
+            params["bank_name"] = bank
+        elif repos:
             params["repos"] = repos
         result = await session.execute(sql, params)
         for rank, row in enumerate(result, start=1):

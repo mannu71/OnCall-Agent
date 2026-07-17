@@ -9,8 +9,8 @@ transient errors in place.
 import pytest
 from botocore.exceptions import ClientError
 
-from app.core.error_classifier import classify_error, FailoverReason
-from app.core.retry import with_retry
+from app.core.llm.error_classifier import classify_error, FailoverReason
+from app.core.resilience.retry import with_retry
 
 
 def _throttle_error():

@@ -195,6 +195,36 @@ def _tail_truncate_lines(text: str, max_chars: int) -> str:
     return "…(older milestones truncated)\n" + "\n".join(kept)
 
 
+#: Placeholder fragments the seed templates write for a not-yet-worked run.
+#: A read_context_block() result containing only these (plus headers / the
+#: objective line) means no real progress has been recorded yet.
+_SEED_MARKERS = ("(not yet started)", "(none yet)")
+
+
+def is_seed_only(block: Optional[str]) -> bool:
+    """True when a ``read_context_block`` result is still just the freshly
+    seeded skeleton — no real plan/progress written yet.
+
+    Pure (string-only, no I/O) so the caller can cheaply decide whether a
+    "resumed investigation state" block is worth injecting on this turn: on the
+    first turn only the seed skeleton exists, and surfacing it would be noise.
+    """
+    if not block or not block.strip():
+        return True
+    for line in block.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue  # section headers
+        if s.startswith("…("):
+            continue  # tail-truncation marker
+        if any(marker in s for marker in _SEED_MARKERS):
+            continue  # untouched STATE/KEY_FACTS/OPEN placeholder
+        if s.startswith("OBJECTIVE:"):
+            continue  # seeded from the query, not progress
+        return False  # a substantive line → real progress exists
+    return True
+
+
 async def read_context_block(session_id: Optional[str]) -> Optional[str]:
     """Return context_summary.txt + milestones.txt content for compaction/
     handoff injection, or None if metamemory isn't seeded / is empty.
@@ -224,6 +254,6 @@ async def read_context_block(session_id: Optional[str]) -> Optional[str]:
 
 __all__ = [
     "PLAN_PATH", "MILESTONES_PATH", "SUMMARY_PATH", "METAMEMORY_SECTION",
-    "is_active", "seed_if_absent", "read_context_block",
+    "is_active", "seed_if_absent", "read_context_block", "is_seed_only",
     "sync_session_persistence_in", "sync_session_persistence_out",
 ]

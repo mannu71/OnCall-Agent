@@ -15,7 +15,7 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 
 from app.config import settings
-from app.core.supervisor import InvestigationSupervisor, SupervisorConfig
+from app.core.quality.supervisor import InvestigationSupervisor, SupervisorConfig
 from app.harness import build_agent_from_spec
 from app.harness.engine import resolve_engine, run_agent_once
 from app.harness.spec_factory import _as_bool
@@ -77,12 +77,19 @@ async def run_plan(
     supervisor_cfg = SupervisorConfig.from_settings()
     # Per-workflow grader override: agent_config["verification_grader"] or
     # deep_features["verification_grader"] wins over the global setting.
-    # Null/absent → global default (False for existing workflows).
+    # Null/absent → global default (False for existing workflows), EXCEPT that
+    # an auto-learn workflow defaults LLM scoring ON: auto-learn persists
+    # findings to the KB, so it should earn a real quality verdict (which also
+    # feeds the durable-write gate in learning.auto_learn) rather than only the
+    # heuristic confidence estimate. Cost stays bounded by supervisor_token_budget.
+    # An explicit verification_grader value still overrides this default.
     _vg_raw = agent_config.get("verification_grader")
     if _vg_raw is None:
         _vg_raw = (agent_config.get("deep_features") or {}).get("verification_grader")
     if _vg_raw is not None:
         supervisor_cfg.llm_scoring_enabled = _as_bool(_vg_raw)
+    elif getattr(spec, "auto_learn", False):
+        supervisor_cfg.llm_scoring_enabled = True
     supervisor = (
         InvestigationSupervisor(supervisor_cfg)
         if supervisor_enabled
@@ -123,7 +130,7 @@ async def run_plan(
             if _idx == 0:
                 _cur_llm = llm
             else:
-                from app.core import model_throttle_tracker as _throttle
+                from app.core.llm import model_throttle_tracker as _throttle
                 _tgt = throttle_target_for(_fallback_chain[_idx - 1])
                 _throttle.mark_throttled(_tgt)
                 logger_instance.warning(
@@ -153,7 +160,7 @@ async def run_plan(
                     engine=_engine,
                 )
             except Exception as _exc:  # noqa: BLE001 — decide failover vs raise
-                from app.core.error_classifier import classify_error as _classify
+                from app.core.llm.error_classifier import classify_error as _classify
                 _ce = _classify(_exc)
                 if _ce.should_fallback and _idx < len(_fallback_chain) - 1:
                     last_exc = _exc

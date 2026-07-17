@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, Tuple
 
-from app.core.redact import redact
+from app.core.privacy.redact import redact
 
 
 async def _sts_expired(
@@ -45,7 +45,7 @@ async def _sts_expired(
     try:
         import boto3
         from botocore.exceptions import ClientError as _BotoClientError
-        from app.core.thread_pools import run_in_aws_pool
+        from app.core.concurrency.thread_pools import run_in_aws_pool
 
         _sts_kwargs: Dict[str, Any] = {"region_name": region}
         if creds.get("aws_profile"):
@@ -240,7 +240,7 @@ async def verify_backends_before_llm(
         aws = next((v for v in _MCP_CRED_VERIFIERS if v.name == "aws"), None)
         if aws is not None:
             if cloudwatch_config.get("aws_profile") or cloudwatch_config.get("access_key_id"):
-                from app.core.aws_credentials import resolve_aws_credentials
+                from app.core.aws.aws_credentials import resolve_aws_credentials
                 cw_creds, cw_region = await resolve_aws_credentials(
                     aws_profile=cloudwatch_config.get("aws_profile"),
                     aws_region=cloudwatch_config.get("aws_region", "us-east-1"),
@@ -318,7 +318,7 @@ async def assemble_base_tools(
 
     # Query-aware gate: a purely conversational turn (e.g. "Hi") needs no logs, so
     # skip binding CloudWatch tools entirely — not a degradation, just nothing to do.
-    from app.core.intent import is_conversational
+    from app.core.quality.intent import is_conversational
     if cloudwatch_config and is_conversational(user_query):
         logger_instance.info(
             "ReactStrategy: conversational turn — skipping CloudWatch tool binding (exec=%s)",
@@ -329,7 +329,7 @@ async def assemble_base_tools(
 
     if cloudwatch_config:
         try:
-            from app.core.aws_credentials import resolve_aws_credentials
+            from app.core.aws.aws_credentials import resolve_aws_credentials
             from app.workflow.tools.cloudwatch_agent_tools import build_cloudwatch_agent_tools
 
             cw_creds, cw_region = await resolve_aws_credentials(

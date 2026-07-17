@@ -1,24 +1,13 @@
-"""Context-management utilities (token budgeting, ledgers).
+"""Context-management package: compaction, tool-output sizing, references.
 
-Placed under ``app.core.context`` so future modules (compression, sliding
-summarisation, reference expansion) can co-locate without colliding with
-the existing ``app.core.context_references`` and ``app.core.context_compression``
-modules.
+Consolidates the app's context-window machinery. Import submodules directly;
+this package intentionally re-exports nothing (avoids import cycles):
+
+* compaction.py / compaction_manager.py — history compaction
+  (``compact``, ``StructuredSummary``, ``ContextCompactionManager``).
+* tool_output.py — headroom sidecar (``compress_then_cap``).
+* overflow.py — LEGACY reactive overflow path.
+* references.py — @file / @url reference expansion.
+* token_budget.py, sliding_window.py — UNUSED (no live callers); kept pending
+  removal in a later pass.
 """
-from app.core.context.token_budget import (
-    LedgerEntry,
-    TokenLedger,
-    make_usage_callback,
-)
-from app.core.context.sliding_window import (
-    SummariseFn,
-    maybe_summarise,
-)
-
-__all__ = [
-    "LedgerEntry",
-    "TokenLedger",
-    "make_usage_callback",
-    "SummariseFn",
-    "maybe_summarise",
-]

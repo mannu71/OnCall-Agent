@@ -22,6 +22,12 @@ synthesis build their LLM through the app's enriched `resolve_llm_config` ->
 `build_llm` path, which injects those creds and the eu cross-region inference
 profile.
 
+The codegraph binary is baked into the image too, so the **code cases of the
+trajectory suite are container-only** (like `run_codegraph`): they bind the real
+`codegraph__*` tools over a fixture indexed once per suite. On a host without the
+engine they fail loud with a `codegraph unavailable` diagnostic rather than
+quietly grading a different tool set.
+
 ```bash
 # copy the harness in (only app/ + data/ are baked into the image)
 docker cp evals agent-api-agent-api-1:/app/evals

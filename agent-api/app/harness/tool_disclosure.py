@@ -50,7 +50,7 @@ _ALWAYS_KEEP_NAMES = {
     "write_todos", "update_todo", "run_command",
     "fs_write", "fs_read", "fs_ls", "fs_grep",
     "fs_append", "fs_upsert", "fs_prune",
-    "skill",
+    "skill", "search_skills",
 }
 # char/4 token heuristic for schema size estimation. This is intentionally
 # approximate — the gate activates on a soft cliff (20K tokens), not a hard
@@ -115,6 +115,46 @@ def _summarize_args(tool: Any) -> str:
         return "args: " + ", ".join(ordered)
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _build_tool_map(names: List[str]) -> str:
+    """Names of the deferred tools, comma-joined — the model-facing tool MAP.
+
+    A search tool the model can't see the shape of is a search tool it won't
+    think to use: the map names what was deferred, so the agent knows the
+    capability exists and what vocabulary to search with. Names only — the
+    schemas are what cost tokens, and those stay deferred. Rides the cached
+    prompt prefix (paid once per run, not per turn).
+
+    Truncated to ``tool_map_char_budget`` chars with a ``+K more`` tail; past
+    that the list stops being readable anyway and search covers the remainder.
+    """
+    try:
+        from app.config import settings
+        budget = int(getattr(settings, "tool_map_char_budget", 2000))
+    except Exception:  # noqa: BLE001 — the map must never break tool assembly
+        budget = 2000
+
+    ordered = sorted(n for n in names if n)
+    if not ordered:
+        return ""
+
+    kept: List[str] = []
+    used = 0
+    for name in ordered:
+        cost = len(name) + (2 if kept else 0)  # ", " separator
+        if used + cost > budget:
+            break
+        kept.append(name)
+        used += cost
+
+    if not kept:  # pathological: even the first name overflows — count only
+        return f"Tool map (deferred, searchable): {len(ordered)} tools — search to find them."
+    listing = ", ".join(kept)
+    remaining = len(ordered) - len(kept)
+    if remaining:
+        listing += f" [+{remaining} more — search to find them]"
+    return f"Tool map (deferred, searchable): {listing}"
 
 
 def build_disclosure_tools(deferred: List[Any]) -> List[Any]:
@@ -204,6 +244,7 @@ def build_disclosure_tools(deferred: List[Any]) -> List[Any]:
         except Exception as exc:  # noqa: BLE001 — surface to the model, don't crash the loop
             return f"[call_tool error] {tool_name} failed: {exc}"
 
+    _map = _build_tool_map(list(by_name))
     search_tool = StructuredTool.from_function(
         coroutine=_search_tools,
         name="search_tools",
@@ -213,6 +254,7 @@ def build_disclosure_tools(deferred: List[Any]) -> List[Any]:
             "full API) are not all loaded at once to save space — use this to find the "
             "right one, then call it with call_tool. Always search before concluding a "
             "capability is unavailable."
+            + (f"\n\n{_map}" if _map else "")
         ),
         args_schema=SearchToolsInput,
     )

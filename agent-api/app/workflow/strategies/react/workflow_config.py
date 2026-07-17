@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.workflow.llm_config import (
     LLM_NODE_TYPES,
@@ -85,8 +86,17 @@ async def resolve_llm_config_for_workflow(workflow: Dict[str, Any]) -> Dict[str,
 
 # Node ``type`` values that represent a Memory node wired to the agent's
 # ``memory`` input port. Kept here next to the connectivity helper so callers
-# share one definition.
-MEMORY_NODE_TYPES = ("vector_memory", "memory")
+# share one definition. (Only ``vector_memory`` has a catalog schema — the old
+# phantom ``"memory"`` alias was dropped since no node of that type can exist.)
+MEMORY_NODE_TYPES = ("vector_memory",)
+
+# The memory tiers a Memory node can enable, selected via its ``memoryTypes``
+# param (comma-joined). Each maps to one recall/write path:
+#   semantic — bank-scoped learned facts (hybrid FTS+vector recall + capture)
+#   pinned   — always-injected operator/agent pinned facts
+#   kb       — knowledge-base recall (known issues / patterns / OKF bundle)
+#   session  — prior-turn chat history replay
+MEMORY_TYPES: Tuple[str, ...] = ("semantic", "pinned", "kb", "session")
 
 # Shared "resource provider" nodes: a Language Model or Memory node wired into a
 # consumer's optional ``lm``/``memory`` port. The connectivity BFS may LAND on
@@ -98,9 +108,101 @@ MEMORY_NODE_TYPES = ("vector_memory", "memory")
 RESOURCE_NODE_TYPES = tuple(dict.fromkeys(LLM_NODE_TYPES + MEMORY_NODE_TYPES))
 
 
+@dataclass(frozen=True)
+class MemoryConfig:
+    """Resolved memory settings for one agent run.
+
+    ``enabled`` is True iff a Memory node is wired to the agent. ``types`` is the
+    set of active tiers (subset of :data:`MEMORY_TYPES`) — EMPTY when a node is
+    wired but the operator unticked every type. When no Memory node is wired,
+    ``enabled`` is False and ``types`` is empty, so every memory path is OFF
+    (strict gating: the Memory node is the single switch).
+    """
+
+    enabled: bool
+    types: frozenset
+    collection: Optional[str] = None
+    top_k: int = 5
+
+    def has(self, memory_type: str) -> bool:
+        return memory_type in self.types
+
+
+def _read_memory_types(node: Dict[str, Any]) -> Tuple[bool, frozenset]:
+    """Return ``(present, types)`` for one Memory node.
+
+    ``present`` is False when the node carries no ``memoryTypes`` key at all — an
+    older node saved before this feature — which is treated as "all types" for
+    backward compatibility. When the key is present it is parsed (comma-joined
+    string or list), so an explicitly-emptied selection yields an EMPTY set,
+    which the save-time validator rejects.
+    """
+    present = False
+    raw: Any = None
+    for container in (node.get("params") or {}, node.get("data") or {}):
+        for key in ("memoryTypes", "memory_types"):
+            if key in container:
+                present = True
+                raw = container[key]
+                break
+        if present:
+            break
+
+    if not present:
+        return False, frozenset(MEMORY_TYPES)
+
+    if isinstance(raw, (list, tuple, set)):
+        vals = [str(x).strip().lower() for x in raw if str(x).strip()]
+    else:
+        vals = [s.strip().lower() for s in str(raw or "").split(",") if s.strip()]
+    return True, frozenset(v for v in vals if v in MEMORY_TYPES)
+
+
+def get_memory_config(workflow: Dict[str, Any]) -> MemoryConfig:
+    """Resolve the agent's memory configuration from wired Memory node(s).
+
+    Unions the ``memoryTypes`` of every Memory node connected to the agent. A
+    node with no ``memoryTypes`` key contributes all tiers (back-compat). When no
+    Memory node is wired, memory is fully disabled.
+    """
+    ids = get_connected_node_ids(workflow, MEMORY_NODE_TYPES)
+    if not ids:
+        return MemoryConfig(enabled=False, types=frozenset())
+
+    nodes_by_id = {n.get("id"): n for n in workflow.get("nodes", []) if n.get("id")}
+    types: set = set()
+    collection: Optional[str] = None
+    top_k = 5
+    for nid in ids:
+        node = nodes_by_id.get(nid) or {}
+        _present, node_types = _read_memory_types(node)
+        types |= set(node_types)
+        params = node.get("params") or {}
+        data = node.get("data") or {}
+        coll = str(params.get("collection") or data.get("collection") or "").strip()
+        if coll and not collection:
+            collection = coll
+        try:
+            tk = int(
+                params.get("topK") or params.get("top_k")
+                or data.get("topK") or data.get("top_k") or 0
+            )
+            if tk:
+                top_k = tk
+        except (TypeError, ValueError):
+            pass
+
+    return MemoryConfig(
+        enabled=True,
+        types=frozenset(types),
+        collection=collection,
+        top_k=top_k,
+    )
+
+
 def has_memory_node(workflow: Dict[str, Any]) -> bool:
     """True when a Memory node is connected to the agent (drives ``spec.memory``)."""
-    return bool(get_connected_node_ids(workflow, MEMORY_NODE_TYPES))
+    return get_memory_config(workflow).enabled
 
 
 def get_connected_node_ids(

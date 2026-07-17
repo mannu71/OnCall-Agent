@@ -148,6 +148,16 @@ def test_tool_exposure() -> None:
     check("tool_exposure: bridge_names are the two bridge tools",
           set(mgr.bridge_names) == {"search_tools", "call_tool"})
 
+    # Tool map: the bridge's search_tools description NAMES what it deferred, so
+    # the model knows the capability exists and what to search for.
+    _search = next(t for t in bound if t.name == "search_tools")
+    check("tool_exposure: search_tools description carries the tool map",
+          "Tool map (deferred, searchable):" in _search.description,
+          _search.description[-200:])
+    check("tool_exposure: tool map names the deferred tools",
+          all(t.name in _search.description for t in rankable),
+          _search.description[-200:])
+
 
 # ── error_classifier: Bedrock context-overflow rung ──────────────────────────
 def test_boto_context_overflow_classifier() -> None:
@@ -155,7 +165,7 @@ def test_boto_context_overflow_classifier() -> None:
     context-overflow messages to CONTEXT_OVERFLOW/should_compress, not UNKNOWN —
     otherwise neither engine's reactive-compact-and-retry rung ever fires."""
     from botocore.exceptions import ClientError
-    from app.core.error_classifier import classify_error, FailoverReason
+    from app.core.llm.error_classifier import classify_error, FailoverReason
 
     def _ve(message: str) -> ClientError:
         return ClientError({"Error": {"Code": "ValidationException", "Message": message}}, "Converse")
@@ -611,6 +621,149 @@ async def test_turn_loop_verify_pending_tracking() -> None:
     check("turn_loop: failed verify records verify_last_passed False", result3.get("verify_last_passed") is False)
 
 
+async def test_turn_loop_run_budget_status() -> None:
+    """Engine-level run-budget accounting: wall-clock deadline + token ceiling
+    map to (fraction, StopReason); disabled budgets are inert."""
+    import time as _time
+    from types import SimpleNamespace
+    from app.harness.engine.turn_loop import TurnLoop
+    from app.harness.engine.loop_state import StopReason, TurnLoopState, TokenLedger
+
+    # Deadline already expired → exhausted, DEADLINE.
+    loop = TurnLoop(
+        _FakeToolBoundLLM([_fake_ai_message("hi")]), [], "sys",
+        agent_config={"run_deadline_seconds": 100}, max_turns=5,
+    )
+    st = TurnLoopState(messages=[])
+    st.deadline_monotonic = _time.monotonic() - 1.0
+    frac, reason = loop._run_budget_status(st)
+    check("run budget: expired deadline → frac>=1.0", frac >= 1.0, f"frac={frac}")
+    check("run budget: expired deadline → DEADLINE", reason == StopReason.DEADLINE)
+
+    # ~95% consumed (5s left of 100s) → nudge zone, not a stop.
+    st2 = TurnLoopState(messages=[])
+    st2.deadline_monotonic = _time.monotonic() + 5.0
+    frac2, reason2 = loop._run_budget_status(st2)
+    check("run budget: 95% consumed lands in [0.9,1.0)", 0.9 <= frac2 < 1.0, f"frac={frac2}")
+    check("run budget: nudge-zone reason is DEADLINE", reason2 == StopReason.DEADLINE)
+
+    # Token budget exceeded → TOKEN_BUDGET.
+    loop_t = TurnLoop(
+        _FakeToolBoundLLM([_fake_ai_message("hi")]), [], "sys",
+        agent_config={"run_token_budget": 1000}, max_turns=5,
+    )
+    st3 = TurnLoopState(messages=[])
+    st3.ledger = TokenLedger(callback=SimpleNamespace(
+        input_tokens=800, output_tokens=400, cache_read_tokens=0, cache_creation_tokens=0,
+    ))
+    frac3, reason3 = loop_t._run_budget_status(st3)
+    check("run budget: 1200/1000 tokens → frac>=1.0", frac3 >= 1.0, f"frac={frac3}")
+    check("run budget: token overrun → TOKEN_BUDGET", reason3 == StopReason.TOKEN_BUDGET)
+
+    # Disabled → inert.
+    loop_off = TurnLoop(
+        _FakeToolBoundLLM([_fake_ai_message("hi")]), [], "sys",
+        agent_config={"run_deadline_seconds": 0, "run_token_budget": 0}, max_turns=5,
+    )
+    frac4, reason4 = loop_off._run_budget_status(TurnLoopState(messages=[]))
+    check("run budget: disabled → (0.0, None)", frac4 == 0.0 and reason4 is None)
+
+    # Effective per-tool timeout = min(cap, remaining deadline).
+    st5 = TurnLoopState(messages=[])
+    st5.deadline_monotonic = _time.monotonic() + 30.0
+    loop_tt = TurnLoop(
+        _FakeToolBoundLLM([_fake_ai_message("hi")]), [], "sys",
+        agent_config={"tool_call_timeout_seconds": 10, "run_deadline_seconds": 100}, max_turns=5,
+    )
+    tt = loop_tt._effective_tool_timeout(st5)
+    check("run budget: tool timeout = min(cap, remaining)", tt is not None and 9.0 < tt <= 10.0, f"tt={tt}")
+    check(
+        "run budget: no cap + no deadline → unbounded tool timeout",
+        loop_off._effective_tool_timeout(TurnLoopState(messages=[])) is None,
+    )
+
+
+async def test_turn_loop_deadline_hard_stop() -> None:
+    """A model that keeps calling tools past its deadline stops with
+    stop_reason=deadline and an exhausted budget block. Uses an injected
+    monotonic clock so the outcome is deterministic (not racing a real
+    sub-millisecond deadline against an in-memory loop)."""
+    import app.harness.engine.turn_loop as _tl
+    from app.harness.engine.turn_loop import TurnLoop
+    from langchain_core.messages import HumanMessage
+
+    class _ClockShim:
+        """Each monotonic() advances a fixed step so wall-clock progress is
+        deterministic. Only monotonic() is used by turn_loop."""
+
+        def __init__(self, step: float):
+            self.t = 0.0
+            self.step = step
+
+        def monotonic(self) -> float:
+            self.t += self.step
+            return self.t
+
+    tool_call = {"name": "fake_tool", "args": {}, "id": "c"}
+    llm = _FakeToolBoundLLM([_fake_ai_message("", tool_calls=[tool_call])] * 20)
+    loop = TurnLoop(
+        llm, [_FakeTool("fake_tool")], "sys",
+        agent_config={"run_deadline_seconds": 100}, max_turns=50,
+    )
+    _orig_time = _tl.time
+    _tl.time = _ClockShim(60.0)  # deadline set at t=60 → 160; exceeded within 2 turns
+    try:
+        result = await loop.run([HumanMessage(content="go")])
+    finally:
+        _tl.time = _orig_time
+    check("run budget e2e: stops with stop_reason=deadline", result.get("stop_reason") == "deadline")
+    check("run budget e2e: budget block present", isinstance(result.get("budget"), dict))
+    check(
+        "run budget e2e: budget block marks exhausted",
+        isinstance(result.get("budget"), dict) and result["budget"].get("exhausted") is True,
+    )
+    check(
+        "run budget e2e: stopped early (well before max_turns)",
+        llm.calls <= 3, f"calls={llm.calls}",
+    )
+
+
+async def test_turn_loop_tool_timeout() -> None:
+    """A tool that outruns its per-call timeout is surfaced as an honest error
+    ToolMessage; the run continues rather than hanging."""
+    import asyncio as _asyncio
+    from app.harness.engine.turn_loop import TurnLoop
+    from langchain_core.messages import HumanMessage
+
+    class _SlowTool:
+        name = "slow_tool"
+
+        async def ainvoke(self, args):
+            await _asyncio.sleep(5)
+            return "done"
+
+    tool_call = {"name": "slow_tool", "args": {}, "id": "c"}
+    llm = _FakeToolBoundLLM([
+        _fake_ai_message("", tool_calls=[tool_call]),
+        _fake_ai_message("Adapted after the tool timed out."),
+    ])
+    loop = TurnLoop(
+        llm, [_SlowTool()], "sys",
+        agent_config={"tool_call_timeout_seconds": 0.1, "run_deadline_seconds": 0}, max_turns=5,
+    )
+    result = await loop.run([HumanMessage(content="go")])
+    # Serialized messages are dicts ({"role": "tool", "content": ...}); the
+    # timed-out tool's error text lands in the tool message content.
+    joined = " ".join(
+        str(m.get("content", "") if isinstance(m, dict) else getattr(m, "content", ""))
+        for m in result.get("messages", [])
+    )
+    _statuses = [tc.get("status") for tc in result.get("tool_calls", [])]
+    check("tool timeout: surfaced as 'timed out' ToolMessage", "timed out" in joined, joined[:160])
+    check("tool timeout: tool call marked error", "error" in _statuses, str(_statuses))
+    check("tool timeout: run still completes cleanly", result.get("stop_reason") == "completed")
+
+
 def test_terminal_state_derivation() -> None:
     from app.harness.terminal_state import derive_terminal_state, terminal_state_for_result
     from app.harness.engine.loop_state import StopReason, TerminalState
@@ -638,6 +791,10 @@ def test_terminal_state_derivation() -> None:
     check(
         "terminal_state: stop_reason=token_budget -> exhausted",
         derive_terminal_state(stop_reason=StopReason.TOKEN_BUDGET.value) == TerminalState.EXHAUSTED.value,
+    )
+    check(
+        "terminal_state: stop_reason=deadline -> exhausted",
+        derive_terminal_state(stop_reason=StopReason.DEADLINE.value) == TerminalState.EXHAUSTED.value,
     )
     check(
         "terminal_state: stop_reason=hitl_paused -> blocked",
@@ -704,6 +861,161 @@ def test_terminal_state_derivation() -> None:
             "stop_reason": "completed", "did_forced_synthesis": False, "verify_pending": False,
         }) == TerminalState.SUCCESS.value,
     )
+    check(
+        "terminal_state: plan_incomplete -> unverified",
+        derive_terminal_state(plan_incomplete=True) == TerminalState.UNVERIFIED.value,
+    )
+    check(
+        "terminal_state: exhausted outranks plan_incomplete",
+        derive_terminal_state(truncated=True, plan_incomplete=True) == TerminalState.EXHAUSTED.value,
+    )
+    check(
+        "terminal_state_for_result: plan_incomplete flag threads through",
+        terminal_state_for_result({"stop_reason": "completed"}, plan_incomplete=True)
+        == TerminalState.UNVERIFIED.value,
+    )
+
+
+async def test_loop_report_payload() -> None:
+    """notify.build_report_payload shapes a compact report defensively; a
+    disabled webhook makes post_run_report a no-op."""
+    from app.core.observability.notify import build_report_payload, post_run_report
+    from app.config import settings
+
+    p = build_report_payload("alarm-triage", {
+        "final_answer": "All clear.", "terminal_state": "success",
+        "execution_id": "e1", "ungrounded_ids": [],
+    }, scheduled=True)
+    check("notify payload: workflow + scheduled flag", p["workflow"] == "alarm-triage" and p["scheduled"] is True)
+    check("notify payload: terminal_state surfaced", p["terminal_state"] == "success")
+    check("notify payload: answer carried", p["final_answer"] == "All clear.")
+
+    # answer/status key fallbacks + truncation
+    p2 = build_report_payload("w", {"answer": "x" * 3000, "status": "partial"}, scheduled=False)
+    check("notify payload: answer-key fallback truncated", p2["final_answer"].endswith("…") and len(p2["final_answer"]) == 2001)
+    check("notify payload: status fallback for terminal_state", p2["terminal_state"] == "partial")
+
+    # None result → safe empties, never raises
+    p3 = build_report_payload("w", None, scheduled=True)
+    check("notify payload: None result is safe", p3["final_answer"] == "" and p3["terminal_state"] is None)
+
+    # Disabled webhook → no send.
+    _prev = getattr(settings, "loop_report_webhook_url", "")
+    settings.loop_report_webhook_url = ""
+    try:
+        sent = await post_run_report("w", {"final_answer": "hi"}, scheduled=True)
+        check("notify: disabled webhook → no-op (returns False)", sent is False)
+    finally:
+        settings.loop_report_webhook_url = _prev
+
+
+def test_token_calibration() -> None:
+    """Per-model EWMA calibration factor: exact no-op when disabled, clamped and
+    learned when enabled; the compaction estimator applies it."""
+    from app.config import settings
+    from app.core.llm import token_calibration as tc
+    from app.core.context.compaction import _estimate_tokens
+
+    _prev = getattr(settings, "token_estimate_calibration_enabled", False)
+    tc.reset()
+    try:
+        # Disabled → factors are 1.0 and the estimator is raw chars/4.
+        settings.token_estimate_calibration_enabled = False
+        tc.record("m", 100, 200)  # ignored while disabled
+        check("token cal: disabled current_factor == 1.0", tc.current_factor() == 1.0)
+        check("token cal: disabled factor_for == 1.0", tc.factor_for("m") == 1.0)
+        check("token cal: disabled estimator is raw chars/4", _estimate_tokens("x" * 40) == 10)
+
+        # Enabled → learns a clamped factor; estimator scales by it.
+        settings.token_estimate_calibration_enabled = True
+        tc.reset()
+        tc.record("m", 100, 150)  # ratio 1.5 (first sample seeds the EWMA)
+        check("token cal: first sample seeds factor", abs(tc.factor_for("m") - 1.5) < 1e-6)
+        check("token cal: current_factor tracks last model", abs(tc.current_factor() - 1.5) < 1e-6)
+        check("token cal: estimator scales by factor", _estimate_tokens("x" * 40) == 15)
+
+        # EWMA blends subsequent samples toward the newest.
+        tc.record("m", 100, 150)
+        check("token cal: repeated same ratio stays ~1.5", abs(tc.factor_for("m") - 1.5) < 1e-6)
+
+        # Clamp: an extreme ratio is bounded to [0.7, 1.6].
+        tc.reset()
+        tc.record("hi", 100, 10_000)  # ratio 100 → clamp to 1.6
+        check("token cal: factor clamped high to 1.6", tc.factor_for("hi") == 1.6)
+        tc.reset()
+        tc.record("lo", 10_000, 100)  # ratio 0.01 → clamp to 0.7
+        check("token cal: factor clamped low to 0.7", tc.factor_for("lo") == 0.7)
+
+        # Non-positive counts never form a ratio.
+        tc.reset()
+        tc.record("z", 0, 100)
+        check("token cal: zero estimate ignored", tc.factor_for("z") == 1.0)
+    finally:
+        settings.token_estimate_calibration_enabled = _prev
+        tc.reset()
+
+
+def test_completion_check() -> None:
+    """check_completion drives the verified-completion terminal signal."""
+    from app.harness.completion_check import check_completion
+
+    check("completion: no plan → not incomplete", check_completion([])["plan_incomplete"] is False)
+    all_terminal = [{"index": 0, "status": "completed"}, {"index": 1, "status": "blocked"}]
+    check(
+        "completion: all completed/blocked → not incomplete",
+        check_completion(all_terminal)["plan_incomplete"] is False,
+    )
+    mixed = [{"index": 0, "status": "completed"}, {"index": 1, "status": "pending"}]
+    r = check_completion(mixed)
+    check("completion: a pending item → incomplete", r["plan_incomplete"] is True and r["open_count"] == 1)
+    in_prog = [{"index": 0, "status": "in_progress"}]
+    check("completion: in_progress counts as open", check_completion(in_prog)["plan_incomplete"] is True)
+    unev = [
+        {"index": 0, "status": "completed"},
+        {"index": 1, "status": "completed", "evidence": "foo.py:9"},
+    ]
+    check(
+        "completion: flags the unevidenced completion only",
+        check_completion(unev)["unevidenced_completions"] == [0],
+    )
+
+
+async def test_planning_evidence_gate() -> None:
+    """update_todo refuses a completed status without evidence when the
+    verified-completion flag is on, and stores evidence when given."""
+    from app.harness import planning_tools as pt
+    from app.config import settings
+
+    sid = "evgate-selftest"
+    tools = pt.build_planning_tools(sid)
+    _update = next(t for t in tools if t.name == "update_todo")
+    _write = next(t for t in tools if t.name == "write_todos")
+    _prev = getattr(settings, "todo_evidence_required", False)
+    try:
+        await _write.ainvoke({"items": ["step one", "step two"]})
+
+        settings.todo_evidence_required = False
+        r_off = (await _update.ainvoke({"index": 0, "status": "completed"})).lower()
+        check("planning gate off: completed allowed without evidence", '"ok": true' in r_off)
+
+        settings.todo_evidence_required = True
+        r_block = (await _update.ainvoke({"index": 1, "status": "completed"})).lower()
+        check(
+            "planning gate on: rejects completed without evidence",
+            '"ok": false' in r_block and "evidence" in r_block,
+        )
+        r_ok = (await _update.ainvoke(
+            {"index": 1, "status": "completed", "evidence": "foo.py:42"}
+        )).lower()
+        check("planning gate on: accepts completed with evidence", '"ok": true' in r_ok)
+        todos = await pt.get_todos(sid)
+        check("planning gate: evidence persisted on the item", todos[1].get("evidence") == "foo.py:42")
+        # blocked without evidence is always allowed (honest non-completion).
+        r_blocked = (await _update.ainvoke({"index": 0, "status": "blocked"})).lower()
+        check("planning gate: blocked allowed without evidence", '"ok": true' in r_blocked)
+    finally:
+        settings.todo_evidence_required = _prev
+        await pt.drop_session(sid)
 
 
 async def test_engine_native_dispatch() -> None:
@@ -742,7 +1054,7 @@ def test_compression_split_preserved_tail() -> None:
     that requested it — a split pair would make Bedrock reject the retry
     this splitter exists to protect (INVALID_CHAT_HISTORY)."""
     from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-    from app.core.memory.compaction import _msg_token_estimate
+    from app.core.context.compaction import _msg_token_estimate
     from app.harness.engine.compression import split_preserved_tail
 
     messages = [
@@ -928,6 +1240,41 @@ async def test_metamemory_read_context_block_caps_milestones() -> None:
     finally:
         await _vdrop3("mm-cap-test")
         await _vdrop3("mm-cap-test-small")
+
+
+def test_metamemory_is_seed_only() -> None:
+    """is_seed_only gates the startup-state injection: True for a freshly
+    seeded skeleton (first turn), False once real progress is written."""
+    from app.harness import metamemory as _mm
+
+    check("is_seed_only: None → True", _mm.is_seed_only(None) is True)
+    check("is_seed_only: empty → True", _mm.is_seed_only("   ") is True)
+
+    # A pristine seed skeleton (summary + milestones header only).
+    seed = (
+        "# SUMMARY v1 (<=500 tokens)\n"
+        "OBJECTIVE: investigate the payment 500s\n"
+        "STATE: (not yet started)\n"
+        "KEY_FACTS: (none yet)\n"
+        "OPEN: (none yet)\n\n"
+        "# MILESTONES v1"
+    )
+    check("is_seed_only: pristine skeleton → True", _mm.is_seed_only(seed) is True)
+
+    # STATE advanced → real progress.
+    worked_state = seed.replace("STATE: (not yet started)", "STATE: traced to auth-svc timeout")
+    check("is_seed_only: advanced STATE → False", _mm.is_seed_only(worked_state) is False)
+
+    # A milestone appended → real progress.
+    with_milestone = seed + "\n2026-07-17 confirmed 504 from auth-svc evidence=/logs/1"
+    check("is_seed_only: appended milestone → False", _mm.is_seed_only(with_milestone) is False)
+
+    # Truncation marker + real milestones (long-run block) → not seed-only.
+    truncated_block = (
+        "# SUMMARY v1\nOBJECTIVE: x\nSTATE: (not yet started)\n\n"
+        "…(older milestones truncated)\nDONE S12 evidence=/x/12"
+    )
+    check("is_seed_only: truncated real block → False", _mm.is_seed_only(truncated_block) is False)
 
 
 async def test_turn_loop_reactive_compact_retry() -> None:
@@ -1361,7 +1708,7 @@ def test_spec_and_facade() -> None:
 # ── supervisor_loop ──────────────────────────────────────────────────────────
 async def test_supervisor_loop() -> None:
     from app.harness.supervisor_loop import run_supervised
-    from app.core.supervisor import SupervisorAction
+    from app.core.quality.supervisor import SupervisorAction
     log = logging.getLogger("t")
 
     class V:
@@ -1515,7 +1862,7 @@ async def test_tool_result_failed_flag_threading() -> None:
     connection-refused message) rendered a green "success" step in the chat
     UI. Verifies the classifier catches this content and that both engines'
     tool-exec paths now pass `failed=` through to the stream callback."""
-    from app.core.tool_guardrails import classify_tool_failure
+    from app.core.tools.tool_guardrails import classify_tool_failure
 
     conn_refused = (
         "[Tool Error] connection refused on 172.16.82.182:5432 — "
@@ -1830,7 +2177,7 @@ async def test_gateway_resolution() -> None:
 # ── cloudwatch instrumentation (Phase 0) ─────────────────────────────────────
 async def test_cloudwatch_cache_stats() -> None:
     """Cache hit/miss counters and reset behave deterministically."""
-    from app.core import cloudwatch_cache as cc
+    from app.core.aws import cloudwatch_cache as cc
 
     cc.invalidate()          # clear store so keys are fresh
     cc.reset_stats()
@@ -1929,7 +2276,7 @@ def test_cloudwatch_severity_clamp() -> None:
 async def test_cloudwatch_analyzer_cache() -> None:
     """run_workflow_analysis caches read-only triage types and bypasses
     unique/side-effecting ones (Phase 1 per-analyzer TTLs)."""
-    from app.core import cloudwatch_cache as cc
+    from app.core.aws import cloudwatch_cache as cc
     from app.services.log_watch_service import LogWatchService
 
     svc = LogWatchService()
@@ -2061,7 +2408,7 @@ def test_cloudwatch_drill_window() -> None:
 async def test_cloudwatch_rate_limiter() -> None:
     """Token bucket grants a burst up to rps immediately, then is gated by refill;
     rps<=0 disables it. Uses a fake clock so no real time passes."""
-    from app.core import cloudwatch_ratelimit as rl
+    from app.core.aws import cloudwatch_ratelimit as rl
 
     clock = {"t": 0.0}
     bucket = rl.TokenBucket(rps=5, time_fn=lambda: clock["t"])
@@ -2478,7 +2825,7 @@ def test_memory_capability_and_autolearn() -> None:
     """Node-driven memory capability + auto-learn safety defaults. DB-free."""
     from app.harness.spec_factory import build_agent_spec
     from app.workflow.strategies.react.workflow_config import has_memory_node
-    from app.core.auto_learn import AutoLearnConfig
+    from app.core.improvement.auto_learn import AutoLearnConfig
 
     base_cfg = {"instructions": "x"}
     ctx: dict = {}
@@ -2520,7 +2867,7 @@ def test_memory_capability_and_autolearn() -> None:
 
     # Generic-task state: only final_answer set, no root_cause / matched_pattern_ids.
     # IncidentKBSink and LogPatternSink must both return applies=False.
-    from app.core.auto_learn import IncidentKBSink, LogPatternSink
+    from app.core.improvement.auto_learn import IncidentKBSink, LogPatternSink
     generic_state = {"final_answer": "All checks passed.", "tool_calls": [], "confidence_score": 0.9}
     check("IncidentKBSink does not apply for generic state (no root_cause)",
           IncidentKBSink().applies(generic_state) is False)
@@ -2541,13 +2888,171 @@ def test_memory_capability_and_autolearn() -> None:
           LogPatternSink().applies(incident_state) is True)
 
 
+def test_memory_typed_node_config() -> None:
+    """Typed Memory node: config resolution + strict gating + save validation. DB-free."""
+    from app.workflow.strategies.react.workflow_config import (
+        get_memory_config, _read_memory_types, MEMORY_TYPES, MEMORY_NODE_TYPES,
+    )
+    from app.workflow.schema.workflow_schema import validate_workflow
+
+    check("phantom 'memory' type dropped", MEMORY_NODE_TYPES == ("vector_memory",))
+
+    agent = {"id": "a", "type": "agent"}
+    edge = [{"source": "a", "target": "m"}]
+
+    def mem(params):
+        return {"id": "m", "type": "vector_memory", "params": params}
+
+    # No node → fully disabled (strict gating).
+    c = get_memory_config({"nodes": [agent], "edges": []})
+    check("no memory node → disabled", c.enabled is False and c.types == frozenset())
+
+    # Absent memoryTypes → all tiers (back-compat).
+    c = get_memory_config({"nodes": [agent, mem({})], "edges": edge})
+    check("absent memoryTypes → all tiers", c.enabled and c.types == frozenset(MEMORY_TYPES))
+
+    # Explicit subset (CSV) and list dialect (memory_types).
+    c = get_memory_config({"nodes": [agent, mem({"memoryTypes": "semantic,kb"})], "edges": edge})
+    check("CSV memoryTypes parsed", c.types == frozenset({"semantic", "kb"}))
+    c = get_memory_config({"nodes": [agent, mem({"memory_types": ["pinned", "session"]})], "edges": edge})
+    check("list dialect + memory_types key parsed", c.types == frozenset({"pinned", "session"}))
+
+    # Explicitly emptied selection → enabled but no tiers.
+    c = get_memory_config({"nodes": [agent, mem({"memoryTypes": ""})], "edges": edge})
+    check("empty memoryTypes → enabled, no tiers", c.enabled and c.types == frozenset())
+
+    # _read_memory_types present flag distinguishes absent vs empty.
+    check("_read_memory_types absent", _read_memory_types(mem({}))[0] is False)
+    check("_read_memory_types empty present",
+          _read_memory_types(mem({"memoryTypes": ""})) == (True, frozenset()))
+
+    # ── save-time validation ──
+    agent_al = {"id": "a", "type": "agent", "params": {"autoLearn": "true"}}
+    agent_no = {"id": "a", "type": "agent", "params": {"autoLearn": "false"}}
+    errs = validate_workflow({"nodes": [agent_al], "edges": []})
+    check("autoLearn without memory node → 400", any("no Memory node is connected" in e for e in errs))
+    errs = validate_workflow({"nodes": [agent_al, mem({})], "edges": edge})
+    check("autoLearn + all-tiers memory node → valid", errs == [])
+    errs = validate_workflow({"nodes": [agent_no, mem({"memoryTypes": ""})], "edges": edge})
+    check("empty memory node → 400", any("select at least one memory type" in e for e in errs))
+    errs = validate_workflow({"nodes": [agent_al, mem({"memoryTypes": "semantic"})], "edges": edge})
+    check("autoLearn needs kb tier → 400", any("kb" in e and "memory tier" in e for e in errs))
+    errs = validate_workflow({"nodes": [agent_no], "edges": []})
+    check("no autoLearn, no memory → no memory errors", errs == [])
+
+
+async def test_memory_recall_gating() -> None:
+    """build_recall_query injects each tier ONLY when its memory type is active. DB-free."""
+    import app.services.semantic_memory as sm_mod
+    import app.services.knowledge_base as kb_mod
+    from app.harness.context_builder import build_recall_query
+
+    calls = {"pinned": 0, "semantic": 0, "kb_issues": 0, "kb_bank": 0}
+
+    async def fake_list_pinned(**kw):
+        calls["pinned"] += 1
+        return [{"content": "escalate to on-call lead", "source": "manual",
+                 "importance": 1.0, "veracity": 1.0}]
+
+    async def fake_recall(q, **kw):
+        if kw.get("bank") == "kb":
+            calls["kb_bank"] += 1
+            return []
+        calls["semantic"] += 1
+        return [{"id": 1, "content": "past finding", "source": "agent",
+                 "importance": 0.5, "veracity": 0.5}]
+
+    async def fake_issues(*a, **k):
+        calls["kb_issues"] += 1
+        return []
+
+    async def fake_patterns(*a, **k):
+        return []
+
+    orig = (sm_mod.semantic_memory.list_pinned, sm_mod.semantic_memory.recall,
+            kb_mod.knowledge_base.search_known_issues,
+            kb_mod.knowledge_base.search_similar_patterns)
+    sm_mod.semantic_memory.list_pinned = fake_list_pinned
+    sm_mod.semantic_memory.recall = fake_recall
+    kb_mod.knowledge_base.search_known_issues = fake_issues
+    kb_mod.knowledge_base.search_similar_patterns = fake_patterns
+
+    q = "why is the payment service throwing 500 errors after the deploy"
+
+    async def run(types):
+        for k in calls:
+            calls[k] = 0
+        return await build_recall_query(
+            user_query=q, cloudwatch_config=None, logger_instance=logging.getLogger("t"),
+            execution_id=None, memory_enabled=bool(types), memory_types=types,
+        )
+
+    try:
+        await run(frozenset({"pinned"}))
+        check("pinned-only injects pinned only",
+              calls["pinned"] == 1 and calls["semantic"] == 0 and calls["kb_issues"] == 0)
+        await run(frozenset({"semantic"}))
+        check("semantic-only injects semantic only",
+              calls["semantic"] == 1 and calls["pinned"] == 0 and calls["kb_issues"] == 0)
+        await run(frozenset({"kb"}))
+        check("kb-only queries kb leg + bundle bank",
+              calls["kb_issues"] == 1 and calls["kb_bank"] == 1 and calls["pinned"] == 0)
+        await run(frozenset())
+        check("empty types injects nothing",
+              calls["pinned"] == 0 and calls["semantic"] == 0 and calls["kb_issues"] == 0)
+        # Legacy contract: memory_types=None → pinned + KB always, semantic on flag.
+        for k in calls:
+            calls[k] = 0
+        await build_recall_query(
+            user_query=q, cloudwatch_config=None, logger_instance=logging.getLogger("t"),
+            execution_id=None, memory_enabled=True, memory_types=None,
+        )
+        check("legacy None → pinned + kb + semantic",
+              calls["pinned"] == 1 and calls["kb_issues"] == 1 and calls["semantic"] == 1)
+    finally:
+        (sm_mod.semantic_memory.list_pinned, sm_mod.semantic_memory.recall,
+         kb_mod.knowledge_base.search_known_issues,
+         kb_mod.knowledge_base.search_similar_patterns) = orig
+
+
+def test_okf_knowledge_bundle() -> None:
+    """OKF bundle: frontmatter round-trip, slug idempotency, index/log, skills migration. DB-free."""
+    import tempfile, pathlib
+    from app.core.knowledge.bundle import (
+        KnowledgeBundle, slugify, migrate_legacy_skills,
+    )
+
+    d = pathlib.Path(tempfile.mkdtemp())
+    b = KnowledgeBundle(d)
+    r = b.write_concept(section="known-issues", title="Payment 500s on deploy",
+                        body="# Root cause\nBad config", description="500s",
+                        tags=["payment"], source="agent", confidence=0.9)
+    check("bundle write creates doc", r["created"] is True and r["slug"] == "payment-500s-on-deploy")
+    parsed = b.read_concept(pathlib.Path(r["path"]))
+    check("OKF frontmatter has required type", parsed["frontmatter"]["type"] == "KnownIssue")
+    check("OKF frontmatter round-trips confidence", parsed["frontmatter"]["confidence"] == 0.9)
+
+    # Same title → update in place (idempotent by slug), not a duplicate.
+    r2 = b.write_concept(section="known-issues", title="Payment 500s on deploy",
+                         body="# Root cause\nStill bad", source="agent")
+    check("bundle write dedupes by slug", r2["created"] is False and len(b.list_concepts()) == 1)
+
+    check("root index.md regenerated", (d / "index.md").exists())
+    check("section index.md regenerated", (d / "known-issues" / "index.md").exists())
+    check("log.md appended", (d / "log.md").exists() and "created" in (d / "log.md").read_text())
+    check("slugify strips unsafe chars", slugify("  Héllo Wörld!! ") == "h-llo-w-rld")
+
+    # Skills migration: only moves the legacy default and never clobbers.
+    check("migrate no-op when skills_dir custom", migrate_legacy_skills("nonexistent-dir") is False)
+
+
 async def test_autolearn_learn_flow() -> None:
     """End-to-end AutoLearnService.learn() pass — trajectory write + skip gate,
     DB-free (db=None, llm=None). Also guards the markdown-only skills collapse:
     no skill distillation config/field remains."""
     import os, tempfile, json as _json
     from dataclasses import fields as _dc_fields
-    from app.core.auto_learn import AutoLearnService, AutoLearnConfig, AutoLearnResult
+    from app.core.improvement.auto_learn import AutoLearnService, AutoLearnConfig, AutoLearnResult
 
     tmpdir = tempfile.mkdtemp(prefix="autolearn_")
     traj = os.path.join(tmpdir, "trajectory.jsonl")
@@ -2564,7 +3069,17 @@ async def test_autolearn_learn_flow() -> None:
 
     svc = AutoLearnService(db=None, llm=None, config=cfg)
 
-    # Approved incident run → trajectory written; DB sinks no-op; no code compile.
+    # Redirect the OKF bundle to a temp dir so IncidentKBSink writes hermetically
+    # (it no longer needs a DB — it writes reviewable OKF files, kb-bank indexing
+    # is a best-effort DB op that no-ops here).
+    import pathlib as _pathlib
+    import app.core.knowledge.bundle as _kb_bundle
+    from app.core.knowledge.bundle import KnowledgeBundle as _KB
+    _kb_root = _pathlib.Path(tmpdir) / "knowledge"
+    _prev_bundle = _kb_bundle._default_bundle
+    _kb_bundle._default_bundle = _KB(_kb_root)
+
+    # Approved incident run → trajectory + OKF known-issue written; no code compile.
     incident_state = {
         "root_cause": "DB pool exhausted",
         "matched_pattern_ids": [1],
@@ -2573,9 +3088,14 @@ async def test_autolearn_learn_flow() -> None:
         "engineer_approved": True,
         "confidence_score": 0.9,
     }
-    r1 = await svc.learn("exec-1", incident_state)
+    try:
+        r1 = await svc.learn("exec-1", incident_state)
+    finally:
+        _kb_bundle._default_bundle = _prev_bundle
     check("autolearn: trajectory saved on approved run", r1.trajectory_saved is True)
-    check("autolearn: kb sink no-op without db", r1.kb_upserted is False)
+    check("autolearn: kb sink writes OKF known-issue", r1.kb_upserted is True)
+    check("autolearn: OKF doc on disk",
+          any((_kb_root / "known-issues").glob("*.md")) if (_kb_root / "known-issues").exists() else False)
     check("autolearn: pattern sink no-op without db", r1.pattern_bumped is False)
     check("autolearn: dynamic node not compiled by default", r1.dynamic_node_compiled is False)
     check("autolearn: approved run not skipped", r1.skipped_reason is None)
@@ -2688,57 +3208,77 @@ def test_memory_audit_logic() -> None:
     check("audit noop when nothing to merge", _plan_deletions(rows, [], 0.5) == ([], True, "noop"))
 
 
-def test_seed_skill_library() -> None:
-    """The starter 'skill cookbook' SKILL.md files load + resolve. DB-free."""
-    from pathlib import Path
-    from app.core.skills.manager import SkillManager
-
-    m = SkillManager(skills_dir=Path("data/skills"))
-    loaded = m.scan_skills()
-    for name in ("log-error-triage", "cloudwatch-alarm-drilldown", "service-restart-checklist"):
-        check(f"seed skill '{name}' loads", name in loaded, str(sorted(loaded)))
-        check(f"seed skill '{name}' resolves via slash", m.resolve_command("/" + name) is not None)
-
-
 async def test_skill_tool_wiring() -> None:
-    """Two-stage skill disclosure: listing, pinned skill tool, slash expand,
-    $ARGUMENTS, scoping, and flag defaults. DB-free."""
+    """Two-stage skill disclosure: the map, search_skills, the pinned skill tool,
+    slash expand, $ARGUMENTS, scoping, and flag defaults. DB-free."""
     from pathlib import Path
     from app.config import settings
     from app.core.skills.manager import SkillManager
     from app.harness.tool_disclosure import _ALWAYS_KEEP_NAMES
-    from app.harness.skill_tools import build_skill_tool, expand_slash_command
+    from app.harness.skill_tools import (
+        build_skill_search_tool, build_skill_tool, expand_slash_command,
+    )
 
     _SEEDS = ("log-error-triage", "cloudwatch-alarm-drilldown", "service-restart-checklist")
 
-    # Flag defaults: skill tool ON, legacy RAG fallback OFF.
     check("flag skill_tool_enabled default True", settings.skill_tool_enabled is True)
-    check("flag skill_rag_selection_enabled default False",
-          settings.skill_rag_selection_enabled is False)
 
-    # skill tool is pinned so progressive disclosure never defers it.
+    # Both skill tools are pinned so progressive disclosure never defers them.
     check("'skill' pinned in _ALWAYS_KEEP_NAMES", "skill" in _ALWAYS_KEEP_NAMES)
+    check("'search_skills' pinned in _ALWAYS_KEEP_NAMES", "search_skills" in _ALWAYS_KEEP_NAMES)
 
-    m = SkillManager(skills_dir=Path("data/skills"))
+    # Hermetic skills_dir (empty tmp): author the test skills in place of the
+    # (removed) bundled seed cookbook so the skill-tool / map / search / slash
+    # mechanics are exercised independently of any local data/skills. Also inject
+    # this manager as the cached default so build_skill_tool / expand_slash_command
+    # (which read get_default_skill_manager) see the same hermetic set.
+    import tempfile
+    import app.core.skills as _skills_pkg
+    _skills_tmp = Path(tempfile.mkdtemp(prefix="harness_skilltool_"))
+    m = SkillManager(skills_dir=_skills_tmp)
+    for _nm in _SEEDS:
+        m.write_skill(_nm, f"---\nname: {_nm}\ndescription: The {_nm} runbook, a proven "
+                           f"procedure for this class of incident.\n---\n\n"
+                           f"## Protocol\n\nRunbook body for {_nm}. $ARGUMENTS\n")
     m.scan_skills()
+    _prev_default_mgr = _skills_pkg._default_manager
+    _skills_pkg._default_manager = m
 
-    # Listing: compact, within budget, contains every seed name.
-    listing = m.build_listing(char_budget=8000, entry_cap=250)
-    check("listing within budget", len(listing) <= 8000, str(len(listing)))
+    # ── Stage one: the map — names only, and far cheaper than the descriptions
+    # it replaced (the whole point of the map).
+    skill_map = m.build_map(char_budget=1500)
+    check("map within budget", len(skill_map) <= 1500, str(len(skill_map)))
     for name in _SEEDS:
-        check(f"listing lists '{name}'", name in listing)
+        check(f"map names '{name}'", name in skill_map)
+    check("map carries names only (no descriptions)", "runbook" not in skill_map, skill_map)
 
-    # Listing scoping: only the allowed skill is listed.
-    scoped = m.build_listing(allowed={"log-error-triage"})
-    check("scoped listing keeps allowed", "log-error-triage" in scoped)
-    check("scoped listing drops others", "service-restart-checklist" not in scoped)
+    # Map scoping: only the allowed skill is named.
+    scoped = m.build_map(allowed={"log-error-triage"})
+    check("scoped map keeps allowed", "log-error-triage" in scoped)
+    check("scoped map drops others", "service-restart-checklist" not in scoped)
 
-    # build_listing per-entry cap holds.
-    capped = m.build_listing(entry_cap=40)
-    check("listing entry cap holds",
-          all(len(ln) <= 40 for ln in capped.splitlines() if ln.strip()), capped)
+    # Over budget the map degrades to a count hint — search still reaches them all.
+    tiny = m.build_map(char_budget=10)
+    check("over-budget map → count hint", tiny == f"{len(_SEEDS)} skills available", tiny)
 
-    # Skill tool: happy path returns the framed runbook body.
+    # ── Stage two, part one: search_skills turns an intent into a name.
+    search = build_skill_search_tool(allowed_skills=None, execution_id="selftest")
+    check("search tool named 'search_skills'", getattr(search, "name", "") == "search_skills")
+    s_out = await search.ainvoke({"query": "triage errors in logs"})
+    check("search finds the matching skill", "log-error-triage" in s_out, s_out[:160])
+    check("search points at the load call", 'skill(skill="' in s_out, s_out[-120:])
+
+    # No match → a fallback naming what IS available, never a raise.
+    s_none = await search.ainvoke({"query": "zzz nonexistent capability"})
+    check("search no-match falls back to names",
+          "No skills matched" in s_none and "log-error-triage" in s_none, s_none[:160])
+
+    # Search honours per-agent scoping.
+    s_scoped = await build_skill_search_tool(
+        allowed_skills={"cloudwatch-alarm-drilldown"}).ainvoke({"query": "triage errors in logs"})
+    check("search enforces scoping", "log-error-triage" not in s_scoped, s_scoped[:160])
+
+    # ── Stage two, part two: skill loads the runbook the search named.
     tool = build_skill_tool(allowed_skills=None, execution_id="selftest", invoked_sink=[])
     check("skill tool named 'skill'", getattr(tool, "name", "") == "skill")
     out = await tool.ainvoke({"skill": "log-error-triage", "args": ""})
@@ -2751,6 +3291,13 @@ async def test_skill_tool_wiring() -> None:
     out2 = await tool2.ainvoke({"skill": "/log-error-triage"})
     check("skill tool tolerates leading slash", "Loaded skill" in out2)
     check("skill tool records invocation in sink", sink == ["log-error-triage"], str(sink))
+
+    # Re-invocation guard: loading the SAME skill again this turn returns a
+    # one-line stub (not the full runbook body again) and doesn't double-record.
+    out2b = await tool2.ainvoke({"skill": "log-error-triage"})
+    check("skill tool guards re-invocation",
+          "already loaded this turn" in out2b and "<skill_instructions" not in out2b, out2b[:120])
+    check("skill tool re-invocation doesn't double-record", sink == ["log-error-triage"], str(sink))
 
     # Unknown skill → error string listing available names (no raise).
     out3 = await tool.ainvoke({"skill": "does-not-exist"})
@@ -2779,11 +3326,77 @@ async def test_skill_tool_wiring() -> None:
     msg = m.build_invocation_message(_sk, user_instruction="the-work")
     check("$ARGUMENTS substituted inline", "Do: the-work now" in msg and "## User Request" not in msg)
 
+    # Frontmatter lint on write: a non-empty description is required (stage-1
+    # skill selection is description-only, so a blank one is un-selectable noise).
+    _rejected = False
+    try:
+        m.write_skill("blank-desc", "---\nname: blank-desc\ndescription: \n---\n\nBody.\n")
+    except ValueError:
+        _rejected = True
+    check("write_skill rejects empty description", _rejected)
+    # A valid description still writes fine (missing when_to_use only warns).
+    m.write_skill("has-desc", "---\nname: has-desc\ndescription: A real description of the skill.\n---\n\nBody.\n")
+    check("write_skill accepts non-empty description", m.get_skill("has-desc") is not None)
+
+    # Restore the real cached default manager (the override was a valid seeded
+    # manager, so this only matters for tests that assert on local data/skills).
+    _skills_pkg._default_manager = _prev_default_mgr
+
+
+async def test_skill_utilization_eval() -> None:
+    """The trajectory suite's skill-utilization path, minus the LLM. Proves the
+    grade_skill_invocation grader and the listing→tool→invoked_sink wiring that
+    run_trajectory.py drives: given a listed skill matching the query, loading it
+    is captured and graded. DB-free, no Bedrock. (The full LLM-in-the-loop case
+    is traj-skill-locate, run in-container.)"""
+    from pathlib import Path
+    import app.core.skills as _skills_pkg
+    from app.core.skills.manager import SkillManager
+    from app.harness.skill_tools import build_skill_tool
+    from evals.accuracy import graders
+
+    # Grader unit checks (pure function).
+    g_hit = graders.grade_skill_invocation(["locate-symbol"], {"must_load": ["locate-symbol"]})
+    check("grade_skill_invocation match → 1.0", g_hit[0] == 1.0, g_hit[1])
+    g_miss = graders.grade_skill_invocation([], {"must_load": ["locate-symbol"]})
+    check("grade_skill_invocation miss → 0.0", g_miss[0] == 0.0, g_miss[1])
+    g_glob = graders.grade_skill_invocation(["locate-symbol"], {"must_load": ["locate-*"]})
+    check("grade_skill_invocation glob match", g_glob[0] == 1.0, g_glob[1])
+    g_not = graders.grade_skill_invocation(["locate-symbol"], {"must_not_load": ["locate-symbol"]})
+    check("grade_skill_invocation must_not_load trips", g_not[0] == 0.0, g_not[1])
+
+    # Wiring over the shipped eval fixture skill (the same disk source the
+    # trajectory case uses): the map names it, the tool loads it, invoked_sink
+    # records it, and the grader scores the load 1.0 — the whole utilization path
+    # an LLM would traverse, with the LLM's choice simulated by a direct call.
+    fixture_dir = Path(__file__).resolve().parent / "accuracy" / "fixtures" / "skills"
+    check("skill fixture dir exists", (fixture_dir / "locate-symbol" / "SKILL.md").exists(), str(fixture_dir))
+    fm = SkillManager(skills_dir=fixture_dir)
+    fm.scan_skills()
+    skill_map = fm.build_map()
+    check("fixture map names locate-symbol", "locate-symbol" in skill_map, skill_map)
+
+    # The skill tool resolves via get_default_skill_manager — inject the fixture
+    # manager as the cached default so the tool sees the fixture set (restored
+    # after, mirroring test_skill_tool_wiring).
+    _prev = _skills_pkg._default_manager
+    _skills_pkg._default_manager = fm
+    try:
+        sink: list = []
+        tool = build_skill_tool(allowed_skills=None, execution_id="util-selftest", invoked_sink=sink)
+        out = await tool.ainvoke({"skill": "locate-symbol", "args": "verify_token"})
+        check("fixture skill loads body", "<skill_instructions" in out and "codegraph__find_symbol" in out)
+        check("fixture skill recorded in sink", sink == ["locate-symbol"], str(sink))
+        graded = graders.grade_skill_invocation(sink, {"must_load": ["locate-symbol"]})
+        check("utilization graded 1.0 end-to-end", graded[0] == 1.0, graded[1])
+    finally:
+        _skills_pkg._default_manager = _prev
+
 
 # ── conversational-intent gate (greetings skip the pre-scan) ──────────────────
 def test_conversational_intent() -> None:
     """is_conversational: small talk → True; anything investigative → False. DB-free."""
-    from app.core.intent import is_conversational
+    from app.core.quality.intent import is_conversational
 
     for greeting in ("Hi", "hello", "  thanks! ", "what can you do?", "good morning",
                      "hey", "who are you"):
@@ -2866,7 +3479,7 @@ async def test_tool_assembler_degrade_not_abort() -> None:
 
     async def _call(side_effect) -> bool:
         with _mock.patch(
-            "app.core.thread_pools.run_in_aws_pool", side_effect=side_effect,
+            "app.core.concurrency.thread_pools.run_in_aws_pool", side_effect=side_effect,
         ):
             return await _sts_expired(
                 {}, "us-east-1",
@@ -2895,7 +3508,7 @@ async def test_tool_assembler_degrade_not_abort() -> None:
 async def test_context_compaction_tiers() -> None:
     """Microcompact (cheap) is tried before the LLM-summary tier. DB-free."""
     from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-    from app.core.memory.compaction_manager import ContextCompactionManager
+    from app.core.context.compaction_manager import ContextCompactionManager
 
     class _FailingTransport:
         """Raises if compact() ever reaches the LLM-summary call — proves the
@@ -3280,7 +3893,7 @@ async def test_configurable_agents() -> None:
     # ── tool-output compression (compress-then-cap; sidecar-free path) ──
     # compression_enabled defaults off, so these exercise the guaranteed-cap
     # path without needing the sidecar reachable.
-    from app.core.compaction.compressor import compress_then_cap
+    from app.core.context.tool_output import compress_then_cap
     from app.workflow.mcp.mcp_langchain_adapter import (
         _compress_or_truncate,
         _truncate_output,
@@ -4279,7 +4892,7 @@ async def test_delegate_batch_budget_economy() -> None:
 async def test_chat_session_compaction() -> None:
     """Per-chat-session compaction helpers — role mapping + replay fix. DB-free."""
     from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-    from app.core.memory.compaction_manager import _chat_dicts_to_messages
+    from app.core.context.compaction_manager import _chat_dicts_to_messages
 
     rows = [
         {"role": "user", "content": "hi"},
@@ -4313,7 +4926,7 @@ async def test_loop_engineering() -> None:
     """Loop 2 + Loop 4 regression cases — DB-free."""
 
     # ── Loop 2: supervisor with llm_scoring OFF is byte-for-byte heuristic path ──
-    from app.core.supervisor import InvestigationSupervisor, SupervisorConfig, SupervisorAction
+    from app.core.quality.supervisor import InvestigationSupervisor, SupervisorConfig, SupervisorAction
 
     cfg_off = SupervisorConfig(llm_scoring_enabled=False)
     sup_off = InvestigationSupervisor(cfg_off)
@@ -4332,7 +4945,7 @@ async def test_loop_engineering() -> None:
 
     cfg_on = SupervisorConfig(llm_scoring_enabled=True)
     sup_on = InvestigationSupervisor(cfg_on)
-    with _mock.patch("app.core.grader.grade_answer", side_effect=RuntimeError("boom")):
+    with _mock.patch("app.core.quality.grader.grade_answer", side_effect=RuntimeError("boom")):
         verdict_failsoft = await sup_on.evaluate(
             final_answer="root cause: the pod was evicted.",
             tool_calls=[],
@@ -4343,7 +4956,7 @@ async def test_loop_engineering() -> None:
           verdict_failsoft.action == SupervisorAction.PASS)
 
     # ── Loop 2: grader returns None (no evidence) — heuristic verdict used ──
-    with _mock.patch("app.core.grader.grade_answer", return_value=None):
+    with _mock.patch("app.core.quality.grader.grade_answer", return_value=None):
         verdict_none = await sup_on.evaluate(
             final_answer="root cause: the pod was evicted.",
             tool_calls=[],
@@ -4904,6 +5517,83 @@ async def test_phase4_supervised_autolearn() -> None:
         _cl.call_llm = _orig
 
 
+def test_bakeoff_aggregate() -> None:
+    """Engine bake-off aggregation: accuracy, p50/p95, recovery counts, head-to-
+    head, and the decision-rule verdict (native-wins / tie / native-worse)."""
+    from evals.accuracy import run_bakeoff as rb
+
+    def mkrows(engine, score, lat, tok, run=0, stop="completed", dfs=False):
+        return [{"id": "c1", "metric": m, "objective": True, "score": score,
+                 "latency_s": lat, "tool_calls_n": 3, "engine": engine, "_run_idx": run,
+                 "stop_reason": stop, "did_forced_synthesis": dfs, "truncated": False,
+                 "total_tokens": tok, "diagnostic": ""}
+                for m in ("tool_selection", "protocol", "final_answer", "grounding")]
+
+    # native strictly better accuracy + faster → adopt native
+    agg = rb.aggregate({"langgraph": mkrows("langgraph", 0.5, 3.0, 2000),
+                        "native": mkrows("native", 1.0, 1.5, 900)})
+    check("bakeoff lg acc 0.5", agg["engines"]["langgraph"]["objective_accuracy"] == 0.5)
+    check("bakeoff nv acc 1.0", agg["engines"]["native"]["objective_accuracy"] == 1.0)
+    check("bakeoff native wins h2h", agg["headtohead"]["candidate_wins"] == 4)
+    check("bakeoff verdict adopts native",
+          agg["verdict"]["recommendation"] == "native" and agg["verdict"]["adoptable"])
+
+    # accuracy tie, native faster → break toward baseline (langgraph)
+    agg2 = rb.aggregate({"langgraph": mkrows("langgraph", 1.0, 2.0, 1000),
+                         "native": mkrows("native", 1.0, 1.5, 900)})
+    check("bakeoff tie breaks to langgraph", agg2["verdict"]["recommendation"] == "langgraph")
+
+    # native regresses accuracy → keep langgraph, not adoptable
+    agg3 = rb.aggregate({"langgraph": mkrows("langgraph", 1.0, 2.0, 1000),
+                         "native": mkrows("native", 0.7, 1.0, 800)})
+    check("bakeoff native-worse keeps langgraph",
+          agg3["verdict"]["recommendation"] == "langgraph" and not agg3["verdict"]["adoptable"])
+
+    # p50/p95 across runs + recovery activation counting (forced synthesis)
+    lg4 = (mkrows("langgraph", 1.0, 2.0, 1000, run=0)
+           + mkrows("langgraph", 1.0, 4.0, 1000, run=1, dfs=True))
+    e = rb.aggregate({"langgraph": lg4})["engines"]["langgraph"]
+    check("bakeoff p50 across runs", e["latency_p50"] == 3.0, str(e["latency_p50"]))
+    check("bakeoff recovery counts forced-synthesis", e["recovery_activations"] == 1,
+          str(e["recovery_activations"]))
+    check("bakeoff dedupes perf to run_units", e["run_units"] == 2, str(e["run_units"]))
+
+
+async def test_bakeoff_engine_threading() -> None:
+    """run_trajectory threads the engine into run_agent_once and enriches rows
+    with the engine tag + result-contract metrics. DB-free (fakes LLM + loop)."""
+    import app.harness.engine as _eng
+    from evals.accuracy import run_trajectory as _rt
+
+    captured: dict = {}
+
+    async def _fake_run_agent_once(spec, llm, tools, query, **kw):
+        captured["engine"] = kw.get("engine")
+        captured["cfg_engine"] = getattr(spec, "agent_config", {}).get("engine")
+        return {"final_answer": "done", "messages": [], "stop_reason": "completed",
+                "total_tokens": 123, "input_tokens": 100, "output_tokens": 23,
+                "did_forced_synthesis": False, "truncated": False}
+
+    async def _fake_llm():
+        return object()
+
+    _orig_rao, _orig_llm = _eng.run_agent_once, _rt._build_agent_llm
+    _eng.run_agent_once = _fake_run_agent_once
+    _rt._build_agent_llm = _fake_llm
+    try:
+        rows, _n = await _rt._attempt({"id": "t1", "question": "q", "expected": {}}, "native")
+    finally:
+        _eng.run_agent_once = _orig_rao
+        _rt._build_agent_llm = _orig_llm
+
+    check("bakeoff threading: engine reached run_agent_once", captured.get("engine") == "native")
+    check("bakeoff threading: engine in agent_config", captured.get("cfg_engine") == "native")
+    r0 = rows[0]
+    check("bakeoff row tagged engine", r0.get("engine") == "native")
+    check("bakeoff row carries stop_reason", r0.get("stop_reason") == "completed")
+    check("bakeoff row carries total_tokens", r0.get("total_tokens") == 123)
+
+
 async def _main() -> int:
     print("=== Agent Harness self-test ===")
     test_import_order_no_cycles()
@@ -4917,6 +5607,8 @@ async def _main() -> int:
     await test_phase2_action_supervisor()
     await test_phase3_tiered_enforcement()
     await test_phase4_supervised_autolearn()
+    test_bakeoff_aggregate()
+    await test_bakeoff_engine_threading()
     await test_engine_native_dispatch()
     await test_turn_loop_happy_path()
     await test_turn_loop_tool_call_then_complete()
@@ -4925,12 +5617,20 @@ async def _main() -> int:
     await test_instrument_langgraph_result()
     await test_turn_loop_max_turns_forced_synthesis()
     await test_turn_loop_verify_pending_tracking()
+    await test_turn_loop_run_budget_status()
+    await test_turn_loop_deadline_hard_stop()
+    await test_turn_loop_tool_timeout()
     test_terminal_state_derivation()
+    test_completion_check()
+    await test_planning_evidence_gate()
+    await test_loop_report_payload()
+    test_token_calibration()
     test_compression_split_preserved_tail()
     test_compression_split_preserved_tail_empty()
     await test_compression_pipeline_delegates()
     await test_compression_metamemory_precheck()
     await test_metamemory_read_context_block_caps_milestones()
+    test_metamemory_is_seed_only()
     await test_turn_loop_reactive_compact_retry()
     await test_turn_loop_truncation_escalation_recovers()
     await test_turn_loop_truncation_ladder_exhausts()
@@ -4949,6 +5649,9 @@ async def _main() -> int:
     test_pinned_facts_budget()
     test_agent_spec()
     test_memory_capability_and_autolearn()
+    test_memory_typed_node_config()
+    await test_memory_recall_gating()
+    test_okf_knowledge_bundle()
     await test_autolearn_learn_flow()
     test_persona_and_supervisor_toggle()
     await test_supervisor_loop()
@@ -4978,8 +5681,8 @@ async def _main() -> int:
     test_session_answer_extraction()
     test_fact_extractor()
     test_memory_audit_logic()
-    test_seed_skill_library()
     await test_skill_tool_wiring()
+    await test_skill_utilization_eval()
     test_conversational_intent()
     test_cloudwatch_prescan_gate()
     await test_tool_assembler_degrade_not_abort()

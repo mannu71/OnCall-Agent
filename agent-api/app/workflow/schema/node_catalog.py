@@ -88,8 +88,13 @@ NODE_SCHEMAS: Dict[str, Dict[str, Any]] = {
     },
     "vector_memory": {
         "category": "Memory",
-        "label": "Vector Memory",
+        "label": "Memory",
         "params": [
+            {"name": "memoryTypes", "dialect_keys": ["memoryTypes", "memory_types"],
+             "required": False, "type": "list",
+             "options": ["semantic", "pinned", "kb", "session"],
+             "desc": "Memory tiers this agent uses (comma-joined). Blank/absent = "
+                     "all. Empty selection is rejected at save."},
             {"name": "collection", "dialect_keys": ["collection"], "required": False,
              "type": "string",
              "desc": "Optional repo/collection scope for recall (blank = global)."},

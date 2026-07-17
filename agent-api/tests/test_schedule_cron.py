@@ -4,9 +4,9 @@ Covers ``_days_to_cron_dow`` and ``_params_to_cron`` in
 ``app.api.v1.endpoints.workflows``.
 
 ``_params_to_cron`` reads the operator-configured GLOBAL timezone via
-``app.core.app_timezone.get_global_timezone_name`` (imported *inside* the
+``app.core.runtime.app_timezone.get_global_timezone_name`` (imported *inside* the
 function). To make local→UTC conversion deterministic we monkeypatch that name
-at ``app.core.app_timezone.get_global_timezone_name`` (the source module), which
+at ``app.core.runtime.app_timezone.get_global_timezone_name`` (the source module), which
 is where the function-local ``from ... import ...`` resolves it.
 """
 import pytest
@@ -39,7 +39,7 @@ def test_days_to_cron_dow(days, expected):
 def utc_tz(monkeypatch):
     """Force the global timezone to UTC so local time == UTC time."""
     monkeypatch.setattr(
-        "app.core.app_timezone.get_global_timezone_name",
+        "app.core.runtime.app_timezone.get_global_timezone_name",
         lambda: "UTC",
     )
 
@@ -78,7 +78,7 @@ def test_params_to_cron_uses_global_tz_for_conversion(monkeypatch):
     EST = UTC-5. A Daily schedule at 09:00 local therefore maps to 14:00 UTC.
     """
     monkeypatch.setattr(
-        "app.core.app_timezone.get_global_timezone_name",
+        "app.core.runtime.app_timezone.get_global_timezone_name",
         lambda: "America/New_York",
     )
     params = {"frequency": "Daily", "time": "09:00", "days": ""}

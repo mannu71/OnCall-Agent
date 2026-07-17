@@ -3,7 +3,7 @@ from fastapi import Depends, HTTPException, status
 
 from app.infrastructure.persistence import WorkflowRepository, ExecutionRepository
 from app.core.dependencies import get_workflow_repository, get_execution_repository
-from app.core.scheduler import workflow_scheduler
+from app.core.runtime.scheduler import workflow_scheduler
 
 
 # Repository dependencies

@@ -14,8 +14,8 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from app.core import privacy
-from app.core.model_metadata import window_size_for_model
-from app.core.redact import redact
+from app.core.llm.model_metadata import window_size_for_model
+from app.core.privacy.redact import redact
 from app.harness.context_builder import apply_synthesis_floor
 from app.workflow.strategies.react.learning import auto_learn
 from app.workflow.strategies.react.preflight import RunPlan
@@ -57,13 +57,12 @@ async def finalize(
     llm = plan.llm
     spec = plan.spec
     code_analyzer_config = plan.code_analyzer_config
-    # Skills to surface on the UI badge: RAG-selected names (legacy fallback
-    # mode) plus skills actually invoked this run — the model's ``skill`` tool
-    # and any user /slash-command (``plan.invoked_skills`` was mutated live by
-    # the skill tool's sink). Deduped, order-preserving.
-    selected_skills = list(
-        dict.fromkeys((plan.selected_skills or []) + (plan.invoked_skills or []))
-    )
+    # Skills to surface on the UI badge: the skills actually invoked this run —
+    # the model's ``skill`` tool and any user /slash-command
+    # (``plan.invoked_skills`` was mutated live by the skill tool's sink). A
+    # ``search_skills`` hit is not an invocation and never lands here. Deduped,
+    # order-preserving; the metadata key stays ``selected_skills`` (UI contract).
+    selected_skills = list(dict.fromkeys(plan.invoked_skills or []))
     recall_hits = plan.recall_hits
 
     # Synthesis-as-floor: if the agent's own answer is empty/refusal/
@@ -76,6 +75,35 @@ async def finalize(
         execution_id=execution_id,
     )
 
+    # Terminal state (app.harness.terminal_state): "was this run actually a
+    # success" — computed HERE (before auto_learn) so learning can refuse to
+    # persist findings from a run that didn't cleanly succeed. Also reused for
+    # the return payload below. Reads the planning-tool todo list for the
+    # verified-completion signal. Best-effort; a derivation failure must never
+    # block the result.
+    _todos = []
+    _completion = {}
+    terminal_state = None
+    try:
+        from app.harness import planning_tools as _pl
+        _todos = await _pl.get_todos(execution_id)
+    except Exception:  # noqa: BLE001
+        _todos = []
+    try:
+        from app.harness.completion_check import check_completion
+        _completion = check_completion(_todos)
+    except Exception:  # noqa: BLE001
+        _completion = {}
+    try:
+        from app.core.quality.intent import is_conversational
+        from app.harness.terminal_state import terminal_state_for_result
+        terminal_state = terminal_state_for_result(
+            result, is_conversational=is_conversational(user_query),
+            plan_incomplete=bool(_completion.get("plan_incomplete")),
+        )
+    except Exception as _ts_err:  # noqa: BLE001
+        logger_instance.debug("ReactStrategy: terminal_state derivation skipped (%s)", _ts_err)
+
     # Post-run learning is OPT-IN per workflow (agent node `autoLearn`).
     # Off by default so a run never writes to skills/memory unless the
     # workflow asked for it. ``spec.auto_learn`` already parsed the toggle
@@ -87,6 +115,7 @@ async def finalize(
                 logger_instance, code_analyzer_config=code_analyzer_config,
                 workflow_name=workflow.get("name") or workflow.get("id") or "",
                 memory_enabled=spec.memory,
+                terminal_state=terminal_state,
             )
         except Exception as _learn_call_err:
             logger_instance.warning(
@@ -203,12 +232,11 @@ async def finalize(
         structured_output = _rehydrate_structured(structured_output, execution_id)
     privacy.drop_vault(execution_id)
 
-    # Deep-agent session scratch (todos + virtual FS). Capture the final
-    # plan for the UI, then drop both stores so nothing outlives the run.
-    _todos = []
+    # Deep-agent session scratch (todos + virtual FS). ``_todos`` was already
+    # captured above (for the terminal-state completion signal); just drop the
+    # store now so nothing outlives the run.
     try:
         from app.harness import planning_tools as _pl
-        _todos = await _pl.get_todos(execution_id)
         await _pl.drop_session(execution_id)
     except Exception:  # noqa: BLE001
         pass
@@ -240,19 +268,7 @@ async def finalize(
         if _context_window_size else 0
     )
 
-    # Terminal state (app.harness.terminal_state): "was this run actually a
-    # success" — never trust a self-reported answer alone. Best-effort; a
-    # derivation failure must never block the result from returning.
-    terminal_state = None
-    try:
-        from app.core.intent import is_conversational
-        from app.harness.terminal_state import terminal_state_for_result
-        terminal_state = terminal_state_for_result(
-            result, is_conversational=is_conversational(user_query),
-        )
-    except Exception as _ts_err:  # noqa: BLE001
-        logger_instance.debug("ReactStrategy: terminal_state derivation skipped (%s)", _ts_err)
-
+    # terminal_state was derived above (before auto_learn, which consumes it).
     return {
         "type": "react",
         "user_query": user_query,

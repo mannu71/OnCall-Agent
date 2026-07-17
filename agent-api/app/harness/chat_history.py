@@ -119,7 +119,7 @@ def repair_tool_pairing(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def estimate_entry_tokens(entries: List[Dict[str, Any]]) -> int:
     """Rough token estimate for trajectory-shaped dicts (chars/4 — consistent
-    with ``app.core.memory.compaction._msg_token_estimate``)."""
+    with ``app.core.context.compaction._msg_token_estimate``)."""
     total = 0
     for entry in entries:
         total += len(str(entry.get("content") or "")) // 4

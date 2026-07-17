@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from app.config import settings
-from app.core.logging_filter import RedactingFilter
+from app.core.observability.logging_filter import RedactingFilter
 
 
 class JSONFormatter(logging.Formatter):

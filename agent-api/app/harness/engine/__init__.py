@@ -10,6 +10,7 @@ directly — that keeps engine selection in one place.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +21,46 @@ logger = logging.getLogger(__name__)
 ENGINE_LANGGRAPH = "langgraph"
 ENGINE_NATIVE = "native"
 _VALID_ENGINES = (ENGINE_LANGGRAPH, ENGINE_NATIVE)
+
+
+def _resolve_run_deadline(agent_config: Optional[Dict[str, Any]]) -> float:
+    """Per-workflow override (agent_config / params mirror) over the global
+    ``agent_run_deadline_seconds``. Absent/invalid → global default. Mirrors
+    TurnLoop._resolve_budget_knob so both engines read the same knob."""
+    cfg = agent_config or {}
+    params = cfg.get("params") if isinstance(cfg.get("params"), dict) else {}
+    raw = cfg.get("run_deadline_seconds")
+    if raw is None:
+        raw = params.get("run_deadline_seconds")
+    if raw is None:
+        raw = getattr(settings, "agent_run_deadline_seconds", 0.0)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _recover_partial_from_checkpointer(
+    checkpointer: Any, thread_id: Optional[str],
+) -> Dict[str, Any]:
+    """Best-effort read-back of a timed-out LangGraph run's partial state by
+    thread_id (same mechanism the subagent timeout path uses). Returns the last
+    AI answer + tool-call count, or empties when nothing is recoverable."""
+    if checkpointer is None or not thread_id:
+        return {"answer": "", "n_calls": 0}
+    try:
+        snap = await checkpointer.aget_tuple({"configurable": {"thread_id": thread_id}})
+        msgs = ((snap.checkpoint or {}).get("channel_values", {}) or {}).get("messages", []) if snap else []
+        answer = ""
+        for m in reversed(msgs):
+            if getattr(m, "type", "") == "ai" and getattr(m, "content", ""):
+                c = m.content
+                answer = c if isinstance(c, str) else str(c)
+                break
+        n_calls = sum(1 for m in msgs if getattr(m, "type", "") == "tool")
+        return {"answer": answer, "n_calls": n_calls}
+    except Exception:  # noqa: BLE001 — recovery must never mask the timeout
+        return {"answer": "", "n_calls": 0}
 
 
 def resolve_engine(
@@ -36,10 +77,11 @@ def resolve_engine(
     ``params`` mirror, same coercion pattern as ``supervisor_enabled``), then
     the global ``AGENT_ENGINE`` setting.
 
-    HITL runs are clamped to ``langgraph`` until the native engine grows its
-    own pause/resume + durable persistence story — resuming a HITL-paused run
-    currently relies on the LangGraph Postgres checkpointer, which the native
-    loop does not yet have.
+    HITL runs are clamped to ``langgraph`` by design: durable pause/resume and
+    partial-state recovery ride on the LangGraph Postgres checkpointer, and the
+    decision is to keep LangGraph as the sole durable/HITL path rather than port
+    a second checkpointer into the native loop (the native loop stays the fast,
+    stateless engine). So a HITL-enabled run always resolves to LangGraph.
     """
     agent_config = agent_config or {}
     ctx = context or {}
@@ -134,7 +176,7 @@ async def run_agent_once(
         )
         _durability = "async"
 
-    return await execute_agent(
+    _run = execute_agent(
         agent,
         user_query,
         logger_instance or logger,
@@ -148,6 +190,42 @@ async def run_agent_once(
         model_name=model_name,
         durability=_durability,
     )
+
+    # Engine-level wall-clock deadline (Phase 1). The native loop enforces this
+    # per-turn with a graceful synthesis nudge; the LangGraph path can only be
+    # bounded coarsely from the outside — a hard wait_for that returns an honest
+    # partial envelope (recovered from the checkpointer when possible) instead of
+    # letting a single run overrun unboundedly. 0 disables.
+    _deadline = _resolve_run_deadline(agent_config)
+    if _deadline <= 0:
+        return await _run
+    try:
+        return await asyncio.wait_for(_run, timeout=_deadline)
+    except asyncio.TimeoutError:
+        (logger_instance or logger).warning(
+            "run_agent_once: LangGraph run exceeded the %.0fs wall-clock deadline "
+            "— returning partial (execution_id=%s)", _deadline, execution_id,
+        )
+        _partial = await _recover_partial_from_checkpointer(checkpointer, thread_id)
+        _prefix = (
+            "Investigation was stopped at its time budget before it could "
+            "complete. Partial findings so far:\n\n"
+        )
+        _answer = (_prefix + _partial["answer"]).strip() if _partial["answer"] else (
+            _prefix + "(no partial answer was recovered)"
+        ).strip()
+        return {
+            "final_answer": _answer,
+            "messages": [],
+            "tool_calls": [],
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "stop_reason": "deadline",
+            "truncated": True,
+        }
 
 
 async def _run_native(

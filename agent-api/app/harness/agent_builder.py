@@ -143,43 +143,37 @@ def compose_system_prompt(
         "- When you reach a useful conclusion or resolution worth reusing, call save_playbook to "
         "record it so future runs can benefit from it.",
     ]
-    # Legacy RAG-injection steering — only when that fallback is active; the
-    # skill-tool path (below) supersedes it. Gated on a stable flag so the
-    # cache prefix stays deterministic per run (re-baseline evals on change).
-    try:
-        from app.config import settings as _skill_settings
-        _rag_on = bool(getattr(_skill_settings, "skill_rag_selection_enabled", False))
-    except Exception:  # noqa: BLE001
-        _rag_on = False
-    if _rag_on:
-        _tool_bullets.append(
-            "- If the memory-context block at the start of the query lists 'Suggested skills' that "
-            "match the current issue, follow that skill's runbook steps before improvising manual "
-            "tool calls — this reuses a proven procedure and is faster."
-        )
     system_parts.append("\n".join(_tool_bullets))
-
-    # § Skills — two-stage disclosure. Static (no skill names), so cache-safe.
-    if has_skill_tool:
-        system_parts.append(
-            "# Skills\n"
-            "- Some tasks have a matching skill — a proven, reusable runbook. The user turn "
-            "lists the available skills under 'Available skills' (name + when to use).\n"
-            "- When a skill matches the request, calling the `skill` tool to load it BEFORE any "
-            "other work is a blocking requirement — then follow its steps, using your other tools "
-            "as it directs. Prefer the skill over improvising your own procedure.\n"
-            "- Never mention a skill without invoking it. A user message starting with "
-            "'/<skill-name>' is a request to invoke that skill."
-        )
 
     # ── Capability sections (registry-driven; stable order) ──────────────
     # Each active capability contributes its system-prompt section in registry
     # order (database → cloudwatch → code_analyzer → any profile extras). The
-    # text lives in app.harness.capabilities; this loop reproduces the previous
-    # inline ordering exactly so the Bedrock cache prefix is unchanged.
+    # text lives in app.harness.capabilities.
     for _cap in active_caps:
         if _cap.section:
             system_parts.append(_cap.section)
+
+    # § Skills — two-stage disclosure. Static (no skill names), so cache-safe.
+    # Deliberately placed AFTER the capability sections: those name a specific
+    # tool for a specific job ("prefer codegraph__find_symbol for a known
+    # symbol"), which directly competes with "load the matching skill first".
+    # When Skills came first the capability text won and the agent skipped the
+    # runbook for the obvious one-shot tool — so the blocking requirement gets
+    # the last word. (Static reorder: the cache prefix stays deterministic.)
+    if has_skill_tool:
+        system_parts.append(
+            "# Skills\n"
+            "- Some tasks have a matching skill — a proven, reusable runbook. The user turn "
+            "carries a 'Skill map': the names of the skills you can load, and nothing more.\n"
+            "- Call `search_skills` with what you are trying to do to see what those names "
+            "mean and which fits; when a map name is obviously the match, load it directly.\n"
+            "- When a skill matches the request, calling the `skill` tool to load it BEFORE any "
+            "other work is a blocking requirement — then follow its steps, using your other tools "
+            "as it directs. This OVERRIDES any tool preference above: if a skill matches, load it "
+            "first even when a capability section names a tool that would answer directly.\n"
+            "- Never mention a skill without invoking it. A user message starting with "
+            "'/<skill-name>' is a request to invoke that skill."
+        )
 
     # ── Dispatch-time governance (3.3) — AGENT_POLICY.md rules sliced to
     # this run's bound tools; empty (no-op) when no rule matches or the

@@ -14,7 +14,7 @@ import logging
 import sys
 from typing import Any, Dict, List, Optional, Protocol
 
-from app.core.error_classifier import ClassifiedError
+from app.core.llm.error_classifier import ClassifiedError
 
 logger = logging.getLogger(__name__)
 
@@ -542,7 +542,7 @@ class TokenUsageCallback:
                 "cache_creation_tokens": self.cache_creation_tokens,
             }
             if self.model_name:
-                from app.core.model_metadata import window_size_for_model
+                from app.core.llm.model_metadata import window_size_for_model
                 window = window_size_for_model(self.model_name)
                 used = self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
                 totals["context_window_size"] = window

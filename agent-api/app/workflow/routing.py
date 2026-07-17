@@ -50,7 +50,7 @@ async def execute_legacy_workflow(
     manual: bool = False,
 ) -> Optional[WorkflowExecution]:
     """Execute a legacy task-based workflow via the scheduler / TaskExecutor."""
-    from app.core.scheduler import workflow_scheduler
+    from app.core.runtime.scheduler import workflow_scheduler
 
     logger.info(
         "Routing legacy workflow '%s' to TaskExecutor via scheduler", workflow_name

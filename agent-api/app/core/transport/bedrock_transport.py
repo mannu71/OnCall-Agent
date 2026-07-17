@@ -11,7 +11,7 @@ import logging
 import threading
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from app.core.thread_pools import run_in_aws_pool
+from app.core.concurrency.thread_pools import run_in_aws_pool
 from app.core.transport.provider import (
     ProviderTransport,
     TransportMessage,

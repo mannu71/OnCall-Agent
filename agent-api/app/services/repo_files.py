@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # on large repos. Within an agent run the file tree is stable, so cache the
 # sorted path list for 5 minutes per repo. Invalidated implicitly on TTL expiry
 # or explicitly via clear("paths:<repo>") after an index run.
-from app.core.ttl_cache import TTLCache as _TTLCache
+from app.core.runtime.ttl_cache import TTLCache as _TTLCache
 _file_paths_cache = _TTLCache(ttl_seconds=300.0, maxsize=32)
 
 # ---------------------------------------------------------------------------

@@ -94,7 +94,7 @@ def prepare_action_space(
         )
     elif _is_anthropic:
         from langchain_core.messages import SystemMessage
-        from app.core.prompt_caching import split_system_prompt
+        from app.core.llm.prompt_caching import split_system_prompt
         head, tail = split_system_prompt(system_prompt)
         blocks: list = [{"type": "text", "text": head, "cache_control": {"type": "ephemeral"}}]
         if tail:
@@ -205,7 +205,7 @@ def _finish_build_agent(
             return {}
         out: Any = msgs
         try:
-            from app.core.memory.compaction_manager import ContextCompactionManager
+            from app.core.context.compaction_manager import ContextCompactionManager
             from app.core.transport import get_transport
             mgr = ContextCompactionManager(
                 transport=get_transport(),
@@ -233,7 +233,7 @@ def _finish_build_agent(
             pass
         if _is_anthropic:
             try:
-                from app.core.prompt_caching import apply_anthropic_cache_control
+                from app.core.llm.prompt_caching import apply_anthropic_cache_control
                 out = apply_anthropic_cache_control(out, cache_ttl="5m")
             except Exception:  # noqa: BLE001 — caching must never break a run
                 pass

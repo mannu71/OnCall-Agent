@@ -15,13 +15,13 @@ from app.models.workflow import (
 )
 from app.infrastructure.persistence import WorkflowRepository, ExecutionRepository
 from app.api.deps import get_workflow_repo, get_execution_repo, verify_workflow_exists
-from app.core.scheduler import workflow_scheduler
+from app.core.runtime.scheduler import workflow_scheduler
 from app.services.visual_workflow_executor import visual_executor
 from app.workflow.routing import execute_workflow as run_workflow, is_workflow_running, is_visual_workflow
 from app.services.workflow_output_extractor import extract_workflow_output
 from app.core.exceptions import NotFoundException
 from app.config import settings
-from app.core.sse import SSE_HEADERS
+from app.core.streaming.sse import SSE_HEADERS
 from app.workflow.event_adapter import workflow_name_event_stream
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
@@ -174,7 +174,7 @@ def _params_to_cron(params: Dict[str, Any]) -> Optional[str]:
     ``params.days`` ("Mon,Tue,…"). The timezone is the operator-configured GLOBAL
     timezone (Settings page) — the node no longer carries its own tz.
     """
-    from app.core.app_timezone import get_global_timezone_name
+    from app.core.runtime.app_timezone import get_global_timezone_name
 
     frequency = (params.get('frequency') or 'Daily').strip()
     time_str = params.get('time') or '09:00'
@@ -816,7 +816,7 @@ async def execute_workflow(
         # replay grows past budget, so a long conversation doesn't keep
         # resending every prior full report every turn.
         try:
-            from app.core.memory.compaction_manager import compact_chat_session_if_needed
+            from app.core.context.compaction_manager import compact_chat_session_if_needed
             await compact_chat_session_if_needed(session_id)
         except Exception as _cc_exc:  # noqa: BLE001 — never fail a run over compaction
             logger.warning("chat session compaction skipped (%s)", _cc_exc)

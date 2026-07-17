@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from app.core.redact import redact
+from app.core.privacy.redact import redact
 from app.harness.helpers import collect_failed_tools, estimate_confidence
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,7 @@ async def auto_learn(
     code_analyzer_config: Optional[Dict[str, Any]] = None,
     workflow_name: str = "",
     memory_enabled: bool = False,
+    terminal_state: Optional[str] = None,
 ) -> None:
     """Persist what this execution found to the knowledge base.
 
@@ -30,11 +31,30 @@ async def auto_learn(
         • trajectory JSONL
         • skill distillation via LLM when enough tool calls exist
 
-    Any failure in either phase is caught and logged as a warning —
-    it must never propagate to the caller.
+    Durable-write gate: the KB/semantic writes (Phases 2, 4, 4b) are skipped
+    when the run did not cleanly succeed — either it cited ungrounded IDs
+    (likely fabrication, both engines set ``result["ungrounded_ids"]``) or its
+    terminal_state is anything other than ``success`` (exhausted/blocked/
+    unverified/stalled). Learning from a shaky run poisons future recall, so a
+    non-success run is recorded (Phase 1) but not learned from.
+
+    Any failure in any phase is caught and logged as a warning — it must never
+    propagate to the caller.
     """
     final_answer = result.get("final_answer") or ""
     execution_end: Optional["datetime"] = None
+
+    # Durable-write gate (see docstring). None terminal_state = caller didn't
+    # derive it → don't block on that signal alone (back-compat).
+    _ungrounded = result.get("ungrounded_ids") or []
+    _state_ok = terminal_state in (None, "success")
+    _learn_ok = _state_ok and not _ungrounded
+    if not _learn_ok:
+        logger_instance.info(
+            "ReactStrategy: durable learning skipped — terminal_state=%s ungrounded_ids=%d "
+            "(recording analysis only, not learning from this run)",
+            terminal_state, len(_ungrounded), extra={"execution_id": execution_id},
+        )
 
     # ── Phase 1: lightweight record_analysis ─────────────────────────
     try:
@@ -56,9 +76,15 @@ async def auto_learn(
             extra={"execution_id": execution_id},
         )
 
+    # Durable-write gate: a non-success/ungrounded run is recorded (Phase 1
+    # above) but never LEARNED from — skip the KB upsert, semantic capture and
+    # fact extraction so shaky findings don't poison future recall.
+    if not _learn_ok:
+        return
+
     # ── Phase 2: closed learning loop (AutoLearnService) ─────────────
     try:
-        from app.core.auto_learn import AutoLearnService, AutoLearnConfig
+        from app.core.improvement.auto_learn import AutoLearnService, AutoLearnConfig
         from app.core.database import AsyncSessionLocal
 
         _config = AutoLearnConfig()
@@ -88,11 +114,17 @@ async def auto_learn(
         # this to decide whether to auto-approve.
         _confidence = estimate_confidence(final_answer, result.get("tool_calls", []))
 
-        # Build the state dict AutoLearnService expects.
+        # Build the state dict AutoLearnService expects. ``root_cause`` is the
+        # trigger for IncidentKBSink (the OKF known-issue write); populate it from
+        # the run's finding so the sink actually fires — historically it was never
+        # set, so the KB write was dead. The whole learn pass is still gated on
+        # confidence (auto-approve threshold), so only confident, resolution-
+        # bearing runs produce a known-issue doc.
         _learn_state = {
             "execution_id": execution_id,
             "user_query": user_query,
             "final_answer": final_answer,
+            "root_cause": final_answer.strip(),
             "workflow_name": result.get("workflow_name") or workflow_name or "",
             "tool_calls": result.get("tool_calls", []),
             "confidence_score": _confidence,
@@ -166,6 +198,40 @@ async def auto_learn(
         logger_instance.warning(
             "ReactStrategy: semantic memory capture failed (non-fatal): %s",
             redact(str(_mem_err)),
+            extra={"execution_id": execution_id},
+        )
+
+    # ── Phase 4b: per-turn durable-fact extraction ──────────────────
+    # Opt-in (``memory_fact_extraction_enabled``) and gated on the semantic tier
+    # (``memory_enabled`` == spec.memory). Extracts a couple of short, durable
+    # facts from this turn and stores them in ``semantic_memory`` (deduped by the
+    # store's sha256 index). Previously this only ran through the removed
+    # MemoryManager provider stack, so the flag was dead — this is the live path.
+    try:
+        from app.config import settings
+        if (
+            getattr(settings, "memory_fact_extraction_enabled", False)
+            and memory_enabled
+            and final_answer.strip()
+        ):
+            from app.core.memory.fact_extractor import extract_and_store
+            from app.harness.context_builder import repos_from_code_analyzer
+
+            repos = repos_from_code_analyzer(code_analyzer_config)
+            n_stored = await extract_and_store(
+                user_query or "",
+                final_answer,
+                repo=(repos[0] if repos else None),
+            )
+            if n_stored:
+                logger_instance.info(
+                    "ReactStrategy: durable-fact extraction stored %d fact(s)",
+                    n_stored, extra={"execution_id": execution_id},
+                )
+    except Exception as _fact_err:
+        logger_instance.warning(
+            "ReactStrategy: durable-fact extraction failed (non-fatal): %s",
+            redact(str(_fact_err)),
             extra={"execution_id": execution_id},
         )
 

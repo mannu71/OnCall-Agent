@@ -1,7 +1,7 @@
 """Action Supervisor — pre-execution review of write-class actions.
 
 Distinct from the post-run *quality* supervisor
-(:mod:`app.harness.supervisor_loop` / :mod:`app.core.supervisor`), which scores a
+(:mod:`app.harness.supervisor_loop` / :mod:`app.core.quality.supervisor`), which scores a
 finished answer and can retry. The Action Supervisor here reviews each
 intercepted write-class action (file edits, code-gen, run_command, playbook/KB
 writes, MCP mutations, wiki publish) *before* it executes, via the shared

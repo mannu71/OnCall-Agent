@@ -70,20 +70,20 @@ def negative_controls() -> Tuple[int, int, List[str]]:
     forbidden_called = [["cloudwatch_correlate_logs"], ["cloudwatch_watch_logs"]]
     checks.append(("selection must-not-call<1.0", graders.grade_tool_selection(forbidden_called, corr_spec)[0] < 1.0))
     # alternation: a '|' pattern matches either alternative
-    alt_spec = {"first_any": ["crawler_find_symbol|crawler_investigate_alert"]}
+    alt_spec = {"first_any": ["codegraph__find_symbol|codegraph__search_graph"]}
     checks.append(("selection alternation==1.0",
-                   graders.grade_tool_selection([["crawler_investigate_alert"]], alt_spec)[0] == 1.0))
+                   graders.grade_tool_selection([["codegraph__search_graph"]], alt_spec)[0] == 1.0))
 
     # protocol: get_body must precede a citation; forbidden re-scan; vacuous pass.
-    proto_spec = {"requires_before": [["crawler_get_body", "edit_file"]],
+    proto_spec = {"requires_before": [["codegraph__get_code_snippet", "edit_file"]],
                   "forbidden": ["cloudwatch_watch_logs"]}
-    read_then_edit = [["crawler_find_symbol"], ["crawler_get_body"], ["edit_file"]]
+    read_then_edit = [["codegraph__find_symbol"], ["codegraph__get_code_snippet"], ["edit_file"]]
     checks.append(("protocol read-before-edit==1.0", graders.grade_protocol(read_then_edit, proto_spec)[0] == 1.0))
-    edit_no_read = [["crawler_find_symbol"], ["edit_file"]]
+    edit_no_read = [["codegraph__find_symbol"], ["edit_file"]]
     checks.append(("protocol edit-without-read<1.0", graders.grade_protocol(edit_no_read, proto_spec)[0] < 1.0))
-    vacuous = [["crawler_find_symbol"]]  # never edits → requires_before vacuously ok
+    vacuous = [["codegraph__find_symbol"]]  # never edits → requires_before vacuously ok
     checks.append(("protocol vacuous==1.0", graders.grade_protocol(vacuous, proto_spec)[0] == 1.0))
-    rescan = [["crawler_find_symbol"], ["cloudwatch_watch_logs"]]
+    rescan = [["codegraph__find_symbol"], ["cloudwatch_watch_logs"]]
     checks.append(("protocol forbidden<1.0", graders.grade_protocol(rescan, proto_spec)[0] < 1.0))
     checks.append(("protocol max_calls<1.0",
                    graders.grade_protocol([["a"], ["b"], ["c"]], {"max_calls": 2})[0] < 1.0))

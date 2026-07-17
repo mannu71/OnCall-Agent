@@ -682,7 +682,7 @@ async def gather_alt_credentials(resolved: Dict[str, Any]) -> list[Dict[str, Any
 
 def throttle_target_for(cfg: Dict[str, Any]):
     """Build the :class:`ThrottleTarget` identifying *cfg*'s routable endpoint."""
-    from app.core.model_throttle_tracker import ThrottleTarget
+    from app.core.llm.model_throttle_tracker import ThrottleTarget
     return ThrottleTarget(
         provider=(cfg.get("provider") or "").lower(),
         region=cfg.get("region") or "",
@@ -713,7 +713,7 @@ def resolve_llm_fallback_chain(
     Pure and synchronous (no DB / network) so it is trivially unit-testable; the
     caller gathers any *alt_credentials* and passes them in.
     """
-    from app.core import model_throttle_tracker as throttle
+    from app.core.llm import model_throttle_tracker as throttle
 
     if enabled is None:
         enabled = settings.routing_fallback_enabled

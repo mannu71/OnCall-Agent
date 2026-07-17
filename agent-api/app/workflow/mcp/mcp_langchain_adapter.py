@@ -16,7 +16,7 @@ import logging
 from typing import Any, Dict, List, Optional, Type
 
 from app.config import settings
-from app.core.compaction.compressor import compress_then_cap
+from app.core.context.tool_output import compress_then_cap
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field, create_model

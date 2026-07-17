@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Union
 from app.config import settings
 from app.core import privacy
 from app.core.privacy.tool_wrap import wrap_tools_with_pseudonymization
-from app.core.redact import redact
+from app.core.privacy.redact import redact
 from app.harness.context_builder import build_recall_query, seed_context_blocks
 from app.harness.spec import AgentSpec
 from app.harness.spec_factory import build_agent_spec, resolve_profile_fields
@@ -37,7 +37,7 @@ from app.workflow.strategies.react.workflow_config import (
     extract_code_analyzer_config,
     extract_subagents_config,
     extract_tools_config,
-    has_memory_node,
+    get_memory_config,
     resolve_default_tools_config,
     resolve_llm_config_for_workflow,
 )
@@ -80,12 +80,11 @@ class RunPlan:
     checkpointer: Any
     cw_synthesis: Any
     recall_hits: int
-    selected_skills: List[str]
     code_analyzer_config: Dict[str, Any]
     conversation_history: Optional[List[Dict[str, Any]]] = None
     # Skills actually invoked this run — via a user /slash-command (recorded at
     # build time) and/or the model's ``skill`` tool (appended live during the
-    # run through the tool's mutable sink). Deduped into ``selected_skills`` for
+    # run through the tool's mutable sink). Surfaced as ``selected_skills`` for
     # the UI badge by the finalizer.
     invoked_skills: List[str] = field(default_factory=list)
 
@@ -215,7 +214,7 @@ async def build_run_plan(
     # one-word "Hi"). Short-circuit with a single cheap, tool-less model
     # call against a tiny capability-aware prompt. Any failure falls through
     # to the full path so a real query is never dropped.
-    from app.core.intent import is_conversational
+    from app.core.quality.intent import is_conversational
     if is_conversational(user_query) and not _skill_slash_matched:
         try:
             from app.harness.conversational import conversational_reply
@@ -258,9 +257,15 @@ async def build_run_plan(
     # the UI's text-only ``history``. Fails open: any error or a non-chat
     # run leaves ``conversation_history`` None, and the caller (executor.py)
     # falls back to ``context.inputs.history`` exactly as today.
+    # Resolve the wired Memory node's config ONCE — the single switch for every
+    # memory tier this turn. No Memory node ⇒ disabled ⇒ every tier off.
+    memory_config = get_memory_config(workflow)
+
     _chat_session_id = (context.get("inputs") or {}).get("_chat_session_id")
     conversation_history: Optional[List[Dict[str, Any]]] = None
-    if _chat_session_id:
+    # Session-history replay is a memory tier: only rebuild prior turns when the
+    # Memory node selected ``session`` (strict gating).
+    if _chat_session_id and memory_config.has("session"):
         from app.harness.chat_history import rebuild_chat_history
         conversation_history = await rebuild_chat_history(
             _chat_session_id,
@@ -274,7 +279,7 @@ async def build_run_plan(
     if getattr(settings, "context_references_enabled", True) and "@" in (user_query or ""):
         try:
             import os as _os
-            from app.core.context_references import preprocess_context_references_async
+            from app.core.context.references import preprocess_context_references_async
             _ref_root = getattr(settings, "context_reference_root", "") or _os.getcwd()
             _ref_res = await preprocess_context_references_async(
                 user_query,
@@ -298,17 +303,18 @@ async def build_run_plan(
             )
 
     # Prepend a knowledge-base recall block (similar past issues / patterns) and
-    # the per-turn skill listing so the agent starts with institutional memory
-    # and knows which skills it can load. Skill scoping (``_allowed_skills``) was
+    # the per-turn skill map so the agent starts with institutional memory and
+    # knows which skills it can load. Skill scoping (``_allowed_skills``) was
     # resolved above alongside slash-command expansion.
     _has_history = bool(conversation_history or (context.get("inputs") or {}).get("history"))
-    augmented_query, recall_hits, selected_skills = await build_recall_query(
+    augmented_query, recall_hits = await build_recall_query(
         user_query=user_query,
         cloudwatch_config=cloudwatch_config,
         logger_instance=logger_instance,
         execution_id=execution_id,
         code_analyzer_config=code_analyzer_config,
-        memory_enabled=has_memory_node(workflow),
+        memory_enabled=memory_config.enabled,
+        memory_types=memory_config.types,
         allowed_skills=list(_allowed_skills) if _allowed_skills else None,
         has_history=_has_history,
     )
@@ -409,6 +415,21 @@ async def build_run_plan(
             "guessing.\n\n" + augmented_query
         )
 
+    # Anchor "now" so the agent resolves relative windows ("past 24h",
+    # "yesterday") from the real current time instead of hallucinating an
+    # absolute date (which produced out-of-retention CloudWatch queries). This is
+    # per-run data, so it belongs in the query — NEVER the cache-stable system
+    # prompt (see agent_builder.compose_system_prompt cache contract).
+    from datetime import datetime as _dt, timezone as _tz
+    _now = _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    augmented_query = (
+        f"[Context] The current date and time is {_now} (UTC). Resolve any "
+        "relative time window (e.g. 'past 24 hours', 'last week', 'yesterday') "
+        "from this — never guess dates. For log/metric queries, prefer a relative "
+        "window (e.g. hours_back) over absolute timestamps when the tool offers "
+        "one.\n\n" + augmented_query
+    )
+
     # Prepend any pre-computed analysis blocks the executor seeded
     # (CloudWatch synthesis, code analysis, anomaly↔code correlation).
     # cw_synthesis is surfaced as a guaranteed answer floor (used by the
@@ -429,20 +450,30 @@ async def build_run_plan(
 
     llm = build_llm(llm_config)
 
-    # Bind the model-invoked ``skill`` tool (stage two of skill disclosure).
-    # Added BEFORE add_extension_tools so subagent snapshots inherit it and
-    # pseudonymization wraps it; it is pinned in tool_disclosure so it is never
-    # deferred. The mutable ``_invoked_skills`` sink records which skills the
-    # model actually loads, for the post-run UI badge.
+    # Bind the model-invoked skill tools (stage two of skill disclosure): the
+    # turn's map carries names only, so ``search_skills`` resolves an intent to
+    # a name and ``skill`` loads that runbook. Added BEFORE add_extension_tools
+    # so subagent snapshots inherit them and pseudonymization wraps them; both
+    # are pinned in tool_disclosure so they are never deferred. The mutable
+    # ``_invoked_skills`` sink records which skills the model actually loads,
+    # for the post-run UI badge — searching isn't invoking, so only the ``skill``
+    # tool feeds it.
     if getattr(settings, "skill_tool_enabled", True):
         try:
-            from app.harness.skill_tools import build_skill_tool
-            tools = list(tools) + [build_skill_tool(
-                allowed_skills=_allowed_skills,
-                execution_id=execution_id,
-                logger_instance=logger_instance,
-                invoked_sink=_invoked_skills,
-            )]
+            from app.harness.skill_tools import build_skill_search_tool, build_skill_tool
+            tools = list(tools) + [
+                build_skill_search_tool(
+                    allowed_skills=_allowed_skills,
+                    execution_id=execution_id,
+                    logger_instance=logger_instance,
+                ),
+                build_skill_tool(
+                    allowed_skills=_allowed_skills,
+                    execution_id=execution_id,
+                    logger_instance=logger_instance,
+                    invoked_sink=_invoked_skills,
+                ),
+            ]
         except Exception as _skill_tool_err:  # noqa: BLE001 — never block a run
             logger_instance.warning(
                 "ReactStrategy: skill tool binding skipped (%s)",
@@ -474,6 +505,23 @@ async def build_run_plan(
         if _metamemory.is_active(bool(_mm_flags.get("filesystem"))):
             await _metamemory.sync_session_persistence_in(execution_id, _chat_session_id)
             await _metamemory.seed_if_absent(execution_id, user_query)
+            # Session-startup state read: on a follow-up chat turn, surface the
+            # plan/progress the prior turn left behind so the agent resumes from
+            # it instead of re-deriving from scratch. Skipped on the first turn
+            # (only the seed skeleton exists → is_seed_only) to avoid injecting
+            # empty state. Pseudonymized like the rest of the query so prior-turn
+            # PII stays behind the same placeholder boundary.
+            if _chat_session_id:
+                _resume_block = await _metamemory.read_context_block(execution_id)
+                if _resume_block and not _metamemory.is_seed_only(_resume_block):
+                    _resume_block = privacy.pseudonymize(_resume_block, execution_id)
+                    augmented_query = (
+                        "[Resumed investigation state — read before acting; keep "
+                        "/plan.txt and /milestones.txt updated as you work]\n"
+                        + _resume_block
+                        + "\n\n"
+                        + augmented_query
+                    )
     except Exception as _mm_err:  # noqa: BLE001 — metamemory must never break a run
         logger_instance.warning("ReactStrategy: metamemory seed skipped (%s)", _mm_err)
     # Pseudonymize coroutine-tool output before it re-enters the LLM (MCP
@@ -489,7 +537,12 @@ async def build_run_plan(
         has_cloudwatch=bool(cloudwatch_config),
         has_code_analyzer=bool(code_analyzer_config),
         session_id=execution_id,
-        has_memory=has_memory_node(workflow),
+        # ``spec.memory`` = the agent has a learnable SEMANTIC memory (drives the
+        # prompt affordance + post-run capture in the finalizer). Pinned/KB/session
+        # tiers inject as context independently and don't need this flag. For a
+        # back-compat node (all tiers) or no node this matches the old signal, so
+        # the cached system prompt is byte-identical for existing workflows.
+        has_memory=memory_config.has("semantic"),
         logger_instance=logger_instance,
     )
 
@@ -515,7 +568,6 @@ async def build_run_plan(
         checkpointer=checkpointer,
         cw_synthesis=cw_synthesis,
         recall_hits=recall_hits,
-        selected_skills=selected_skills,
         code_analyzer_config=code_analyzer_config,
         conversation_history=conversation_history,
         invoked_skills=_invoked_skills,

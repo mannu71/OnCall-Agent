@@ -60,7 +60,7 @@ def validate_spec(spec: AgentSpecConfig) -> List[str]:
 def _known_builtin_names() -> set:
     """Best-effort set of registered built-in tool names; empty when unavailable."""
     try:
-        from app.core.tool_registry import registry
+        from app.core.tools.tool_registry import registry
         names = set()
         for getter in ("list_names", "names", "all"):
             fn = getattr(registry, getter, None)

@@ -52,7 +52,7 @@ async def run_selftest_guard() -> Dict[str, Any]:
 async def _import_smoke_guard() -> Dict[str, Any]:
     """Minimal import-level smoke check when pytest is unavailable."""
     try:
-        from app.core.supervisor import InvestigationSupervisor, SupervisorConfig
+        from app.core.quality.supervisor import InvestigationSupervisor, SupervisorConfig
         from app.core.improvement.analyzer import compute_signals
 
         sup = InvestigationSupervisor(SupervisorConfig())

@@ -7,7 +7,7 @@ from collections import defaultdict
 
 from app.infrastructure.persistence import ExecutionRepository
 from app.config import settings
-from app.core.workflow_concurrency import workflow_semaphore
+from app.core.concurrency.workflow_concurrency import workflow_semaphore
 from app.services.execution_state import execution_state
 from app.services.mcp_client_manager import MCPClientManager
 from app.workflow.executor.events import ExecutionEvent
@@ -418,12 +418,12 @@ class VisualWorkflowExecutor:
             workflow: ReactFlow workflow dict (same schema as ``execute_workflow``).
             inputs:   Optional initial shared state injected before the first node.
             registry: NodeRegistry to use.  Defaults to ``default_registry``
-                      from ``app.engine``.
+                      from ``app.workflow.graph_engine``.
 
         Returns:
             The shared state dict after the graph terminates.
         """
-        from app.engine.crawler_engine import WorkflowGraph, default_registry
+        from app.workflow.graph_engine import WorkflowGraph, default_registry
 
         reg = registry or default_registry
         shared: Dict[str, Any] = {"inputs": inputs or {}, "workflow": workflow}

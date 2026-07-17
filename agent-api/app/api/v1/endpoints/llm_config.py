@@ -5,8 +5,8 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.infrastructure.persistence import llm_config_repository, model_key_repository
-from app.core.redact import redact
-from app.core.thread_pools import run_in_aws_pool
+from app.core.privacy.redact import redact
+from app.core.concurrency.thread_pools import run_in_aws_pool
 
 router = APIRouter(prefix="/llm-config", tags=["llm-config"])
 logger = logging.getLogger(__name__)

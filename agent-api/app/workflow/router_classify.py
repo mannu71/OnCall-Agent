@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from app.config import settings
-from app.core.model_router import NodeRole, explain, model_for
+from app.core.llm.model_router import NodeRole, explain, model_for
 from app.workflow.llm_config import find_llm_node_for_consumer, resolve_llm_config_for_node
 
 # NOTE: build_llm is imported lazily inside classify_route(), NOT here.

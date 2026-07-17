@@ -100,7 +100,7 @@ async def execute_nodes_bfs(
     ``VisualWorkflowExecutor._execute_node`` bound to the instance. It is
     invoked as ``await execute_node_fn(execution_id, node, execution_results)``.
     """
-    from app.core.parallel_flow import ParallelFlowConfig
+    from app.core.concurrency.parallel_flow import ParallelFlowConfig
 
     executed: set = set()
     execution_results: Dict[str, Any] = {}

@@ -2,7 +2,7 @@
 
 When a turn is purely conversational (a greeting, a thank-you, or a "what can you
 do / what tools are available" meta-question — see
-``app.core.intent.is_conversational``), it needs no logs, no code search, and no
+``app.core.quality.intent.is_conversational``), it needs no logs, no code search, and no
 DB. Routing it through the full agent build is wasteful: the model would still
 receive the full system prompt PLUS every bound tool schema (codegraph, DB-schema,
 vfs, planning, edit, delegate). That measured ~28K input tokens for a one-word "Hi".
@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from app.core import privacy
-from app.core.redact import redact
+from app.core.privacy.redact import redact
 
 
 def _capability_lines(

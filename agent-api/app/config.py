@@ -361,6 +361,40 @@ class Settings(BaseSettings):
     # that truncated half-thought returned as the final answer. 8192 leaves room
     # for reasoning + a tool call in one turn. Override via AGENT_MAX_OUTPUT_TOKENS.
     agent_max_output_tokens: int = Field(default=8192, validation_alias="AGENT_MAX_OUTPUT_TOKENS")
+    # ── Engine-level run budgets (native turn loop) ───────────────────────────
+    # A wall-clock deadline threaded INTO the loop itself, distinct from the
+    # outer supervisor_wall_clock_seconds (which is only checked BETWEEN agent
+    # turns, so a single slow turn or tool run can overshoot it). At ~90% of the
+    # deadline the loop gets one graceful "synthesize now" nudge (mirrors the
+    # max-turns forced-synthesis rung); at 100% it stops with a partial answer
+    # rather than being killed mid-thought. Defaults to 840s so it fires just
+    # before the 900s supervisor ceiling, converting that hard cliff into a
+    # graceful partial. Set to 0 to disable. Override via env.
+    agent_run_deadline_seconds: float = Field(
+        default=840.0, validation_alias="AGENT_RUN_DEADLINE_SECONDS"
+    )
+    # Per-run total-token ceiling (input+output across all turns). 0 = disabled
+    # (today's behavior). When >0 the loop gets the same graceful synthesis nudge
+    # at ~90% then stops with stop_reason=token_budget at 100%. Surfaces the
+    # otherwise-unreachable StopReason.TOKEN_BUDGET. Override via env.
+    agent_run_token_budget: int = Field(
+        default=0, validation_alias="AGENT_RUN_TOKEN_BUDGET"
+    )
+    # Per-tool-call wall-clock cap (seconds). 0 = disabled (today's behavior;
+    # a hanging tool is bounded only by the model/Bedrock read timeout). 240
+    # recommended — matches DELEGATION_CHILD_TIMEOUT_SECONDS. A timed-out tool
+    # returns an honest error ToolMessage to the model, never aborts the turn.
+    # Also clamped to the remaining run deadline when one is set. Override via env.
+    agent_tool_call_timeout_seconds: float = Field(
+        default=0.0, validation_alias="AGENT_TOOL_CALL_TIMEOUT_SECONDS"
+    )
+    # Learn a per-model correction factor for the chars/4 token heuristic from
+    # actual Bedrock usage (app.core.llm.token_calibration), so compaction thresholds
+    # track real token counts. Off by default — an exact no-op (factor 1.0) until
+    # enabled and an observation is recorded. Override via env.
+    token_estimate_calibration_enabled: bool = Field(
+        default=False, validation_alias="TOKEN_ESTIMATE_CALIBRATION_ENABLED"
+    )
     mcp_tool_output_max_chars: int = 8000
     # Universal safety-net ceiling for ANY single tool result that lacks its own
     # cap (db/edit/playbook StructuredTools). Larger than the per-family 8 KB
@@ -451,15 +485,20 @@ class Settings(BaseSettings):
     step_events_enabled: bool = Field(default=False, validation_alias="STEP_EVENTS_ENABLED")
     # Metamemory (app.harness.metamemory): seeds /plan.txt, /milestones.txt,
     # /context_summary.txt in the session VFS at run start and steers compaction
-    # to inject them instead of re-summarizing raw history. Off by default;
-    # requires AgentSpec.filesystem (a no-op otherwise — nowhere to seed files).
-    metamemory_enabled: bool = Field(default=False, validation_alias="METAMEMORY_ENABLED")
+    # to inject them instead of re-summarizing raw history. Also read at the
+    # start of a follow-up turn so a resumed investigation begins with prior
+    # plan/progress in view (preflight injects a resumed-state block). Default
+    # ON: still a full no-op unless AgentSpec.filesystem is set on the profile
+    # (nowhere to seed files otherwise), so existing non-filesystem workflows
+    # are byte-identical. Toggle in Settings → Feature flags.
+    metamemory_enabled: bool = Field(default=True, validation_alias="METAMEMORY_ENABLED")
     # Persist metamemory files across chat turns (migration 029's
     # execution_scratch_store, keyed "session:<chat_session_id>") instead of the
-    # per-run-only default. Off by default; requires scratch_store_backend to
-    # reach the same table set persistence for todos/offload scratch does.
+    # per-run-only default. Default ON but self-gating: a no-op unless
+    # scratch_store_backend == "postgres" (the durable table the cross-turn
+    # persistence relies on), so memory-backend deployments are unaffected.
     vfs_session_persistence_enabled: bool = Field(
-        default=False, validation_alias="VFS_SESSION_PERSISTENCE_ENABLED",
+        default=True, validation_alias="VFS_SESSION_PERSISTENCE_ENABLED",
     )
     guardrail_hard_stop: bool = False
 
@@ -603,12 +642,23 @@ class Settings(BaseSettings):
     agent_planning_enabled: bool = Field(
         default=True, validation_alias="AGENT_PLANNING_ENABLED"
     )
+    # Verified completion: when True, update_todo refuses to mark a plan item
+    # completed without cited evidence (a tool ref / file:line / evidence ID),
+    # and the finalizer flags a plan left with incomplete items as UNVERIFIED
+    # so a half-finished run can't self-report success. Off by default — only
+    # meaningful when the planning tools are in play (AgentSpec.planning).
+    todo_evidence_required: bool = Field(
+        default=False, validation_alias="TODO_EVIDENCE_REQUIRED"
+    )
 
-    # ── Skill disclosure (two-stage: listing + model-invoked tool) ───────────
-    # Primary skill mechanism. Every non-conversational turn gets a compact
-    # listing of available skills (name + description); the model loads a
-    # skill's full runbook on demand via the ``skill`` tool. A user message
-    # starting with ``/<skill-name>`` deterministically expands that skill.
+    # ── Skill + tool disclosure (two-stage: map + search/load tools) ─────────
+    # Stage one is a MAP — names only, near-zero per-turn cost: every
+    # non-conversational turn gets a ``# Skill map`` block naming the available
+    # skills, and a deferred MCP tool set is named in the ``search_tools``
+    # description. Stage two is the model's own lookup: ``search_skills`` /
+    # ``search_tools`` rank the map by intent, then ``skill`` loads the full
+    # runbook (or ``call_tool`` invokes the tool). A user message starting with
+    # ``/<skill-name>`` bypasses both stages and expands that skill directly.
     skill_tool_enabled: bool = Field(
         default=True, validation_alias="SKILL_TOOL_ENABLED"
     )
@@ -616,33 +666,39 @@ class Settings(BaseSettings):
     skill_slash_commands_enabled: bool = Field(
         default=True, validation_alias="SKILL_SLASH_COMMANDS_ENABLED"
     )
-    # Total char budget for the per-turn skill listing block (~1% of a typical
-    # context window). The listing shrinks entry descriptions to fit.
-    skill_listing_char_budget: int = Field(
-        default=8000, validation_alias="SKILL_LISTING_CHAR_BUDGET"
+    # Char budget for the per-turn skill map (names only). Over budget the map
+    # degrades to a count-only hint — search_skills still reaches every skill.
+    skill_map_char_budget: int = Field(
+        default=1500, validation_alias="SKILL_MAP_CHAR_BUDGET"
     )
-    # Per-entry char cap in the listing (one skill's name + description line).
-    skill_listing_entry_chars: int = Field(
-        default=250, validation_alias="SKILL_LISTING_ENTRY_CHARS"
+    # Default number of skills ``search_skills`` returns per query.
+    skill_search_k: int = Field(default=5, validation_alias="SKILL_SEARCH_K")
+    # Char budget for the tool map embedded in the ``search_tools`` description
+    # (deferred tool names). Over budget it truncates to "+K more".
+    tool_map_char_budget: int = Field(
+        default=2000, validation_alias="TOOL_MAP_CHAR_BUDGET"
     )
-    # Cap on the full runbook body injected when a skill is loaded (by the
-    # ``skill`` tool or by RAG fallback). Longer bodies are truncated.
+    # Cap on the full runbook body injected when a skill is loaded by the
+    # ``skill`` tool. Longer bodies are truncated.
     skill_body_inject_chars: int = Field(
         default=8000, validation_alias="SKILL_BODY_INJECT_CHARS"
     )
 
-    # ── RAG-selected skills (legacy fallback) ────────────────────────────────
-    # Auto-select and inject the single best-matching skill's full body per
-    # query (lexical overlap). Superseded by the skill-tool listing above; kept
-    # as a fallback and default OFF. If both are on, the listing wins.
-    skill_rag_selection_enabled: bool = Field(
-        default=False, validation_alias="SKILL_RAG_SELECTION_ENABLED"
+    # ── Knowledge bundle (OKF) + skill storage (file-based; no DB) ────────────
+    # Durable knowledge (known issues, log patterns, services, skills) lives as
+    # an Open Knowledge Format bundle: a portable directory of markdown files
+    # with YAML frontmatter. Auto-learn writes here (reviewable file diffs) and
+    # concepts are indexed into the ``kb`` memory bank for recall.
+    knowledge_dir: str = Field(default="data/knowledge", validation_alias="KNOWLEDGE_DIR")
+    knowledge_bundle_enabled: bool = Field(
+        default=True, validation_alias="KNOWLEDGE_BUNDLE_ENABLED"
     )
-    skill_rag_k: int = Field(default=2, validation_alias="SKILL_RAG_K")
-
-    # ── Skill storage (file-based; no DB) ────────────────────────────────────
-    # Skills are markdown SKILL.md files (SkillManager) under skills_dir.
-    skills_dir: str = Field(default="data/skills", validation_alias="SKILLS_DIR")
+    # Skills are markdown SKILL.md files (SkillManager) under skills_dir — now a
+    # sub-tree of the knowledge bundle so skills + KB share one portable bundle
+    # and can cross-link (a known-issue doc → its runbook skill).
+    skills_dir: str = Field(
+        default="data/knowledge/skills", validation_alias="SKILLS_DIR"
+    )
 
     # ── Delegation (multi-agent) ─────────────────────────────────────────────
     # Bounds for the orchestrator→specialist delegation layer.  All per-node /
@@ -942,6 +998,22 @@ class Settings(BaseSettings):
     # Scheduler settings
     scheduler_timezone: str = "UTC"
     max_concurrent_workflows: int = 5
+    # ── Cadenced report-only loops ────────────────────────────────────────────
+    # Optional webhook a scheduled (cron-fired) run POSTs a compact result
+    # report to (app.core.observability.notify.post_run_report). Empty = off (no report sent);
+    # any delivery failure is swallowed. The report-only "L1" loop pattern: the
+    # cron fires an investigation that REPORTS rather than acts.
+    loop_report_webhook_url: str = Field(
+        default="", validation_alias="LOOP_REPORT_WEBHOOK_URL"
+    )
+    # Carry a scheduled loop's own progress ledger across fires: each cron fire
+    # of workflow <name> resumes the metamemory ledger keyed "workflow:<name>"
+    # (reuses the Phase-2 session-persistence machinery). Off by default; also
+    # requires the metamemory + postgres-scratch prerequisites to have any
+    # effect. Toggle in Settings → Feature flags.
+    loop_state_continuity_enabled: bool = Field(
+        default=False, validation_alias="LOOP_STATE_CONTINUITY_ENABLED"
+    )
 
     @field_validator(
         "aws_ssl_verify",

@@ -27,10 +27,22 @@ async def _invoke_one(
     tool: Any,
     tool_name: str,
     args: Dict[str, Any],
+    timeout: Optional[float] = None,
 ) -> str:
     try:
-        result = await tool.ainvoke(args)
+        if timeout and timeout > 0:
+            result = await asyncio.wait_for(tool.ainvoke(args), timeout=timeout)
+        else:
+            result = await tool.ainvoke(args)
         return result if isinstance(result, str) else str(result)
+    except asyncio.TimeoutError:
+        # Honest error surfaced to the model (never raised) — the turn
+        # continues so the model can adapt (narrower query / different tool)
+        # rather than the whole run hanging on one slow tool.
+        return (
+            f"Error: tool '{tool_name}' timed out after {timeout:.0f}s and was "
+            f"cancelled. Try a narrower query or a different approach."
+        )
     except Exception as exc:  # noqa: BLE001 — surfaced to the model, not raised
         return f"Error: {exc}\n Please fix your mistakes."
 
@@ -67,6 +79,7 @@ async def execute_tool_calls(
     tool_call_count_before: int = 0,
     recorder: Any = None,
     step_index: int = 0,
+    tool_timeout: Optional[float] = None,
 ) -> ToolExecResult:
     """Run every ``tool_calls`` entry on ``ai_message`` concurrently.
 
@@ -77,7 +90,7 @@ async def execute_tool_calls(
     any steer notes drained at the tool boundary.
     """
     from langchain_core.messages import HumanMessage, ToolMessage
-    from app.core.tool_guardrails import (
+    from app.core.tools.tool_guardrails import (
         ToolCallGuardrailController,
         classify_tool_failure,
         append_toolguard_guidance,
@@ -137,7 +150,7 @@ async def execute_tool_calls(
         if tool is None:
             output_str = f"Error: tool '{tc_name}' is not available."
         else:
-            output_str = await _invoke_one(tool, tc_name, tc_args)
+            output_str = await _invoke_one(tool, tc_name, tc_args, timeout=tool_timeout)
         _latency_ms = (asyncio.get_event_loop().time() - _t0) * 1000.0
 
         is_failed, _reason = classify_tool_failure(tc_name, output_str)

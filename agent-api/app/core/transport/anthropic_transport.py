@@ -66,7 +66,7 @@ class AnthropicTransport(ProviderTransport):
         system: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> TransportResponse:
-        from app.core.prompt_caching import apply_cache_control
+        from app.core.llm.prompt_caching import apply_cache_control
 
         system_prompt = system or self._extract_system(messages)
         api_messages = self._build_messages(messages)
@@ -124,7 +124,7 @@ class AnthropicTransport(ProviderTransport):
         system: Optional[str] = None,
         on_usage: Optional[UsageCallback] = None,
     ) -> AsyncGenerator[str, None]:
-        from app.core.prompt_caching import apply_cache_control
+        from app.core.llm.prompt_caching import apply_cache_control
 
         system_prompt = system or self._extract_system(messages)
         api_messages  = self._build_messages(messages)

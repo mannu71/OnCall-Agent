@@ -161,6 +161,86 @@ def validate_workflow(workflow_dict: Dict[str, Any]) -> List[str]:
             if not _llm_node_has_model(node):
                 errors.append(f"LLM node '{label}' has no model selected.")
 
+    errors.extend(_validate_memory_wiring(workflow_dict))
+    return errors
+
+
+def _is_truthy(value: Any) -> bool:
+    """Coerce a dialect param (bool or "true"/"false"/"1" string) to bool."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
+def _node_label(node: Dict[str, Any]) -> str:
+    return (
+        get_node_param(node, "label")
+        or node.get("name")
+        or f"{node.get('type') or 'node'} {node.get('id', '?')}"
+    )
+
+
+def _validate_memory_wiring(workflow_dict: Dict[str, Any]) -> List[str]:
+    """Cross-node memory rules — the first connectivity-aware validation.
+
+    Enforces the "attach a Memory node and pick types" contract:
+      1. An agent with Auto-learn on MUST have a Memory node wired.
+      2. A wired Memory node must have at least one memory type selected
+         (an explicitly-emptied selection is rejected; an absent selection
+         defaults to all types and is fine, for backward compatibility).
+      3. Auto-learn writes to the semantic + KB tiers, so both must be selected
+         on the connected Memory node.
+    """
+    errors: List[str] = []
+    nodes = workflow_dict.get("nodes")
+    if not isinstance(nodes, list):
+        return errors
+
+    # Lazy import to avoid any import-time cycle (this module loads early).
+    try:
+        from app.workflow.strategies.react.workflow_config import (
+            get_memory_config,
+            _read_memory_types,
+        )
+    except Exception as exc:  # noqa: BLE001 — never block save on an import hiccup
+        logger.debug("validate_workflow: memory-config import failed (%s)", exc)
+        return errors
+
+    # Rule 2: every wired Memory node needs a non-empty type selection.
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("type") != "vector_memory":
+            continue
+        present, types = _read_memory_types(node)
+        if present and not types:
+            errors.append(
+                f"Memory node '{_node_label(node)}': select at least one memory "
+                "type (semantic, pinned, kb, or session)."
+            )
+
+    # Rules 1 & 3: agents with Auto-learn need a properly-typed Memory node.
+    agent_nodes = [
+        n for n in nodes
+        if isinstance(n, dict) and n.get("type") == "agent"
+        and _is_truthy(get_node_param(n, "autoLearn", "auto_learn"))
+    ]
+    if agent_nodes:
+        mem = get_memory_config(workflow_dict)
+        for agent in agent_nodes:
+            label = _node_label(agent)
+            if not mem.enabled:
+                errors.append(
+                    f"Agent '{label}' has Auto-learn enabled but no Memory node is "
+                    "connected — attach a Memory node and select memory types."
+                )
+                continue
+            missing = [t for t in ("semantic", "kb") if t not in mem.types]
+            if missing:
+                errors.append(
+                    f"Agent '{label}' has Auto-learn enabled, which writes to the "
+                    f"{' and '.join(missing)} memory tier(s) — enable "
+                    f"{' and '.join(missing)} on the connected Memory node."
+                )
+
     return errors
 
 

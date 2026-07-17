@@ -34,6 +34,7 @@ class StopReason(str, enum.Enum):
     PROMPT_TOO_LONG = "prompt_too_long"
     MAX_TURNS = "max_turns"
     TOKEN_BUDGET = "token_budget"
+    DEADLINE = "deadline"
     HITL_PAUSED = "hitl_paused"
 
 
@@ -103,6 +104,12 @@ class TurnLoopState:
     withheld_errors: List[Any] = field(default_factory=list)
     ledger: TokenLedger = field(default_factory=TokenLedger)
     truncated: bool = False
+    # Engine-level run budgets (Phase 1). ``deadline_monotonic`` is an absolute
+    # time.monotonic() deadline (None = no wall-clock budget); ``budget_nudged``
+    # gates the one-time graceful "synthesize now" nudge shared by both the
+    # wall-clock and token-budget rungs, so it fires at most once per run.
+    deadline_monotonic: Optional[float] = None
+    budget_nudged: bool = False
     # Environment-first verification (3.1): True from the turn an edit_file/
     # create_file call succeeds until run_verify is subsequently called (pass
     # or fail — being called at all clears "pending"). Only meaningful when

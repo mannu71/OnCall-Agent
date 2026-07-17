@@ -12,7 +12,7 @@ from app.infrastructure.persistence import ExecutionRepository
 from app.api.deps import get_execution_repo
 from app.services.workflow_output_extractor import extract_workflow_output
 from app.workflow.event_adapter import execution_event_stream
-from app.core.sse import SSE_HEADERS
+from app.core.streaming.sse import SSE_HEADERS
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/executions", tags=["executions"])

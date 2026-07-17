@@ -19,7 +19,7 @@ from botocore.config import Config as BotocoreConfig
 from botocore.exceptions import ClientError
 
 from app.config import settings
-from app.core.thread_pools import run_in_aws_pool
+from app.core.concurrency.thread_pools import run_in_aws_pool
 
 # Honour the same SSL-bypass env var used by watch_tools.
 if not settings.aws_ssl_verify:

@@ -722,8 +722,8 @@ async def analyze_cloudwatch_with_llm(
         # gets; redact() additionally strips secrets. Real identifiers stay in the
         # deterministic report appended to the output, so nothing is lost to the
         # engineer.
-        from app.core.redact import redact
-        from app.core.toon import encode_toon, TOON_LEGEND
+        from app.core.privacy.redact import redact
+        from app.core.llm.toon import encode_toon, TOON_LEGEND
         # Serialize the compact evidence as TOON (uniform arrays → header + rows,
         # keys written once) instead of pretty JSON — ~30–60% fewer tokens on the
         # error_patterns/anomalies/drilldown tables. redact() still strips secrets.

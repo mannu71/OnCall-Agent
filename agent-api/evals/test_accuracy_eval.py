@@ -26,9 +26,11 @@ def test_graders_bite():
 @pytest.mark.asyncio
 async def test_objective_accuracy():
     agg = await run_all()
-    crawler = agg["crawler"]["objective_accuracy"]
+    # runner.aggregate() emits "codegraph" (the Code Crawler backend was removed);
+    # the old "crawler" key was stale and raised KeyError before the gate ran.
+    codegraph = agg["codegraph"]["objective_accuracy"]
     cloud = agg["cloudwatch"]["objective_accuracy"]
-    assert crawler >= OBJECTIVE_THRESHOLD, f"CodeCrawler objective accuracy {crawler:.4f} < {OBJECTIVE_THRESHOLD}"
+    assert codegraph >= OBJECTIVE_THRESHOLD, f"codegraph objective accuracy {codegraph:.4f} < {OBJECTIVE_THRESHOLD}"
     assert cloud >= OBJECTIVE_THRESHOLD, f"CloudWatch objective accuracy {cloud:.4f} < {OBJECTIVE_THRESHOLD}"
 
     traj = agg.get("trajectory") or {}

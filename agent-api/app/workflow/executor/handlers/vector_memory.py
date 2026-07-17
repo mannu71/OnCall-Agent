@@ -34,6 +34,19 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
     params = node.get("params", {}) or {}
     data = node.get("data", {}) or {}
 
+    # This node emits the "Recalled Memory" (semantic) block. Honour the node's
+    # own memory-type selection: skip recall when the operator unticked
+    # ``semantic`` on this Memory node. Absent key ⇒ all tiers (back-compat).
+    from app.workflow.strategies.react.workflow_config import _read_memory_types
+    _present, _types = _read_memory_types(node)
+    if _present and "semantic" not in _types:
+        return {
+            "status": "success",
+            "memory_recall_type": "semantic",
+            "output": "",
+            "count": 0,
+        }
+
     # Resolve the query the agent will be asked (same source the agent node uses).
     user_query = (
         (context.get("inputs", {}) or {}).get("user_query")

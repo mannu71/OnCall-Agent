@@ -171,8 +171,16 @@ def build_playbook_tools() -> List[Any]:
             from app.config import settings
             if not getattr(settings, "pinned_facts_enabled", True):
                 return "pin_fact is disabled in this environment."
+            # A pinned fact is injected into EVERY future turn, so reject trivial
+            # or empty content outright — it would be permanent context noise.
+            _clean = (fact or "").strip()
+            if len(_clean) < 10:
+                return (
+                    "pin_fact rejected: a pinned fact must be a substantive, "
+                    "durable statement (too short/empty)."
+                )
             from app.services.semantic_memory import semantic_memory
-            row_id = await semantic_memory.pin_fact(fact, repo=repo)
+            row_id = await semantic_memory.pin_fact(_clean, repo=repo)
             if row_id is None:
                 return "pin_fact: nothing stored (empty fact)."
             scope = f"repo '{repo}'" if repo else "global"

@@ -539,7 +539,7 @@ def wrap_tools_with_output_cap(tools: List[Any], max_chars: int) -> List[Any]:
                 # Compress-then-cap through the shared helper. MCP wrappers are
                 # excluded above (no coroutine), so no tool is ever compressed
                 # twice. The cap is identical to the no-compression path.
-                from app.core.compaction.compressor import compress_then_cap
+                from app.core.context.tool_output import compress_then_cap
                 return await compress_then_cap(
                     out,
                     lambda t: _cap_text(t, max_chars, __name),
