@@ -406,6 +406,7 @@ function rowHeight(slot) {
   if (slot.kind === 'textarea')                                return TEXTAREA_H;
   if (slot.kind === 'select' || slot.kind === 'llm-select' ||
       slot.kind === 'db-select' || slot.kind === 'mcp-select' || slot.kind === 'repo-select' ||
+      slot.kind === 'memory-select' ||
       slot.kind === 'aws-profile-select') return SELECT_H;
   if (slot.kind === 'weekday-select')                          return WEEKDAY_H;
   if (slot.kind === 'file-select')                             return FIELD_H;
@@ -754,11 +755,14 @@ function SlotRow({ slot, value, gtz }) {
       </div>
     );
   }
-  if (slot.kind === 'llm-select' || slot.kind === 'db-select' || slot.kind === 'mcp-select') {
+  if (slot.kind === 'llm-select' || slot.kind === 'db-select' || slot.kind === 'mcp-select' ||
+      slot.kind === 'memory-select') {
     // Canvas card: show selected value(s) as plain text — actual picker is in properties panel
     const parts = value ? String(value).split(',').filter(Boolean) : [];
-    const noun = slot.kind === 'llm-select' ? 'models' : 'servers';
-    const display = parts.length === 0 ? '—'
+    const noun = slot.kind === 'llm-select' ? 'models'
+      : slot.kind === 'memory-select' ? 'types' : 'servers';
+    // A Memory node with no memoryTypes key yet means "all tiers" (back-compat).
+    const display = parts.length === 0 ? (slot.kind === 'memory-select' ? 'all types' : '—')
       : parts.length === 1 ? parts[0]
       : `${parts.length} ${noun}`;
     return (
@@ -2643,11 +2647,23 @@ function SkillsPicker({ value, onChange, skillCatalog }) {
 
 // Multi-select dropdown for db-select slots
 // Uses position:fixed so the dropdown escapes overflowY:auto panel clipping
-function MultiDbSelect({ value, options, onChange }) {
+function MultiDbSelect({ value, options, onChange, noun = 'servers', emptyText = 'No MCP servers configured' }) {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef(null);
   const dropRef    = useRef(null);
   const [dropPos, setDropPos] = useState({ top: 0, left: 0, width: 0 });
+
+  // Options may be plain strings or { value, label } objects (labelled selects
+  // like memory-types). Normalise to { value, label } and keep a value→label map.
+  const opts = useMemo(
+    () => (options || []).map(o => (typeof o === 'string' ? { value: o, label: o } : o)),
+    [options],
+  );
+  const labelOf = useMemo(() => {
+    const m = {};
+    opts.forEach(o => { m[o.value] = o.label; });
+    return m;
+  }, [opts]);
 
   const selected = useMemo(() => value ? value.split(',').filter(Boolean) : [], [value]);
 
@@ -2678,8 +2694,8 @@ function MultiDbSelect({ value, options, onChange }) {
   };
 
   const label = selected.length === 0 ? '— select —'
-    : selected.length === 1 ? selected[0]
-    : `${selected.length} servers selected`;
+    : selected.length === 1 ? (labelOf[selected[0]] || selected[0])
+    : `${selected.length} ${noun} selected`;
 
   return (
     <div>
@@ -2701,14 +2717,14 @@ function MultiDbSelect({ value, options, onChange }) {
                    zIndex: 9999, background: '#fff', border: '1px solid #e2e8f0', borderRadius: 8,
                    boxShadow: '0 8px 24px rgba(0,0,0,0.12)', overflow: 'hidden',
                    maxHeight: 260, overflowY: 'auto' }}>
-          {options.length === 0 ? (
+          {opts.length === 0 ? (
             <div style={{ padding: '10px 12px', fontSize: 12, color: '#94a3b8' }}>
-              No MCP servers configured
+              {emptyText}
             </div>
-          ) : options.map(opt => {
-            const checked = selected.includes(opt);
+          ) : opts.map(opt => {
+            const checked = selected.includes(opt.value);
             return (
-              <div key={opt} onClick={() => toggle(opt)}
+              <div key={opt.value} onClick={() => toggle(opt.value)}
                 style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '8px 12px',
                          cursor: 'pointer', fontSize: 12, fontWeight: 500,
                          color: checked ? '#0f172a' : '#334155',
@@ -2726,7 +2742,7 @@ function MultiDbSelect({ value, options, onChange }) {
                   )}
                 </span>
                 <Icon name="db" size={11} color={checked ? '#dc2626' : '#94a3b8'} />
-                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{opt}</span>
+                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{opt.label}</span>
               </div>
             );
           })}
@@ -2908,7 +2924,7 @@ function MultiRepoSelect({ value, onChange }) {
   );
 }
             function ParamRow({ k, label, v, slotKind, onChange, selectOptions, slotAccept, onFileChange,
-                    slotAction, allParams, nodes, updateMultipleParams, slotPlaceholder,
+                    slotAction, allParams, nodes, updateMultipleParams, slotPlaceholder, slotHint,
                     llmOptions, toolCatalog, profileCatalog, skillCatalog }) {
   const [customKeys, setCustomKeys] = React.useState(() => new Set());
   const isCode      = slotKind === 'textarea';
@@ -2916,7 +2932,7 @@ function MultiRepoSelect({ value, onChange }) {
   const isFilePick  = slotKind === 'file-select';
   // 'llm-select'/'mcp-select' are multi: selecting N items yields N output ports
   // that can each be wired to a different consumer.
-  const isMultiDb   = slotKind === 'db-select' || slotKind === 'llm-select' || slotKind === 'mcp-select';
+  const isMultiDb   = slotKind === 'db-select' || slotKind === 'llm-select' || slotKind === 'mcp-select' || slotKind === 'memory-select';
   const isRepoSel   = slotKind === 'repo-select';
   const isSelect    = slotKind === 'select';
   const isToggle    = slotKind === 'toggle';
@@ -3204,6 +3220,8 @@ function MultiRepoSelect({ value, onChange }) {
               onChange={val => onChange?.(k, val)} />
           : isMultiDb
           ? <MultiDbSelect value={String(v ?? '')} options={selectOptions || []}
+              noun={slotKind === 'llm-select' ? 'models' : slotKind === 'memory-select' ? 'types' : 'servers'}
+              emptyText={slotKind === 'memory-select' ? 'No memory types' : 'No MCP servers configured'}
               onChange={val => onChange?.(k, val)} />
           : isSelect && selectOptions
           ? <div style={{ position: 'relative' }}>
@@ -3226,6 +3244,11 @@ function MultiRepoSelect({ value, onChange }) {
               style={{ ...baseStyle, color: v ? '#0f172a' : '#94a3b8' }} />
         }
       </div>
+      {slotHint && (
+        <div style={{ marginTop: 5, fontSize: 10.5, lineHeight: 1.45, color: '#94a3b8' }}>
+          {slotHint}
+        </div>
+      )}
     </div>
   );
 }
@@ -3454,7 +3477,7 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpS
         <SHdr>{def.desc}</SHdr>
 
         {(() => {
-          const EDITABLE_KINDS = new Set(['field', 'select', 'segment', 'textarea', 'llm-select', 'db-select', 'mcp-select', 'repo-select', 'weekday-select', 'file-select', 'toggle', 'chips', 'routes-editor', 'subagents-editor', 'skills-picker', 'aws-profile-select']);
+          const EDITABLE_KINDS = new Set(['field', 'select', 'segment', 'textarea', 'llm-select', 'db-select', 'mcp-select', 'memory-select', 'repo-select', 'weekday-select', 'file-select', 'toggle', 'chips', 'routes-editor', 'subagents-editor', 'skills-picker', 'aws-profile-select']);
           const currentParams = node.params || {};
           const editableSlots = (def.slots || []).filter(s => {
             if (!EDITABLE_KINDS.has(s.kind)) return false;
@@ -3477,11 +3500,12 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpS
 
           const renderSlot = (slot) => {
             const selectOptions =
-              slot.kind === 'llm-select'  ? llmOptions :
-              slot.kind === 'db-select'   ? dbOptions  :
-              slot.kind === 'mcp-select'  ? mcpOptions :
-              slot.kind === 'select'      ? (slot.options || []) :
-              slot.kind === 'segment'     ? (slot.options || []) :
+              slot.kind === 'llm-select'    ? llmOptions :
+              slot.kind === 'db-select'     ? dbOptions  :
+              slot.kind === 'mcp-select'    ? mcpOptions :
+              slot.kind === 'memory-select' ? (slot.options || []) :
+              slot.kind === 'select'        ? (slot.options || []) :
+              slot.kind === 'segment'       ? (slot.options || []) :
               null;
             // For selects, fall back to the node default so pre-existing
             // workflows missing a param (e.g. writeMode) show the default
@@ -3500,6 +3524,7 @@ function NodeProperties({ node, onUpdateNode, onDelete, llms, dbServers, allMcpS
                 nodes={nodes}
                 updateMultipleParams={updateMultipleParams}
                 slotPlaceholder={slot.placeholder}
+                slotHint={slot.hint}
                 llmOptions={llmOptions}
                 toolCatalog={toolCatalog}
                 profileCatalog={profileCatalog}

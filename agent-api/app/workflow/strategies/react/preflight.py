@@ -23,7 +23,7 @@ from app.harness.spec_factory import build_agent_spec, resolve_profile_fields
 from app.harness.tool_assembler import (
     add_extension_tools,
     assemble_base_tools,
-    verify_backends_before_llm,
+    collect_backend_degradations,
 )
 from app.workflow.execution_port import ExecutionPort
 from app.harness.hitl import make_checkpointer
@@ -359,19 +359,17 @@ async def build_run_plan(
         llm_config=llm_config,
     )
 
-    # Hard credential/connection gate — runs BEFORE any LLM call. Directive:
-    # never invoke the model when a wired backend can't be verified. Unlike the
-    # graceful-degrade path in assemble_base_tools (which continues with whatever
-    # built), this aborts with a deterministic message so the model is never
-    # asked to work against — or narrate a failure of — an unverified backend
-    # (which is how an expired AWS session produced a hallucinated "refresh your
-    # creds" essay instead of a clean, cheap short-circuit). Reuses the
-    # _expired_creds_msg short-circuit envelope below.
+    # Pre-LLM credential probe — runs BEFORE any LLM call, but DEGRADES rather
+    # than aborts. Directive: the model always runs with the tools that ARE
+    # available and is told explicitly (via the [System notice] below) what is
+    # not, so it picks tools from the user's question instead of the whole turn
+    # short-circuiting on an unrelated backend (which is how an expired AWS
+    # session used to block a pure-database question). The only hard-abort left
+    # is assemble_base_tools' own _expired_creds_msg (model's-own-creds dead, or
+    # nothing built at all) — handled by the envelope below.
     if not _expired_creds_msg:
-        _expired_creds_msg = await verify_backends_before_llm(
+        _degraded = list(_degraded or []) + await collect_backend_degradations(
             wired_mcp_servers=wired_mcp_server_names(workflow),
-            cloudwatch_config=cloudwatch_config,
-            mcp_barrier_failed=_mcp_barrier_failed,
             execution_id=execution_id,
             logger_instance=logger_instance,
         )

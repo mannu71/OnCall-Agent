@@ -3505,6 +3505,62 @@ async def test_tool_assembler_degrade_not_abort() -> None:
           await _call(None) is False)
 
 
+async def test_collect_backend_degradations() -> None:
+    """collect_backend_degradations DEGRADES (returns notes), never aborts.
+
+    A wired AWS-matching MCP server whose downstream creds are confirmed expired
+    yields a degrade note — so the caller folds it into the turn's [System
+    notice] and the model still runs with the OTHER tools (this is what lets a
+    pure-database question answer even while CloudWatch creds are dead). A server
+    matching no verifier, valid creds, or no wired servers at all yield no note.
+    Hermetic: mocks the STS pool and the MCP config repo.
+    """
+    import unittest.mock as _mock
+    import logging as _logging
+    from botocore.exceptions import ClientError
+    from app.harness.tool_assembler import collect_backend_degradations
+
+    _quiet = _logging.getLogger("harness_selftest.collect_degradations")
+    _quiet.disabled = True
+
+    _expired_err = ClientError(
+        {"Error": {"Code": "ExpiredTokenException", "Message": "token expired"}},
+        "GetCallerIdentity",
+    )
+
+    async def _get_by_name(name):
+        return {"env": {"AWS_PROFILE": "cs-production"}}
+
+    # `from app.infrastructure.persistence import mcp_config_repository` resolves
+    # to a singleton INSTANCE (the package shadows the submodule name), so patch
+    # the method on that exact object — a dotted-string patch target would find
+    # the submodule instead.
+    from app.infrastructure.persistence import mcp_config_repository as _repo
+
+    async def _run(servers, side_effect=_expired_err):
+        with _mock.patch(
+            "app.core.concurrency.thread_pools.run_in_aws_pool", side_effect=side_effect,
+        ), _mock.patch.object(_repo, "get_by_name", side_effect=_get_by_name):
+            return await collect_backend_degradations(
+                wired_mcp_servers=servers, execution_id=None, logger_instance=_quiet,
+            )
+
+    notes = await _run(["cloudwatch-mcp"])
+    check("collect_degradations: expired AWS server yields exactly one note",
+          len(notes) == 1)
+    check("collect_degradations: note names the server",
+          "cloudwatch-mcp" in notes[0])
+    check("collect_degradations: note is degrade-phrased, not an abort",
+          "No answer was generated" not in notes[0] and "may fail this turn" in notes[0])
+
+    check("collect_degradations: non-AWS server yields no note (connection verifies it)",
+          await _run(["postgres-main"]) == [])
+    check("collect_degradations: no wired servers yields no note",
+          await _run([]) == [])
+    check("collect_degradations: valid AWS creds yield no note",
+          await _run(["aws-logs"], side_effect=None) == [])
+
+
 async def test_context_compaction_tiers() -> None:
     """Microcompact (cheap) is tried before the LLM-summary tier. DB-free."""
     from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
@@ -5686,6 +5742,7 @@ async def _main() -> int:
     test_conversational_intent()
     test_cloudwatch_prescan_gate()
     await test_tool_assembler_degrade_not_abort()
+    await test_collect_backend_degradations()
     # ── context compaction: microcompact tier before the LLM-summary tier ──
     await test_context_compaction_tiers()
     # ── per-chat-session compaction: role mapping + system-history replay ──

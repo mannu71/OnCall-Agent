@@ -150,13 +150,18 @@ _CLOUDWATCH_SECTION = (
 )
 
 _CODE_ANALYZER_SECTION = (
+    "Use these tools for questions about the SOURCE CODE — how it is structured, what a "
+    "symbol does, how services call each other, where a behavior is implemented. They read "
+    "code, not live data: for a question about current data, records, counts, or statuses, "
+    "query the connected database (or other data source) instead — code shows how the data "
+    "is produced, not what is in it.\n"
     "Code Crawler tools are available over the connected repositories, backed by the "
     "codegraph engine. Fetch only what each question needs — never read whole files or "
     "dump the codebase. Every codegraph tool takes project=\"<repo name>\"; pass the exact "
     "short repo name shown in the tool descriptions and in your initial code-analysis "
     "context.\n"
-    "GRAPH TOOLS FIRST: the repos are PRE-INDEXED, so prefer the sub-second, index-backed "
-    "graph tools for discovery — codegraph__search_graph(query, project) for structure, "
+    "WITHIN code analysis, PREFER GRAPH TOOLS: the repos are PRE-INDEXED, so prefer the "
+    "sub-second, index-backed graph tools for discovery — codegraph__search_graph(query, project) for structure, "
     "codegraph__find_symbol(name, project) for a known symbol, codegraph__search_semantic("
     "query, project) for a concept/description, codegraph__query_graph / codegraph__trace_path "
     "for relationships, and codegraph__get_code_snippet to read the exact lines. "

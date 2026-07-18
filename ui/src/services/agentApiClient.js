@@ -119,8 +119,10 @@ export function extractPrivacyRedactions(data) {
 }
 
 export function extractSelectedSkills(data) {
-    // `selected_skills`: names of markdown skills the agent auto-selected (RAG)
-    // for this query, surfaced as a badge so the selection is visible.
+    // `selected_skills`: names of the markdown skills the agent actually loaded
+    // (via its `skill` tool or a /slash-command) while answering this query,
+    // surfaced as a badge so the runbook it followed is visible. The key name
+    // predates the map/search disclosure flow; it is the stable API contract.
     if (!data || typeof data !== 'object') return [];
     if (Array.isArray(data.selected_skills)) return data.selected_skills;
     for (const c of _nodeContainers(data)) {

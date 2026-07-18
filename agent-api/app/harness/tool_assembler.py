@@ -168,50 +168,44 @@ _MCP_CRED_VERIFIERS: List[_McpCredVerifier] = [
 ]
 
 
-async def verify_backends_before_llm(
+async def collect_backend_degradations(
     *,
     wired_mcp_servers: List[str],
-    cloudwatch_config: Optional[Dict[str, Any]],
-    mcp_barrier_failed: List[str],
     execution_id: Optional[str],
     logger_instance: Any,
-) -> Optional[str]:
-    """Hard credential/connection gate that runs BEFORE any LLM call.
+) -> List[str]:
+    """Pre-LLM credential probe that DEGRADES (never aborts) on stale creds.
 
-    Returns a user-facing message (→ caller short-circuits, no model call) when a
-    wired backend can't be verified, else ``None``. Stricter than the
-    degrade-and-continue policy in :func:`assemble_base_tools`: the model must
-    never be invoked against — nor asked to narrate a failure of — an unverified
-    backend. Provider-agnostic:
+    Returns a list of agent-facing degrade notes for any wired backend whose
+    credentials are confirmed dead — the caller folds these into the turn's
+    ``[System notice]`` so the model knows what's unavailable and picks tools
+    accordingly. The model ALWAYS runs with the tools that ARE available; it is
+    told explicitly what is not, rather than the whole turn being short-circuited
+    (which is how an expired AWS session used to block a pure-database question).
 
-    1. **Connection** — ANY wired MCP server the barrier could not connect
-       short-circuits. Works for every server type with no special-casing.
-    2. **Credentials** — a successful connection IS the generic verification for
-       every provider whose connect authenticates. Only a provider whose
-       connection can succeed with stale downstream creds needs a deeper probe;
-       those register a :class:`_McpCredVerifier` (currently just AWS) that runs
-       against the *exact* identity the backend will use — a native
-       ``cloudwatch_tool`` node's profile/keys, or the server's own ``env``
-       (``AWS_PROFILE`` / keys), NOT the default chain (a different identity that
-       made the gate block a valid MCP server with a working ``AWS_PROFILE``).
-       A server matching no verifier passes on connection alone.
+    Scope note — this handles only the one case the generic machinery misses: a
+    provider whose MCP CONNECTION can succeed while its downstream creds are stale
+    (AWS STS: token valid at the handshake, then 401s on the first API call), so
+    the failure would otherwise surface mid-run. Such providers register a
+    :class:`_McpCredVerifier` (currently just AWS) that probes the SAME identity
+    the server's subprocess uses, resolved from that server's own ``env``. Every
+    other failure mode already degrades on its own:
+
+    * A dead MCP connection is reported by the barrier (see the caller's
+      ``_mcp_barrier_failed`` fold) — not handled here.
+    * The native CloudWatch node is probed and stripped-with-a-note directly in
+      :func:`assemble_base_tools`; re-probing it here would just duplicate that.
+    * A provider whose connect authenticates (ADO PAT, Postgres DSN, …) fails the
+      barrier when its creds are bad.
+
+    A probe error is inconclusive and never yields a note.
     """
-    if mcp_barrier_failed:
-        servers = ", ".join(sorted(set(mcp_barrier_failed)))
-        logger_instance.warning(
-            "ReactStrategy: pre-LLM gate — wired MCP server(s) not connected: %s (exec=%s)",
-            servers, execution_id, extra={"execution_id": execution_id},
-        )
-        return (
-            f"The required tool server(s) [{servers}] are not connected, so live data "
-            f"cannot be queried. No answer was generated to avoid guessing — reconnect "
-            f"the server(s) (check the MCP configuration / network) and retry."
-        )
+    notes: List[str] = []
 
     # Deep credential verification via the provider-verifier registry. Probe the
     # SAME creds each backend will actually use, deduped by (provider, creds,
     # region) so two servers sharing an identity probe once. A probe error is
-    # inconclusive and never blocks the turn.
+    # inconclusive and yields no note.
     probed_signatures: set = set()
 
     async def _run(verifier: _McpCredVerifier, creds: Dict[str, Any],
@@ -232,24 +226,6 @@ async def verify_backends_before_llm(
                 extra={"execution_id": execution_id},
             )
             return None
-
-    # Native CloudWatch node — an AWS capability without an MCP node. Verified by
-    # the AWS verifier, but its creds resolve via the model-key store (explicit
-    # profile/keys) or the default chain, not a server env.
-    if cloudwatch_config:
-        aws = next((v for v in _MCP_CRED_VERIFIERS if v.name == "aws"), None)
-        if aws is not None:
-            if cloudwatch_config.get("aws_profile") or cloudwatch_config.get("access_key_id"):
-                from app.core.aws.aws_credentials import resolve_aws_credentials
-                cw_creds, cw_region = await resolve_aws_credentials(
-                    aws_profile=cloudwatch_config.get("aws_profile"),
-                    aws_region=cloudwatch_config.get("aws_region", "us-east-1"),
-                )
-            else:
-                cw_creds, cw_region = {}, cloudwatch_config.get("aws_region")
-            msg = await _run(aws, cw_creds, cw_region, "the CloudWatch backend")
-            if msg:
-                return msg
 
     # Every wired MCP server — the FIRST verifier that matches probes the
     # server's own env creds (the exact identity its subprocess runs with),
@@ -278,9 +254,21 @@ async def verify_backends_before_llm(
             creds, region = verifier.extract(env)
             msg = await _run(verifier, creds, region, f"the '{name}' MCP server")
             if msg:
-                return msg
+                # `msg` is the abort-phrased probe result ("No answer was
+                # generated…"); in the degrade path an answer WILL be produced,
+                # so emit a self-contained note instead of embedding it.
+                where = creds.get("aws_profile")
+                hint = (
+                    f"refresh with `aws sso login --profile {where}`"
+                    if where else
+                    "refresh with `aws sso login` or update the server's env"
+                )
+                notes.append(
+                    f"The '{name}' MCP server's {verifier.name.upper()} credentials are "
+                    f"expired — its tools may fail this turn ({hint})."
+                )
 
-    return None
+    return notes
 
 
 async def assemble_base_tools(

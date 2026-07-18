@@ -140,6 +140,13 @@ def compose_system_prompt(
         "# Using your tools",
         "- Prefer the most specific tool over a generic one, and fetch only what the question "
         "needs — never read whole files or dump an entire schema when a targeted lookup will do.",
+        "- Match each question to the tool whose domain fits what is being asked, and pick by "
+        "what the question is ABOUT — not by habit. A question about live data, records, counts, "
+        "or current state is answered by querying the DATA SOURCE that holds it (e.g. a connected "
+        "database) — not by reading the code that writes it. A question about how the system is "
+        "BUILT or where logic lives is answered by the code tools. Logs, metrics, and alarms are "
+        "answered by the observability tools. If the tool you need is not directly visible in your "
+        "tool list, use search_tools to find it before falling back to a different domain's tools.",
         "- When you reach a useful conclusion or resolution worth reusing, call save_playbook to "
         "record it so future runs can benefit from it.",
     ]

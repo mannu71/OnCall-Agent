@@ -12,7 +12,8 @@ import agentApiClient from '../services/agentApiClient.js';
 
 const FS_SKILL_TEMPLATE = `---
 name: my_new_skill
-description: One paragraph describing when to use this skill.
+description: One sentence describing what this skill does and when to use it.
+when_to_use: The trigger conditions, in the words a user would phrase the request.
 ---
 
 ## Protocol
@@ -271,8 +272,10 @@ export default function Skills() {
                   onChange={(e) => setFsForm({ ...fsForm, content: e.target.value })}
                 />
                 <p className="text-[11px] text-muted-foreground mt-1">
-                  Must include YAML frontmatter fenced by <code>---</code> with at least a <code>name</code> field.
-                  You can paste content directly or upload a <code>.md</code> file.
+                  Must include YAML frontmatter fenced by <code>---</code> with a <code>name</code> and a
+                  non-empty <code>description</code> (the only text the agent sees when deciding whether to use
+                  the skill; an optional <code>when_to_use</code> improves matching). Paste content directly or
+                  upload a <code>.md</code> file.
                 </p>
               </div>
             </div>

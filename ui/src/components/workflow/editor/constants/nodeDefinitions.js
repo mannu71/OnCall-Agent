@@ -80,11 +80,29 @@ export const NODE_TYPES = {
 
   // ── Memory ───────────────────────────────────────────────────
   vector_memory: {
-    category: 'Memory', label: 'Vector Memory', icon: 'db',
-    desc: 'Semantic vector recall',
+    category: 'Memory', label: 'Memory', icon: 'db',
+    desc: 'Typed memory recall + capture',
     slots: [
-      { kind: 'field',    id: 'collection', label: 'Collection', mono: true },
-      { kind: 'field',    id: 'topK',       label: 'Top K', suffix: 'matches' },
+      { kind: 'memory-select', id: 'memoryTypes', label: 'Memory types',
+        hint: 'Which memory tiers this agent uses. Semantic = facts learned from past runs; '
+            + 'Pinned = operator facts injected every turn; Knowledge base = curated known '
+            + 'issues & runbooks; Session = recall of earlier turns in this chat. Leave all '
+            + 'on unless you want to narrow it.',
+        options: [
+          { value: 'semantic', label: 'Semantic (learned facts)' },
+          { value: 'pinned',   label: 'Pinned facts' },
+          { value: 'kb',       label: 'Knowledge base' },
+          { value: 'session',  label: 'Session history' },
+        ] },
+      // Advanced tuning — sensible defaults (global scope, 5 matches); tucked
+      // into the properties panel's Advanced group so the node shows only
+      // Memory types by default.
+      { kind: 'field',    id: 'collection', label: 'Collection', mono: true, advanced: true,
+        hint: 'Optional namespace to scope recall to (e.g. a repo name). Leave blank to '
+            + 'recall from the shared global memory.' },
+      { kind: 'field',    id: 'topK',       label: 'Top K', suffix: 'matches', advanced: true,
+        hint: 'Maximum number of memories to pull into context per recall. Default 5 — '
+            + 'higher adds recall but costs tokens.' },
       { kind: 'port-out', id: 'mem',        label: 'Memory', portType: 'memory' },
     ],
   },
@@ -270,7 +288,7 @@ export const NODE_TYPES = {
 // ── Default params applied when a node is dropped from the palette ───────────
 export const NODE_DEFAULTS = {
   schedule:    { frequency: 'Every 15 min', time: '09:00', days: 'Mon,Tue,Wed,Thu,Fri', tz: 'UTC' },
-  vector_memory: { collection: '', topK: '5' },
+  vector_memory: { memoryTypes: 'semantic,pinned,kb,session', collection: '', topK: '5' },
   cloudwatch_tool: { region: 'us-east-1', profile: '', groups: '', analysis: 'error-patterns', analysis_depth: 'auto', tool_mode: 'auto', range: '15m', threshold: '10', alerts: 'false' },
   subagents:   { subagents: '[]' },
   subagent_window: { name: 'Subagent', description: '', w: '300', h: '360' },

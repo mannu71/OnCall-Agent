@@ -193,19 +193,55 @@ function agentAutoLearnOn(node) {
   return false;
 }
 
+const MEMORY_TYPE_KEYS = ['memoryTypes', 'memory_types'];
+const VALID_MEMORY_TYPES = new Set(['semantic', 'pinned', 'kb', 'session']);
+
+/**
+ * Returns { present, types } for a Memory node's `memoryTypes`. `present` is
+ * false when the key is absent (older node → treated as "all types"); a present
+ * key that parses to an empty selection is the state the save-time validator
+ * rejects. Mirrors the backend `_read_memory_types`.
+ */
+function readMemoryTypes(node) {
+  for (const src of [node?.params || {}, node || {}]) {
+    for (const k of MEMORY_TYPE_KEYS) {
+      if (k in src) {
+        const raw = src[k];
+        const parts = (Array.isArray(raw) ? raw : String(raw ?? '').split(','))
+          .map(s => String(s).trim().toLowerCase())
+          .filter(s => VALID_MEMORY_TYPES.has(s));
+        return { present: true, types: new Set(parts) };
+      }
+    }
+  }
+  return { present: false, types: new Set(VALID_MEMORY_TYPES) };
+}
+
 /**
  * Non-blocking workflow lint. Returns an array of { nodeId, message } warnings.
- * Currently: auto-learn requires a Memory node (auto-learn captures/recalls via
- * memory; without a Memory node the backend enables it implicitly and warns).
+ * Auto-learn requires a Memory node with the semantic + kb tiers; a Memory node
+ * with every type unticked is un-usable. These mirror the save-time 400s so the
+ * user sees them before hitting save.
  */
 export function workflowWarnings(nodes, edges) {
   const warnings = [];
   for (const n of nodes || []) {
-    if (n?.type === 'agent' && agentAutoLearnOn(n) && !agentHasMemoryNode(n, nodes, edges)) {
-      warnings.push({
-        nodeId: n.id,
-        message: 'Auto-learn requires a Memory node — connect one to this agent so learned findings persist and are recalled.',
-      });
+    if (n?.type === 'vector_memory') {
+      const { present, types } = readMemoryTypes(n);
+      if (present && types.size === 0) {
+        warnings.push({
+          nodeId: n.id,
+          message: 'Memory node: select at least one memory type (semantic, pinned, kb, or session).',
+        });
+      }
+    }
+    if (n?.type === 'agent' && agentAutoLearnOn(n)) {
+      if (!agentHasMemoryNode(n, nodes, edges)) {
+        warnings.push({
+          nodeId: n.id,
+          message: 'Auto-learn requires a Memory node — connect one to this agent so learned findings persist and are recalled.',
+        });
+      }
     }
   }
   return warnings;
