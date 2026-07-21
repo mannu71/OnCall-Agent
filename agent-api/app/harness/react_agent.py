@@ -7,8 +7,7 @@ composition stays shared in ``agent_builder.compose_system_prompt``.
 
 :func:`prepare_action_space` factors out the governance + prompt-caching
 setup (playbook tools, policy engine, provider-aware cache binding) so the
-native turn-loop engine (``app.harness.engine``) can build an equivalent
-action space without depending on LangGraph.
+tool-calling surface is assembled in exactly one place.
 """
 from __future__ import annotations
 
@@ -17,6 +16,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from app.harness.agent_builder import compose_system_prompt
+from app.harness.run_budget import (
+    BUDGET_SYNTHESIS_NUDGE,
+    NUDGE_FRACTION,
+    RunBudgetExhausted,
+    budget_status,
+    get_run_budget,
+)
 from app.harness.tool_setup import build_playbook_tools
 
 logger = logging.getLogger(__name__)
@@ -46,8 +52,7 @@ def prepare_action_space(
 ) -> ActionSpace:
     """Governance (policy engine) + provider-aware prompt caching.
 
-    Shared by every engine that runs a ReAct loop over ``tools`` — appends
-    agent-writable playbook tools, applies the declarative policy engine
+    Appends agent-writable playbook tools, applies the declarative policy engine
     (single evaluation point), and binds provider-native prompt caching
     (Bedrock ``cachePoint`` / Anthropic ``cache_control`` blocks).
     """
@@ -74,6 +79,16 @@ def prepare_action_space(
         )
     except Exception as _pol_err:  # noqa: BLE001 — never break a run on governance
         logger.warning("ReactAgent: policy engine skipped (%s)", _pol_err)
+
+    # ── Per-tool wall-clock cap ───────────────────────────────────────
+    # After governance, so the policy wrappers are themselves capped: a tool
+    # that hangs inside an approval wait is exactly the case worth bounding.
+    # No-op unless a cap or a run deadline is configured.
+    try:
+        from app.harness.tool_timeout import wrap_tools_with_timeout
+        all_tools = wrap_tools_with_timeout(all_tools)
+    except Exception as _to_err:  # noqa: BLE001 — a cap must never break a run
+        logger.warning("ReactAgent: per-tool timeout skipped (%s)", _to_err)
 
     # ── Prompt caching (provider-aware) ───────────────────────────────
     _provider_name = type(llm).__name__
@@ -194,49 +209,125 @@ def _finish_build_agent(
     playbook_tools_count = action_space.playbook_tool_count
 
     # ── Proactive mid-loop compaction ─────────────────────────────────
+    # The pipeline is built ONCE per agent build, not per model call. The hook
+    # fires on every ReAct superstep, so constructing a manager + transport each
+    # time was pure per-call overhead; worse, the old inline form estimated the
+    # whole message list TWICE (once for the metamemory pre-check, once for the
+    # manager's own threshold gate) on a list that grows all run. Reusing the
+    # shared CompressionPipeline fixes both — it threads a single
+    # `precomputed_total` through both gates.
+    #
+    # Safe to hoist: ContextCompactionManager holds only config (its summaries
+    # persist keyed by session_id, not on the instance) and get_transport() is
+    # already lru_cached, so a build-scoped instance behaves identically to a
+    # fresh one. The hook's output contract (`llm_input_messages`) is unchanged,
+    # so checkpointing and HITL resume are unaffected.
     _compaction_session = session_id or "react-agent"
     _compaction_model = (
         getattr(llm, "model_id", None) or getattr(llm, "model", None) or None
     )
 
+    try:
+        from app.core.context.compaction_manager import ContextCompactionManager
+        from app.core.transport import get_transport
+        from app.harness.engine.compression import CompressionPipeline
+        _pipeline: Any = CompressionPipeline(
+            ContextCompactionManager(
+                transport=get_transport(),
+                session_id=_compaction_session,
+                model=_compaction_model,
+            ),
+            vfs_session_id=session_id,
+        )
+    except Exception:  # noqa: BLE001 — compaction must never break a run
+        _pipeline = None
+
     async def _pre_model_hook(state: Dict[str, Any]) -> Dict[str, Any]:
         msgs = state.get("messages") or []
         if not msgs:
             return {}
-        out: Any = msgs
-        try:
-            from app.core.context.compaction_manager import ContextCompactionManager
-            from app.core.transport import get_transport
-            mgr = ContextCompactionManager(
-                transport=get_transport(),
-                session_id=_compaction_session,
-                model=_compaction_model,
-            )
-            out = None
-            if session_id:
-                from app.harness.engine.compression import maybe_metamemory_summary
-                out = await maybe_metamemory_summary(
-                    list(msgs),
-                    vfs_session_id=session_id,
-                    compaction_threshold_tokens=mgr.compaction_threshold_tokens,
-                    keep_recent_tokens=mgr.keep_recent_tokens,
-                    estimate_tokens=mgr.estimate_tokens,
+
+        # ── Engine-level run budgets: wall-clock deadline + token ceiling ──
+        # Checked here because this hook is the one place that runs before
+        # EVERY model call — the same cadence the former native loop used at the
+        # top of each turn. At ~90% the model gets one graceful "synthesize
+        # now" nudge; at 100% we raise, and execute_agent turns that into an
+        # honest partial answer rather than a mid-thought kill.
+        _budget = get_run_budget()
+        _nudge_now = False
+        if _budget is not None:
+            _frac, _reason = budget_status(_budget)
+            if _reason is not None and _frac >= 1.0:
+                logger.warning(
+                    "ReactAgent: run budget exhausted (%s, %.0f%%) — stopping "
+                    "with a partial answer", _reason, _frac * 100,
                 )
-            if out is None:
-                out = await mgr.compact_if_needed(list(msgs))
-        except Exception:  # noqa: BLE001 — compaction must never break a run
-            out = msgs
+                raise RunBudgetExhausted(_reason)
+            if _reason is not None and _frac >= NUDGE_FRACTION and not _budget.nudged:
+                # Shared instance → the flag is visible to every superstep, so
+                # the nudge is delivered exactly once per run.
+                _budget.nudged = True
+                _nudge_now = True
+                logger.warning(
+                    "ReactAgent: run budget at %.0f%% (%s) — nudging for final "
+                    "synthesis", _frac * 100, _reason,
+                )
+
+        out: Any = msgs
+        if _pipeline is not None:
+            try:
+                out = await _pipeline.maybe_compact(list(msgs))
+            except Exception:  # noqa: BLE001 — compaction must never break a run
+                out = msgs
         try:
             from app.harness.agent_runner import sanitize_messages_for_model
             out = sanitize_messages_for_model(out)
         except Exception:  # noqa: BLE001 — a guard must never break a run
             pass
+
+        # The nudge rides the model view only (`llm_input_messages`), never the
+        # persisted graph state. It goes in AFTER sanitizing, because sanitize
+        # is what strips a dangling tool call off the tail — appending a human
+        # turn before that would leave the model an unanswered tool call and an
+        # invalid history.
+        if _nudge_now:
+            try:
+                from langchain_core.messages import HumanMessage
+                out = list(out) + [HumanMessage(content=BUDGET_SYNTHESIS_NUDGE)]
+            except Exception:  # noqa: BLE001 — a nudge must never break a run
+                pass
+
         if _is_anthropic:
             try:
                 from app.core.llm.prompt_caching import apply_anthropic_cache_control
                 out = apply_anthropic_cache_control(out, cache_ttl="5m")
             except Exception:  # noqa: BLE001 — caching must never break a run
                 pass
+
+        # ── Token-estimate calibration (opt-in, default off) ──────────────
+        # Teaches the chars/4 heuristic what this model's tokenizer actually
+        # does, so compaction thresholds fire at the right time. Done HERE, on
+        # the next hook entry, because that is the first moment the provider's
+        # actual prompt-token count for the PREVIOUS call is available — the
+        # alternative (hooking the token callback) would make app.core.streaming
+        # import from app.harness. Needs a run budget to reach the counter, which
+        # the default-on deadline provides; without one, calibration idles.
+        if _budget is not None and _pipeline is not None:
+            try:
+                from app.core.llm import token_calibration
+                if token_calibration.is_enabled():
+                    _seen = _budget.prompt_tokens_seen()
+                    if _budget.last_prompt_estimate > 0:
+                        token_calibration.record(
+                            _compaction_model,
+                            _budget.last_prompt_estimate,
+                            _seen - _budget.last_prompt_tokens_seen,
+                        )
+                    _budget.last_prompt_estimate = _pipeline.estimate_tokens(out)
+                    _budget.last_prompt_tokens_seen = _seen
+            except Exception:  # noqa: BLE001 — telemetry must never break a run
+                pass
+
         if out is msgs:
             return {}
         return {"llm_input_messages": out}

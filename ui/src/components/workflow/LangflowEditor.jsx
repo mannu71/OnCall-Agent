@@ -72,17 +72,6 @@ function _dataToParams(type, data) {
         system:  data.instructions  || data.system  || '',
         maxIter: String(data.maxIterations || data.maxIter || '10'),
       };
-    case 'anthropic_model':
-      return {
-        model:  data.model   || data.modelId || '',
-        temp:   String(data.temperature ?? data.temp ?? '0.7'),
-        system: data.system  || '',
-      };
-    case 'openai_model':
-      return {
-        model: data.model  || data.modelId || '',
-        temp:  String(data.temperature ?? data.temp ?? '0.7'),
-      };
     case 'schedule':
       return { cron: data.cron || '*/15 * * * *', tz: data.tz || 'UTC' };
     case 'vector_memory':
@@ -358,9 +347,8 @@ const SAMPLE_WORKFLOW = {
   nodes: [
     { id: 'n_trigger', type: 'schedule',        x:   20, y:  40, name: 'Every 15 min',     status: 'success',
       params: { cron: '*/15 * * * *', tz: 'UTC' } },
-    { id: 'n_model',   type: 'anthropic_model', x:  300, y:  40, name: 'Claude Haiku 4.5', status: 'idle',
-      params: { model: 'claude-haiku-4-5', temp: '0.2',
-                system: 'You triage SLO breaches. Return JSON with breaches[] and severity.' } },
+    { id: 'n_model',   type: 'language_model',  x:  300, y:  40, name: 'Language Model',   status: 'idle',
+      params: { llm: '', temp: '0.2' } },
     { id: 'n_mem',     type: 'vector_memory',   x:  300, y: 360, name: 'Past breaches',    status: 'idle',
       params: { collection: 'slo-history', topK: '6' } },
     { id: 'n_tool_cw', type: 'cloudwatch_tool', x:  300, y: 580, name: 'CloudWatch',       status: 'idle',

@@ -12,7 +12,7 @@ from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal
-from app.models.db_models import AlertModel, LogPatternModel, KnowledgeEntryModel
+from app.models.db_models import AlertModel
 
 logger = logging.getLogger(__name__)
 
@@ -438,43 +438,21 @@ async def get_knowledge_entries(
     category: Optional[str] = None,
     limit: int = 50
 ) -> Dict[str, Any]:
-    """Get knowledge entries from the knowledge base.
+    """Get known-issue entries from the OKF knowledge bundle.
 
-    This tool retrieves knowledge entries that can be matched against
-    detected patterns for automated resolution suggestions.
+    Retrieves curated known issues that can be matched against detected patterns
+    for automated resolution suggestions. Ids are concept slugs (strings).
 
     Args:
-        category: Filter by category (database, network, authentication, etc.)
+        category: Filter by category/tag (database, network, authentication, etc.)
         limit: Maximum number of entries to return
 
     Returns:
         List of knowledge entries
     """
-    async with AsyncSessionLocal() as session:
-        query = select(KnowledgeEntryModel).limit(limit)
-
-        if category:
-            query = query.where(KnowledgeEntryModel.category == category)
-
-        result = await session.execute(query)
-        entries = result.scalars().all()
-
-        return {
-            "success": True,
-            "entries": [
-                {
-                    "id": entry.id,
-                    "title": entry.title,
-                    "description": entry.description,
-                    "symptoms": entry.symptoms,
-                    "solution": entry.solution,
-                    "category": entry.category,
-                    "source": entry.source,
-                }
-                for entry in entries
-            ],
-            "count": len(entries)
-        }
+    from app.core.knowledge import list_known_issues
+    entries = list_known_issues(category=category, limit=limit)
+    return {"success": True, "entries": entries, "count": len(entries)}
 
 
 # Backward-compat alias — remove once all callers are updated
@@ -489,48 +467,27 @@ async def create_knowledge_entry(
     solution: str,
     category: str
 ) -> Dict[str, Any]:
-    """Create a new knowledge entry in the knowledge base.
+    """Create a known-issue entry in the OKF knowledge bundle.
 
-    This tool adds a knowledge entry that can be used for pattern matching
-    and automated resolution suggestions.
+    Writes a reviewable ``known-issues/<slug>.md`` doc and indexes it into the
+    ``kb`` memory bank so FTS recall surfaces it.
 
     Args:
         title: Entry title
-        description: Detailed description
+        description: Detailed description (root cause)
         symptoms: List of symptoms/signatures to match
         solution: Resolution steps
-        category: Entry category
+        category: Entry category (recorded as a tag)
 
     Returns:
         Created knowledge entry
     """
-    async with AsyncSessionLocal() as session:
-        entry = KnowledgeEntryModel(
-            title=title,
-            description=description,
-            symptoms=symptoms,
-            solution=solution,
-            category=category,
-            source="manual",
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-        )
-        session.add(entry)
-        await session.commit()
-        await session.refresh(entry)
-
-        return {
-            "success": True,
-            "entry": {
-                "id": entry.id,
-                "title": entry.title,
-                "description": entry.description,
-                "symptoms": entry.symptoms,
-                "solution": entry.solution,
-                "category": entry.category,
-                "source": entry.source,
-            }
-        }
+    from app.core.knowledge import create_known_issue as _create
+    entry = await _create(
+        title=title, description=description, symptoms=symptoms,
+        solution=solution, category=category, source="manual",
+    )
+    return {"success": True, "entry": entry}
 
 
 # Backward-compat alias

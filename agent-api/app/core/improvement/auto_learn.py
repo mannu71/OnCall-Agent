@@ -5,9 +5,9 @@ When an agent execution finishes the module optionally:
      immediately; otherwise record the result and wait for engineer approval.
   2. **LearningSink dispatch** — iterates registered sinks; each sink decides
      via ``applies(state)`` whether it is relevant to the current run.
-     Built-in sinks: IncidentKBSink (knowledge_entries upsert) and
-     LogPatternSink (log_patterns severity bump).  Third-party sinks can be
-     appended to ``DEFAULT_SINKS`` before the service is instantiated.
+     Built-in sink: IncidentKBSink (writes an OKF known-issue doc + indexes it
+     into the ``kb`` bank).  Third-party sinks can be appended to
+     ``DEFAULT_SINKS`` before the service is instantiated.
   3. **Trajectory write** — append a structured JSONL record to the
      trajectory file for audit and quality tracking.
   4. **Dynamic node compilation** (opt-in) — when ≥ MIN_TOOL_CALLS tool calls
@@ -170,12 +170,17 @@ class IncidentKBSink(LearningSink):
             bundle = get_default_bundle()
             title = _make_title(root_cause)
             body = _render_known_issue_body(root_cause, state)
+            tags = _derive_tags(
+                root_cause,
+                _extract_symptoms(state),
+                extra=[str(state.get("workflow_name") or "general")],
+            )
             res = bundle.write_concept(
                 section="known-issues",
                 title=title,
                 body=body,
                 description=root_cause[:500],
-                tags=[str(state.get("workflow_name") or "general")],
+                tags=tags,
                 source="agent",
                 confidence=state.get("confidence_score"),
                 extra_frontmatter={"execution_id": str(execution_id)},
@@ -193,61 +198,10 @@ class IncidentKBSink(LearningSink):
             return False
 
 
-class LogPatternSink(LearningSink):
-    """Increment severity for log_patterns matched during this run.
-
-    Only runs when ``state["matched_pattern_ids"]`` is non-empty.
-    """
-
-    def applies(self, state: Dict[str, Any]) -> bool:
-        return bool(state.get("matched_pattern_ids"))
-
-    async def persist(
-        self,
-        execution_id: str,
-        state: Dict[str, Any],
-        db: Any,
-    ) -> bool:
-        if db is None:
-            return False
-
-        pattern_ids: List[int] = state.get("matched_pattern_ids") or []
-        if not pattern_ids:
-            return False
-
-        try:
-            from sqlalchemy import text
-
-            for pid in pattern_ids:
-                await db.execute(
-                    text(
-                        """
-                        UPDATE log_patterns
-                        SET severity = LEAST(severity + 1, 10),
-                            updated_at = NOW()
-                        WHERE id = :pid
-                        """
-                    ),
-                    {"pid": pid},
-                )
-            await db.commit()
-            logger.info("LogPatternSink: bumped %d log_pattern(s)", len(pattern_ids))
-            return True
-
-        except Exception as exc:
-            logger.warning("LogPatternSink: pattern bump failed — %s", exc)
-            try:
-                await db.rollback()
-            except Exception:
-                pass
-            return False
-
-
 # Default sinks registered for every AutoLearnService instance.
 # Append custom sinks here before the service is first instantiated.
 DEFAULT_SINKS: List[LearningSink] = [
     IncidentKBSink(),
-    LogPatternSink(),
 ]
 
 
@@ -587,3 +541,64 @@ def _build_solution(state: Dict[str, Any]) -> str:
             text = s.get("text") or s.get("title") or str(s)
             parts.append(f"• {text}")
     return "\n".join(parts)[:2000]
+
+
+# Error/operational vocabulary worth indexing as tags (synonym anchors for
+# paraphrase recall). Deterministic — no LLM call.
+_ERROR_VOCAB = frozenset({
+    "timeout", "timeouts", "exhausted", "exhaustion", "expired", "throttle",
+    "throttled", "throttling", "deadlock", "oom", "latency", "retry", "retries",
+    "crash", "exception", "leak", "overflow", "underflow", "unauthorized",
+    "forbidden", "ratelimit", "backoff", "saturation", "unavailable", "refused",
+    "reset", "deserialize", "deserializing", "serialization", "duplicate",
+    "missing", "notfound", "connection", "pool", "memory", "disk", "cpu",
+})
+_CAMEL_RE = re.compile(r"\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+\b")  # ≥2-hump CamelCase
+_SNAKE_RE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")       # snake_case
+_QUOTED_RE = re.compile(r"['\"`]([^'\"`\n]{2,48})['\"`]")          # quoted spans
+_HTTP_RE = re.compile(r"\b([45]\d{2})\b")                         # 4xx/5xx status codes
+
+
+def _derive_tags(
+    root_cause: str,
+    symptoms: Optional[List[str]] = None,
+    *,
+    extra: Optional[List[str]] = None,
+    max_tags: int = 8,
+) -> List[str]:
+    """Derive searchable tags from a root cause + symptom strings (deterministic).
+
+    Extracts, in priority order: quoted phrases and CamelCase/snake_case
+    identifiers (the most specific anchors — error class names, function names),
+    HTTP status codes, then known error/operational vocabulary. Tags become
+    weight-A FTS lexemes and act as synonyms for paraphrase queries, so this is
+    the main lever for FTS-only recall accuracy. Capped at *max_tags*, deduped
+    case-insensitively, order-preserving.
+    """
+    blob = " ".join([root_cause or "", *(symptoms or [])])
+    ordered: List[str] = []
+
+    def _add(tag: str) -> None:
+        tag = (tag or "").strip()
+        if not tag or len(tag) < 2:
+            return
+        if any(tag.lower() == t.lower() for t in ordered):
+            return
+        ordered.append(tag)
+
+    for t in extra or []:
+        _add(str(t))
+    for m in _QUOTED_RE.findall(blob):
+        _add(m)
+    for m in _CAMEL_RE.findall(blob):
+        _add(m)
+    for m in _SNAKE_RE.findall(blob):
+        _add(m)
+    for code in _HTTP_RE.findall(blob):
+        _add(f"HTTP {code}")
+    lowered = blob.lower()
+    for word in sorted(_ERROR_VOCAB):  # sorted → deterministic tag order/cap
+        if re.search(rf"\b{re.escape(word)}\b", lowered):
+            _add(word)
+
+    return ordered[:max_tags]

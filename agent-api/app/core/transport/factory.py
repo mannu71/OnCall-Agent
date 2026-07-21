@@ -27,22 +27,18 @@ def get_transport(provider: Optional[str] = None) -> ProviderTransport:
     """
     name = (provider or settings.provider_transport).lower()
 
-    if name == "anthropic":
-        from app.core.transport.anthropic_transport import AnthropicTransport
-        import os
-        api_key = os.getenv("ANTHROPIC_API_KEY") or ""
-        if not api_key:
-            logger.warning("ANTHROPIC_API_KEY is not set — AnthropicTransport will fail on first call")
-        logger.info("ProviderTransport: using Anthropic direct API")
-        return AnthropicTransport(api_key=api_key)
-
-    if name in {"bedrock", "aws_bedrock"}:
+    if name in {"bedrock", "aws_bedrock", "aws", "aws bedrock"}:
         from app.core.transport.bedrock_transport import BedrockTransport
         region  = settings.effective_bedrock_region
         profile = settings.aws_profile
         logger.info("ProviderTransport: using AWS Bedrock (region=%s)", region)
         return BedrockTransport(region=region, profile=profile)
 
+    # Bedrock-only. Fail loudly rather than silently routing generation to a
+    # provider this deployment does not use — same policy (and wording) as
+    # app.workflow.strategies.react.llm_factory.build_llm.
     raise ValueError(
-        f"Unknown PROVIDER_TRANSPORT value '{name}'. Supported: 'anthropic', 'bedrock'."
+        f"Unsupported provider '{name}'. This application uses AWS Bedrock "
+        "exclusively for generation (plus the local snowflake-arctic-embed-s "
+        "model for embeddings). Set PROVIDER_TRANSPORT=bedrock."
     )

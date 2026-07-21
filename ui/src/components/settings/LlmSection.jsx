@@ -1,5 +1,5 @@
 import React from 'react';
-import { Cpu, Edit2, Layers, Plus, RefreshCw, Sparkles, Trash2 } from 'lucide-react';
+import { Cpu, Edit2, Plus, RefreshCw, Sparkles, Trash2 } from 'lucide-react';
 import {
     CARD,
     EMPTY_STATE,
@@ -94,7 +94,6 @@ export default function LlmSection({
                                     <th className={TABLE_HEAD}>Name</th>
                                     <th className={TABLE_HEAD} style={{ width: 140 }}>Provider</th>
                                     <th className={TABLE_HEAD} style={{ width: 100 }}>Temp</th>
-                                    <th className={TABLE_HEAD} style={{ width: 140 }}>Role</th>
                                     <th className={TABLE_HEAD} style={{ width: 130 }}>Status</th>
                                     <th className={TABLE_HEAD} style={{ width: 110 }} />
                                 </tr>
@@ -102,9 +101,6 @@ export default function LlmSection({
                             <tbody>
                                 {llmEntries.map(([name, config]) => {
                                     const status = llmConnectionStatus[name];
-                                    const isEmbedding = Boolean(
-                                        config.use_for_embeddings ?? config.useForEmbeddings,
-                                    );
                                     const temp = config.temperature ?? 0;
 
                                     return (
@@ -137,15 +133,6 @@ export default function LlmSection({
                                                 <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11.5px] text-slate-600">
                                                     {Number(temp).toFixed(1)}
                                                 </code>
-                                            </td>
-                                            <td className={TABLE_CELL}>
-                                                {isEmbedding ? (
-                                                    <SBadge variant="violet" icon={<Layers className="size-3" />}>
-                                                        Embeddings
-                                                    </SBadge>
-                                                ) : (
-                                                    <span className="text-xs text-slate-500">Reasoning</span>
-                                                )}
                                             </td>
                                             <td className={TABLE_CELL}>
                                                 <SStatusBadge status={status?.status} message={status?.message} />

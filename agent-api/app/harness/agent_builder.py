@@ -140,8 +140,20 @@ def compose_system_prompt(
         "# Using your tools",
         "- Prefer the most specific tool over a generic one, and fetch only what the question "
         "needs — never read whole files or dump an entire schema when a targeted lookup will do.",
+        # The routing procedure must START with the skill check when the skill
+        # tool is bound: a caveat appended after the domain rules was measured
+        # (trajectory eval, traj-skill-locate) to lose — the model runs the
+        # routing procedure to its concrete tool choice and never comes back.
+        # Conditional on has_skill_tool: deterministic given the bound tools,
+        # so the cachePoint prefix stays stable (same basis as "# Skills").
         "- Match each question to the tool whose domain fits what is being asked, and pick by "
-        "what the question is ABOUT — not by habit. A question about live data, records, counts, "
+        "what the question is ABOUT — not by habit. "
+        + ("STEP ZERO of this routing, before choosing any domain tool: check the 'Skill map' "
+           "in the user turn — when a listed skill matches the request, load it with the "
+           "`skill` tool FIRST and let its runbook direct the tool choice. Route yourself only "
+           "when no skill matches. "
+           if has_skill_tool else "")
+        + "A question about live data, records, counts, "
         "or current state is answered by querying the DATA SOURCE that holds it (e.g. a connected "
         "database) — not by reading the code that writes it. A question about how the system is "
         "BUILT or where logic lives is answered by the code tools. Logs, metrics, and alarms are "
@@ -159,28 +171,6 @@ def compose_system_prompt(
     for _cap in active_caps:
         if _cap.section:
             system_parts.append(_cap.section)
-
-    # § Skills — two-stage disclosure. Static (no skill names), so cache-safe.
-    # Deliberately placed AFTER the capability sections: those name a specific
-    # tool for a specific job ("prefer codegraph__find_symbol for a known
-    # symbol"), which directly competes with "load the matching skill first".
-    # When Skills came first the capability text won and the agent skipped the
-    # runbook for the obvious one-shot tool — so the blocking requirement gets
-    # the last word. (Static reorder: the cache prefix stays deterministic.)
-    if has_skill_tool:
-        system_parts.append(
-            "# Skills\n"
-            "- Some tasks have a matching skill — a proven, reusable runbook. The user turn "
-            "carries a 'Skill map': the names of the skills you can load, and nothing more.\n"
-            "- Call `search_skills` with what you are trying to do to see what those names "
-            "mean and which fits; when a map name is obviously the match, load it directly.\n"
-            "- When a skill matches the request, calling the `skill` tool to load it BEFORE any "
-            "other work is a blocking requirement — then follow its steps, using your other tools "
-            "as it directs. This OVERRIDES any tool preference above: if a skill matches, load it "
-            "first even when a capability section names a tool that would answer directly.\n"
-            "- Never mention a skill without invoking it. A user message starting with "
-            "'/<skill-name>' is a request to invoke that skill."
-        )
 
     # ── Dispatch-time governance (3.3) — AGENT_POLICY.md rules sliced to
     # this run's bound tools; empty (no-op) when no rule matches or the
@@ -245,6 +235,30 @@ def compose_system_prompt(
                 "for separable parts of a larger task so your own context stays focused on "
                 "synthesis; they cannot delegate further."
             )
+
+    # § Skills — two-stage disclosure. Static (no skill names), so cache-safe.
+    # MUST be the LAST platform section: the capability sections name a specific
+    # tool for a specific job ("prefer codegraph__find_symbol for a known
+    # symbol"), which directly competes with "load the matching skill first",
+    # and recency is what was measured to win — when Skills came before the
+    # capability text the agent skipped the runbook for the obvious one-shot
+    # tool, and when later default-on sections (scratch-fs/planning) slid in
+    # after it the same regression came back. Keep every other section above
+    # this one. (Static order: the cache prefix stays deterministic.)
+    if has_skill_tool:
+        system_parts.append(
+            "# Skills\n"
+            "- Some tasks have a matching skill — a proven, reusable runbook. The user turn "
+            "carries a 'Skill map': the names of the skills you can load, and nothing more.\n"
+            "- Call `search_skills` with what you are trying to do to see what those names "
+            "mean and which fits; when a map name is obviously the match, load it directly.\n"
+            "- When a skill matches the request, calling the `skill` tool to load it BEFORE any "
+            "other work is a blocking requirement — then follow its steps, using your other tools "
+            "as it directs. This OVERRIDES any tool preference above: if a skill matches, load it "
+            "first even when a capability section names a tool that would answer directly.\n"
+            "- Never mention a skill without invoking it. A user message starting with "
+            "'/<skill-name>' is a request to invoke that skill."
+        )
 
     if instructions:
         system_parts.append(f"\nAdditional instructions:\n{instructions}")

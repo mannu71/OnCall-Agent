@@ -46,27 +46,7 @@ export const NODE_TYPES = {
     ],
   },
   // ── Models ───────────────────────────────────────────────────
-  // Legacy types kept for existing saved workflows — hidden from palette
-  anthropic_model: {
-    category: 'Models', label: 'Anthropic', icon: 'sparkle', paletteHidden: true,
-    desc: 'Claude chat completion',
-    slots: [
-      { kind: 'select',   id: 'model',  label: 'Model name' },
-      { kind: 'field',    id: 'temp',   label: 'Temperature', suffix: '0–1' },
-      { kind: 'textarea', id: 'system', label: 'System message' },
-      { kind: 'port-out', id: 'lm',     label: 'Language Model', portType: 'model' },
-    ],
-  },
-  openai_model: {
-    category: 'Models', label: 'OpenAI', icon: 'sparkle', paletteHidden: true,
-    desc: 'GPT chat completion',
-    slots: [
-      { kind: 'select',   id: 'model', label: 'Model name' },
-      { kind: 'field',    id: 'temp',  label: 'Temperature', suffix: '0–2' },
-      { kind: 'port-out', id: 'lm',   label: 'Language Model', portType: 'model' },
-    ],
-  },
-  // New unified LLM node — dropdown populated from Settings
+  // The unified LLM node — dropdown populated from Settings
   language_model: {
     category: 'Models', label: 'Language Model', icon: 'sparkle',
     desc: 'Pick one or more models · wire each output',

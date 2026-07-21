@@ -247,17 +247,6 @@ class Settings(BaseSettings):
 
     # Runtime retention / concurrency
     max_runtime_events: int = 500
-    embedding_concurrency: int = 4
-    # Bedrock embedding model + output dimension. Titan Text Embeddings V2
-    # (amazon.titan-embed-text-v2:0) supports 256/512/1024 dims (1024 best
-    # quality) and is the account-enabled model; V1 (titan-embed-text-v1, 1536)
-    # is not enabled here. All embedding columns are vector(1024) (migration 019).
-    embedding_model_id: str = Field(
-        default="amazon.titan-embed-text-v2:0", validation_alias="EMBEDDING_MODEL_ID"
-    )
-    embedding_dimensions: int = Field(
-        default=1024, validation_alias="EMBEDDING_DIMENSIONS"
-    )
 
     # ── ONNX code-embedding semantic search ──────────────────────────────────
     # A Bedrock-independent embedding path for concept-level code search (fills
@@ -314,7 +303,12 @@ class Settings(BaseSettings):
     )
 
     # Agent / tools / output limits
-    provider_transport: str = "anthropic"
+    # Bedrock-only: this is the sole generative provider (see
+    # app.workflow.strategies.react.llm_factory, which rejects anything else).
+    # The default must match that policy — docker-compose sets
+    # PROVIDER_TRANSPORT=bedrock, but anything running outside compose (tests,
+    # evals on the host, a fresh deploy) falls back to this value.
+    provider_transport: str = "bedrock"
     # Default model id for the shared DB-resolved LLM utility (app.core.llm.
     # call_llm) — used as the env fallback when no DB LLM config exists, and as a
     # last-resort model for compaction summaries. Backs graders, supervision, and
@@ -334,12 +328,6 @@ class Settings(BaseSettings):
     # the limit mid-investigation and returned a "Let me search…" preamble.
     # Override via AGENT_RECURSION_LIMIT.
     agent_recursion_limit: int = Field(default=25, validation_alias="AGENT_RECURSION_LIMIT")
-    # Which ReAct loop engine drives an agent run. "langgraph" (default) keeps
-    # today's langgraph.prebuilt.create_react_agent behavior untouched. "native"
-    # opts into the hand-rolled turn loop (app.harness.engine) being built out
-    # incrementally — gated on the accuracy eval before it becomes the default.
-    # Per-workflow override: agent_config["engine"] / params["engine"].
-    agent_engine: str = Field(default="langgraph", validation_alias="AGENT_ENGINE")
     # Non-streaming agent invocation wall-clock cap (agent_runner.invoke_agent).
     # Used by the workflow-executor's non-streaming fallback and by subagent
     # delegation (subagent_factory._run_child calls execute_agent with no
@@ -361,30 +349,33 @@ class Settings(BaseSettings):
     # that truncated half-thought returned as the final answer. 8192 leaves room
     # for reasoning + a tool call in one turn. Override via AGENT_MAX_OUTPUT_TOKENS.
     agent_max_output_tokens: int = Field(default=8192, validation_alias="AGENT_MAX_OUTPUT_TOKENS")
-    # ── Engine-level run budgets (native turn loop) ───────────────────────────
+    # ── Engine-level run budgets ──────────────────────────────────────────────
     # A wall-clock deadline threaded INTO the loop itself, distinct from the
     # outer supervisor_wall_clock_seconds (which is only checked BETWEEN agent
     # turns, so a single slow turn or tool run can overshoot it). At ~90% of the
-    # deadline the loop gets one graceful "synthesize now" nudge (mirrors the
+    # deadline the agent gets one graceful "synthesize now" nudge (mirrors the
     # max-turns forced-synthesis rung); at 100% it stops with a partial answer
-    # rather than being killed mid-thought. Defaults to 840s so it fires just
+    # rather than being killed mid-thought — see app.harness.run_budget, which
+    # enforces both rungs from the pre-model hook. Defaults to 840s so it fires just
     # before the 900s supervisor ceiling, converting that hard cliff into a
     # graceful partial. Set to 0 to disable. Override via env.
     agent_run_deadline_seconds: float = Field(
         default=840.0, validation_alias="AGENT_RUN_DEADLINE_SECONDS"
     )
-    # Per-run total-token ceiling (input+output across all turns). 0 = disabled
-    # (today's behavior). When >0 the loop gets the same graceful synthesis nudge
-    # at ~90% then stops with stop_reason=token_budget at 100%. Surfaces the
-    # otherwise-unreachable StopReason.TOKEN_BUDGET. Override via env.
+    # Per-run total-token ceiling (input+output across all turns; cache reads and
+    # writes are excluded). 0 = disabled. When >0 the agent gets the same graceful
+    # synthesis nudge at ~90% then stops with stop_reason=token_budget at 100%.
+    # Override via env.
     agent_run_token_budget: int = Field(
         default=0, validation_alias="AGENT_RUN_TOKEN_BUDGET"
     )
-    # Per-tool-call wall-clock cap (seconds). 0 = disabled (today's behavior;
-    # a hanging tool is bounded only by the model/Bedrock read timeout). 240
-    # recommended — matches DELEGATION_CHILD_TIMEOUT_SECONDS. A timed-out tool
-    # returns an honest error ToolMessage to the model, never aborts the turn.
-    # Also clamped to the remaining run deadline when one is set. Override via env.
+    # Per-tool-call wall-clock cap (seconds), enforced by app.harness.tool_timeout.
+    # 0 = no explicit cap; a tool is then still bounded by whatever remains of
+    # agent_run_deadline_seconds above (so a hung tool cannot outlive its run).
+    # 240 recommended — matches DELEGATION_CHILD_TIMEOUT_SECONDS. A timed-out
+    # tool returns an honest error string to the model and the turn continues;
+    # it never aborts the run. The effective cap is always the smaller of this
+    # and the remaining run deadline. Override via env.
     agent_tool_call_timeout_seconds: float = Field(
         default=0.0, validation_alias="AGENT_TOOL_CALL_TIMEOUT_SECONDS"
     )
@@ -478,7 +469,7 @@ class Settings(BaseSettings):
     )
     # Step-level trajectory events (app.harness.step_recorder, migration 030's
     # trajectory_events table). Off by default: a no-op recorder is used, zero
-    # extra DB writes. When on, the native turn loop records one event per
+    # extra DB writes. When on, the agent records one event per
     # model turn / tool call, buffered in memory and flushed as a single batch
     # insert at the end of the run — never a per-step DB round-trip. LangGraph
     # engine runs are not yet instrumented (native-engine-only for now).
@@ -529,24 +520,15 @@ class Settings(BaseSettings):
 
     # ── Bank-scoped semantic memory ──────────────────────────────────────────
     # Learned, operational memory: auto-captured investigation findings recalled
-    # (hybrid FTS+vector) before each run, scoped per-repo + a shared global bank.
-    # Opt-in (default off) so it is a no-op until an operator enables it.
+    # (Postgres FTS) before each run, scoped per-repo + a shared global bank.
+    # Opt-in (default off) so it is a no-op until an operator enables it. Recall
+    # is full-text over the OKF bundle + semantic_memory banks; document-side
+    # tags act as paraphrase synonyms (the Bedrock-embedding legs were removed).
     semantic_memory_enabled: bool = Field(
         default=False, validation_alias="SEMANTIC_MEMORY_ENABLED"
     )
-    # Retrieval mode: 'hybrid' (FTS+vector, best recall/lowest tokens), 'fts'
-    # (no embeddings — zero embed calls), or 'vector' (pure semantic).
-    memory_retrieval_mode: str = Field(
-        default="hybrid", validation_alias="MEMORY_RETRIEVAL_MODE"
-    )
     # Token-budget guardrails (keep recall net-positive, not a per-turn leak):
     memory_recall_k: int = Field(default=4, validation_alias="MEMORY_RECALL_K")
-    # Cosine threshold for the vector recall leg. Tuned for Titan V2, whose
-    # normalized embeddings score related text ~0.4–0.5 (lower than V1) — 0.6
-    # filtered everything. Hybrid RRF + the k-cap keep precision.
-    memory_recall_min_score: float = Field(
-        default=0.35, validation_alias="MEMORY_RECALL_MIN_SCORE"
-    )
     memory_max_chars: int = Field(default=600, validation_alias="MEMORY_MAX_CHARS")
     # Only auto-capture an investigation finding when confidence is at least this
     # (avoids storing low-value/uncertain results). 0 captures everything.
@@ -693,6 +675,12 @@ class Settings(BaseSettings):
     knowledge_bundle_enabled: bool = Field(
         default=True, validation_alias="KNOWLEDGE_BUNDLE_ENABLED"
     )
+    # Retrievability lint: recall is FTS-only (no vector fallback), so a concept
+    # with no tags and a thin title is unfindable by paraphrase. write_concept
+    # logs a warning when a doc has fewer than this many tags or a too-short
+    # description; the same check backs the bundle-scan lint. Advisory only —
+    # never blocks a write (0 disables the tag check).
+    knowledge_min_tags: int = Field(default=3, validation_alias="KNOWLEDGE_MIN_TAGS")
     # Skills are markdown SKILL.md files (SkillManager) under skills_dir — now a
     # sub-tree of the knowledge bundle so skills + KB share one portable bundle
     # and can cross-link (a known-issue doc → its runbook skill).

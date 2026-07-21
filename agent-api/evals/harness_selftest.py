@@ -191,30 +191,6 @@ def test_boto_context_overflow_classifier() -> None:
     )
 
 
-# ── engine: resolve_engine() flag resolution + native NotImplementedError ────
-def test_engine_resolution() -> None:
-    from app.harness.engine import resolve_engine, ENGINE_LANGGRAPH, ENGINE_NATIVE
-
-    check("engine: defaults to langgraph", resolve_engine({}) == ENGINE_LANGGRAPH)
-    check("engine: defaults to langgraph with no config", resolve_engine(None) == ENGINE_LANGGRAPH)
-    check(
-        "engine: per-workflow override via agent_config['engine']",
-        resolve_engine({"engine": "native"}) == ENGINE_NATIVE,
-    )
-    check(
-        "engine: per-workflow override via params mirror",
-        resolve_engine({"params": {"engine": "native"}}) == ENGINE_NATIVE,
-    )
-    check(
-        "engine: unknown value falls back to langgraph",
-        resolve_engine({"engine": "bogus"}) == ENGINE_LANGGRAPH,
-    )
-    check(
-        "engine: hitl_enabled clamps native→langgraph",
-        resolve_engine({"engine": "native", "hitl_enabled": True}) == ENGINE_LANGGRAPH,
-    )
-
-
 def _fake_ai_message(content: str = "", tool_calls=None, truncated: bool = False):
     from langchain_core.messages import AIMessage
     return AIMessage(
@@ -226,7 +202,7 @@ def _fake_ai_message(content: str = "", tool_calls=None, truncated: bool = False
 
 class _FakeToolBoundLLM:
     """Stands in for a tool-bound chat model. Not Bedrock/Anthropic-named, so
-    TurnLoop.__init__ exercises the generic bind_tools() fallback path."""
+    Exercises the generic bind_tools() fallback path."""
 
     def __init__(self, responses):
         self._responses = list(responses)
@@ -252,38 +228,6 @@ class _FakeTool:
 
     async def ainvoke(self, args):
         return self._result
-
-
-async def test_turn_loop_happy_path() -> None:
-    """A model that answers with no tool_calls on turn 1 completes immediately."""
-    from app.harness.engine.turn_loop import TurnLoop
-    from app.harness import AgentSpec
-
-    from langchain_core.messages import HumanMessage
-
-    llm = _FakeToolBoundLLM([_fake_ai_message("The answer is 42.")])
-    loop = TurnLoop(llm, [], "You are a helpful agent.", agent_config={}, max_turns=5)
-    result = await loop.run([HumanMessage(content="what is the answer?")])
-    check("turn_loop: happy path final_answer", result["final_answer"] == "The answer is 42.")
-    check("turn_loop: happy path no truncation", not result.get("truncated"))
-    check("turn_loop: happy path single model call", llm.calls == 1)
-
-
-async def test_turn_loop_tool_call_then_complete() -> None:
-    """Turn 1 calls a tool, turn 2 synthesizes from the tool result."""
-    from app.harness.engine.turn_loop import TurnLoop
-    from langchain_core.messages import HumanMessage
-
-    tool_call = {"name": "fake_tool", "args": {"x": 1}, "id": "call_1"}
-    llm = _FakeToolBoundLLM([
-        _fake_ai_message("", tool_calls=[tool_call]),
-        _fake_ai_message("Done, found it via fake_tool."),
-    ])
-    loop = TurnLoop(llm, [_FakeTool("fake_tool")], "sys", agent_config={}, max_turns=5)
-    result = await loop.run([HumanMessage(content="investigate")])
-    check("turn_loop: tool round-trip completes", result["final_answer"] == "Done, found it via fake_tool.")
-    check("turn_loop: tool round-trip records tool_calls", len(result["tool_calls"]) == 1)
-    check("turn_loop: tool round-trip 2 model calls", llm.calls == 2)
 
 
 async def test_step_recorder() -> None:
@@ -393,53 +337,10 @@ async def test_step_recorder() -> None:
         _s.step_events_enabled = _orig_flag
 
 
-async def test_turn_loop_step_events_wiring() -> None:
-    """End-to-end: step_events_enabled=True on a real TurnLoop run persists
-    model_turn + tool_call events with the run's execution_id as trace_id."""
-    from app.harness.engine.turn_loop import TurnLoop
-    from app.config import settings as _s
-    from langchain_core.messages import HumanMessage
-    from app.infrastructure.persistence.trajectory_event_repository import (
-        trajectory_event_repository as _ter_instance,
-    )
-
-    captured: list = []
-
-    async def _fake_append_batch(events):
-        captured.extend(events)
-
-    _orig_append = _ter_instance.append_batch
-    _orig_flag = _s.step_events_enabled
-    _ter_instance.append_batch = _fake_append_batch
-    _s.step_events_enabled = True
-    try:
-        tool_call = {"name": "fake_tool", "args": {"x": 1}, "id": "call_1"}
-        llm = _FakeToolBoundLLM([
-            _fake_ai_message("", tool_calls=[tool_call]),
-            _fake_ai_message("Done, found it via fake_tool."),
-        ])
-        loop = TurnLoop(
-            llm, [_FakeTool("fake_tool")], "sys", agent_config={}, max_turns=5,
-            execution_id="turnloop-step-events-exec",
-        )
-        await loop.run([HumanMessage(content="investigate")])
-    finally:
-        _ter_instance.append_batch = _orig_append
-        _s.step_events_enabled = _orig_flag
-
-    types = [e["type"] for e in captured]
-    check("turn_loop+step_events: model_turn events recorded", types.count("model_turn") == 2, str(types))
-    check("turn_loop+step_events: tool_call event recorded", types.count("tool_call") == 1, str(types))
-    check(
-        "turn_loop+step_events: all events carry execution_id as trace_id",
-        bool(captured) and all(e["trace_id"] == "turnloop-step-events-exec" for e in captured),
-    )
-
-
 async def test_instrument_langgraph_result() -> None:
-    """LangGraph parity (post-hoc): _instrument_langgraph_result derives the
-    same trajectory events / failure-ledger recording / verify tracking the
-    native turn loop produces live, from a serialized LangGraph message list."""
+    """_instrument_langgraph_result derives trajectory events / failure-ledger
+    recording / verify tracking post-hoc, from a serialized LangGraph message
+    list."""
     from app.harness.agent_runner import _instrument_langgraph_result
     from app.harness.step_recorder import StepRecorder
     from app.harness.verify_tracking import VerifyState
@@ -555,218 +456,9 @@ async def test_instrument_langgraph_result() -> None:
     )
 
 
-async def test_turn_loop_max_turns_forced_synthesis() -> None:
-    """A model that never stops calling tools gets a forced-synthesis nudge
-    once, then hits a hard MAX_TURNS-equivalent stop shortly after."""
-    from app.harness.engine.turn_loop import TurnLoop
-    from app.harness.engine.loop_state import StopReason
-    from langchain_core.messages import HumanMessage
-
-    tool_call = {"name": "fake_tool", "args": {}, "id": "call_x"}
-    # Always returns a tool call — never lets the loop terminate naturally.
-    llm = _FakeToolBoundLLM([_fake_ai_message("", tool_calls=[tool_call])] * 20)
-    loop = TurnLoop(llm, [_FakeTool("fake_tool")], "sys", agent_config={}, max_turns=1)
-    result = await loop.run([HumanMessage(content="loop forever")])
-    check("turn_loop: max_turns eventually stops", llm.calls < 20, f"calls={llm.calls}")
-    check("turn_loop: max_turns produces a final_answer key", "final_answer" in result)
-    check(
-        "turn_loop: max_turns surfaces stop_reason=max_turns",
-        result.get("stop_reason") == StopReason.MAX_TURNS.value, result.get("stop_reason"),
-    )
-    check("turn_loop: max_turns surfaces did_forced_synthesis", result.get("did_forced_synthesis") is True)
-
-
-async def test_turn_loop_verify_pending_tracking() -> None:
-    """An edit_file call with no follow-up run_verify leaves verify_pending
-    True in the result; a subsequent run_verify call clears it."""
-    import json as _json
-    from app.harness.engine.turn_loop import TurnLoop
-    from langchain_core.messages import HumanMessage
-
-    edit_call = {"name": "edit_file", "args": {}, "id": "c1"}
-    llm = _FakeToolBoundLLM([
-        _fake_ai_message("", tool_calls=[edit_call]),
-        _fake_ai_message("Edited the file."),
-    ])
-    edit_tool = _FakeTool("edit_file", result=_json.dumps({"ok": True, "file": "a.py"}))
-    loop = TurnLoop(llm, [edit_tool], "sys", agent_config={}, max_turns=5)
-    result = await loop.run([HumanMessage(content="fix the bug")])
-    check("turn_loop: edit without verify leaves verify_pending True", result.get("verify_pending") is True)
-    check("turn_loop: verify_last_passed unset without a run_verify call", result.get("verify_last_passed") is None)
-
-    verify_call = {"name": "run_verify", "args": {"repo": "x"}, "id": "c2"}
-    llm2 = _FakeToolBoundLLM([
-        _fake_ai_message("", tool_calls=[edit_call]),
-        _fake_ai_message("", tool_calls=[verify_call]),
-        _fake_ai_message("Edited and verified."),
-    ])
-    edit_tool2 = _FakeTool("edit_file", result=_json.dumps({"ok": True, "file": "a.py"}))
-    verify_tool = _FakeTool("run_verify", result=_json.dumps({"ok": True, "exit_code": 0}))
-    loop2 = TurnLoop(llm2, [edit_tool2, verify_tool], "sys", agent_config={}, max_turns=5)
-    result2 = await loop2.run([HumanMessage(content="fix the bug")])
-    check("turn_loop: run_verify clears verify_pending", result2.get("verify_pending") is False)
-    check("turn_loop: verify_last_passed reflects run_verify result", result2.get("verify_last_passed") is True)
-
-    verify_call_fail = {"name": "run_verify", "args": {"repo": "x"}, "id": "c3"}
-    llm3 = _FakeToolBoundLLM([
-        _fake_ai_message("", tool_calls=[edit_call]),
-        _fake_ai_message("", tool_calls=[verify_call_fail]),
-        _fake_ai_message("Tried to verify, it failed."),
-    ])
-    edit_tool3 = _FakeTool("edit_file", result=_json.dumps({"ok": True, "file": "a.py"}))
-    verify_tool_fail = _FakeTool("run_verify", result=_json.dumps({"ok": False, "exit_code": 1}))
-    loop3 = TurnLoop(llm3, [edit_tool3, verify_tool_fail], "sys", agent_config={}, max_turns=5)
-    result3 = await loop3.run([HumanMessage(content="fix the bug")])
-    check("turn_loop: failed verify still clears pending", result3.get("verify_pending") is False)
-    check("turn_loop: failed verify records verify_last_passed False", result3.get("verify_last_passed") is False)
-
-
-async def test_turn_loop_run_budget_status() -> None:
-    """Engine-level run-budget accounting: wall-clock deadline + token ceiling
-    map to (fraction, StopReason); disabled budgets are inert."""
-    import time as _time
-    from types import SimpleNamespace
-    from app.harness.engine.turn_loop import TurnLoop
-    from app.harness.engine.loop_state import StopReason, TurnLoopState, TokenLedger
-
-    # Deadline already expired → exhausted, DEADLINE.
-    loop = TurnLoop(
-        _FakeToolBoundLLM([_fake_ai_message("hi")]), [], "sys",
-        agent_config={"run_deadline_seconds": 100}, max_turns=5,
-    )
-    st = TurnLoopState(messages=[])
-    st.deadline_monotonic = _time.monotonic() - 1.0
-    frac, reason = loop._run_budget_status(st)
-    check("run budget: expired deadline → frac>=1.0", frac >= 1.0, f"frac={frac}")
-    check("run budget: expired deadline → DEADLINE", reason == StopReason.DEADLINE)
-
-    # ~95% consumed (5s left of 100s) → nudge zone, not a stop.
-    st2 = TurnLoopState(messages=[])
-    st2.deadline_monotonic = _time.monotonic() + 5.0
-    frac2, reason2 = loop._run_budget_status(st2)
-    check("run budget: 95% consumed lands in [0.9,1.0)", 0.9 <= frac2 < 1.0, f"frac={frac2}")
-    check("run budget: nudge-zone reason is DEADLINE", reason2 == StopReason.DEADLINE)
-
-    # Token budget exceeded → TOKEN_BUDGET.
-    loop_t = TurnLoop(
-        _FakeToolBoundLLM([_fake_ai_message("hi")]), [], "sys",
-        agent_config={"run_token_budget": 1000}, max_turns=5,
-    )
-    st3 = TurnLoopState(messages=[])
-    st3.ledger = TokenLedger(callback=SimpleNamespace(
-        input_tokens=800, output_tokens=400, cache_read_tokens=0, cache_creation_tokens=0,
-    ))
-    frac3, reason3 = loop_t._run_budget_status(st3)
-    check("run budget: 1200/1000 tokens → frac>=1.0", frac3 >= 1.0, f"frac={frac3}")
-    check("run budget: token overrun → TOKEN_BUDGET", reason3 == StopReason.TOKEN_BUDGET)
-
-    # Disabled → inert.
-    loop_off = TurnLoop(
-        _FakeToolBoundLLM([_fake_ai_message("hi")]), [], "sys",
-        agent_config={"run_deadline_seconds": 0, "run_token_budget": 0}, max_turns=5,
-    )
-    frac4, reason4 = loop_off._run_budget_status(TurnLoopState(messages=[]))
-    check("run budget: disabled → (0.0, None)", frac4 == 0.0 and reason4 is None)
-
-    # Effective per-tool timeout = min(cap, remaining deadline).
-    st5 = TurnLoopState(messages=[])
-    st5.deadline_monotonic = _time.monotonic() + 30.0
-    loop_tt = TurnLoop(
-        _FakeToolBoundLLM([_fake_ai_message("hi")]), [], "sys",
-        agent_config={"tool_call_timeout_seconds": 10, "run_deadline_seconds": 100}, max_turns=5,
-    )
-    tt = loop_tt._effective_tool_timeout(st5)
-    check("run budget: tool timeout = min(cap, remaining)", tt is not None and 9.0 < tt <= 10.0, f"tt={tt}")
-    check(
-        "run budget: no cap + no deadline → unbounded tool timeout",
-        loop_off._effective_tool_timeout(TurnLoopState(messages=[])) is None,
-    )
-
-
-async def test_turn_loop_deadline_hard_stop() -> None:
-    """A model that keeps calling tools past its deadline stops with
-    stop_reason=deadline and an exhausted budget block. Uses an injected
-    monotonic clock so the outcome is deterministic (not racing a real
-    sub-millisecond deadline against an in-memory loop)."""
-    import app.harness.engine.turn_loop as _tl
-    from app.harness.engine.turn_loop import TurnLoop
-    from langchain_core.messages import HumanMessage
-
-    class _ClockShim:
-        """Each monotonic() advances a fixed step so wall-clock progress is
-        deterministic. Only monotonic() is used by turn_loop."""
-
-        def __init__(self, step: float):
-            self.t = 0.0
-            self.step = step
-
-        def monotonic(self) -> float:
-            self.t += self.step
-            return self.t
-
-    tool_call = {"name": "fake_tool", "args": {}, "id": "c"}
-    llm = _FakeToolBoundLLM([_fake_ai_message("", tool_calls=[tool_call])] * 20)
-    loop = TurnLoop(
-        llm, [_FakeTool("fake_tool")], "sys",
-        agent_config={"run_deadline_seconds": 100}, max_turns=50,
-    )
-    _orig_time = _tl.time
-    _tl.time = _ClockShim(60.0)  # deadline set at t=60 → 160; exceeded within 2 turns
-    try:
-        result = await loop.run([HumanMessage(content="go")])
-    finally:
-        _tl.time = _orig_time
-    check("run budget e2e: stops with stop_reason=deadline", result.get("stop_reason") == "deadline")
-    check("run budget e2e: budget block present", isinstance(result.get("budget"), dict))
-    check(
-        "run budget e2e: budget block marks exhausted",
-        isinstance(result.get("budget"), dict) and result["budget"].get("exhausted") is True,
-    )
-    check(
-        "run budget e2e: stopped early (well before max_turns)",
-        llm.calls <= 3, f"calls={llm.calls}",
-    )
-
-
-async def test_turn_loop_tool_timeout() -> None:
-    """A tool that outruns its per-call timeout is surfaced as an honest error
-    ToolMessage; the run continues rather than hanging."""
-    import asyncio as _asyncio
-    from app.harness.engine.turn_loop import TurnLoop
-    from langchain_core.messages import HumanMessage
-
-    class _SlowTool:
-        name = "slow_tool"
-
-        async def ainvoke(self, args):
-            await _asyncio.sleep(5)
-            return "done"
-
-    tool_call = {"name": "slow_tool", "args": {}, "id": "c"}
-    llm = _FakeToolBoundLLM([
-        _fake_ai_message("", tool_calls=[tool_call]),
-        _fake_ai_message("Adapted after the tool timed out."),
-    ])
-    loop = TurnLoop(
-        llm, [_SlowTool()], "sys",
-        agent_config={"tool_call_timeout_seconds": 0.1, "run_deadline_seconds": 0}, max_turns=5,
-    )
-    result = await loop.run([HumanMessage(content="go")])
-    # Serialized messages are dicts ({"role": "tool", "content": ...}); the
-    # timed-out tool's error text lands in the tool message content.
-    joined = " ".join(
-        str(m.get("content", "") if isinstance(m, dict) else getattr(m, "content", ""))
-        for m in result.get("messages", [])
-    )
-    _statuses = [tc.get("status") for tc in result.get("tool_calls", [])]
-    check("tool timeout: surfaced as 'timed out' ToolMessage", "timed out" in joined, joined[:160])
-    check("tool timeout: tool call marked error", "error" in _statuses, str(_statuses))
-    check("tool timeout: run still completes cleanly", result.get("stop_reason") == "completed")
-
-
 def test_terminal_state_derivation() -> None:
     from app.harness.terminal_state import derive_terminal_state, terminal_state_for_result
-    from app.harness.engine.loop_state import StopReason, TerminalState
+    from app.harness.terminal_state import StopReason, TerminalState
 
     check(
         "terminal_state: plain success",
@@ -836,9 +528,8 @@ def test_terminal_state_derivation() -> None:
         terminal_state_for_result({}) == TerminalState.SUCCESS.value,
     )
 
-    # LangGraph parity: execute_agent()'s result dict shape (stop_reason/
-    # did_forced_synthesis/verify_pending/verify_last_passed, added for
-    # LangGraph parity with the native engine) classifies identically.
+    # execute_agent()'s result dict shape (stop_reason/did_forced_synthesis/
+    # verify_pending/verify_last_passed) classifies as expected.
     check(
         "terminal_state_for_result: LangGraph recursion-limit recovery -> exhausted",
         terminal_state_for_result({
@@ -1018,37 +709,6 @@ async def test_planning_evidence_gate() -> None:
         await pt.drop_session(sid)
 
 
-async def test_engine_native_dispatch() -> None:
-    """run_agent_once(engine='native') routes through TurnLoop, not the
-    LangGraph path — verified by monkeypatching the native entry point."""
-    import app.harness.engine as engine_mod
-    from app.harness import AgentSpec
-
-    spec = AgentSpec(agent_config={}, has_cloudwatch=False, has_code_analyzer=False,
-                      permission_mode="auto_allow", session_id="x")
-    called = {}
-
-    async def _fake_run_native(spec_, llm, tools, user_query, **kw):
-        called["hit"] = True
-        called["user_query"] = user_query
-        return {"final_answer": "native ran", "messages": [], "tool_calls": [],
-                "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
-                "cache_read_tokens": 0, "cache_creation_tokens": 0}
-
-    orig = engine_mod._run_native
-    engine_mod._run_native = _fake_run_native
-    try:
-        result = await engine_mod.run_agent_once(
-            spec, llm="LLM", tools=[], user_query="hi", engine=engine_mod.ENGINE_NATIVE,
-        )
-        check("engine: native dispatch reaches _run_native", called.get("hit") is True)
-        check("engine: native dispatch passes query through", called.get("user_query") == "hi")
-        check("engine: native dispatch returns its result", result.get("final_answer") == "native ran")
-    finally:
-        engine_mod._run_native = orig
-
-
-# ── engine: compression pipeline / preserved-tail contract ───────────────────
 def test_compression_split_preserved_tail() -> None:
     """The tail boundary must never orphan a ToolMessage from the AIMessage
     that requested it — a split pair would make Bedrock reject the retry
@@ -1277,131 +937,6 @@ def test_metamemory_is_seed_only() -> None:
     check("is_seed_only: truncated real block → False", _mm.is_seed_only(truncated_block) is False)
 
 
-async def test_turn_loop_reactive_compact_retry() -> None:
-    """A context-overflow error on turn 1 triggers exactly one reactive
-    compact-and-retry, then the (now-shorter) request succeeds on turn 2."""
-    from botocore.exceptions import ClientError
-    from langchain_core.messages import HumanMessage
-    from app.harness.engine.turn_loop import TurnLoop
-
-    class _OverflowThenOkLLM(_FakeToolBoundLLM):
-        def __init__(self, ok_response):
-            super().__init__([ok_response])
-            self.attempts = 0
-
-        async def ainvoke(self, messages, config=None):
-            self.attempts += 1
-            if self.attempts == 1:
-                raise ClientError(
-                    {"Error": {"Code": "ValidationException", "Message": "Input is too long for requested model."}},
-                    "Converse",
-                )
-            return await super().ainvoke(messages, config=config)
-
-    llm = _OverflowThenOkLLM(_fake_ai_message("Recovered after compaction."))
-    loop = TurnLoop(llm, [], "sys", agent_config={}, max_turns=5)
-
-    async def _fake_reactive_compact(messages):
-        return messages  # no-op stand-in; only call-count matters here
-
-    loop._compression.reactive_compact = _fake_reactive_compact
-    result = await loop.run([HumanMessage(content="huge context")])
-    check("turn_loop: recovers after one reactive compact", result["final_answer"] == "Recovered after compaction.")
-    check("turn_loop: exactly 2 model attempts (overflow + retry)", llm.attempts == 2)
-
-
-async def test_turn_loop_truncation_escalation_recovers() -> None:
-    """Turn 1 is truncated -> escalate max_output_tokens once -> turn 2 (now
-    with the higher ceiling bound) completes cleanly."""
-    from langchain_core.messages import HumanMessage
-    from app.harness.engine.turn_loop import TurnLoop
-
-    llm = _FakeToolBoundLLM([
-        _fake_ai_message("half a tho", truncated=True),
-        _fake_ai_message("...ught, now complete."),
-    ])
-    loop = TurnLoop(llm, [], "sys", agent_config={}, max_turns=5)
-    result = await loop.run([HumanMessage(content="long investigation")])
-    check("turn_loop: truncation escalation recovers", result["final_answer"] == "...ught, now complete.")
-    check("turn_loop: truncation escalation not flagged truncated", not result.get("truncated"))
-    check("turn_loop: truncation escalation used exactly 2 calls", llm.calls == 2)
-
-
-async def test_turn_loop_truncation_ladder_exhausts() -> None:
-    """A model that stays truncated through escalation + all recovery turns
-    gets an honest partial answer, never a confident half-thought."""
-    from langchain_core.messages import HumanMessage
-    from app.harness.engine.turn_loop import TurnLoop
-    from app.harness.engine.recovery import MAX_OUTPUT_TOKENS_RECOVERY_LIMIT
-
-    always_truncated = [_fake_ai_message("still going", truncated=True)] * 10
-    llm = _FakeToolBoundLLM(always_truncated)
-    loop = TurnLoop(llm, [], "sys", agent_config={}, max_turns=20)
-    result = await loop.run([HumanMessage(content="long investigation")])
-    check("turn_loop: exhausted ladder flags truncated", result.get("truncated") is True)
-    check(
-        "turn_loop: exhausted ladder final_answer is honest partial",
-        (result["final_answer"] or "").startswith("Investigation was cut off"),
-    )
-    # 1 initial + 1 escalation + MAX_OUTPUT_TOKENS_RECOVERY_LIMIT resume attempts.
-    check(
-        "turn_loop: exhausted ladder used bounded call count",
-        llm.calls == 2 + MAX_OUTPUT_TOKENS_RECOVERY_LIMIT,
-        f"calls={llm.calls}",
-    )
-
-
-async def test_turn_loop_midthought_continuation() -> None:
-    """A short mid-investigation preamble ('Let me search for...') gets one
-    extra turn to actually conclude, instead of being returned as the answer."""
-    from langchain_core.messages import HumanMessage
-    from app.harness.engine.turn_loop import TurnLoop
-
-    llm = _FakeToolBoundLLM([
-        _fake_ai_message("Let me search for more details on this."),
-        _fake_ai_message("Root cause: the retry queue overflowed."),
-    ])
-    loop = TurnLoop(llm, [], "sys", agent_config={}, max_turns=5)
-    result = await loop.run([HumanMessage(content="why did it fail?")])
-    check(
-        "turn_loop: mid-thought preamble gets a continuation",
-        result["final_answer"] == "Root cause: the retry queue overflowed.",
-    )
-    check("turn_loop: mid-thought continuation used exactly 2 calls", llm.calls == 2)
-
-
-async def test_recovery_call_model_with_backoff() -> None:
-    """call_model_with_backoff retries a transient error in place and
-    respects a retry_predicate that vetoes in-place retry."""
-    import asyncio
-    from app.harness.engine.recovery import call_model_with_backoff
-
-    class _FlakyOnce:
-        def __init__(self):
-            self.attempts = 0
-
-        async def __call__(self):
-            self.attempts += 1
-            if self.attempts == 1:
-                raise asyncio.TimeoutError("transient")
-            return "ok"
-
-    flaky = _FlakyOnce()
-    result = await call_model_with_backoff(flaky, max_retries=2)
-    check("recovery: transient error retried in place", result == "ok" and flaky.attempts == 2)
-
-    async def _always_fails():
-        raise asyncio.TimeoutError("transient")
-
-    vetoed = False
-    try:
-        await call_model_with_backoff(_always_fails, retry_predicate=lambda ce: False, max_retries=3)
-    except asyncio.TimeoutError:
-        vetoed = True
-    check("recovery: retry_predicate=False stops in-place retry immediately", vetoed)
-
-
-# ── chat_history: tool-inclusive history replay ──────────────────────────────
 def test_build_initial_messages_tool_replay() -> None:
     """build_initial_messages must reconstruct AIMessage.tool_calls +
     ToolMessage.tool_call_id from the extended dict shape, while staying
@@ -1860,8 +1395,8 @@ async def test_tool_result_failed_flag_threading() -> None:
     but the boolean was discarded rather than threaded through — so a tool
     that returns normally (no exception) with error CONTENT (e.g. a DB
     connection-refused message) rendered a green "success" step in the chat
-    UI. Verifies the classifier catches this content and that both engines'
-    tool-exec paths now pass `failed=` through to the stream callback."""
+    UI. Verifies the classifier catches this content and that the tool-exec
+    path now passes `failed=` through to the stream callback."""
     from app.core.tools.tool_guardrails import classify_tool_failure
 
     conn_refused = (
@@ -1892,31 +1427,7 @@ async def test_tool_result_failed_flag_threading() -> None:
         async def on_error(self, error):
             pass
 
-    # ── native engine: execute_tool_calls (tool_exec.py) ──
-    from app.harness.engine.tool_exec import execute_tool_calls
-
-    failing_tool = _FakeTool("postgres-production__query", conn_refused)
-    ok_tool = _FakeTool("other_tool", '{"rows": []}')
-    ai_msg = _fake_ai_message("", tool_calls=[
-        {"id": "c1", "name": "postgres-production__query", "args": {}},
-        {"id": "c2", "name": "other_tool", "args": {}},
-    ])
-    native_cb = _FakeStreamCallback()
-    await execute_tool_calls(
-        ai_msg, {"postgres-production__query": failing_tool, "other_tool": ok_tool},
-        stream_callback=native_cb,
-    )
-    native_by_name = {name: failed for name, _result, failed in native_cb.tool_results}
-    check(
-        "tool_exec.execute_tool_calls: threads failed=True for the connection-refused tool",
-        native_by_name.get("postgres-production__query") is True,
-    )
-    check(
-        "tool_exec.execute_tool_calls: threads failed=False for the healthy tool",
-        native_by_name.get("other_tool") is False,
-    )
-
-    # ── LangGraph engine: the on_tool_end streaming branch in agent_runner.py ──
+    # ── the on_tool_end streaming branch in agent_runner.py ──
     # Exercised directly rather than through the full astream loop (which needs
     # a live LangGraph agent) — this reproduces exactly the guardrail
     # post-check + on_tool_result call that agent_runner.py's on_tool_end
@@ -2865,27 +2376,28 @@ def test_memory_capability_and_autolearn() -> None:
     check("auto-learn compile_dynamic_nodes off by default",
           AutoLearnConfig().compile_dynamic_nodes is False)
 
-    # Generic-task state: only final_answer set, no root_cause / matched_pattern_ids.
-    # IncidentKBSink and LogPatternSink must both return applies=False.
-    from app.core.improvement.auto_learn import IncidentKBSink, LogPatternSink
+    # Generic-task state: only final_answer set, no root_cause.
+    # IncidentKBSink must return applies=False. (LogPatternSink was removed with
+    # the log_patterns table — knowledge is OKF-only now.)
+    from app.core.improvement.auto_learn import IncidentKBSink, _derive_tags
     generic_state = {"final_answer": "All checks passed.", "tool_calls": [], "confidence_score": 0.9}
     check("IncidentKBSink does not apply for generic state (no root_cause)",
           IncidentKBSink().applies(generic_state) is False)
-    check("LogPatternSink does not apply for generic state (no matched_pattern_ids)",
-          LogPatternSink().applies(generic_state) is False)
 
-    # Incident state: sinks must apply.
+    # Incident state: the KB sink must apply.
     incident_state = {
         "root_cause": "High error rate in payment-service due to DB timeout.",
-        "matched_pattern_ids": [1, 2],
         "final_answer": "Rolled back migration.",
         "tool_calls": [],
         "confidence_score": 0.9,
     }
     check("IncidentKBSink applies for incident state (has root_cause)",
           IncidentKBSink().applies(incident_state) is True)
-    check("LogPatternSink applies for incident state (has matched_pattern_ids)",
-          LogPatternSink().applies(incident_state) is True)
+
+    # Tag derivation extracts identifiers + error vocab (the paraphrase synonyms).
+    _tags = _derive_tags("DB timeout exhausted the ConnectionPool", ["HTTP 503 from payment-service"])
+    check("_derive_tags surfaces identifiers/vocab",
+          any(t.lower() == "connectionpool" for t in _tags) and "timeout" in [t.lower() for t in _tags])
 
 
 def test_memory_typed_node_config() -> None:
@@ -2942,12 +2454,16 @@ def test_memory_typed_node_config() -> None:
 
 
 async def test_memory_recall_gating() -> None:
-    """build_recall_query injects each tier ONLY when its memory type is active. DB-free."""
+    """build_recall_query injects each tier ONLY when its memory type is active. DB-free.
+
+    KB recall is now pure OKF FTS over the ``kb`` bank (the legacy
+    knowledge_entries/log_patterns embedding search was removed), so the kb tier
+    is served by a single ``recall(bank='kb')`` call.
+    """
     import app.services.semantic_memory as sm_mod
-    import app.services.knowledge_base as kb_mod
     from app.harness.context_builder import build_recall_query
 
-    calls = {"pinned": 0, "semantic": 0, "kb_issues": 0, "kb_bank": 0}
+    calls = {"pinned": 0, "semantic": 0, "kb_bank": 0}
 
     async def fake_list_pinned(**kw):
         calls["pinned"] += 1
@@ -2962,20 +2478,9 @@ async def test_memory_recall_gating() -> None:
         return [{"id": 1, "content": "past finding", "source": "agent",
                  "importance": 0.5, "veracity": 0.5}]
 
-    async def fake_issues(*a, **k):
-        calls["kb_issues"] += 1
-        return []
-
-    async def fake_patterns(*a, **k):
-        return []
-
-    orig = (sm_mod.semantic_memory.list_pinned, sm_mod.semantic_memory.recall,
-            kb_mod.knowledge_base.search_known_issues,
-            kb_mod.knowledge_base.search_similar_patterns)
+    orig = (sm_mod.semantic_memory.list_pinned, sm_mod.semantic_memory.recall)
     sm_mod.semantic_memory.list_pinned = fake_list_pinned
     sm_mod.semantic_memory.recall = fake_recall
-    kb_mod.knowledge_base.search_known_issues = fake_issues
-    kb_mod.knowledge_base.search_similar_patterns = fake_patterns
 
     q = "why is the payment service throwing 500 errors after the deploy"
 
@@ -2990,16 +2495,16 @@ async def test_memory_recall_gating() -> None:
     try:
         await run(frozenset({"pinned"}))
         check("pinned-only injects pinned only",
-              calls["pinned"] == 1 and calls["semantic"] == 0 and calls["kb_issues"] == 0)
+              calls["pinned"] == 1 and calls["semantic"] == 0 and calls["kb_bank"] == 0)
         await run(frozenset({"semantic"}))
         check("semantic-only injects semantic only",
-              calls["semantic"] == 1 and calls["pinned"] == 0 and calls["kb_issues"] == 0)
+              calls["semantic"] == 1 and calls["pinned"] == 0 and calls["kb_bank"] == 0)
         await run(frozenset({"kb"}))
-        check("kb-only queries kb leg + bundle bank",
-              calls["kb_issues"] == 1 and calls["kb_bank"] == 1 and calls["pinned"] == 0)
+        check("kb-only queries the kb bundle bank only",
+              calls["kb_bank"] == 1 and calls["pinned"] == 0 and calls["semantic"] == 0)
         await run(frozenset())
         check("empty types injects nothing",
-              calls["pinned"] == 0 and calls["semantic"] == 0 and calls["kb_issues"] == 0)
+              calls["pinned"] == 0 and calls["semantic"] == 0 and calls["kb_bank"] == 0)
         # Legacy contract: memory_types=None → pinned + KB always, semantic on flag.
         for k in calls:
             calls[k] = 0
@@ -3008,11 +2513,9 @@ async def test_memory_recall_gating() -> None:
             execution_id=None, memory_enabled=True, memory_types=None,
         )
         check("legacy None → pinned + kb + semantic",
-              calls["pinned"] == 1 and calls["kb_issues"] == 1 and calls["semantic"] == 1)
+              calls["pinned"] == 1 and calls["kb_bank"] == 1 and calls["semantic"] == 1)
     finally:
-        (sm_mod.semantic_memory.list_pinned, sm_mod.semantic_memory.recall,
-         kb_mod.knowledge_base.search_known_issues,
-         kb_mod.knowledge_base.search_similar_patterns) = orig
+        (sm_mod.semantic_memory.list_pinned, sm_mod.semantic_memory.recall) = orig
 
 
 def test_okf_knowledge_bundle() -> None:
@@ -3132,6 +2635,62 @@ def test_persona_and_supervisor_toggle() -> None:
     # Autonomy toggle coercion: 'false' string must read as autonomous (False).
     check("supervisor 'false' string coerces to False", _as_bool("false") is False)
     check("supervisor 'true' string coerces to True", _as_bool("true") is True)
+
+
+def test_skill_prompt_ordering_contract() -> None:
+    """Guard the two prompt-ordering constraints that were MEASURED to make or
+    break skill usage (traj-skill-locate), and are otherwise protected only by
+    comments in agent_builder + the container-only trajectory eval:
+
+      1. '# Skills' must be the LAST '# ' platform section — a capability section
+         naming a one-shot tool would otherwise win on recency over "load the
+         matching skill first".
+      2. The skill check ('STEP ZERO') must be EMBEDDED inside the '# Using your
+         tools' routing bullet, before the domain rules — a caveat appended after
+         them was measured to lose.
+
+    A new default-on section appended after '# Skills' silently regresses skill
+    usage; this catches it at commit time.
+    """
+    import re as _re
+    from types import SimpleNamespace
+    from app.harness.agent_builder import compose_system_prompt
+
+    _skill_tool = SimpleNamespace(name="skill")
+    prompt = compose_system_prompt(
+        tools=[_skill_tool],
+        agent_config={"instructions": ""},
+        has_cloudwatch=True, has_code_analyzer=True,
+        planning=True, filesystem=True,
+    )
+    # (1) '# Skills' is the last '# '-prefixed platform heading. ('## Context'
+    # from persona doesn't match '# '; the user-turn '# Skill map' isn't here.)
+    heads = [m.group(1) for m in _re.finditer(r'(?:^|\n)(# [^\n]+)', prompt)]
+    check("compose: '# Skills' section present when skill tool bound",
+          any(h.startswith("# Skills") for h in heads), str(heads))
+    check("compose: '# Skills' is the LAST platform section",
+          bool(heads) and heads[-1].startswith("# Skills"),
+          f"last heading was {heads[-1] if heads else '<none>'}")
+
+    # (2) STEP ZERO is inside the routing bullet, ahead of the domain rules.
+    check("compose: STEP ZERO present when skill tool bound", "STEP ZERO" in prompt)
+    if "STEP ZERO" in prompt and "# Using your tools" in prompt:
+        check("compose: STEP ZERO sits in the tool-routing section",
+              prompt.index("# Using your tools")
+              < prompt.index("STEP ZERO")
+              < prompt.index("A question about live data"))
+
+    # (3) Neither appears without the skill tool bound (cache-prefix determinism:
+    # both clauses are gated on has_skill_tool).
+    prompt_no_skill = compose_system_prompt(
+        tools=[], agent_config={"instructions": ""},
+        has_cloudwatch=True, has_code_analyzer=True,
+        planning=True, filesystem=True,
+    )
+    check("compose: no '# Skills' section without skill tool",
+          "# Skills" not in prompt_no_skill)
+    check("compose: no STEP ZERO without skill tool",
+          "STEP ZERO" not in prompt_no_skill)
 
 
 # ── chat sessions ─────────────────────────────────────────────────────────────
@@ -3292,11 +2851,11 @@ async def test_skill_tool_wiring() -> None:
     check("skill tool tolerates leading slash", "Loaded skill" in out2)
     check("skill tool records invocation in sink", sink == ["log-error-triage"], str(sink))
 
-    # Re-invocation guard: loading the SAME skill again this turn returns a
+    # Re-invocation guard: loading the SAME skill again this context returns a
     # one-line stub (not the full runbook body again) and doesn't double-record.
     out2b = await tool2.ainvoke({"skill": "log-error-triage"})
     check("skill tool guards re-invocation",
-          "already loaded this turn" in out2b and "<skill_instructions" not in out2b, out2b[:120])
+          "already loaded in this context" in out2b and "<skill_instructions" not in out2b, out2b[:120])
     check("skill tool re-invocation doesn't double-record", sink == ["log-error-triage"], str(sink))
 
     # Unknown skill → error string listing available names (no raise).
@@ -3472,12 +3031,16 @@ async def test_tool_assembler_degrade_not_abort() -> None:
     import unittest.mock as _mock
     import logging as _logging
     from botocore.exceptions import ClientError
-    from app.harness.tool_assembler import _sts_expired
+    from app.harness.tool_assembler import _sts_expired, _reset_sts_cache
 
     _quiet_logger = _logging.getLogger("harness_selftest._sts_expired_probe")
     _quiet_logger.disabled = True
 
     async def _call(side_effect) -> bool:
+        # Every case below probes the SAME identity with a different outcome, so
+        # drop the negative-result memo first — otherwise a cached "creds fine"
+        # would satisfy the later checks without exercising the probe at all.
+        _reset_sts_cache()
         with _mock.patch(
             "app.core.concurrency.thread_pools.run_in_aws_pool", side_effect=side_effect,
         ):
@@ -3518,7 +3081,7 @@ async def test_collect_backend_degradations() -> None:
     import unittest.mock as _mock
     import logging as _logging
     from botocore.exceptions import ClientError
-    from app.harness.tool_assembler import collect_backend_degradations
+    from app.harness.tool_assembler import collect_backend_degradations, _reset_sts_cache
 
     _quiet = _logging.getLogger("harness_selftest.collect_degradations")
     _quiet.disabled = True
@@ -3538,6 +3101,7 @@ async def test_collect_backend_degradations() -> None:
     from app.infrastructure.persistence import mcp_config_repository as _repo
 
     async def _run(servers, side_effect=_expired_err):
+        _reset_sts_cache()  # cases share one identity — see _sts_expired's memo
         with _mock.patch(
             "app.core.concurrency.thread_pools.run_in_aws_pool", side_effect=side_effect,
         ), _mock.patch.object(_repo, "get_by_name", side_effect=_get_by_name):
@@ -4148,12 +3712,9 @@ async def test_configurable_agents() -> None:
         _te_instance.list_for_trace = _orig_list_for_trace
 
 
-async def test_subagent_engine_routing() -> None:
-    """_run_child dispatches through app.harness.engine.run_agent_once with
-    the SAME engine resolution as the parent (per-def agent_config['engine']
-    override, or the global AGENT_ENGINE default) — not a hardcoded
-    LangGraph path. Also verifies the max_turns*2 -> recursion_limit unit
-    both engines share, and that a child keeps a scoped tool
+async def test_subagent_dispatch() -> None:
+    """_run_child dispatches through app.harness.engine.run_agent_once, passing
+    the max_turns*2 -> recursion_limit unit, and a child keeps a scoped tool
     (pin_fact isn't in the blocked-tools list)."""
     import json
     import app.harness.engine as engine_mod
@@ -4166,7 +3727,6 @@ async def test_subagent_engine_routing() -> None:
     captured = {}
 
     async def _fake_run_agent_once(spec, llm, tools, user_query, **kw):
-        captured["engine"] = kw.get("engine")
         captured["recursion_limit"] = kw.get("recursion_limit")
         captured["tool_names"] = sorted(getattr(t, "name", "") for t in tools)
         return {"final_answer": "child done", "messages": [], "tool_calls": []}
@@ -4175,28 +3735,16 @@ async def test_subagent_engine_routing() -> None:
     engine_mod.run_agent_once = _fake_run_agent_once
     try:
         result = await sf._run_child(
-            llm=None, sub_tools=[_RoutingFakeTool("pin_fact")], agent_config={"engine": "native"},
+            llm=None, sub_tools=[_RoutingFakeTool("pin_fact")], agent_config={},
             name="test-child", role_prompt=None, capabilities=[], output_schema=None,
             model_name=None, depth_remaining=1, parent_execution_id="parent-1",
             timeout_s=0, output_max=4000, task="do the thing", max_turns=3,
         )
         parsed = json.loads(result)
-        check("subagent: dispatch honors per-def engine override", captured.get("engine") == "native")
         check("subagent: recursion_limit = max_turns*2", captured.get("recursion_limit") == 6)
         check("subagent: child keeps the scoped tool", "pin_fact" in captured.get("tool_names", []))
         check("subagent: child result envelope status ok", parsed.get("status") == "ok")
         check("subagent: child result carries answer", parsed.get("answer") == "child done")
-
-        captured.clear()
-        await sf._run_child(
-            llm=None, sub_tools=[], agent_config={}, name="test-child2", role_prompt=None,
-            capabilities=[], output_schema=None, model_name=None, depth_remaining=1,
-            parent_execution_id="parent-1", timeout_s=0, output_max=4000, task="do it",
-        )
-        check(
-            "subagent: no per-def override falls back to global AGENT_ENGINE default",
-            captured.get("engine") == engine_mod.ENGINE_LANGGRAPH,
-        )
     finally:
         engine_mod.run_agent_once = orig
 
@@ -4245,11 +3793,11 @@ async def test_agent_durability_and_max_concurrency() -> None:
     agent_runner.execute_agent = _fake_execute_agent
     settings.agent_durability = "exit"
     try:
-        await engine_mod.run_agent_once(_Spec(hitl=False), None, [], "q", engine="langgraph")
+        await engine_mod.run_agent_once(_Spec(hitl=False), None, [], "q")
         check("durability: non-HITL run passes configured 'exit' through", seen.get("durability") == "exit")
 
         seen.clear()
-        await engine_mod.run_agent_once(_Spec(hitl=True), None, [], "q", engine="langgraph")
+        await engine_mod.run_agent_once(_Spec(hitl=True), None, [], "q")
         check("durability: HITL run clamped to 'async'", seen.get("durability") == "async")
     finally:
         harness_mod.build_agent_from_spec = orig_build
@@ -4430,6 +3978,11 @@ async def test_subagent_model_precedence() -> None:
     orig_role_get = model_role_repository.get
     orig_bl = llmf.build_llm
     orig_override = settings.subagent_model_override
+    # Isolate the precedence chain from the compiled-agent cache: a cache-eligible
+    # child skips LLM resolution entirely (the model is baked into the graph), and
+    # these fakes hand build_agent_from_spec a string instead of a real LLM.
+    orig_cache = settings.subagent_compiled_cache_enabled
+    settings.subagent_compiled_cache_enabled = False
 
     engine_mod.run_agent_once = _fake_run_once
     llm_config_mod.resolve_llm_config_by_name = _fake_resolve_by_name
@@ -4439,7 +3992,7 @@ async def test_subagent_model_precedence() -> None:
     settings.subagent_model_override = None
 
     _kw = dict(
-        sub_tools=[], agent_config={"engine": "native"}, role_prompt=None,
+        sub_tools=[], agent_config={}, role_prompt=None,
         capabilities=[], output_schema=None, depth_remaining=1,
         parent_execution_id="p", timeout_s=0, output_max=4000, task="t",
     )
@@ -4473,6 +4026,7 @@ async def test_subagent_model_precedence() -> None:
         model_role_repository.get = orig_role_get
         llmf.build_llm = orig_bl
         settings.subagent_model_override = orig_override
+        settings.subagent_compiled_cache_enabled = orig_cache
 
 
 async def test_delegation_phase_b() -> None:
@@ -5053,7 +4607,7 @@ async def test_loop_engineering() -> None:
     check("loop4: prompt+policy proposals not eligible", dry2["eligible"] == 0)
 
     # ── 3.2 Failure->governance conversion (mocked failure_ledger) ──
-    # NOTE: analyzer.py/apply.py/tool_exec.py all import the singleton via
+    # NOTE: analyzer.py/apply.py/failure_hook.py all import the singleton via
     # `from app.infrastructure.persistence import failure_ledger_repository`
     # (resolving to __init__.py's instance) — patch that SAME object, not the
     # separate instance failure_ledger_repository.py itself also constructs.
@@ -5145,8 +4699,8 @@ async def test_loop_engineering() -> None:
         _fl_instance.list_open = _orig_list_open
         _fl_instance.mark_converted = _orig_mark_converted
 
-    # ── live tool_exec failure hook (gated by governance_conversion_enabled) ──
-    from app.harness.engine.tool_exec import _record_failure_fingerprint
+    # ── live failure hook (gated by governance_conversion_enabled) ──
+    from app.harness.failure_hook import record_failure_fingerprint as _record_failure_fingerprint
     from app.config import settings as _gov_settings
 
     fake_ledger2 = _FakeFailureLedger()
@@ -5155,11 +4709,11 @@ async def test_loop_engineering() -> None:
     try:
         _gov_settings.governance_conversion_enabled = False
         await _record_failure_fingerprint("some_tool", "Error: boom", "exec-x")
-        check("tool_exec failure hook: no-op when governance_conversion_enabled=False", fake_ledger2.rows == {})
+        check("failure hook: no-op when governance_conversion_enabled=False", fake_ledger2.rows == {})
 
         _gov_settings.governance_conversion_enabled = True
         await _record_failure_fingerprint("some_tool", "Error: boom", "exec-x")
-        check("tool_exec failure hook: records fingerprint when enabled", len(fake_ledger2.rows) == 1)
+        check("failure hook: records fingerprint when enabled", len(fake_ledger2.rows) == 1)
     finally:
         _gov_settings.governance_conversion_enabled = _orig_gov_flag
         _fl_instance.record = _orig_record
@@ -5573,109 +5127,623 @@ async def test_phase4_supervised_autolearn() -> None:
         _cl.call_llm = _orig
 
 
-def test_bakeoff_aggregate() -> None:
-    """Engine bake-off aggregation: accuracy, p50/p95, recovery counts, head-to-
-    head, and the decision-rule verdict (native-wins / tie / native-worse)."""
-    from evals.accuracy import run_bakeoff as rb
+def test_run_budget() -> None:
+    """Run budgets: fraction math, the once-per-run nudge, and the hard stop.
 
-    def mkrows(engine, score, lat, tok, run=0, stop="completed", dfs=False):
-        return [{"id": "c1", "metric": m, "objective": True, "score": score,
-                 "latency_s": lat, "tool_calls_n": 3, "engine": engine, "_run_idx": run,
-                 "stop_reason": stop, "did_forced_synthesis": dfs, "truncated": False,
-                 "total_tokens": tok, "diagnostic": ""}
-                for m in ("tool_selection", "protocol", "final_answer", "grounding")]
+    These are the rungs that make a long investigation end with an honest
+    partial answer instead of a mid-thought kill.
+    """
+    import time as _time
+    from app.harness.run_budget import (
+        RunBudget, RunBudgetExhausted, budget_status, build_run_budget,
+        get_run_budget, set_run_budget, reset_run_budget,
+        STOP_DEADLINE, STOP_TOKEN_BUDGET,
+    )
 
-    # native strictly better accuracy + faster → adopt native
-    agg = rb.aggregate({"langgraph": mkrows("langgraph", 0.5, 3.0, 2000),
-                        "native": mkrows("native", 1.0, 1.5, 900)})
-    check("bakeoff lg acc 0.5", agg["engines"]["langgraph"]["objective_accuracy"] == 0.5)
-    check("bakeoff nv acc 1.0", agg["engines"]["native"]["objective_accuracy"] == 1.0)
-    check("bakeoff native wins h2h", agg["headtohead"]["candidate_wins"] == 4)
-    check("bakeoff verdict adopts native",
-          agg["verdict"]["recommendation"] == "native" and agg["verdict"]["adoptable"])
+    class _CB:
+        def __init__(self, i=0, o=0):
+            self.input_tokens, self.output_tokens = i, o
 
-    # accuracy tie, native faster → break toward baseline (langgraph)
-    agg2 = rb.aggregate({"langgraph": mkrows("langgraph", 1.0, 2.0, 1000),
-                         "native": mkrows("native", 1.0, 1.5, 900)})
-    check("bakeoff tie breaks to langgraph", agg2["verdict"]["recommendation"] == "langgraph")
+    check("run_budget: no budget -> (0.0, None)", budget_status(None) == (0.0, None))
+    check("run_budget: unconfigured budget -> no reason",
+          budget_status(RunBudget()) == (0.0, None))
 
-    # native regresses accuracy → keep langgraph, not adoptable
-    agg3 = rb.aggregate({"langgraph": mkrows("langgraph", 1.0, 2.0, 1000),
-                         "native": mkrows("native", 0.7, 1.0, 800)})
-    check("bakeoff native-worse keeps langgraph",
-          agg3["verdict"]["recommendation"] == "langgraph" and not agg3["verdict"]["adoptable"])
+    # Wall clock: 100s budget with 10s left = 90% consumed.
+    _rb = RunBudget(deadline_monotonic=_time.monotonic() + 10.0, deadline_seconds=100.0)
+    _frac, _reason = budget_status(_rb)
+    check("run_budget: deadline fraction ~0.9", 0.88 <= _frac <= 0.92, f"{_frac}")
+    check("run_budget: deadline reason", _reason == STOP_DEADLINE)
 
-    # p50/p95 across runs + recovery activation counting (forced synthesis)
-    lg4 = (mkrows("langgraph", 1.0, 2.0, 1000, run=0)
-           + mkrows("langgraph", 1.0, 4.0, 1000, run=1, dfs=True))
-    e = rb.aggregate({"langgraph": lg4})["engines"]["langgraph"]
-    check("bakeoff p50 across runs", e["latency_p50"] == 3.0, str(e["latency_p50"]))
-    check("bakeoff recovery counts forced-synthesis", e["recovery_activations"] == 1,
-          str(e["recovery_activations"]))
-    check("bakeoff dedupes perf to run_units", e["run_units"] == 2, str(e["run_units"]))
+    # Tokens: input+output only (cache counters excluded, matching the ledger).
+    _rb_t = RunBudget(token_budget=1000, token_cb=_CB(600, 200))
+    _frac_t, _reason_t = budget_status(_rb_t)
+    check("run_budget: token fraction 0.8", abs(_frac_t - 0.8) < 1e-9, f"{_frac_t}")
+    check("run_budget: token reason", _reason_t == STOP_TOKEN_BUDGET)
+    check("run_budget: exhausted token budget >= 1.0",
+          budget_status(RunBudget(token_budget=100, token_cb=_CB(80, 40)))[0] >= 1.0)
+
+    # Whichever budget is closest to exhaustion wins.
+    _rb_both = RunBudget(
+        deadline_monotonic=_time.monotonic() + 90.0, deadline_seconds=100.0,
+        token_budget=1000, token_cb=_CB(700, 0),
+    )
+    check("run_budget: most-consumed budget wins",
+          budget_status(_rb_both)[1] == STOP_TOKEN_BUDGET)
+
+    check("run_budget: no knobs configured -> None (zero overhead)",
+          build_run_budget({"run_deadline_seconds": 0, "run_token_budget": 0}) is None)
+    _built = build_run_budget({"run_deadline_seconds": 30})
+    check("run_budget: per-workflow deadline override honoured",
+          _built is not None and _built.deadline_seconds == 30.0)
+    _built_p = build_run_budget({"params": {"run_token_budget": 5000}})
+    check("run_budget: params mirror honoured",
+          _built_p is not None and _built_p.token_budget == 5000)
+
+    # ContextVar round-trip — the hook reads the budget through it.
+    _tok = set_run_budget(_built)
+    check("run_budget: get returns the bound budget", get_run_budget() is _built)
+    reset_run_budget(_tok)
+    check("run_budget: reset unbinds", get_run_budget() is None)
+
+    check("run_budget: exhaustion carries the reason",
+          RunBudgetExhausted(STOP_DEADLINE).reason == STOP_DEADLINE)
+    check("run_budget: exhaustion is never retried by with_retry",
+          getattr(RunBudgetExhausted(STOP_DEADLINE), "never_retry", False) is True)
 
 
-async def test_bakeoff_engine_threading() -> None:
-    """run_trajectory threads the engine into run_agent_once and enriches rows
-    with the engine tag + result-contract metrics. DB-free (fakes LLM + loop)."""
-    import app.harness.engine as _eng
-    from evals.accuracy import run_trajectory as _rt
+async def test_run_budget_hook_and_retry() -> None:
+    """The budget rungs as wired: with_retry refuses to retry a budget stop,
+    and the nudge latches once per run."""
+    import time as _time
+    from app.harness.run_budget import (
+        RunBudget, RunBudgetExhausted, set_run_budget, reset_run_budget,
+        BUDGET_SYNTHESIS_NUDGE, budget_status, NUDGE_FRACTION,
+    )
+    from app.core.resilience.retry import with_retry
 
-    captured: dict = {}
+    # with_retry must not retry a budget stop even when the caller's predicate
+    # says "retry everything" — otherwise the budget would be meaningless.
+    _calls = {"n": 0}
 
-    async def _fake_run_agent_once(spec, llm, tools, query, **kw):
-        captured["engine"] = kw.get("engine")
-        captured["cfg_engine"] = getattr(spec, "agent_config", {}).get("engine")
-        return {"final_answer": "done", "messages": [], "stop_reason": "completed",
-                "total_tokens": 123, "input_tokens": 100, "output_tokens": 23,
-                "did_forced_synthesis": False, "truncated": False}
+    async def _boom():
+        _calls["n"] += 1
+        raise RunBudgetExhausted("deadline")
 
-    async def _fake_llm():
-        return object()
-
-    _orig_rao, _orig_llm = _eng.run_agent_once, _rt._build_agent_llm
-    _eng.run_agent_once = _fake_run_agent_once
-    _rt._build_agent_llm = _fake_llm
     try:
-        rows, _n = await _rt._attempt({"id": "t1", "question": "q", "expected": {}}, "native")
-    finally:
-        _eng.run_agent_once = _orig_rao
-        _rt._build_agent_llm = _orig_llm
+        await with_retry(_boom, retry_on=lambda _c: True, max_retries=3)
+        check("run_budget: with_retry re-raises", False, "no exception raised")
+    except RunBudgetExhausted:
+        check("run_budget: with_retry re-raises", True)
+    check("run_budget: with_retry called it exactly once", _calls["n"] == 1, str(_calls["n"]))
 
-    check("bakeoff threading: engine reached run_agent_once", captured.get("engine") == "native")
-    check("bakeoff threading: engine in agent_config", captured.get("cfg_engine") == "native")
-    r0 = rows[0]
-    check("bakeoff row tagged engine", r0.get("engine") == "native")
-    check("bakeoff row carries stop_reason", r0.get("stop_reason") == "completed")
-    check("bakeoff row carries total_tokens", r0.get("total_tokens") == 123)
+    _rb = RunBudget(deadline_monotonic=_time.monotonic() + 5.0, deadline_seconds=100.0)
+    _tok = set_run_budget(_rb)
+    try:
+        _frac, _reason = budget_status(_rb)
+        check("run_budget: 95% consumed crosses the nudge line", _frac >= NUDGE_FRACTION)
+        check("run_budget: nudge not yet fired", _rb.nudged is False)
+        _rb.nudged = True
+        check("run_budget: nudge latches (fires once per run)", _rb.nudged is True)
+        # The nudge must be a registered synthetic prefix, or chat-history turn
+        # segmentation would mistake it for a real user turn on replay.
+        from app.harness.agent_runner import SYNTHETIC_NUDGE_PREFIXES
+        check("run_budget: nudge is a recognized synthetic prefix",
+              BUDGET_SYNTHESIS_NUDGE in SYNTHETIC_NUDGE_PREFIXES)
+    finally:
+        reset_run_budget(_tok)
+
+
+async def test_mcp_barrier_parallel_connect() -> None:
+    """The pre-connect barrier connects wired MCP servers CONCURRENTLY.
+
+    Cold starts are dominated by each subprocess's own handshake (CloudWatch
+    alone is ~7s), so a sequential barrier cost the SUM of every server's cold
+    start on every turn. Three 0.3s servers must finish in ~0.3s, not ~0.9s.
+    A failing server must not cancel its siblings.
+    """
+    import asyncio as _a, time as _t
+    from app.workflow.strategies.react import workflow_config as wc
+
+    DELAY = 0.3
+
+    class _FakeMgr:
+        def __init__(self): self.connected = set(); self.filters = {}; self.last_errors = {}
+        def is_connected(self, key): return key in self.connected
+        async def connect_server(self, key, cfg):
+            await _a.sleep(DELAY)
+            if "bad" in key:
+                self.last_errors[key] = "boom"
+                return False
+            self.connected.add(key); return True
+        def set_tool_filter(self, key, pats): self.filters[key] = pats
+
+    class _FakeRepo:
+        async def get_by_name(self, name):
+            return {"command": "x", "args": [], "env": {}}
+
+    workflow = {"nodes": [
+        {"id": "n1", "type": "mcp_server",
+         "params": {"servers": "alpha,beta,bad-one", "tools": "alpha__*"}},
+    ], "edges": []}
+
+    import app.infrastructure.persistence as _persist
+    _orig_repo = _persist.mcp_config_repository
+    _orig_ids = wc.get_connected_node_ids
+    _persist.mcp_config_repository = _FakeRepo()
+    wc.get_connected_node_ids = lambda w, t: ["n1"]
+    try:
+        mgr = _FakeMgr()
+        t0 = _t.monotonic()
+        failed = await wc.connect_agent_mcp_nodes(workflow, mgr)
+        elapsed = _t.monotonic() - t0
+    finally:
+        _persist.mcp_config_repository = _orig_repo
+        wc.get_connected_node_ids = _orig_ids
+
+    check("mcp barrier: connects concurrently (~1x delay, not 3x)",
+          elapsed < DELAY * 2, f"elapsed={elapsed:.2f}s for 3x{DELAY}s servers")
+    check("mcp barrier: a failing server is reported", failed == ["bad-one"], str(failed))
+    check("mcp barrier: a failing server does not cancel siblings",
+          {"n1__alpha", "n1__beta"} <= mgr.connected, str(mgr.connected))
+    check("mcp barrier: tool filter still applied", mgr.filters.get("n1__alpha") == ["alpha__*"])
+
+
+class _FakeChatModel:
+    """A real Runnable chat model for tests that must build an actual
+    ``create_react_agent`` graph (the lighter ``_FakeToolBoundLLM`` is not a
+    Runnable, and langchain's stock fake raises NotImplementedError on
+    ``bind_tools``, which create_react_agent always calls)."""
+
+    def __new__(cls, responses):
+        from langchain_core.language_models.fake_chat_models import (
+            FakeMessagesListChatModel,
+        )
+
+        class _M(FakeMessagesListChatModel):
+            def bind_tools(self, tools, **kw):
+                return self
+
+        return _M(responses=responses)
+
+
+async def test_run_budget_stops_real_graph() -> None:
+    """A consumed budget raises out of a REAL compiled graph, unwrapped, for
+    both graph shapes — and execute_agent turns that into an honest partial.
+
+    The unwrapped part matters: execute_agent and the v2 stream loop both key
+    on ``isinstance(exc, RunBudgetExhausted)``. If a LangGraph upgrade started
+    wrapping node exceptions, the budget stop would silently become a raw error
+    surfaced to the user instead of a labelled partial answer — this is the
+    check that catches that.
+    """
+    import time as _time
+    from langchain_core.messages import AIMessage
+    from langgraph.checkpoint.memory import MemorySaver
+    from app.harness.react_agent import _finish_build_agent
+    from app.harness.run_budget import (
+        RunBudget, RunBudgetExhausted, set_run_budget, reset_run_budget,
+    )
+
+    async def _raises(hitl: bool):
+        llm = _FakeChatModel([AIMessage(content="done")])
+        agent = _finish_build_agent(
+            llm, [], {"hitl_enabled": hitl}, "sys", "single",
+            checkpointer=MemorySaver() if hitl else None, session_id="budget-test",
+        )
+        # Deadline already blown -> the hook must raise on the first model call.
+        rb = RunBudget(deadline_monotonic=_time.monotonic() - 1.0, deadline_seconds=100.0)
+        tok = set_run_budget(rb)
+        try:
+            await agent.ainvoke({"messages": [("user", "hi")]},
+                                {"configurable": {"thread_id": "t-budget"}})
+            return None
+        except RunBudgetExhausted as exc:
+            return exc
+        except BaseException:  # noqa: BLE001 — any other type is the failure
+            return False
+        finally:
+            reset_run_budget(tok)
+
+    _plain = await _raises(False)
+    check("run_budget: raises unwrapped from a real create_react_agent graph",
+          isinstance(_plain, RunBudgetExhausted) and _plain.reason == "deadline",
+          repr(_plain))
+    _hitl = await _raises(True)
+    check("run_budget: raises unwrapped through the HITL subgraph wrapper",
+          isinstance(_hitl, RunBudgetExhausted) and _hitl.reason == "deadline",
+          repr(_hitl))
+
+    # End-to-end: execute_agent converts the raise into a labelled partial.
+    #
+    # The budget is injected already-spent rather than configured with a tiny
+    # deadline: a short wall-clock budget is a RACE (on a warm process the hook
+    # can fire well inside 1ms, leaving the budget legitimately unspent and the
+    # run completing normally). Budget CONSTRUCTION from agent_config is covered
+    # by test_run_budget; what this asserts is execute_agent's handling of the
+    # raise, which needs the exhaustion to be certain.
+    import logging as _logging
+    from app.harness import agent_runner
+    _quiet = _logging.getLogger("harness_selftest.run_budget_e2e")
+    _quiet.disabled = True
+    llm = _FakeChatModel([AIMessage(content="done")])
+    agent = _finish_build_agent(llm, [], {}, "sys", "single",
+                                checkpointer=MemorySaver(), session_id="budget-e2e")
+
+    def _spent_budget(agent_config, *, token_cb=None):
+        return RunBudget(deadline_monotonic=_time.monotonic() - 1.0,
+                         deadline_seconds=1.0, token_cb=token_cb)
+
+    _orig_build = agent_runner.build_run_budget
+    agent_runner.build_run_budget = _spent_budget
+    try:
+        result = await agent_runner.execute_agent(
+            agent, "investigate this", _quiet, execution_id="budget-e2e",
+            thread_id="budget-e2e",
+        )
+    finally:
+        agent_runner.build_run_budget = _orig_build
+
+    check("run_budget: execute_agent returns instead of raising",
+          isinstance(result, dict), type(result).__name__)
+    check("run_budget: envelope stop_reason=deadline",
+          result.get("stop_reason") == "deadline", str(result.get("stop_reason")))
+    check("run_budget: envelope flagged truncated", result.get("truncated") is True)
+    check("run_budget: answer says it was stopped at its limit",
+          "stopped at its configured time limit" in (result.get("final_answer") or ""),
+          (result.get("final_answer") or "")[:120])
+
+
+async def test_tool_call_timeout() -> None:
+    """Per-tool wall-clock cap: a hung tool returns an honest error ToolMessage
+    instead of consuming the run, the wrapped tool is still a real BaseTool
+    (so bind_tools can still build its schema), and the cap is a no-op when
+    unconfigured."""
+    import asyncio as _a
+    from langchain_core.tools import StructuredTool
+    from app.config import settings as _s
+    from app.harness import tool_timeout as tt
+
+    async def _slow(x: str = "") -> str:
+        await _a.sleep(5)
+        return "never"
+
+    async def _fast(x: str = "") -> str:
+        return "quick"
+
+    def _mk(name, fn):
+        return StructuredTool.from_function(
+            coroutine=fn, name=name, description=f"{name} tool",
+        )
+
+    _orig_cap = _s.agent_tool_call_timeout_seconds
+    _orig_deadline = _s.agent_run_deadline_seconds
+    try:
+        # ── Unconfigured → untouched (zero overhead for a default deployment).
+        _s.agent_tool_call_timeout_seconds = 0.0
+        _s.agent_run_deadline_seconds = 0.0
+        _tools = [_mk("t_a", _fast)]
+        check("tool timeout: no cap + no deadline -> tools returned untouched",
+              tt.wrap_tools_with_timeout(_tools) is _tools)
+        check("tool timeout: effective_timeout None when unconfigured",
+              tt.effective_timeout() is None)
+
+        # ── Configured → a hung tool is cut off with an honest error.
+        _s.agent_tool_call_timeout_seconds = 0.25
+        wrapped = tt.wrap_tools_with_timeout([_mk("slow_tool", _slow), _mk("fast_tool", _fast)])
+        slow, fast = wrapped[0], wrapped[1]
+
+        t0 = _a.get_event_loop().time()
+        out = await slow.ainvoke({"x": ""})
+        elapsed = _a.get_event_loop().time() - t0
+        check("tool timeout: hung tool returns rather than hanging", elapsed < 2.0,
+              f"elapsed={elapsed:.2f}s")
+        check("tool timeout: message names the tool and says it timed out",
+              "slow_tool" in out and "timed out" in out, str(out)[:120])
+        check("tool timeout: message is a plain string, not an exception",
+              isinstance(out, str))
+        check("tool timeout: a fast tool is unaffected",
+              await fast.ainvoke({"x": ""}) == "quick")
+
+        # ── The wrapped tool must remain a usable BaseTool: create_react_agent
+        # calls bind_tools, which converts each tool to a provider schema. A
+        # duck-typed proxy would fail here — this is the check that catches it.
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+        _schema = convert_to_openai_tool(slow)
+        check("tool timeout: wrapped tool still converts to a tool schema",
+              _schema.get("function", {}).get("name") == "slow_tool", str(_schema)[:140])
+
+        # ── Wrapping copies: the caller's original tool keeps its own coroutine.
+        _orig_tool = _mk("orig_tool", _fast)
+        _ = tt.wrap_tools_with_timeout([_orig_tool])
+        check("tool timeout: wrapping does not mutate the caller's tool",
+              _orig_tool.coroutine is _fast)
+
+        # ── A self-bounding tool (MCPToolWrapper.tool_timeout) is TIGHTENED to
+        #    the configured cap, never loosened — the operator knob must reach
+        #    MCP tools, but a tool's own stricter limit still wins.
+        from pydantic import BaseModel as _BM
+
+        class _SelfBounded(_BM):
+            name: str = "mcp_like"
+            tool_timeout: float | None = None
+
+        _s.agent_tool_call_timeout_seconds = 30.0
+        _loose = _SelfBounded(tool_timeout=60.0)
+        _strict = _SelfBounded(tool_timeout=5.0)
+        _unset = _SelfBounded(tool_timeout=None)
+        _res = tt.wrap_tools_with_timeout([_loose, _strict, _unset])
+        check("tool timeout: a looser self-bounded tool is tightened to the cap",
+              _res[0].tool_timeout == 30.0, str(_res[0].tool_timeout))
+        check("tool timeout: a stricter self-bounded tool keeps its own limit",
+              _res[1].tool_timeout == 5.0, str(_res[1].tool_timeout))
+        check("tool timeout: an unset self-bounded tool gets the cap",
+              _res[2].tool_timeout == 30.0, str(_res[2].tool_timeout))
+        check("tool timeout: tightening does not mutate the caller's tool",
+              _loose.tool_timeout == 60.0, str(_loose.tool_timeout))
+
+        # ── Clamped to the remaining run deadline when that is the tighter bound.
+        from app.harness.run_budget import RunBudget, set_run_budget, reset_run_budget
+        import time as _time
+        _s.agent_tool_call_timeout_seconds = 600.0
+        _tok = set_run_budget(RunBudget(
+            deadline_monotonic=_time.monotonic() + 5.0, deadline_seconds=100.0))
+        try:
+            eff = tt.effective_timeout()
+            check("tool timeout: clamped to the remaining run deadline",
+                  eff is not None and eff <= 5.1, str(eff))
+        finally:
+            reset_run_budget(_tok)
+    finally:
+        _s.agent_tool_call_timeout_seconds = _orig_cap
+        _s.agent_run_deadline_seconds = _orig_deadline
+
+
+async def test_token_calibration_feed() -> None:
+    """The calibration loop is CLOSED: the pre-model hook feeds real
+    (estimate, actual) observations back into token_calibration.
+
+    Without a feeder the learned factor stays 1.0 forever and the opt-in flag
+    silently does nothing — this asserts an observation actually lands.
+    """
+    import time as _time
+    from langchain_core.messages import AIMessage
+    from app.config import settings as _s
+    from app.core.llm import token_calibration as _tc
+    from app.harness.react_agent import _finish_build_agent
+    from app.harness.run_budget import RunBudget, set_run_budget, reset_run_budget
+
+    class _CB:
+        """Stands in for TokenUsageCallback: books a prompt on each model call."""
+        def __init__(self):
+            self.input_tokens = 0
+            self.output_tokens = 0
+            self.cache_read_tokens = 0
+            self.cache_creation_tokens = 0
+
+    recorded = []
+    _orig_record = _tc.record
+    _orig_enabled = _s.token_estimate_calibration_enabled
+    _tc.record = lambda model, est, act: recorded.append((model, est, act))
+    _s.token_estimate_calibration_enabled = True
+    try:
+        llm = _FakeChatModel([AIMessage(content="one"), AIMessage(content="two")])
+        agent = _finish_build_agent(llm, [], {}, "sys", "single",
+                                    checkpointer=None, session_id="calib")
+        cb = _CB()
+        rb = RunBudget(deadline_monotonic=_time.monotonic() + 600.0,
+                       deadline_seconds=600.0, token_cb=cb)
+        tok = set_run_budget(rb)
+        try:
+            # First model call: nothing to attribute yet, but the estimate is parked.
+            await agent.ainvoke({"messages": [("user", "hello there")]},
+                                {"configurable": {"thread_id": "calib"}})
+            check("token calibration: first call parks an estimate",
+                  rb.last_prompt_estimate > 0, str(rb.last_prompt_estimate))
+            check("token calibration: nothing recorded from the first call yet",
+                  recorded == [], str(recorded))
+
+            # Provider reports the real prompt size; the NEXT hook entry
+            # attributes it to the estimate parked above.
+            cb.input_tokens = 900
+            cb.cache_read_tokens = 100        # cached prompt still occupies context
+            await agent.ainvoke({"messages": [("user", "second turn")]},
+                                {"configurable": {"thread_id": "calib"}})
+        finally:
+            reset_run_budget(tok)
+
+        check("token calibration: an observation was recorded", len(recorded) == 1,
+              str(recorded))
+        if recorded:
+            _model, _est, _act = recorded[0]
+            check("token calibration: actual counts include the cache counters",
+                  _act == 1000, str(_act))
+            check("token calibration: estimate is the parked chars/4 figure",
+                  _est > 0, str(_est))
+    finally:
+        _tc.record = _orig_record
+        _s.token_estimate_calibration_enabled = _orig_enabled
+
+    # Default-off must stay an exact no-op.
+    check("token calibration: disabled -> factor is exactly 1.0",
+          _tc.factor_for("any-model") == 1.0)
+
+
+async def test_truncation_resume_loop() -> None:
+    """A turn cut off by the output-token ceiling is RESUMED, up to a bounded
+    number of attempts, then labelled honestly.
+
+    A long synthesis can hit the ceiling more than once, so a single resume is
+    not always enough; equally, resuming forever would burn the budget. Both
+    ends are asserted here.
+    """
+    from langchain_core.messages import HumanMessage
+    from app.harness import agent_runner
+
+    class _FakeAgent:
+        """Returns truncated turns until ``complete_after`` invocations."""
+
+        def __init__(self, complete_after: int):
+            self.complete_after = complete_after
+            self.calls = 0
+
+        async def ainvoke(self, state, config=None, **kw):
+            self.calls += 1
+            done = self.calls > self.complete_after
+            msg = _fake_ai_message(
+                "finished answer" if done else "partial...", truncated=not done,
+            )
+            return {"messages": list(state.get("messages", [])) + [msg]}
+
+        async def aget_state(self, config):
+            return None
+
+    _quiet = __import__("logging").getLogger("harness_selftest.truncation")
+    _quiet.disabled = True
+
+    # ── Recovers when a resume succeeds ────────────────────────────────
+    agent = _FakeAgent(complete_after=2)   # truncated, truncated, then complete
+    result = await agent_runner.execute_agent(
+        agent, "write a long report", _quiet, execution_id="trunc-ok",
+    )
+    check("truncation: resumes more than once when still truncated",
+          agent.calls == 3, f"calls={agent.calls}")
+    check("truncation: keeps the completed answer",
+          result.get("final_answer") == "finished answer", str(result.get("final_answer")))
+    check("truncation: a recovered run is not flagged truncated",
+          not result.get("truncated"))
+    check("truncation: a recovered run reports stop_reason=completed",
+          result.get("stop_reason") == "completed", str(result.get("stop_reason")))
+
+    # ── Gives up honestly when every resume is still truncated ─────────
+    agent2 = _FakeAgent(complete_after=99)   # never completes
+    result2 = await agent_runner.execute_agent(
+        agent2, "write a long report", _quiet, execution_id="trunc-exhaust",
+    )
+    check("truncation: resume attempts are bounded",
+          agent2.calls == 1 + agent_runner._TRUNCATION_RESUME_LIMIT,
+          f"calls={agent2.calls}")
+    check("truncation: exhausted run is flagged truncated",
+          result2.get("truncated") is True)
+    check("truncation: exhausted run says it was cut off",
+          "cut off by the model output limit" in (result2.get("final_answer") or ""),
+          (result2.get("final_answer") or "")[:100])
+    check("truncation: exhausted run reports stop_reason=token_budget",
+          result2.get("stop_reason") == "token_budget", str(result2.get("stop_reason")))
+
+    # ── The resume nudge must be a registered synthetic prefix, or replayed
+    #    history would treat it as a real user turn.
+    check("truncation: resume nudge is a recognized synthetic prefix",
+          agent_runner.CONTINUE_TRUNCATED_NUDGE in agent_runner.SYNTHETIC_NUDGE_PREFIXES)
+    _ = HumanMessage(content=agent_runner.CONTINUE_TRUNCATED_NUDGE)
+
+
+async def test_midthought_and_overflow_recovery() -> None:
+    """Two recovery rungs that previously had coverage only on the deleted
+    native loop, asserted against the LangGraph path that actually ships:
+
+    * a turn ending on a narrated next action gets one more turn to act, and
+      the fuller answer is kept (but a WORSE continuation is discarded);
+    * a context-overflow error compresses the input and retries instead of
+      failing the run.
+    """
+    from app.harness import agent_runner
+
+    _quiet = __import__("logging").getLogger("harness_selftest.recovery")
+    _quiet.disabled = True
+
+    # ── Mid-thought preamble → one more turn ───────────────────────────
+    class _MidthoughtAgent:
+        def __init__(self, second: str):
+            self.calls = 0
+            self.second = second
+
+        async def ainvoke(self, state, config=None, **kw):
+            self.calls += 1
+            text = "Now let me check the error logs:" if self.calls == 1 else self.second
+            return {"messages": list(state.get("messages", []))
+                    + [_fake_ai_message(text)]}
+
+        async def aget_state(self, config):
+            return None
+
+    _full = "Root cause: the retry loop never resets its counter (worker.py:88)."
+    a1 = _MidthoughtAgent(second=_full)
+    r1 = await agent_runner.execute_agent(a1, "why did it fail", _quiet,
+                                          execution_id="mid-ok")
+    check("midthought: narrated next action triggers one more turn", a1.calls == 2,
+          f"calls={a1.calls}")
+    check("midthought: the fuller answer replaces the preamble",
+          r1.get("final_answer") == _full, str(r1.get("final_answer"))[:80])
+
+    # A continuation that adds nothing must NOT replace the original.
+    a2 = _MidthoughtAgent(second="Now let me check the error logs:")
+    r2 = await agent_runner.execute_agent(a2, "why did it fail", _quiet,
+                                          execution_id="mid-nogain")
+    check("midthought: a no-better continuation keeps the original answer",
+          r2.get("final_answer") == "Now let me check the error logs:",
+          str(r2.get("final_answer"))[:80])
+
+    # ── Context overflow → compress + retry ────────────────────────────
+    from botocore.exceptions import ClientError
+
+    def _overflow_error():
+        # The real shape Bedrock raises; a bare ValueError would not classify.
+        return ClientError(
+            {"Error": {"Code": "ValidationException",
+                       "Message": "Input is too long for requested model."}},
+            "Converse",
+        )
+
+    class _OverflowAgent:
+        def __init__(self):
+            self.calls = 0
+
+        async def ainvoke(self, state, config=None, **kw):
+            self.calls += 1
+            if self.calls == 1:
+                raise _overflow_error()
+            return {"messages": list(state.get("messages", []))
+                    + [_fake_ai_message("recovered answer")]}
+
+        async def aget_state(self, config):
+            return None
+
+    from app.core.llm.error_classifier import classify_error
+    _classified = classify_error(_overflow_error())
+    check("overflow: the error classifies as should_compress",
+          _classified.should_compress is True)
+
+    a3 = _OverflowAgent()
+    r3 = await agent_runner.execute_agent(a3, "big question", _quiet,
+                                          execution_id="overflow")
+    check("overflow: run retries after compressing instead of failing",
+          a3.calls == 2, f"calls={a3.calls}")
+    check("overflow: retry answer is returned",
+          r3.get("final_answer") == "recovered answer", str(r3.get("final_answer"))[:80])
 
 
 async def _main() -> int:
     print("=== Agent Harness self-test ===")
     test_import_order_no_cycles()
+    test_run_budget()
     test_envelopes()
+    await test_run_budget_hook_and_retry()
+    await test_mcp_barrier_parallel_connect()
+    await test_run_budget_stops_real_graph()
+    await test_tool_call_timeout()
+    await test_token_calibration_feed()
+    await test_truncation_resume_loop()
+    await test_midthought_and_overflow_recovery()
     test_tool_router()
     test_tool_exposure()
     test_boto_context_overflow_classifier()
-    test_engine_resolution()
     await test_phase0_substrate()
     await test_phase1_action_approval()
     await test_phase2_action_supervisor()
     await test_phase3_tiered_enforcement()
     await test_phase4_supervised_autolearn()
-    test_bakeoff_aggregate()
-    await test_bakeoff_engine_threading()
-    await test_engine_native_dispatch()
-    await test_turn_loop_happy_path()
-    await test_turn_loop_tool_call_then_complete()
     await test_step_recorder()
-    await test_turn_loop_step_events_wiring()
     await test_instrument_langgraph_result()
-    await test_turn_loop_max_turns_forced_synthesis()
-    await test_turn_loop_verify_pending_tracking()
-    await test_turn_loop_run_budget_status()
-    await test_turn_loop_deadline_hard_stop()
-    await test_turn_loop_tool_timeout()
     test_terminal_state_derivation()
     test_completion_check()
     await test_planning_evidence_gate()
@@ -5687,11 +5755,6 @@ async def _main() -> int:
     await test_compression_metamemory_precheck()
     await test_metamemory_read_context_block_caps_milestones()
     test_metamemory_is_seed_only()
-    await test_turn_loop_reactive_compact_retry()
-    await test_turn_loop_truncation_escalation_recovers()
-    await test_turn_loop_truncation_ladder_exhausts()
-    await test_turn_loop_midthought_continuation()
-    await test_recovery_call_model_with_backoff()
     # ── chat_history: tool-inclusive history replay ──
     test_build_initial_messages_tool_replay()
     test_extract_turn_segment()
@@ -5710,6 +5773,7 @@ async def _main() -> int:
     test_okf_knowledge_bundle()
     await test_autolearn_learn_flow()
     test_persona_and_supervisor_toggle()
+    test_skill_prompt_ordering_contract()
     await test_supervisor_loop()
     await test_trajectory_export_step_events()
     await test_tool_result_failed_flag_threading()
@@ -5754,7 +5818,7 @@ async def _main() -> int:
     test_budget_ledger()
     await test_delegate_batch_budget_economy()
     # ── Phase 5: delegated children route through the engine flag ──
-    await test_subagent_engine_routing()
+    await test_subagent_dispatch()
     await test_subagent_model_precedence()
     # ── LangGraph perf knobs: durability/max_concurrency + stream_mode v2 ──
     await test_agent_durability_and_max_concurrency()

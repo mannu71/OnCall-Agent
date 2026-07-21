@@ -95,9 +95,19 @@ def render(agg: Dict[str, Any]) -> str:
             "codebase or schema.\n")
         add(f"Recall accuracy: **{_pct(lk['objective_accuracy'])}** ({lk['passed']}/{lk['n']}).\n")
 
+    rt = agg.get("retrieval") or {}
+    if rt.get("n"):
+        add("## FTS knowledge retrieval\n")
+        add("Deterministic hit@5 over a labelled corpus written into a throwaway OKF bundle and "
+            "indexed into an isolated `kb_eval` bank, then recalled with `mode='fts'` — no "
+            "embeddings. Half the queries are paraphrases, matched via document-side tag synonyms "
+            "(weight-A FTS lexemes). Exercises the production `semantic_memory.recall` SQL.\n")
+        add(f"Hit@5 accuracy: **{_pct(rt['objective_accuracy'])}** ({rt['passed']}/{rt['n']}).\n")
+
     add("## Sub-perfect cases\n")
     fails = _fail_rows(c["rows"]) + _fail_rows(w["rows"]) \
-        + _fail_rows(t.get("rows") or []) + _fail_rows(lk.get("rows") or [])
+        + _fail_rows(t.get("rows") or []) + _fail_rows(lk.get("rows") or []) \
+        + _fail_rows(rt.get("rows") or [])
     if not fails:
         add("_None on objective metrics._\n")
     else:

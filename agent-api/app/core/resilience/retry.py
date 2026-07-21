@@ -76,6 +76,13 @@ async def with_retry(
             last_error = exc
             classified = classify_error(exc)
 
+            # Control-flow signals (e.g. a run budget running out) are never
+            # transient — retrying one does the exact thing it was raised to
+            # stop. Honoured ahead of `retry_on` so a caller's predicate cannot
+            # opt into retrying them by accident.
+            if getattr(exc, "never_retry", False):
+                raise
+
             _should_retry = retry_on(classified) if retry_on else classified.retryable
             if not _should_retry or attempt >= max_retries:
                 raise
@@ -92,8 +99,13 @@ async def with_retry(
             if on_retry:
                 try:
                     await on_retry(attempt + 1, classified)
-                except Exception:
-                    pass
+                except Exception as hook_exc:  # noqa: BLE001
+                    # A failing hook must never break the retry it observes.
+                    logger.debug(
+                        "with_retry: on_retry hook raised (%s), continuing",
+                        hook_exc,
+                        exc_info=True,
+                    )
 
             await asyncio.sleep(wait)
 

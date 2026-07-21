@@ -174,60 +174,41 @@ async def build_recall_query(
             )
         return None, 0
 
-    # ── (c) KB recall (known issues / similar patterns) ──────────────────────
+    # ── (c) KB recall (OKF knowledge bundle, FTS over the ``kb`` bank) ────────
+    # Durable operational knowledge (known issues, log patterns, curated docs)
+    # lives in the OKF bundle and is indexed into the ``kb`` memory bank. Recall
+    # is Postgres FTS — tags act as paraphrase synonyms. The legacy
+    # knowledge_entries/log_patterns tables and their embedding search were
+    # removed.
     async def _recall_kb() -> Tuple[Optional[str], int]:
         if not _kb_on:
             return None, 0
         try:
-            from app.services.knowledge_base import knowledge_base as _kb
-            from app.harness.helpers import build_recall_context
-
-            # The two base lookups are independent — fan them out concurrently.
-            _issues, _patterns = await asyncio.gather(
-                _kb.search_known_issues(user_query, limit=3, threshold=0.65),
-                _kb.search_similar_patterns(user_query, limit=3, threshold=0.65),
+            from app.config import settings as _settings
+            if not getattr(_settings, "knowledge_bundle_enabled", True):
+                return None, 0
+            from app.services.semantic_memory import (
+                semantic_memory as _sm, format_recall_block as _fmt,
             )
-            # CloudWatch log-group patterns depend on _patterns for dedupe, so they
-            # run after the fan-out and merge in the same order as before.
+
+            _kb_hits = await _sm.recall(user_query, bank="kb")
+            # CloudWatch log-group context: recall docs mentioning the watched
+            # groups, merged/deduped by id.
             if cloudwatch_config:
                 _lg_query = " ".join(cloudwatch_config.get("log_groups") or [])
                 if _lg_query:
-                    _cw_pat = await _kb.search_similar_patterns(
-                        _lg_query, limit=2, threshold=0.55,
-                    )
-                    seen = {p.get("id") for p in _patterns}
-                    for _p in _cw_pat:
+                    seen = {h.get("id") for h in _kb_hits}
+                    for _p in await _sm.recall(_lg_query, bank="kb", k=2):
                         if _p.get("id") not in seen:
-                            _patterns.append(_p)
+                            _kb_hits.append(_p)
                             seen.add(_p.get("id"))
-            hits = len(_issues) + len(_patterns)
-            recall_block = build_recall_context(_issues, _patterns) or ""
-
-            # OKF knowledge bundle: auto-learn writes durable knowledge as OKF
-            # docs indexed into the ``kb`` memory bank. Surface those too (hybrid
-            # recall), merged under the legacy KB hits. A separate corpus from
-            # repo/global learned facts, so it uses its own bank.
-            try:
-                from app.config import settings as _settings
-                if getattr(_settings, "knowledge_bundle_enabled", True):
-                    from app.services.semantic_memory import (
-                        semantic_memory as _sm, format_recall_block as _fmt,
-                    )
-                    _kb_hits = await _sm.recall(user_query, bank="kb")
-                    if _kb_hits:
-                        _okf_block = _fmt(_kb_hits).replace(
-                            "## Learned memory (from past investigations)",
-                            "## Knowledge base (curated)",
-                        )
-                        recall_block = f"{recall_block}\n\n{_okf_block}".strip()
-                        hits += len(_kb_hits)
-            except Exception as _okf_err:  # noqa: BLE001 — bundle recall is best-effort
-                logger_instance.debug(
-                    "ReactStrategy: OKF bundle recall skipped (%s)", redact(str(_okf_err)),
-                    extra={"execution_id": execution_id},
-                )
-
-            return (recall_block or None), hits
+            if not _kb_hits:
+                return None, 0
+            recall_block = _fmt(_kb_hits).replace(
+                "## Learned memory (from past investigations)",
+                "## Knowledge base (curated)",
+            )
+            return (recall_block or None), len(_kb_hits)
         except Exception as _recall_err:  # noqa: BLE001 — recall is best-effort
             logger_instance.warning(
                 "ReactStrategy: KB recall failed (non-fatal): %s",

@@ -6,7 +6,7 @@ const BEDROCK_PROVIDER = {
     id: 'bedrock',
     name: 'AWS Bedrock',
     icon: '🌩️',
-    scope: 'Anthropic, Llama, Titan embeddings',
+    scope: 'Anthropic, Llama',
 };
 
 export default function ProviderKeysSection({ modelKey, onEdit }) {

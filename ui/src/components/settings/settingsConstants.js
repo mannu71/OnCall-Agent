@@ -69,7 +69,6 @@ export const EMPTY_LLM_FORM = {
     model: '',
     icon: '🧠',
     temperature: 0,
-    use_for_embeddings: false,
 };
 
 export const EMPTY_BEDROCK_CREDS = {

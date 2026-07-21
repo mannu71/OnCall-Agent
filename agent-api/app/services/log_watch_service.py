@@ -425,13 +425,16 @@ class LogWatchService:
         return await create_knowledge_entry(**kwargs)
 
     async def list_patterns(self, **kwargs: Any) -> List[Dict[str, Any]]:
-        return await knowledge_base.list_log_patterns(**kwargs)
+        from app.core.knowledge import list_patterns
+        return list_patterns(**kwargs)
 
     async def add_pattern(self, **kwargs: Any) -> Dict[str, Any]:
-        return await knowledge_base.add_log_pattern(**kwargs)
+        from app.core.knowledge import add_pattern
+        return await add_pattern(**kwargs)
 
     async def search_patterns(self, **kwargs: Any) -> List[Dict[str, Any]]:
-        return await knowledge_base.search_similar_patterns(**kwargs)
+        from app.core.knowledge import search_patterns
+        return await search_patterns(**kwargs)
 
     async def list_baselines(self, **kwargs: Any) -> List[Dict[str, Any]]:
         return await knowledge_base.get_baseline_metrics(**kwargs)

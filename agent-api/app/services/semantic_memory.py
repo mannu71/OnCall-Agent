@@ -2,14 +2,13 @@
 
 Learned, operational memory captured while operating the system (confirmed root
 causes, symptom→fix, human-authoritative facts) — complementary to the static,
-code-derived ``repo_docs`` intelligence (migration 015). Recall is **hybrid
-FTS + vector** over the active repo bank ∪ the shared global bank, fused with
-Reciprocal Rank Fusion so exact-identifier matches (FTS) and paraphrase matches
-(vector) both surface without score normalisation.
-
-Embeddings reuse the existing Bedrock Titan :class:`EmbeddingService`
-(Bedrock-only). When embeddings are unavailable (FTS-only mode, or a transient
-embed failure) rows are still stored and recalled via the FTS leg.
+code-derived ``repo_docs`` intelligence. Recall is **Postgres full-text search**
+over the active repo bank ∪ the shared global bank (or a single named bank such
+as ``'kb'`` for the OKF knowledge bundle). The ``search_vector`` is weighted —
+title/tags at weight A, description at B, body at D — so ``ts_rank`` boosts
+title/tag matches; document-side tags act as paraphrase synonyms. No embeddings:
+the Bedrock Titan vector leg was removed in favour of FTS (zero embed calls, no
+AWS dependency on the recall hot path).
 """
 from __future__ import annotations
 
@@ -23,11 +22,12 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.core.database import AsyncSessionLocal
-from app.services.knowledge_base import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
-# Reciprocal Rank Fusion constant — dampens the contribution of lower ranks.
+# Rank-fusion constant — dampens the contribution of lower ranks. With a single
+# FTS leg this simply preserves ts_rank order; retained so the scoring shape is
+# stable if a second ranking signal is ever added.
 _RRF_K = 60
 
 
@@ -63,8 +63,8 @@ def _bank_filter(repos: Optional[List[str]], bank: Optional[str] = None) -> str:
 class SemanticMemoryService:
     """Store and recall bank-scoped semantic memories."""
 
-    def __init__(self, embedding_service: Optional[EmbeddingService] = None):
-        self.embedding_service = embedding_service or EmbeddingService()
+    def __init__(self) -> None:
+        pass
 
     # ── write ────────────────────────────────────────────────────────────────
 
@@ -77,40 +77,59 @@ class SemanticMemoryService:
         importance: float = 0.5,
         veracity: float = 0.5,
         bank: Optional[str] = None,
+        title: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        description: Optional[str] = None,
     ) -> Optional[int]:
         """Store one memory; dedupe on (bank, repo, content hash).
 
         Returns the row id, or None when *content* is empty. Best-effort: a DB or
         embedding error is logged and swallowed (memory must never break a run).
+
+        When *title*, *tags*, or *description* are given (the OKF ``kb`` path),
+        the FTS ``search_vector`` is built **weighted** — title+tags at weight A,
+        description at B, body/``content`` at the default D — so ``ts_rank`` boosts
+        title/tag matches ~10×. Tags act as document-side synonyms, the paraphrase
+        mechanism that lets FTS-only recall match reworded queries. Calls without
+        any structured field build a single unweighted vector, byte-identical to
+        the prior behaviour.
         """
         content = (content or "").strip()
         if not content:
             return None
         bank = bank or ("repo" if repo else "global")
-        sha = _sha256(content)
 
-        emb_param: Optional[str] = None
-        if (settings.memory_retrieval_mode or "hybrid") != "fts":
-            try:
-                emb = await self.embedding_service.generate_embedding(content)
-                if emb:
-                    emb_param = str(emb)
-            except Exception as e:  # noqa: BLE001 — fall back to FTS-only storage
-                logger.warning("semantic_memory: embed failed, storing FTS-only (%s)", e)
+        # Weighted-vs-plain search_vector. weight_a = title + tags (synonyms),
+        # weight_b = description. The sha folds in the structured fields so a
+        # frontmatter-only edit (e.g. new tags) yields a new dedup identity and
+        # deterministically re-indexes.
+        tags_text = " ".join(str(t).strip() for t in (tags or []) if str(t).strip())
+        weight_a = " ".join(p for p in ((title or "").strip(), tags_text) if p)
+        weight_b = (description or "").strip()
+        structured = bool(weight_a or weight_b)
+        sha = _sha256(content if not structured else f"{content}\x00{weight_a}\x00{weight_b}")
+
+        if structured:
+            search_vector_sql = (
+                "setweight(to_tsvector('english', :weight_a), 'A') || "
+                "setweight(to_tsvector('english', :weight_b), 'B') || "
+                "to_tsvector('english', :content)"
+            )
+        else:
+            search_vector_sql = "to_tsvector('english', :content)"
 
         sql = text(
-            """
+            f"""
             INSERT INTO semantic_memory
-              (bank, repo_name, content, content_sha256, embedding, search_vector,
+              (bank, repo_name, content, content_sha256, search_vector,
                source, importance, veracity, created_at)
             VALUES
-              (:bank, :repo, :content, :sha, CAST(:emb AS vector),
-               to_tsvector('english', :content), :source, :importance, :veracity, now())
+              (:bank, :repo, :content, :sha,
+               {search_vector_sql}, :source, :importance, :veracity, now())
             ON CONFLICT (bank, COALESCE(repo_name, ''), content_sha256)
             DO UPDATE SET
                importance    = GREATEST(semantic_memory.importance, EXCLUDED.importance),
                veracity      = EXCLUDED.veracity,
-               embedding     = COALESCE(EXCLUDED.embedding, semantic_memory.embedding),
                search_vector = EXCLUDED.search_vector,
                source        = EXCLUDED.source
             RETURNING id
@@ -123,7 +142,8 @@ class SemanticMemoryService:
                     "repo": repo,
                     "content": content,
                     "sha": sha,
-                    "emb": emb_param,
+                    "weight_a": weight_a,
+                    "weight_b": weight_b,
                     "source": source,
                     "importance": float(importance),
                     "veracity": float(veracity),
@@ -143,24 +163,20 @@ class SemanticMemoryService:
         *,
         repo: Optional[str] = None,
         k: Optional[int] = None,
-        threshold: Optional[float] = None,
-        mode: Optional[str] = None,
         bank: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Return up to *k* memories most relevant to *query* (hybrid by default).
+        """Return up to *k* memories most relevant to *query* (Postgres FTS).
 
         Searches the repo bank ∪ global bank, or — when *bank* is given — that
-        single bank (e.g. ``'kb'`` for the OKF knowledge bundle). ``mode``
-        ('hybrid'|'fts'|'vector') defaults to ``settings.memory_retrieval_mode``.
-        Results are token-bounded by the caller (the provider truncates each
-        ``content``).
+        single bank (e.g. ``'kb'`` for the OKF knowledge bundle). Ranking is
+        ``ts_rank`` over the weighted ``search_vector`` (title/tags weight A);
+        document-side tags act as paraphrase synonyms. Results are token-bounded
+        by the caller (the provider truncates each ``content``).
         """
         query = (query or "").strip()
         if not query:
             return []
         k = k or settings.memory_recall_k
-        threshold = settings.memory_recall_min_score if threshold is None else threshold
-        mode = (mode or settings.memory_retrieval_mode or "hybrid").lower()
         per_leg = max(k * 3, k)
         repos = _normalize_repos(repo)
 
@@ -169,11 +185,7 @@ class SemanticMemoryService:
 
         try:
             async with AsyncSessionLocal() as session:
-                if mode in ("hybrid", "vector"):
-                    await self._vector_leg(session, query, repos, threshold, per_leg,
-                                           rows_by_id, rrf, bank)
-                if mode in ("hybrid", "fts"):
-                    await self._fts_leg(session, query, repos, per_leg, rows_by_id, rrf, bank)
+                await self._fts_leg(session, query, repos, per_leg, rows_by_id, rrf, bank)
         except Exception as e:  # noqa: BLE001 — recall must never break a run
             logger.warning("semantic_memory: recall failed (%s)", e)
             return []
@@ -189,37 +201,6 @@ class SemanticMemoryService:
         if results:
             await self._bump_recall([r["id"] for r in results])
         return results
-
-    async def _vector_leg(self, session, query, repos, threshold, limit,
-                          rows_by_id, rrf, bank=None) -> None:
-        try:
-            emb = await self.embedding_service.generate_embedding(query)
-        except Exception as e:  # noqa: BLE001 — degrade to FTS-only
-            logger.warning("semantic_memory: query embed failed (%s)", e)
-            return
-        if not emb:
-            return
-        sql = text(
-            f"""
-            SELECT id, content, source, importance, veracity,
-                   1 - (embedding <=> CAST(:emb AS vector)) AS score
-            FROM semantic_memory
-            WHERE {_bank_filter(repos, bank)}
-              AND embedding IS NOT NULL
-              AND 1 - (embedding <=> CAST(:emb AS vector)) > :threshold
-            ORDER BY score DESC
-            LIMIT :limit
-            """
-        )
-        params = {"emb": str(emb), "threshold": float(threshold), "limit": limit}
-        if bank:
-            params["bank_name"] = bank
-        elif repos:
-            params["repos"] = repos
-        result = await session.execute(sql, params)
-        for rank, row in enumerate(result, start=1):
-            rows_by_id.setdefault(row.id, _row_dict(row))
-            rrf[row.id] = rrf.get(row.id, 0.0) + 1.0 / (_RRF_K + rank)
 
     async def _fts_leg(self, session, query, repos, limit, rows_by_id, rrf, bank=None) -> None:
         # OR-semantics: plainto_tsquery ANDs every term, so a query with any word
@@ -335,9 +316,9 @@ class SemanticMemoryService:
         sql = text(
             """
             INSERT INTO semantic_memory
-              (bank, repo_name, content, content_sha256, embedding, search_vector,
+              (bank, repo_name, content, content_sha256, search_vector,
                source, importance, veracity, created_at)
-            SELECT 'pinned', repo_name, content, content_sha256, embedding,
+            SELECT 'pinned', repo_name, content, content_sha256,
                    search_vector, source, GREATEST(importance, 0.8), veracity, now()
             FROM semantic_memory
             WHERE bank IN ('repo', 'global') AND recall_count >= :threshold

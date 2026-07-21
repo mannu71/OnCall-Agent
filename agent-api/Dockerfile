@@ -79,7 +79,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --timeout 180 --retries 10 \
     --trusted-host pypi.org \
     --trusted-host files.pythonhosted.org \
-    -r requirements-semantic.txt "langchain-openai>=1.1.0"
+    -r requirements-semantic.txt
 
 # ── Stage 2 — runtime-base: common runtime (no venv, no Node) ───────────────────
 # ripgrep powers the repo_grep code-grep tool (small; kept in both).

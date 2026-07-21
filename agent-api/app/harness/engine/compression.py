@@ -1,9 +1,8 @@
-"""Native turn-loop engine — compression pipeline.
+"""Agent engine — compression pipeline.
 
 Orchestrates WHEN to compact; ``ContextCompactionManager`` (and the shared
 ``app.core.context.compaction.compact()``) stays the HOW (LLM summarize,
-deterministic prune, ``memory_summaries`` persistence) — reused unchanged so
-both engines produce equivalent summaries.
+deterministic prune, ``memory_summaries`` persistence) — reused unchanged.
 
 Order per turn: microcompact -> threshold autocompact (both already inside
 ``ContextCompactionManager.compact_if_needed``, reused as-is) -> reactive
@@ -113,7 +112,13 @@ async def maybe_metamemory_summary(
 
 
 class CompressionPipeline:
-    """Owns the compaction call sites for one native-engine run."""
+    """Owns the compaction call sites for one agent run.
+
+    Built once per run (or per agent build, for the LangGraph engine's
+    ``pre_model_hook``) and reused across every model call — it holds no
+    per-call state, and sharing one instance is what lets a single token
+    estimate serve both gates in :meth:`maybe_compact`.
+    """
 
     def __init__(self, manager: Any, *, vfs_session_id: Any = None) -> None:
         self._mgr = manager
@@ -145,6 +150,12 @@ class CompressionPipeline:
                 return metamemory_messages
             return await self._mgr.compact_if_needed(messages, precomputed_total=total)
         return await self._mgr.compact_if_needed(messages)
+
+    def estimate_tokens(self, messages: List[Any]) -> int:
+        """The manager's token estimate for a message list. Exposed so callers
+        (e.g. the token-estimate calibration feed) don't reach into the
+        manager through a private attribute."""
+        return self._mgr.estimate_tokens(messages)
 
     async def reactive_compact(self, messages: List[Any]) -> List[Any]:
         """Forced summary regardless of threshold — only on a genuine

@@ -63,7 +63,7 @@ FLAG_CATALOG: List[Dict[str, Any]] = [
     # ── Memory & learning ──
     {"key": "semantic_memory_enabled", "type": "bool", "group": "Memory & learning",
      "label": "Semantic memory recall",
-     "help": "Retrieve bank-scoped semantic memories (hybrid FTS+vector) per turn."},
+     "help": "Retrieve bank-scoped semantic memories (Postgres FTS) per turn."},
     {"key": "memory_fact_extraction_enabled", "type": "bool", "group": "Memory & learning",
      "label": "Durable-fact extraction",
      "help": "After each turn, extract a few durable facts into semantic memory."},
@@ -85,13 +85,13 @@ FLAG_CATALOG: List[Dict[str, Any]] = [
              "scratch store. Requires the Postgres scratch backend; otherwise a no-op."},
 
     # ── Agent behaviour ──
-    {"key": "agent_planning_enabled", "type": "bool", "group": "Agent behaviour",
-     "label": "Plan → execute → verify",
-     "help": "Add the planning discipline and planning tools to the system prompt."},
+    # ``agent_planning_enabled`` is deliberately NOT listed: plan → execute →
+    # verify is default-on and is simply how the agent works, so there is no
+    # operator decision to make. It stays overridable via AGENT_PLANNING_ENABLED.
     {"key": "todo_evidence_required", "type": "bool", "group": "Agent behaviour",
      "label": "Verified task completion",
      "help": "Refuse to mark a plan item completed without cited evidence, and flag a "
-             "run that ends with an incomplete plan as unverified. Needs the planning tools."},
+             "run that ends with an incomplete plan as unverified."},
     {"key": "pii_pseudonymization_enabled", "type": "bool", "group": "Agent behaviour",
      "label": "PII pseudonymization",
      "help": "Pseudonymize PII in flagship/KYC flows before it reaches the model."},

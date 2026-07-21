@@ -35,7 +35,7 @@ class InvestigationState(TypedDict):
     investigation_type: str    # "full" | "db_only" | "log_only" | "code_only"
 
     # ── Context injected by supervisor before agent dispatch ─────────────────
-    past_cases: List[dict]     # Similar past investigations from pgvector similarity search
+    past_cases: List[dict]     # Similar past investigations from OKF kb-bank FTS recall
 
     # ── Agent findings — Annotated reducers allow parallel Send() writes ─────
     log_findings:  Annotated[List[dict], merge_findings]

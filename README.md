@@ -9,7 +9,7 @@ kyc-protect-oncall-agent/
 ├── docker-compose.yml      # The single full-stack definition: postgres + backend + headroom + UI
 ├── agent-api/              # Python FastAPI backend (workflows, agents, MCP, scheduler)
 │   ├── app/                # Application code (see "Repository layout" below)
-│   ├── migrations/         # PostgreSQL schema: 001_schema.sql (+ future 002_*.sql)
+│   ├── migrations/         # PostgreSQL schema: 001_schema.sql, 002_fts_only_retrieval.sql
 │   └── requirements.txt    # Python dependencies
 ├── ui/                     # React frontend (Docker nginx or Vite dev)
 │   ├── src/                # React app (workflow builder, scheduler, settings)
@@ -154,7 +154,7 @@ The schema is a single squashed baseline, `agent-api/migrations/001_schema.sql`.
 docker exec -i kyc-agent-db psql -v ON_ERROR_STOP=1 -U kycuser -d kycagent < migrations/001_schema.sql
 ```
 
-Future schema changes are added as new `002_*.sql`, `003_*.sql`, … files and applied by re-running setup (or by piping each new file in the same way).
+Later schema changes are numbered files in the same directory — currently `002_fts_only_retrieval.sql` (drops the embedding stack; see its header for the required pre-step) — applied by re-running setup, or by piping each file in the same way.
 
 ### Step 4 — Configure the backend (optional)
 

@@ -23,11 +23,50 @@ raised) so a bad skill name never crashes the agent loop — the same convention
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import re
 from typing import Any, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Per-execution-context "already loaded this turn" set for the ``skill`` tool's
+# re-invocation guard. The SAME skill tool object is shared by the parent agent
+# and every subagent (subagents receive the parent's tool objects, scoped — see
+# app.harness.subagent_factory._scope_tools), so a guard held in the tool's
+# closure would leak across contexts: a skill loaded inside a subagent (whose
+# messages the parent never sees) would make a later parent load return the
+# "already loaded" stub, leaving the parent believing it has a runbook it does
+# not. Keying the guard on a ContextVar fixes that — each agent run installs its
+# own set via :func:`install_load_guard` (called from run_agent_once, the single
+# entry point for both parent and child), so the sets are naturally isolated.
+# Default ``None`` = no guard installed (standalone/direct tool use, e.g. tests);
+# the tool then falls back to its own per-instance set.
+_load_guard_ctx: contextvars.ContextVar[Optional[Set[str]]] = contextvars.ContextVar(
+    "skill_load_guard", default=None
+)
+
+
+def install_load_guard(preloaded: Optional[List[str]] = None) -> contextvars.Token:
+    """Install a fresh per-context skill-load guard set, returning the reset token.
+
+    Call once at the start of every agent run (parent and each subagent) and
+    ``reset_load_guard`` in a finally — this is what isolates one context's
+    "already loaded" bookkeeping from another's. ``preloaded`` seeds the set with
+    skills whose runbook is already in the context before the model's first call
+    (deterministic ``/slash`` expansion); pass a STABLE snapshot, not the live
+    invoked-sink, so a retried attempt doesn't inherit the previous attempt's
+    model-loaded names (whose runbooks are gone from the rebuilt context).
+    """
+    return _load_guard_ctx.set(set(preloaded or ()))
+
+
+def reset_load_guard(token: contextvars.Token) -> None:
+    """Restore the previous skill-load guard (pair with :func:`install_load_guard`)."""
+    try:
+        _load_guard_ctx.reset(token)
+    except (ValueError, LookupError):  # token from another context — best-effort
+        pass
 
 # Matches a leading "/skill-name optional args…" (DOTALL so multi-line args are
 # captured). The name is a slug: starts alnum, then word chars or hyphens.
@@ -87,11 +126,23 @@ def build_skill_tool(
     appends each successfully-loaded skill name to, so the run can surface which
     skills actually fired (the UI badge) — shared across subagent snapshots
     because they reuse the same tool object.
+
+    The re-invocation guard (don't re-emit a runbook already in this context) is
+    kept SEPARATE from ``invoked_sink``: it reads the per-context guard set
+    installed by :func:`install_load_guard` (falling back to a private
+    per-instance set when none is installed, e.g. direct/test use). Because that
+    set is per-execution-context, a skill loaded in a subagent never stubs a
+    load in the parent — the bug that arises from ``invoked_sink`` being both the
+    badge log AND shared across contexts. See ``_load_guard_ctx``.
     """
     from langchain_core.tools import StructuredTool
     from pydantic import BaseModel, Field
 
     log = logger_instance or logger
+    # Fallback guard for when no ContextVar guard is installed (standalone tool
+    # use / tests). In a real run, install_load_guard's per-context set takes
+    # precedence, so parent and subagent stay isolated.
+    _instance_guard: Set[str] = set()
 
     class SkillInput(BaseModel):
         skill: str = Field(
@@ -104,6 +155,14 @@ def build_skill_tool(
         args: str = Field(
             default="",
             description="Optional free-text arguments / context for the skill.",
+        )
+        part: int = Field(
+            default=1,
+            description=(
+                "Which part of a long runbook to load (1-based). Only needed when a "
+                "previous load ended with a 'call skill(..., part=N)' notice because "
+                "the runbook was too long to return at once; leave as 1 otherwise."
+            ),
         )
 
     def _available_names() -> List[str]:
@@ -119,13 +178,19 @@ def build_skill_tool(
         except Exception:  # noqa: BLE001
             return []
 
-    async def _invoke_skill(skill: str, args: str = "") -> str:
+    async def _invoke_skill(skill: str, args: str = "", part: int = 1) -> str:
         name = (skill or "").strip().lstrip("/")
         if not name:
             return (
                 "[skill error] No skill name given. Pick one from the Skill map, or "
                 "call search_skills to find it."
             )
+        try:
+            part = int(part)
+        except (TypeError, ValueError):
+            part = 1
+        if part < 1:
+            part = 1
         try:
             from app.config import settings
             from app.core.skills import get_default_skill_manager
@@ -148,41 +213,75 @@ def build_skill_tool(
                 "(it is user-command only)."
             )
 
-        # Hard re-invocation guard: if this skill was already loaded this turn,
-        # don't re-emit its full (capped-8K) runbook — that's pure token waste and
-        # the model already has the instructions in context. Return a one-line
-        # stub instead. The prompt-only "do not invoke again" directive below is
-        # advisory; this makes it enforced. (invoked_sink is the turn's load log.)
-        if invoked_sink is not None and resolved.name in invoked_sink:
+        # Re-invocation guard: if this skill's FIRST part was already loaded in
+        # THIS context, don't re-emit its (capped) runbook — pure token waste, the
+        # model already has the instructions above. A stub is returned instead.
+        # Guard is per-context (see _load_guard_ctx) so a subagent's load never
+        # stubs the parent. A part>=2 request is a deliberate continuation, not a
+        # reload, so it is never stubbed.
+        guard = _load_guard_ctx.get()
+        if guard is None:
+            guard = _instance_guard
+        if part <= 1 and resolved.name in guard:
             return (
-                f"[skill] '{resolved.name}' is already loaded this turn — its "
+                f"[skill] '{resolved.name}' is already loaded in this context — its "
                 "instructions are above. Continue following them; do not reload it."
             )
 
-        body = mgr.build_invocation_message(resolved, user_instruction=args or "")
-        cap = int(getattr(settings, "skill_body_inject_chars", 8000))
-        if len(body) > cap:
-            body = body[:cap].rstrip() + "\n\n…(runbook truncated — continues on disk)"
+        full_body = mgr.build_invocation_message(resolved, user_instruction=args or "")
+        cap = max(1, int(getattr(settings, "skill_body_inject_chars", 8000)))
+        total_parts = max(1, (len(full_body) + cap - 1) // cap)
+        if part > total_parts:
+            return (
+                f"[skill error] Skill '{resolved.name}' has only {total_parts} part(s); "
+                f"part {part} does not exist. Load part {total_parts} or lower."
+            )
+        body = full_body[(part - 1) * cap: part * cap].rstrip()
+        # Actionable continuation notice — the runbook lives in the manager, not on
+        # any tool-reachable filesystem, so point the model at the next part call
+        # rather than at "on disk" (which it cannot read).
+        if total_parts > 1:
+            if part < total_parts:
+                body += (
+                    f"\n\n…(part {part}/{total_parts} — call "
+                    f'skill(skill="{resolved.name}", part={part + 1}) for the rest)'
+                )
+            else:
+                body += f"\n\n…(part {part}/{total_parts} — end of runbook)"
 
+        # Record the load: the guard (so part-1 reloads stub) and the badge sink
+        # (so the UI shows the skill fired). Both are idempotent per name.
+        guard.add(resolved.name)
         if invoked_sink is not None and resolved.name not in invoked_sink:
             invoked_sink.append(resolved.name)
         log.info(
-            "skill_tools: loaded skill '%s' (exec=%s)", resolved.name, execution_id,
+            "skill_tools: loaded skill '%s' part %d/%d (exec=%s)",
+            resolved.name, part, total_parts, execution_id,
             extra={"execution_id": execution_id},
         )
 
         desc = (resolved.description or "").strip()
-        header = f'Loaded skill "{resolved.name}"'
-        if desc:
-            header += f" — {desc}"
+        if part > 1:
+            header = f'Continuation of skill "{resolved.name}" (part {part}/{total_parts})'
+            footer = (
+                "This is a continuation of the runbook above. Keep following it; load "
+                "further parts only if a notice above asks you to."
+            )
+        else:
+            header = f'Loaded skill "{resolved.name}"'
+            if desc:
+                header += f" — {desc}"
+            footer = (
+                "You have now loaded this skill. Follow its instructions step by step for "
+                "the user's current task, using your other tools as the skill directs. Do "
+                "not reload this skill; only fetch a further part if a notice above asks."
+            )
         return (
             f"{header}\n\n"
             f'<skill_instructions name="{resolved.name}">\n'
             f"{body}\n"
             "</skill_instructions>\n\n"
-            "You have now loaded this skill. Follow its instructions step by step for "
-            "the user's current task, using your other tools as the skill directs. Do "
-            "not invoke this skill again this turn."
+            f"{footer}"
         )
 
     return StructuredTool.from_function(
@@ -261,14 +360,11 @@ def build_skill_search_tool(
             # ``skill`` tool and the map.
             mgr = get_default_skill_manager()
             effective = mgr.model_invocable_names(allowed_skills)
-            # An EMPTY effective set means nothing is invocable — but
-            # select_for_query reads a falsy ``allowed`` as "no scoping" and
-            # would search everything, surfacing skills this agent must not see.
-            # Short-circuit to the no-match fallback instead.
-            hits = (
-                mgr.select_for_query((query or "").strip(), k=k, allowed=effective)
-                if effective else []
-            )
+            # ``effective`` is the EXACT invocable set for this agent. Pass it
+            # straight through: select_for_query treats an explicit empty set as
+            # "nothing invocable" (returns []), distinct from None ("no scoping"),
+            # so a scoped agent with no invocable skills never leaks the library.
+            hits = mgr.select_for_query((query or "").strip(), k=k, allowed=effective)
         except Exception as exc:  # noqa: BLE001 — surface, don't crash the loop
             log.warning(
                 "skill_tools: skill search failed for %r (%s)", query, exc,

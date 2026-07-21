@@ -21,8 +21,7 @@ action / outcome / reward / meta):
 written (see ``trajectory_event_repository.append_reward``) — everything
 else is immutable once recorded, preserving the causal record.
 
-Wired into BOTH engines: the native turn loop records live
-(``app.harness.engine.turn_loop``); the LangGraph engine records post-hoc
+The agent records post-hoc
 over the final serialized message list
 (``app.harness.agent_runner._instrument_langgraph_result``).
 """

@@ -50,10 +50,6 @@ semantic = [
     "onnxruntime>=1.20.0",
     "tokenizers>=0.20.0",
 ]
-# OpenAI / Azure-OpenAI LLM provider support (Bedrock is the default provider).
-openai = [
-    "langchain-openai>=1.1.0",
-]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21.0",

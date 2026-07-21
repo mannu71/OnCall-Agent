@@ -274,7 +274,6 @@ export const agentApiClient = {
         if (o.userQuery) params.query = o.userQuery;
         if (o.outputMode) params.output_mode = o.outputMode;
         if (o.permissionMode) params.permission_mode = o.permissionMode;
-        if (o.engine) params.engine = o.engine;
         // When a persisted chat session is active, the backend records the user
         // and assistant turns against it so the conversation survives a refresh.
         if (o.sessionId) params.session_id = o.sessionId;
@@ -338,7 +337,7 @@ export const agentApiClient = {
         try {
             const data = await this.executeWorkflow(workflowName, {
                 background: false, userQuery, history: h.history, sessionId: h.sessionId,
-                engine: h.engine, signal: h.signal,
+                signal: h.signal,
             });
             if (data && data.status === 'already_running') {
                 throw new Error(`Agent "${workflowName}" is already running. Wait for it to finish.`);

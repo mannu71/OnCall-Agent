@@ -1,12 +1,10 @@
 import React from 'react';
-import { Layers } from 'lucide-react';
 import {
     DlgAlert,
     SButton,
     SDialog,
     SDlgField,
     SInput,
-    SSegmented,
     SSelect,
 } from './settings-ui';
 import {
@@ -26,7 +24,6 @@ export default function AddLlmDialog({
     bedrockRegion,
     saving,
 }) {
-    const embed = Boolean(formData.use_for_embeddings);
     const reasoning = isReasoningModel(formData.model);
 
     return (
@@ -102,20 +99,6 @@ export default function AddLlmDialog({
                 </DlgAlert>
             )}
 
-            <SDlgField label="Role">
-                <SSegmented
-                    value={embed ? 'embed' : 'reason'}
-                    onChange={(v) => setFormData({
-                        ...formData,
-                        use_for_embeddings: v === 'embed',
-                    })}
-                    options={[
-                        { value: 'reason', label: 'Reasoning' },
-                        { value: 'embed', label: 'Embeddings', icon: <Layers className="size-3.5" /> },
-                    ]}
-                />
-            </SDlgField>
-
             {hasBedrockCredentials ? (
                 <DlgAlert variant="success">
                     AWS credentials configured
@@ -124,14 +107,6 @@ export default function AddLlmDialog({
             ) : (
                 <DlgAlert variant="warning">
                     No AWS credentials found. Configure AWS Bedrock credentials first.
-                </DlgAlert>
-            )}
-
-            {embed && (
-                <DlgAlert variant="warning">
-                    <strong>Data leaves the container during indexing.</strong>
-                    {' '}
-                    Embedding calls flow to AWS Bedrock. Confirm this is acceptable for your compliance posture.
                 </DlgAlert>
             )}
         </SDialog>

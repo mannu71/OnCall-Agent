@@ -68,3 +68,63 @@ def test_repos_from_code_analyzer():
     assert repos_from_code_analyzer(cfg) == ["compliance-api", "kyc-protect-api"]
     # tolerate bare-string repo entries
     assert repos_from_code_analyzer({"repos": ["a", "b"]}) == ["a", "b"]
+
+
+# ── OKF structured indexing (weighted FTS input) ─────────────────────────────
+
+def test_concept_fields_for_index_carries_tags_and_flat():
+    from pathlib import Path
+    from app.core.knowledge.bundle import KnowledgeBundle
+
+    b = KnowledgeBundle(Path("."))  # no IO — pure parse
+    doc = {
+        "frontmatter": {
+            "title": "DB pool exhausted",
+            "description": "connections used up",
+            "tags": ["database", "connection pool"],
+        },
+        "body": "Root cause: pool saturated.",
+    }
+    fields = b.concept_fields_for_index(doc)
+    assert fields["title"] == "DB pool exhausted"
+    assert fields["tags"] == ["database", "connection pool"]
+    assert fields["description"] == "connections used up"
+    # flat = title + description + body (displayable content column); tags are
+    # deliberately NOT in flat — they ride the weight-A vector, not the content.
+    assert "DB pool exhausted" in fields["flat"]
+    assert "connections used up" in fields["flat"]
+    assert "Root cause" in fields["flat"]
+    assert "connection pool" not in fields["flat"]
+
+
+def test_concept_fields_for_index_tolerates_scalar_tag_and_missing():
+    from pathlib import Path
+    from app.core.knowledge.bundle import KnowledgeBundle
+
+    b = KnowledgeBundle(Path("."))
+    fields = b.concept_fields_for_index({"frontmatter": {"title": "T", "tags": "solo"}, "body": ""})
+    assert fields["tags"] == ["solo"]
+    fields2 = b.concept_fields_for_index({"frontmatter": {"title": "T"}, "body": "b"})
+    assert fields2["tags"] == []
+
+
+# ── producer tag derivation (paraphrase synonym anchors) ─────────────────────
+
+def test_derive_tags_extracts_identifiers_codes_and_vocab():
+    from app.core.improvement.auto_learn import _derive_tags
+
+    tags = _derive_tags(
+        "The AmlScreen processor threw ArgumentOutOfRangeException; the connection "
+        "pool was exhausted and it returned HTTP 429",
+        ["job hit rate_limit_exceeded"],
+        extra=["test-workflow"],
+    )
+    lower = [t.lower() for t in tags]
+    assert "test-workflow" in lower               # extra preserved, ranked first
+    assert "argumentoutofrangeexception" in lower  # CamelCase identifier
+    assert "rate_limit_exceeded" in lower          # snake_case identifier
+    assert "http 429" in lower                     # status code
+    assert "exhausted" in lower                    # error vocab
+    assert len(tags) <= 8                          # capped
+    # dedup is case-insensitive
+    assert len(tags) == len({t.lower() for t in tags})

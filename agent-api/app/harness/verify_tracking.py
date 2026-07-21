@@ -1,12 +1,10 @@
-"""Environment-first verification tracking (3.1) — engine-agnostic.
+"""Environment-first verification tracking (3.1).
 
 Tools whose successful call means "the agent changed code" (edit_file /
 create_file) are expected to be followed by a run_verify call before a run
-can honestly report success. This module owns the shared scanning logic so
-BOTH the native turn loop (``app.harness.engine.turn_loop``) and the
-LangGraph path (``app.harness.agent_runner``) derive identical
-``verify_pending`` / ``verify_last_passed`` signals regardless of which
-engine executed the run — matching edit_tools.py's tool names and the
+can honestly report success. This module owns the scanning logic that derives
+the ``verify_pending`` / ``verify_last_passed`` signals for the LangGraph path
+(``app.harness.agent_runner``) — matching edit_tools.py's tool names and the
 harness's own "# Verify your changes" system-prompt discipline.
 """
 from __future__ import annotations
@@ -21,7 +19,7 @@ EDIT_TOOL_NAMES = frozenset({"edit_file", "create_file"})
 
 @dataclass
 class VerifyState:
-    """Minimal, engine-agnostic mirror of TurnLoopState's two verify fields."""
+    """The two verify signals tracked across a run."""
 
     pending: bool = False
     last_passed: Optional[bool] = None
@@ -30,7 +28,7 @@ class VerifyState:
 def scan_tool_calls(state: VerifyState, tool_calls: List[Any], tool_messages: List[Any]) -> None:
     """Update *state* in place from one turn's (tool_calls, tool_messages) pair.
 
-    ``tool_calls`` entries may be plain dicts (native engine: {"name": ...})
+    ``tool_calls`` entries may be plain dicts ({"name": ...})
     or LangChain tool_call dicts (LangGraph: {"name": ...} too — same shape).
     ``tool_messages`` entries must expose ``.content`` (a JSON string) or be
     plain strings. Best-effort — never raises.

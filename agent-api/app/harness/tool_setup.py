@@ -121,8 +121,10 @@ def build_playbook_tools() -> List[Any]:
         category: str = PydanticField(description="Category, e.g. 'database', 'auth', 'network', 'agent_discovered'.")
 
     class PatchPlaybookInput(BaseModel):
-        issue_id: int = PydanticField(description="The integer ID of the known issue to update.")
-        new_solution: str = PydanticField(description="Replacement solution text.")
+        slug: str = PydanticField(
+            description="The slug of the known issue to update (returned by save_playbook)."
+        )
+        new_solution: str = PydanticField(description="Replacement resolution text.")
 
     class PinFactInput(BaseModel):
         fact: str = PydanticField(
@@ -139,30 +141,63 @@ def build_playbook_tools() -> List[Any]:
 
     async def _save_playbook(title: str, symptoms: List[str], solution: str, category: str) -> str:
         try:
-            from app.services.knowledge_base import knowledge_base as _kb
-            result = await _kb.upsert_playbook(
+            from pathlib import Path
+            from app.core.knowledge import get_default_bundle, index_concept_into_kb
+            from app.core.improvement.auto_learn import _derive_tags
+
+            symptoms = [s for s in (symptoms or []) if str(s).strip()]
+            parts: List[str] = []
+            if symptoms:
+                parts.append("# Symptoms\n" + "\n".join(f"- {s}" for s in symptoms))
+            parts.append("# Resolution\n" + (solution or "").strip())
+            body = "\n\n".join(parts)
+            tags = _derive_tags(f"{title}\n{solution}", symptoms,
+                                extra=[category] if category else [])
+            bundle = get_default_bundle()
+            res = bundle.write_concept(
+                section="known-issues",
                 title=title[:120],
-                symptoms=symptoms,
-                solution=solution,
-                category=category,
+                body=body,
+                description=(solution or title)[:500],
+                tags=tags,
                 source="agent",
             )
-            action = result.get("action", "saved")
-            return f"Playbook {action}: id={result.get('id')} title='{result.get('title')}'"
+            await index_concept_into_kb(bundle, Path(res["path"]), bank="kb")
+            action = "created" if res["created"] else "updated"
+            return f"Playbook {action}: slug='{res['slug']}' title='{title[:120]}'"
         except Exception as exc:
             return f"save_playbook failed: {exc}"
 
-    async def _patch_playbook(issue_id: int, new_solution: str) -> str:
+    async def _patch_playbook(slug: str, new_solution: str) -> str:
         try:
-            from app.services.knowledge_base import knowledge_base as _kb
-            result = await _kb.patch_playbook_solution(
-                issue_id=issue_id,
-                new_solution=new_solution,
+            import re
+            from pathlib import Path
+            from app.core.knowledge import get_default_bundle, index_concept_into_kb
+
+            bundle = get_default_bundle()
+            path = bundle.concept_path("known-issues", slug)
+            doc = bundle.read_concept(path)
+            if not doc:
+                return f"patch_playbook error: no known issue with slug '{slug}'"
+            fm = doc.get("frontmatter") or {}
+            body = doc.get("body") or ""
+            new_res = "# Resolution\n" + (new_solution or "").strip()
+            # Replace an existing Resolution section, else append one.
+            if re.search(r"(?m)^#\s+Resolution\b", body):
+                body = re.sub(r"(?ms)^#\s+Resolution\b.*?(?=^#\s|\Z)", new_res + "\n\n", body).rstrip()
+            else:
+                body = (body.rstrip() + "\n\n" + new_res).strip()
+            res = bundle.write_concept(
+                section="known-issues",
+                title=str(fm.get("title") or slug),
+                body=body,
+                description=str(fm.get("description") or ""),
+                tags=fm.get("tags") or [],
                 source="agent",
+                confidence=fm.get("confidence"),
             )
-            if "error" in result:
-                return f"patch_playbook error: {result['error']}"
-            return f"Playbook patched: id={result.get('id')} title='{result.get('title')}'"
+            await index_concept_into_kb(bundle, Path(res["path"]), bank="kb")
+            return f"Playbook patched: slug='{res['slug']}'"
         except Exception as exc:
             return f"patch_playbook failed: {exc}"
 
@@ -203,7 +238,7 @@ def build_playbook_tools() -> List[Any]:
             coroutine=_patch_playbook,
             name="patch_playbook",
             description=(
-                "Update the solution of an existing playbook by its integer ID. "
+                "Update the resolution of an existing playbook by its slug (from save_playbook). "
                 "Use this when you have found a better resolution than what is already recorded."
             ),
             args_schema=PatchPlaybookInput,

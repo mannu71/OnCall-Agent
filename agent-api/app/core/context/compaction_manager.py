@@ -267,7 +267,7 @@ class ContextCompactionManager:
     async def force_compact(self, messages: List[BaseMessage]) -> List[BaseMessage]:
         """Force a summary regardless of the threshold gate.
 
-        Used by the native engine's reactive-compact rung: reached only after
+        Used by the reactive-compact rung: reached only after
         a genuine context-overflow error from the model, so waiting for
         ``compact_if_needed``'s threshold check (which the overflowing
         request already exceeded) would be pointless. The recent tail is

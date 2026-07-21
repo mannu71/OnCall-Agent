@@ -85,7 +85,7 @@ def _llm_node_has_model(node: Dict[str, Any]) -> bool:
     - LangflowEditor multi-select: params.models (list of str or {name})
     - LangflowEditor comma-joined: params.llm "A,B"
     """
-    # Check scalar keys first (legacy + anthropic_model / openai_model)
+    # Check scalar keys first (legacy dialects + language_model)
     scalar = get_node_param(
         node, "model", "modelId", "model_id", "modelName",
         "configName", "llmConfigId", "llm",

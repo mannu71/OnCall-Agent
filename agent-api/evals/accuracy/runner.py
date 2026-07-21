@@ -18,8 +18,10 @@ from evals.accuracy.run_codegraph import run_codegraph_suite
 from evals.accuracy.run_cloudwatch import run_cloudwatch_suite
 from evals.accuracy.run_trajectory import run_trajectory_suite
 from evals.accuracy.run_lookup import run_lookup_suite
+from evals.accuracy.run_retrieval import run_retrieval_suite
 
-_TRAJ_METRICS = ("tool_selection", "protocol", "final_answer", "grounding", "post_check")
+_TRAJ_METRICS = ("tool_selection", "protocol", "final_answer", "grounding",
+                 "skill_invocation", "post_check")
 
 
 def _mean(rows: List[Dict[str, Any]]) -> float:
@@ -31,6 +33,7 @@ def aggregate(
     cloud: List[Dict[str, Any]],
     trajectory: List[Dict[str, Any]] | None = None,
     lookup: List[Dict[str, Any]] | None = None,
+    retrieval: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     cw_obj = [r for r in cloud if r.get("objective")]
     cw_sev = [r for r in cloud if r["metric"] == "severity"]
@@ -58,6 +61,7 @@ def aggregate(
                                       "passed": sum(1 for r in rows if r["score"] >= 0.999)}
 
     lookup = lookup or []
+    retrieval = retrieval or []
 
     return {
         "codegraph": {
@@ -90,6 +94,12 @@ def aggregate(
             "passed": sum(1 for r in lookup if r["score"] >= 0.999),
             "rows": lookup,
         },
+        "retrieval": {
+            "objective_accuracy": _mean(retrieval),
+            "n": len(retrieval),
+            "passed": sum(1 for r in retrieval if r["score"] >= 0.999),
+            "rows": retrieval,
+        },
     }
 
 
@@ -98,7 +108,8 @@ async def run_all() -> Dict[str, Any]:
     cloud = await run_cloudwatch_suite()
     trajectory = await run_trajectory_suite()
     lookup = await run_lookup_suite()
-    return aggregate(codegraph, cloud, trajectory, lookup)
+    retrieval = await run_retrieval_suite()
+    return aggregate(codegraph, cloud, trajectory, lookup, retrieval)
 
 
 def _print_summary(agg: Dict[str, Any]) -> None:
@@ -123,6 +134,10 @@ def _print_summary(agg: Dict[str, Any]) -> None:
     if lk.get("n"):
         print(f"Lazy-lookup recall accuracy     : {lk['objective_accuracy']*100:6.2f}%  "
               f"({lk['passed']}/{lk['n']})")
+    rt = agg.get("retrieval") or {}
+    if rt.get("n"):
+        print(f"FTS retrieval hit@5 accuracy    : {rt['objective_accuracy']*100:6.2f}%  "
+              f"({rt['passed']}/{rt['n']})")
     print("==========================================================\n")
 
 

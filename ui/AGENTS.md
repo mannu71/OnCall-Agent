@@ -77,7 +77,7 @@ src/
       ScheduleList.jsx        ← List of all schedules
 
     settings/
-      ModelKeyDialog.jsx      ← API key management dialog
+      BedrockCredentialsDialog.jsx  ← AWS Bedrock credential management
 
     sidebar/
       AppSidebar.jsx          ← Main navigation sidebar

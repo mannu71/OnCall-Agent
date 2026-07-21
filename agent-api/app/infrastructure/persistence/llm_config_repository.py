@@ -3,12 +3,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
-from sqlalchemy import select, delete, update
+from sqlalchemy import select, delete
 
 from app.infrastructure.persistence.base import BaseAsyncRepository
 from app.models.db_models import LLMConfigModel
 from app.services.credential_transformer import CredentialTransformer
-from app.services.provider_schema_registry import ProviderSchema
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +32,6 @@ class LLMConfigRepository(BaseAsyncRepository):
     async def create(self, config_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new LLM configuration and return it."""
         async def _work(session):
-            use_for_embeddings = config_data.get("use_for_embeddings") or config_data.get("useForEmbeddings", False)
-            if use_for_embeddings:
-                await session.execute(
-                    update(LLMConfigModel).values(use_for_embeddings=False)
-                )
             config = LLMConfigModel(
                 name=config_data["name"],
                 provider=config_data["provider"],
@@ -50,7 +44,6 @@ class LLMConfigRepository(BaseAsyncRepository):
                 icon=config_data.get("icon"),
                 description=config_data.get("description"),
                 aws_profile=config_data.get("aws_profile"),
-                use_for_embeddings=use_for_embeddings,
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
             )
@@ -63,11 +56,6 @@ class LLMConfigRepository(BaseAsyncRepository):
     async def update(self, name: str, config_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Update an existing LLM configuration; return it, or None."""
         async def _work(session):
-            use_for_embeddings = config_data.get("use_for_embeddings") or config_data.get("useForEmbeddings")
-            if use_for_embeddings:
-                await session.execute(
-                    update(LLMConfigModel).values(use_for_embeddings=False)
-                )
             config = (await session.execute(
                 select(LLMConfigModel).where(LLMConfigModel.name == name)
             )).scalar_one_or_none()
@@ -87,8 +75,6 @@ class LLMConfigRepository(BaseAsyncRepository):
                 "icon": "icon",
                 "description": "description",
                 "aws_profile": "aws_profile",
-                "use_for_embeddings": "use_for_embeddings",
-                "useForEmbeddings": "use_for_embeddings",
             }
             for json_key, col_name in field_map.items():
                 if json_key in config_data:
@@ -171,6 +157,4 @@ class LLMConfigRepository(BaseAsyncRepository):
             "icon": config.icon,
             "description": config.description,
             "aws_profile": config.aws_profile,
-            "use_for_embeddings": config.use_for_embeddings or False,
-            "useForEmbeddings": config.use_for_embeddings or False,
         }

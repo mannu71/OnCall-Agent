@@ -33,7 +33,7 @@ async def auto_learn(
 
     Durable-write gate: the KB/semantic writes (Phases 2, 4, 4b) are skipped
     when the run did not cleanly succeed — either it cited ungrounded IDs
-    (likely fabrication, both engines set ``result["ungrounded_ids"]``) or its
+    (likely fabrication, the harness sets ``result["ungrounded_ids"]``) or its
     terminal_state is anything other than ``success`` (exhausted/blocked/
     unverified/stalled). Learning from a shaky run poisons future recall, so a
     non-success run is recorded (Phase 1) but not learned from.

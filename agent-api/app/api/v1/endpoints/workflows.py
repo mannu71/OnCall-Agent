@@ -708,7 +708,6 @@ async def execute_workflow(
     input: Optional[str] = None,
     output_mode: Optional[str] = None,
     permission_mode: Optional[str] = None,
-    engine: Optional[str] = None,
     session_id: Optional[str] = None,
     inputs: Optional[Dict[str, Any]] = Body(None),
     workflow_repo: WorkflowRepository = Depends(get_workflow_repo)
@@ -735,10 +734,6 @@ async def execute_workflow(
     if permission_mode:
         # Tool gatekeeping: default | auto_allow | plan.
         inputs = {**(inputs or {}), "permission_mode": permission_mode}
-    if engine:
-        # Per-turn agent-mode override: langgraph (ReAct) | native — see
-        # app.harness.engine.resolve_engine.
-        inputs = {**(inputs or {}), "engine": engine}
     if session_id:
         # Marks this execution as chat-triggered (Dashboard "Recent runs"
         # excludes these by default — see build_result/persist_execution).

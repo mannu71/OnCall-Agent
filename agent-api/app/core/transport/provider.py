@@ -46,8 +46,8 @@ class ProviderTransport(ABC):
     """Abstract base class for LLM provider transports.
 
     Concrete implementations:
-    - AnthropicTransport  (direct Anthropic API)
-    - BedrockTransport    (AWS Bedrock with boto3)
+    - BedrockTransport    (AWS Bedrock with boto3) — the only one. Generation is
+      Bedrock-only; ``factory.get_transport`` rejects any other provider.
     """
 
     @abstractmethod

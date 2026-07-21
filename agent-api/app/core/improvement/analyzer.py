@@ -58,7 +58,7 @@ def fingerprint_error(text: str) -> str:
     """Regex-normalize an error string into a stable, low-cardinality key
     (digits collapsed to '#', truncated to 80 chars). Shared by
     compute_signals' batch analysis and the live failure_ledger hook
-    (app.harness.engine.tool_exec) so both produce the SAME fingerprint for
+    (app.harness.failure_hook) so both produce the SAME fingerprint for
     the same underlying error class."""
     return re.sub(r"\d+", "#", str(text or ""))[:80]
 

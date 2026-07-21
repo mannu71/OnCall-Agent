@@ -20,8 +20,10 @@ integration, code-intelligence indexing, and real-time SSE monitoring.
   `MCPClientManager`.
 - **Scheduling** — APScheduler runs cron workflows; heartbeat monitor maps
   CloudWatch alarms to investigation workflows.
-- **Persistence** — PostgreSQL for workflows, executions, memory, and vector
-  embeddings (pgvector). The Code Crawler keeps its own SQLite store per project.
+- **Persistence** — PostgreSQL for workflows, executions, and memory. Durable
+  knowledge lives in the OKF bundle (`data/knowledge/`) and is recalled via
+  Postgres full-text search (no embeddings). The Code Crawler keeps its own
+  SQLite store per project.
 
 Legacy **YAML task lists** (shell / python / nested workflow) still run through
 `TaskExecutor` for backward compatibility. Python scripts execute in an isolated
@@ -37,7 +39,7 @@ subprocess, not via in-process `exec()`.
 | Workflows | Visual executor + strategy pattern (ReAct, batch, router) |
 | Agents | LangGraph, LangChain (Bedrock / OpenAI / Anthropic / …) |
 | Data | PostgreSQL + asyncpg, SQL migrations in `migrations/` |
-| Vectors | pgvector via `EmbeddingService` |
+| Knowledge | OKF bundle (`data/knowledge/`) recalled via Postgres FTS |
 | Code Crawler | native codegraph C engine (MCP over stdio) + `repo_*` file tools |
 | Streaming | Server-Sent Events (executions, scheduler, log watch) |
 | UI pairing | React editor in `../ui` (Langflow-style node editor) |
@@ -57,7 +59,7 @@ agent-api/
 │   ├── services/             # visual executor, codegraph indexer, log watch, KB
 │   └── workflow/             # strategies, handlers, routing, LLM config,
 │       └── graph_engine/     #   generic AsyncFlow / AsyncNode DAG framework
-├── migrations/               # 001_schema.sql (squashed baseline) + future 002_*.sql
+├── migrations/               # 001_schema.sql (squashed baseline), 002_fts_only_retrieval.sql
 ├── tests/                    # pytest suite
 └── pyproject.toml
 ```
@@ -109,9 +111,10 @@ psql "$DATABASE_URL" -f migrations/001_schema.sql
 a `schema_migrations` table: re-runs are a no-op, and a pre-existing database
 (whose schema already matches) is stamped as applied **without** re-executing.
 
-**Authoring new migrations:** add the next numbered file, `002_*.sql`,
-`003_*.sql`, … — one forward change per file. Applied by re-running setup (the
-runner applies any tracked-as-unapplied files in filename order).
+**Authoring new migrations:** add the next numbered file after
+`002_fts_only_retrieval.sql` — one forward change per file, in this same
+`migrations/` directory (the runner only scans here). Applied by re-running
+setup, which applies any tracked-as-unapplied files in filename order.
 
 `init_db()` verifies connectivity only — it does **not** call `create_all`.
 

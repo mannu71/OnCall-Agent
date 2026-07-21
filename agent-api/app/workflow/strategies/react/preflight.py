@@ -9,6 +9,7 @@ auto-learn, trajectory save, structured output, and PII rehydration live in
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
@@ -87,6 +88,11 @@ class RunPlan:
     # run through the tool's mutable sink). Surfaced as ``selected_skills`` for
     # the UI badge by the finalizer.
     invoked_skills: List[str] = field(default_factory=list)
+    # Stable snapshot of the /slash-expanded skills only (runbook already in the
+    # user turn before the model runs). Seeds the engine's per-context skill
+    # re-invocation guard. Kept separate from the live ``invoked_skills`` sink so
+    # a retried attempt doesn't inherit the previous attempt's model-loaded names.
+    slash_preloaded_skills: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -307,17 +313,6 @@ async def build_run_plan(
     # knows which skills it can load. Skill scoping (``_allowed_skills``) was
     # resolved above alongside slash-command expansion.
     _has_history = bool(conversation_history or (context.get("inputs") or {}).get("history"))
-    augmented_query, recall_hits = await build_recall_query(
-        user_query=user_query,
-        cloudwatch_config=cloudwatch_config,
-        logger_instance=logger_instance,
-        execution_id=execution_id,
-        code_analyzer_config=code_analyzer_config,
-        memory_enabled=memory_config.enabled,
-        memory_types=memory_config.types,
-        allowed_skills=list(_allowed_skills) if _allowed_skills else None,
-        has_history=_has_history,
-    )
 
     # MCP barrier: connect every agent-reachable ``mcp_server`` node (including
     # those contained in a ``subagent_window``, which the edge-ordered scheduler
@@ -327,10 +322,11 @@ async def build_run_plan(
     # match nothing and the capability vanishes for the turn. Failures come back
     # as server names so we can tell the agent what's missing instead of letting
     # it discover the gap by claiming it has no such tool.
-    _mcp_barrier_failed: List[str] = []
-    if mcp_manager:
+    async def _barrier() -> List[str]:
+        if not mcp_manager:
+            return []
         try:
-            _mcp_barrier_failed = await connect_agent_mcp_nodes(
+            return await connect_agent_mcp_nodes(
                 workflow, mcp_manager, execution_id=execution_id,
             )
         except Exception as _bar_err:  # noqa: BLE001 — never block a run on the barrier
@@ -338,6 +334,28 @@ async def build_run_plan(
                 "ReactStrategy: MCP pre-connect barrier failed (non-fatal): %s",
                 redact(str(_bar_err)), extra={"execution_id": execution_id},
             )
+            return []
+
+    # Recall and the barrier touch nothing in common (recall reads the query and
+    # memory config; the barrier connects subprocesses), so they run together —
+    # the barrier's multi-second cold starts now hide behind the recall lookups
+    # instead of being added to them. ``_barrier`` swallows its own errors, so
+    # gather's first-exception behaviour only ever surfaces a recall failure,
+    # exactly as when these were sequential awaits.
+    (augmented_query, recall_hits), _mcp_barrier_failed = await asyncio.gather(
+        build_recall_query(
+            user_query=user_query,
+            cloudwatch_config=cloudwatch_config,
+            logger_instance=logger_instance,
+            execution_id=execution_id,
+            code_analyzer_config=code_analyzer_config,
+            memory_enabled=memory_config.enabled,
+            memory_types=memory_config.types,
+            allowed_skills=list(_allowed_skills) if _allowed_skills else None,
+            has_history=_has_history,
+        ),
+        _barrier(),
+    )
 
     # Assemble the base action space (MCP + CloudWatch + crawler + DB
     # schema tools, pruned by the relevance router) via the harness.
@@ -347,32 +365,44 @@ async def build_run_plan(
     # couldn't be built this turn; `_expired_creds_msg` is set only
     # when NOTHING could be built or the model's own credentials are
     # confirmed dead.
-    tools, _expired_creds_msg, _degraded = await assemble_base_tools(
-        tools_config=tools_config,
-        mcp_manager=mcp_manager,
-        execution_id=execution_id,
-        cloudwatch_config=cloudwatch_config,
-        code_analyzer_config=code_analyzer_config,
-        db_server_map=context.get("db_server_map") or {},
-        user_query=user_query,
-        logger_instance=logger_instance,
-        llm_config=llm_config,
-    )
-
-    # Pre-LLM credential probe — runs BEFORE any LLM call, but DEGRADES rather
-    # than aborts. Directive: the model always runs with the tools that ARE
-    # available and is told explicitly (via the [System notice] below) what is
-    # not, so it picks tools from the user's question instead of the whole turn
-    # short-circuiting on an unrelated backend (which is how an expired AWS
-    # session used to block a pure-database question). The only hard-abort left
-    # is assemble_base_tools' own _expired_creds_msg (model's-own-creds dead, or
-    # nothing built at all) — handled by the envelope below.
-    if not _expired_creds_msg:
-        _degraded = list(_degraded or []) + await collect_backend_degradations(
+    #
+    # Runs CONCURRENTLY with the pre-LLM credential probe below: both are I/O
+    # over the same backends, and the probe's results are only ever *appended*
+    # to `degraded`, so nothing it returns can change how tools are assembled.
+    # The probes they each make against a shared AWS identity collapse into one
+    # round-trip via the STS memo in tool_assembler._sts_expired.
+    (tools, _expired_creds_msg, _degraded), _cred_notes = await asyncio.gather(
+        assemble_base_tools(
+            tools_config=tools_config,
+            mcp_manager=mcp_manager,
+            execution_id=execution_id,
+            cloudwatch_config=cloudwatch_config,
+            code_analyzer_config=code_analyzer_config,
+            db_server_map=context.get("db_server_map") or {},
+            user_query=user_query,
+            logger_instance=logger_instance,
+            llm_config=llm_config,
+        ),
+        # Pre-LLM credential probe — runs BEFORE any LLM call, but DEGRADES
+        # rather than aborts. Directive: the model always runs with the tools
+        # that ARE available and is told explicitly (via the [System notice]
+        # below) what is not, so it picks tools from the user's question instead
+        # of the whole turn short-circuiting on an unrelated backend (which is
+        # how an expired AWS session used to block a pure-database question).
+        # The only hard-abort left is assemble_base_tools' own
+        # _expired_creds_msg (model's-own-creds dead, or nothing built at all)
+        # — handled by the envelope below.
+        collect_backend_degradations(
             wired_mcp_servers=wired_mcp_server_names(workflow),
             execution_id=execution_id,
             logger_instance=logger_instance,
-        )
+        ),
+    )
+
+    # Notes are discarded on a hard abort — that envelope returns immediately
+    # below and never shows the agent a [System notice].
+    if not _expired_creds_msg:
+        _degraded = list(_degraded or []) + _cred_notes
 
     if _expired_creds_msg:
         return EarlyReturn({
@@ -569,6 +599,9 @@ async def build_run_plan(
         code_analyzer_config=code_analyzer_config,
         conversation_history=conversation_history,
         invoked_skills=_invoked_skills,
+        # At this point only /slash names are in _invoked_skills (the model
+        # hasn't run yet); snapshot them for the guard seed.
+        slash_preloaded_skills=list(_invoked_skills),
     )
 
 

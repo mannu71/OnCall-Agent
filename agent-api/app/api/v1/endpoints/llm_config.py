@@ -31,47 +31,38 @@ async def _discovered_models_response(
     return payload
 
 
-class LLMProviderConfig(BaseModel):
-    provider: str = Field(..., description="Provider name (OpenAI, Anthropic, etc.)")
-    model: Optional[str] = Field(None, description="Model name")
-    endpoint: Optional[str] = Field(None, description="Custom endpoint URL")
-    baseUrl: Optional[str] = Field(None, description="Base URL for Ollama")
-    temperature: Optional[float] = Field(0.7, description="Temperature setting")
-    maxTokens: Optional[int] = Field(4096, description="Max tokens")
-
-
 class DiscoverModelsRequest(BaseModel):
-    provider: str = Field(..., description="Provider name from Model Keys (OpenAI, Anthropic, etc.)")
+    provider: str = Field("AWS Bedrock", description="Provider name from Model Keys (AWS Bedrock)")
 
 
 @router.post("/discover/models", response_model=Dict[str, Any])
 async def discover_provider_models(request: DiscoverModelsRequest):
-    """Discover available models for a configured provider.
+    """Discover available models for the configured Bedrock credentials.
 
-    Looks up the provider's credentials from Model Keys and calls
-    the provider's list-models API. Supports: OpenAI, Anthropic,
-    Google, Groq, Azure OpenAI, Ollama, AWS Bedrock.
+    Looks up the Bedrock Model Key and calls ``ListFoundationModels``. AWS
+    Bedrock is the only supported provider — generation is Bedrock-only (see
+    ``app.workflow.strategies.react.llm_factory``), so discovering models from
+    any other provider would only produce configs that cannot run.
     """
-    import httpx
     import boto3
     import os
     from botocore.exceptions import ClientError as BotoClientError
 
-    ssl_verify = os.environ.get("AWS_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
-
-    # Canonicalise the provider name so callers can pass either the UI label
-    # ("AWS Bedrock") or a legacy / short alias ("bedrock"). Both the model-
-    # keys lookup and the dispatch chain below need the canonical form.
+    # Accept either the UI label ("AWS Bedrock") or a short/legacy alias.
     _CANONICAL = {
-        "aws bedrock":  "AWS Bedrock", "bedrock": "AWS Bedrock", "aws-bedrock": "AWS Bedrock", "aws_bedrock": "AWS Bedrock",
-        "openai":       "OpenAI",      "open_ai":  "OpenAI",     "open-ai":     "OpenAI",
-        "anthropic":    "Anthropic",
-        "azure openai": "Azure OpenAI","azure":    "Azure OpenAI","azure_openai":"Azure OpenAI","azure-openai":"Azure OpenAI",
-        "google":       "Google",      "gemini":   "Google",     "google-genai":"Google",      "google_genai":"Google",
-        "groq":         "Groq",
-        "ollama":       "Ollama",
+        "aws bedrock": "AWS Bedrock", "bedrock": "AWS Bedrock",
+        "aws-bedrock": "AWS Bedrock", "aws_bedrock": "AWS Bedrock",
+        "aws": "AWS Bedrock",
     }
     provider = _CANONICAL.get((request.provider or "").strip().lower(), request.provider)
+    if provider != "AWS Bedrock":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model discovery is not supported for provider '{provider}'. "
+                "This application uses AWS Bedrock exclusively."
+            ),
+        )
 
     mk = await model_key_repository.get_by_provider(provider, include_secrets=True)
     if not mk:
@@ -80,37 +71,23 @@ async def discover_provider_models(request: DiscoverModelsRequest):
             detail=f"No Model Key configured for provider '{provider}'. Configure it in Model Keys first.",
         )
 
-    api_key = mk.get("api_key")
-    secret_key = mk.get("secret_key")
-    endpoint = mk.get("endpoint")
     region = mk.get("region")
     access_key_id = mk.get("access_key_id")
     secret_access_key = mk.get("secret_access_key")
     session_token = mk.get("session_token")
 
+    # Keyed on model families Bedrock actually hosts.
     ICON_MAP = {
-        "gpt": "🧠",
-        "o1": "🧠",
-        "o3": "🧠",
-        "o4": "🧠",
         "claude": "🤖",
-        "gemini": "✨",
         "llama": "🦙",
         "mistral": "⚡",
         "mixtral": "⚡",
-        "gemma": "💎",
-        "phi": "🔮",
-        "qwen": "🐉",
         "deepseek": "🔍",
         "command": "🔵",
         "titan": "📝",
         "cohere": "🔵",
         "ai21": "🟣",
         "stability": "🎨",
-        "dall": "🎨",
-        "whisper": "🎙️",
-        "tts": "🔊",
-        "dify": "🔗",
     }
 
     def pick_icon(model_id: str) -> str:
@@ -118,219 +95,41 @@ async def discover_provider_models(request: DiscoverModelsRequest):
         return next((v for k, v in ICON_MAP.items() if k in model_lower), "🤖")
 
     try:
-        if provider == "AWS Bedrock":
-            bedrock_region = region or "us-east-1"
-            kwargs = {"region_name": bedrock_region}
-            if access_key_id and secret_access_key:
-                kwargs["aws_access_key_id"] = access_key_id
-                kwargs["aws_secret_access_key"] = secret_access_key
-                if session_token:
-                    kwargs["aws_session_token"] = session_token
-            import os
-            if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
-                from botocore.config import Config
-                kwargs["config"] = Config(retries={"max_attempts": 3})
-                kwargs["verify"] = False
-            try:
-                client = boto3.client("bedrock", **kwargs)
-                response = await run_in_aws_pool(client.list_foundation_models)
-            except BotoClientError as e:
-                raise HTTPException(status_code=502, detail=f"Failed to query AWS Bedrock: {e}")
-            models = response.get("modelSummaries", [])
-            discovered = []
-            for m in models:
-                model_id = m.get("modelId", "")
-                provider_name = m.get("providerName", "")
-                model_name = m.get("modelName", "")
-                if not model_id:
-                    continue
-                display_name = model_name or (model_id.split(".")[-1] if "." in model_id else model_id)
-                discovered.append({
-                    "name": display_name,
-                    "model": model_id,
-                    "provider": "AWS Bedrock",
-                    "region": bedrock_region,
-                    "icon": pick_icon(model_id),
-                    "description": f"{provider_name} - {model_id}" if provider_name else model_id,
-                })
-            logger.info("Discovered %d Bedrock models in %s", len(discovered), bedrock_region)
-            return await _discovered_models_response(provider, discovered)
-
-        elif provider == "OpenAI":
-            if not api_key:
-                raise HTTPException(status_code=400, detail="No API key configured for OpenAI")
-            async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as client:
-                resp = await client.get(
-                    "https://api.openai.com/v1/models",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
-                if not resp.is_success:
-                    raise HTTPException(status_code=502, detail=f"OpenAI API error: HTTP {resp.status_code}")
-                data = resp.json()
-            discovered = []
-            for m in data.get("data", []):
-                model_id = m.get("id", "")
-                if not model_id:
-                    continue
-                display_name = model_id
-                discovered.append({
-                    "name": display_name,
-                    "model": model_id,
-                    "provider": "OpenAI",
-                    "icon": pick_icon(model_id),
-                    "description": model_id,
-                })
-            discovered.sort(key=lambda x: x["name"])
-            logger.info("Discovered %d OpenAI models", len(discovered))
-            return await _discovered_models_response(provider, discovered)
-
-        elif provider == "Anthropic":
-            if not api_key:
-                raise HTTPException(status_code=400, detail="No API key configured for Anthropic")
-            async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as client:
-                resp = await client.get(
-                    "https://api.anthropic.com/v1/models",
-                    headers={
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
-                    },
-                )
-                if not resp.is_success:
-                    raise HTTPException(status_code=502, detail=f"Anthropic API error: HTTP {resp.status_code}")
-                data = resp.json()
-            discovered = []
-            for m in data.get("data", []):
-                model_id = m.get("id", "")
-                display_name = m.get("display_name", model_id)
-                if not model_id:
-                    continue
-                discovered.append({
-                    "name": display_name,
-                    "model": model_id,
-                    "provider": "Anthropic",
-                    "icon": pick_icon(model_id),
-                    "description": display_name,
-                })
-            discovered.sort(key=lambda x: x["name"])
-            logger.info("Discovered %d Anthropic models", len(discovered))
-            return await _discovered_models_response(provider, discovered)
-
-        elif provider == "Google":
-            if not api_key:
-                raise HTTPException(status_code=400, detail="No API key configured for Google")
-            async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as client:
-                resp = await client.get(
-                    f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-                )
-                if not resp.is_success:
-                    raise HTTPException(status_code=502, detail=f"Google API error: HTTP {resp.status_code}")
-                data = resp.json()
-            discovered = []
-            for m in data.get("models", []):
-                model_id = m.get("name", "").replace("models/", "")
-                display_name = m.get("displayName", model_id)
-                if not model_id:
-                    continue
-                discovered.append({
-                    "name": display_name,
-                    "model": model_id,
-                    "provider": "Google",
-                    "icon": pick_icon(model_id),
-                    "description": m.get("description", display_name),
-                })
-            discovered.sort(key=lambda x: x["name"])
-            logger.info("Discovered %d Google models", len(discovered))
-            return await _discovered_models_response(provider, discovered)
-
-        elif provider == "Groq":
-            if not api_key:
-                raise HTTPException(status_code=400, detail="No API key configured for Groq")
-            async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as client:
-                resp = await client.get(
-                    "https://api.groq.com/openai/v1/models",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
-                if not resp.is_success:
-                    raise HTTPException(status_code=502, detail=f"Groq API error: HTTP {resp.status_code}")
-                data = resp.json()
-            discovered = []
-            for m in data.get("data", []):
-                model_id = m.get("id", "")
-                if not model_id:
-                    continue
-                display_name = model_id
-                discovered.append({
-                    "name": display_name,
-                    "model": model_id,
-                    "provider": "Groq",
-                    "icon": pick_icon(model_id),
-                    "description": model_id,
-                })
-            discovered.sort(key=lambda x: x["name"])
-            logger.info("Discovered %d Groq models", len(discovered))
-            return await _discovered_models_response(provider, discovered)
-
-        elif provider == "Azure OpenAI":
-            if not api_key:
-                raise HTTPException(status_code=400, detail="No API key configured for Azure OpenAI")
-            if not endpoint:
-                raise HTTPException(status_code=400, detail="No endpoint configured for Azure OpenAI")
-            async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as client:
-                resp = await client.get(
-                    f"{endpoint}/openai/models?api-version=2024-02-01",
-                    headers={"api-key": api_key},
-                )
-                if not resp.is_success:
-                    raise HTTPException(status_code=502, detail=f"Azure OpenAI API error: HTTP {resp.status_code}")
-                data = resp.json()
-            discovered = []
-            for m in data.get("data", []):
-                model_id = m.get("id", "")
-                display_name = m.get("id", model_id)
-                if not model_id:
-                    continue
-                discovered.append({
-                    "name": display_name,
-                    "model": model_id,
-                    "provider": "Azure OpenAI",
-                    "endpoint": endpoint,
-                    "icon": pick_icon(model_id),
-                    "description": f"{model_id} @ {endpoint}",
-                })
-            discovered.sort(key=lambda x: x["name"])
-            logger.info("Discovered %d Azure OpenAI models", len(discovered))
-            return await _discovered_models_response(provider, discovered)
-
-        elif provider == "Ollama":
-            ollama_url = endpoint or "http://localhost:11434"
-            async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as client:
-                resp = await client.get(f"{ollama_url}/api/tags")
-                if not resp.is_success:
-                    raise HTTPException(status_code=502, detail=f"Ollama API error: HTTP {resp.status_code}")
-                data = resp.json()
-            discovered = []
-            for m in data.get("models", []):
-                model_id = m.get("name", "")
-                if not model_id:
-                    continue
-                display_name = model_id
-                discovered.append({
-                    "name": display_name,
-                    "model": model_id,
-                    "provider": "Ollama",
-                    "baseUrl": ollama_url,
-                    "icon": pick_icon(model_id),
-                    "description": f"{model_id} ({m.get('size', '')})" if m.get("size") else model_id,
-                })
-            discovered.sort(key=lambda x: x["name"])
-            logger.info("Discovered %d Ollama models", len(discovered))
-            return await _discovered_models_response(provider, discovered)
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Model discovery not supported for provider '{provider}'. Supported: OpenAI, Anthropic, Google, Groq, Azure OpenAI, Ollama, AWS Bedrock",
-            )
+        bedrock_region = region or "us-east-1"
+        kwargs = {"region_name": bedrock_region}
+        if access_key_id and secret_access_key:
+            kwargs["aws_access_key_id"] = access_key_id
+            kwargs["aws_secret_access_key"] = secret_access_key
+            if session_token:
+                kwargs["aws_session_token"] = session_token
+        if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
+            from botocore.config import Config
+            kwargs["config"] = Config(retries={"max_attempts": 3})
+            kwargs["verify"] = False
+        try:
+            client = boto3.client("bedrock", **kwargs)
+            response = await run_in_aws_pool(client.list_foundation_models)
+        except BotoClientError as e:
+            raise HTTPException(status_code=502, detail=f"Failed to query AWS Bedrock: {e}")
+        models = response.get("modelSummaries", [])
+        discovered = []
+        for m in models:
+            model_id = m.get("modelId", "")
+            provider_name = m.get("providerName", "")
+            model_name = m.get("modelName", "")
+            if not model_id:
+                continue
+            display_name = model_name or (model_id.split(".")[-1] if "." in model_id else model_id)
+            discovered.append({
+                "name": display_name,
+                "model": model_id,
+                "provider": "AWS Bedrock",
+                "region": bedrock_region,
+                "icon": pick_icon(model_id),
+                "description": f"{provider_name} - {model_id}" if provider_name else model_id,
+            })
+        logger.info("Discovered %d Bedrock models in %s", len(discovered), bedrock_region)
+        return await _discovered_models_response(provider, discovered)
 
     except HTTPException:
         raise
@@ -347,26 +146,18 @@ class AWSDiscoverRequest(BaseModel):
 
 
 class LLMConfigCreate(BaseModel):
-    # Tolerate both snake_case (use_for_embeddings) and camelCase
-    # (useForEmbeddings) so the UI can send either. populate_by_name lets
-    # Pydantic accept the field name in addition to the alias.
     model_config = {"populate_by_name": True}
 
     name: str = Field(..., description="LLM configuration name")
     provider: str = Field(..., description="Provider name")
     model: Optional[str] = Field(None, description="Model name")
     endpoint: Optional[str] = Field(None, description="Custom endpoint URL")
-    baseUrl: Optional[str] = Field(None, description="Base URL for Ollama")
+    baseUrl: Optional[str] = Field(None, description="Optional base URL override")
     temperature: Optional[float] = Field(0.7, description="Temperature setting")
     maxTokens: Optional[int] = Field(4096, description="Max tokens")
     region: Optional[str] = Field(None, description="AWS region")
     icon: Optional[str] = Field(None, description="Icon")
     description: Optional[str] = Field(None, description="Description")
-    use_for_embeddings: Optional[bool] = Field(
-        None,
-        alias="useForEmbeddings",
-        description="Flag this config as the active embedding model (single-row exclusive)",
-    )
 
 
 class LLMConfigUpdate(BaseModel):
@@ -376,17 +167,12 @@ class LLMConfigUpdate(BaseModel):
     provider: Optional[str] = Field(None, description="Provider name")
     model: Optional[str] = Field(None, description="Model name")
     endpoint: Optional[str] = Field(None, description="Custom endpoint URL")
-    baseUrl: Optional[str] = Field(None, description="Base URL for Ollama")
+    baseUrl: Optional[str] = Field(None, description="Optional base URL override")
     temperature: Optional[float] = Field(None, description="Temperature setting")
     maxTokens: Optional[int] = Field(None, description="Max tokens")
     region: Optional[str] = Field(None, description="AWS region")
     icon: Optional[str] = Field(None, description="Icon")
     description: Optional[str] = Field(None, description="Description")
-    use_for_embeddings: Optional[bool] = Field(
-        None,
-        alias="useForEmbeddings",
-        description="Flag this config as the active embedding model (single-row exclusive)",
-    )
 
 
 def mask_api_key(api_key: str) -> str:
@@ -637,7 +423,6 @@ class LLMTestRequest(BaseModel):
 
 @router.post("/{llm_name}/test", response_model=Dict[str, Any])
 async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] = None):
-    import httpx
 
     cfg = await llm_config_repository.get_by_name(llm_name)
     if not cfg:
@@ -668,147 +453,57 @@ async def test_llm_connection(llm_name: str, request: Optional[LLMTestRequest] =
             test_config["region"] = request.region
 
     provider = test_config.get("provider", "")
-    model = test_config.get("model", "")
-    endpoint = test_config.get("endpoint", "")
-    base_url = test_config.get("base_url") or test_config.get("baseUrl", "")
-    api_key = ""
-
-    if not api_key and provider not in ("AWS Bedrock", "Bedrock", "bedrock", "Ollama"):
-        mk = await model_key_repository.get_by_provider(provider, include_secrets=True)
-        if mk:
-            if mk.get("api_key") and not api_key:
-                api_key = mk["api_key"]
-            if mk.get("endpoint") and not endpoint:
-                endpoint = mk["endpoint"]
-            if mk.get("region") and not test_config.get("region"):
-                test_config["region"] = mk["region"]
+    if provider not in ("AWS Bedrock", "Bedrock", "bedrock"):
+        return {
+            "success": False,
+            "error": (
+                f"Unsupported provider '{provider}'. This application uses AWS "
+                "Bedrock exclusively."
+            ),
+        }
 
     import os
-    ssl_verify = os.environ.get("AWS_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
+    import boto3
+    from botocore.exceptions import ClientError as BotoClientError
 
-    headers = {"Content-Type": "application/json"}
+    region = test_config.get("region", "us-east-1")
+    access_key_id = test_config.get("access_key_id")
+    secret_access_key = test_config.get("secret_access_key")
+    session_token = test_config.get("session_token")
+
+    mk = await model_key_repository.get_by_provider("AWS Bedrock", include_secrets=True)
+    if mk:
+        if not access_key_id and mk.get("access_key_id"):
+            access_key_id = mk["access_key_id"]
+        if not secret_access_key and mk.get("secret_access_key"):
+            secret_access_key = mk["secret_access_key"]
+        if not session_token and mk.get("session_token"):
+            session_token = mk["session_token"]
+        if (not region or region == "us-east-1") and mk.get("region"):
+            region = mk["region"]
+
+    boto_kwargs = {"region_name": region}
+    if access_key_id and secret_access_key:
+        boto_kwargs["aws_access_key_id"] = access_key_id
+        boto_kwargs["aws_secret_access_key"] = secret_access_key
+        if session_token:
+            boto_kwargs["aws_session_token"] = session_token
+    if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
+        boto_kwargs["verify"] = False
 
     try:
-        async with httpx.AsyncClient(timeout=10.0, verify=ssl_verify) as client:
-            if provider == "OpenAI":
-                if not api_key:
-                    return {"success": False, "error": "No API key configured"}
-                resp = await client.get(
-                    "https://api.openai.com/v1/models",
-                    headers={**headers, "Authorization": f"Bearer {api_key}"}
-                )
-                if resp.is_success:
-                    return {"success": True, "message": "Connected to OpenAI"}
-                return {"success": False, "error": f"HTTP {resp.status_code}"}
-
-            elif provider == "Anthropic":
-                if not api_key:
-                    return {"success": False, "error": "No API key configured"}
-                resp = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        **headers,
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01"
-                    },
-                    json={"model": model or "claude-3-5-sonnet-20241022", "max_tokens": 1, "messages": []}
-                )
-                if resp.is_success or resp.status_code == 400:
-                    return {"success": True, "message": "Connected to Anthropic"}
-                return {"success": False, "error": f"HTTP {resp.status_code}"}
-
-            elif provider == "Groq":
-                if not api_key:
-                    return {"success": False, "error": "No API key configured"}
-                resp = await client.get(
-                    "https://api.groq.com/openai/v1/models",
-                    headers={**headers, "Authorization": f"Bearer {api_key}"}
-                )
-                if resp.is_success:
-                    return {"success": True, "message": "Connected to Groq"}
-                return {"success": False, "error": f"HTTP {resp.status_code}"}
-
-            elif provider == "Google":
-                if not api_key:
-                    return {"success": False, "error": "No API key configured"}
-                resp = await client.get(
-                    f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-                    headers=headers
-                )
-                if resp.is_success:
-                    return {"success": True, "message": "Connected to Google"}
-                return {"success": False, "error": f"HTTP {resp.status_code}"}
-
-            elif provider == "Azure OpenAI":
-                if not endpoint:
-                    return {"success": False, "error": "Azure endpoint URL is required"}
-                if not api_key:
-                    return {"success": False, "error": "No API key configured"}
-                resp = await client.get(
-                    f"{endpoint}/openai/models?api-version=2024-02-01",
-                    headers={**headers, "api-key": api_key}
-                )
-                if resp.is_success:
-                    return {"success": True, "message": "Connected to Azure OpenAI"}
-                return {"success": False, "error": f"HTTP {resp.status_code}"}
-
-            elif provider == "Ollama":
-                ollama_url = base_url or "http://localhost:11434"
-                resp = await client.get(f"{ollama_url}/api/tags", headers=headers)
-                if resp.is_success:
-                    return {"success": True, "message": "Connected to Ollama"}
-                return {"success": False, "error": f"HTTP {resp.status_code}"}
-
-            elif provider in ("AWS Bedrock", "Bedrock", "bedrock"):
-                import boto3
-                from botocore.exceptions import ClientError as BotoClientError
-
-                region = test_config.get("region", "us-east-1")
-                access_key_id = test_config.get("access_key_id")
-                secret_access_key = test_config.get("secret_access_key")
-                session_token = test_config.get("session_token")
-
-                mk = await model_key_repository.get_by_provider("AWS Bedrock", include_secrets=True)
-                if mk:
-                    if not access_key_id and mk.get("access_key_id"):
-                        access_key_id = mk["access_key_id"]
-                    if not secret_access_key and mk.get("secret_access_key"):
-                        secret_access_key = mk["secret_access_key"]
-                    if not session_token and mk.get("session_token"):
-                        session_token = mk["session_token"]
-                    if (not region or region == "us-east-1") and mk.get("region"):
-                        region = mk["region"]
-
-                boto_kwargs = {"region_name": region}
-                if access_key_id and secret_access_key:
-                    boto_kwargs["aws_access_key_id"] = access_key_id
-                    boto_kwargs["aws_secret_access_key"] = secret_access_key
-                    if session_token:
-                        boto_kwargs["aws_session_token"] = session_token
-                if os.environ.get("AWS_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
-                    boto_kwargs["verify"] = False
-
-                try:
-                    bedrock = boto3.client("bedrock", **boto_kwargs)
-                    await run_in_aws_pool(
-                        lambda: bedrock.list_foundation_models(byProvider="anthropic")
-                    )
-                    return {"success": True, "message": f"Connected to AWS Bedrock ({region})"}
-                except BotoClientError as e:
-                    error_code = e.response.get("Error", {}).get("Code", "")
-                    if "ExpiredToken" in str(e) or error_code == "ExpiredTokenException":
-                        return {"success": False, "error": "AWS credentials expired. Please refresh your AWS credentials and try again."}
-                    if "AccessDenied" in str(e) or error_code == "AccessDeniedException":
-                        return {"success": False, "error": "Access denied. Check that your AWS credentials have Bedrock permissions."}
-                    return {"success": False, "error": f"AWS Bedrock error: {e}"}
-
-            else:
-                return {"success": False, "error": f"Unknown provider: {provider}"}
-
-    except httpx.TimeoutException:
-        return {"success": False, "error": "Connection timeout"}
-    except httpx.ConnectError:
-        return {"success": False, "error": "Connection refused - check if service is running"}
+        bedrock = boto3.client("bedrock", **boto_kwargs)
+        await run_in_aws_pool(
+            lambda: bedrock.list_foundation_models(byProvider="anthropic")
+        )
+        return {"success": True, "message": f"Connected to AWS Bedrock ({region})"}
+    except BotoClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if "ExpiredToken" in str(e) or error_code == "ExpiredTokenException":
+            return {"success": False, "error": "AWS credentials expired. Please refresh your AWS credentials and try again."}
+        if "AccessDenied" in str(e) or error_code == "AccessDeniedException":
+            return {"success": False, "error": "Access denied. Check that your AWS credentials have Bedrock permissions."}
+        return {"success": False, "error": f"AWS Bedrock error: {e}"}
     except Exception as e:
         logger.error("Error testing LLM connection: %s", redact(str(e)))
         return {"success": False, "error": str(e)}

@@ -40,7 +40,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from evals.accuracy import _bootstrap  # noqa: F401  (boto3 SSL patch on import)
 from evals.accuracy import graders
@@ -124,9 +124,18 @@ def _turns_from_messages(messages: List[Dict[str, Any]]) -> List[List[str]]:
 SKILLS_FIXTURE_DIR = os.path.join(HERE, "fixtures", "skills")
 
 
-def _install_skill_fixture(invoked_sink: List[str]) -> Tuple[List[Any], List[str], Any]:
+def _install_skill_fixture(
+    invoked_sink: List[str], allowed: Optional[Set[str]] = None,
+) -> Tuple[List[Any], List[str], Any]:
     """Point the shared SkillManager at the eval's skill fixtures and build the
     pinned ``search_skills`` + ``skill`` tools over it.
+
+    ``allowed``: per-case skill scoping — the set of fixture skill names this
+    case's agent may see/load (its map, search, and invoke set). ``None`` = every
+    fixture skill (the whole library). Real deployments scope skills per agent
+    (the Agent node's Skills picker), and a case's realistic map size is what
+    determines skill-first reliability, so each case declares its own set rather
+    than inheriting the accidental union of every fixture on disk.
 
     Returns ``(skill_tools, prev_default_mgr, mgr)``: the tools to bind, and the
     previously-cached default manager so the caller can restore it (skills use a
@@ -146,20 +155,22 @@ def _install_skill_fixture(invoked_sink: List[str]) -> Tuple[List[Any], List[str
     _skills_pkg._default_manager = mgr
 
     tools = [
-        build_skill_search_tool(allowed_skills=None, execution_id="trajectory"),
+        build_skill_search_tool(allowed_skills=allowed, execution_id="trajectory"),
         build_skill_tool(
-            allowed_skills=None, execution_id="trajectory", invoked_sink=invoked_sink),
+            allowed_skills=allowed, execution_id="trajectory", invoked_sink=invoked_sink),
     ]
     return tools, prev, mgr
 
 
-def _skill_map_block(mgr: Any) -> str:
+def _skill_map_block(mgr: Any, allowed: Optional[Set[str]] = None) -> str:
     """The ``# Skill map`` block preflight injects — the production builder itself,
-    so the eval exercises the real stage-1 disclosure and can't drift from it."""
+    so the eval exercises the real stage-1 disclosure and can't drift from it.
+    ``allowed`` scopes the map to this case's visible skills (per-agent scoping)."""
     from app.config import settings
     from app.harness.context_builder import build_skill_map_block
 
     return build_skill_map_block(mgr.build_map(
+        allowed=allowed,
         char_budget=int(getattr(settings, "skill_map_char_budget", 1500))))
 
 
@@ -218,29 +229,25 @@ def _zero_rows(
 
 async def _attempt(
     case: Dict[str, Any],
-    engine: Optional[str] = None,
     *,
     mcp_manager: Any = None,
     codegraph_err: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """Run one agent trajectory for *case*; return (rows, tool_call_count).
 
-    ``engine`` selects the agent loop (``"langgraph"`` | ``"native"`` | None for
-    ``settings.agent_engine``). We drive ``run_agent_once`` — the dual-engine
-    dispatch — rather than ``execute_agent`` directly, so the same case set can
-    be graded against both engines with byte-identical result contracts.
+    We drive ``run_agent_once`` rather than ``execute_agent`` directly so the
+    suite exercises the same entry point production uses.
 
     ``mcp_manager`` / ``codegraph_err``: the suite-level codegraph session (see
-    :func:`run_trajectory_suite`). Keyword-only so existing positional callers
-    (harness_selftest's engine-threading check) keep working. A code case with no
-    working engine fails loud here, before any Bedrock spend.
+    :func:`run_trajectory_suite`). A code case with no working engine fails loud
+    here, before any Bedrock spend.
     """
     from app.harness import AgentSpec
     from app.harness.hitl import make_checkpointer
     from app.harness.engine import run_agent_once
-    from app.config import settings as _settings
 
-    engine_name = engine or getattr(_settings, "agent_engine", "langgraph")
+    # Retained as a stable column in the report schema.
+    engine_name = "langgraph"
 
     trace = ToolTrace()
     recording: Optional[FakeCloudWatchRecording] = None
@@ -325,18 +332,21 @@ async def _attempt(
 
         skill_map_block = ""
         if _skill_wanted:
-            skill_tools, _skill_prev, _skill_mgr = _install_skill_fixture(invoked_skills)
+            # Per-case skill scoping: ``skill_allow`` lists the fixture skills this
+            # case's agent may see (its realistic map). Absent → every fixture,
+            # matching the legacy behaviour.
+            _allow_list = case.get("skill_allow")
+            _allowed = set(_allow_list) if _allow_list else None
+            skill_tools, _skill_prev, _skill_mgr = _install_skill_fixture(
+                invoked_skills, allowed=_allowed)
             # Binding the skill tool makes agent_builder add the "# Skills" prompt.
             tools.extend(skill_tools)
-            skill_map_block = _skill_map_block(_skill_mgr)
+            skill_map_block = _skill_map_block(_skill_mgr, allowed=_allowed)
 
         tools = trace.wrap(tools)
 
-        # Thread the engine through agent_config so resolve_engine honors it
-        # (run_agent_once builds the agent internally for the langgraph branch,
-        # or routes to the native TurnLoop).
         spec = AgentSpec(
-            agent_config={"engine": engine_name}, has_cloudwatch=bool(case.get("cw_fixture")),
+            agent_config={}, has_cloudwatch=bool(case.get("cw_fixture")),
             has_code_analyzer=bool(code_cfg), permission_mode="auto_allow",
             session_id=case["id"])
         checkpointer = await make_checkpointer()
@@ -357,7 +367,7 @@ async def _attempt(
             result = await run_agent_once(
                 spec, llm, tools, query,
                 logger_instance=logger, execution_id=case["id"], thread_id=case["id"],
-                checkpointer=checkpointer, engine=engine_name)
+                checkpointer=checkpointer)
         except Exception as exc:  # noqa: BLE001 — a crashed run is a 0, not a stack trace
             _restore_skill_default()
             rows = _zero_rows(
@@ -438,17 +448,16 @@ def _objective_sum(rows: List[Dict[str, Any]]) -> float:
 
 async def _run_case(
     case: Dict[str, Any],
-    engine: Optional[str] = None,
     *,
     mcp_manager: Any = None,
     codegraph_err: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Run a case; retry once and keep the better-scoring run (Bedrock is noisy)."""
     kw = {"mcp_manager": mcp_manager, "codegraph_err": codegraph_err}
-    rows, _ = await _attempt(case, engine, **kw)
+    rows, _ = await _attempt(case, **kw)
     obj = [r for r in rows if r.get("objective")]
     if obj and (_objective_sum(rows) < len(obj)):  # any objective miss → retry once
-        retry_rows, _ = await _attempt(case, engine, **kw)
+        retry_rows, _ = await _attempt(case, **kw)
         if _objective_sum(retry_rows) > _objective_sum(rows):
             rows = retry_rows
         for r in rows:
@@ -486,9 +495,8 @@ async def _start_codegraph(cases: List[Dict[str, Any]]) -> Tuple[Any, Optional[s
         return manager, f"{type(exc).__name__}: {exc}"
 
 
-async def run_trajectory_suite(engine: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Run the trajectory suite. ``engine`` selects the agent loop for every case
-    (``None`` → ``settings.agent_engine``); the bake-off passes each engine in turn."""
+async def run_trajectory_suite() -> List[Dict[str, Any]]:
+    """Run the trajectory suite."""
     cases = _load_cases()
     manager, codegraph_err = await _start_codegraph(cases)
     if codegraph_err:
@@ -498,7 +506,7 @@ async def run_trajectory_suite(engine: Optional[str] = None) -> List[Dict[str, A
     try:
         for case in cases:
             out.extend(await _run_case(
-                case, engine, mcp_manager=manager, codegraph_err=codegraph_err))
+                case, mcp_manager=manager, codegraph_err=codegraph_err))
     finally:
         if manager is not None:
             try:

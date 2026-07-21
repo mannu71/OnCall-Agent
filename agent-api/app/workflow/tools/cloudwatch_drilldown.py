@@ -357,14 +357,16 @@ def fixup_insights_query(query: str, *, default_limit: int = _DEFAULT_FIXUP_LIMI
 
 
 def compact_kb_patterns(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Compact KB log_pattern hits for tool output."""
+    """Compact OKF ``kb``-bank recall rows for tool output."""
     out: List[Dict[str, Any]] = []
     for m in matches[:2]:
+        content = (m.get("content") or "").strip()
+        name = content.split("\n", 1)[0][:80] if content else None
         out.append({
-            "name": m.get("name"),
-            "severity": m.get("severity"),
-            "similarity": round(float(m.get("similarity") or 0), 2),
-            "prior_notes": (m.get("description") or "")[:180],
+            "name": name,
+            "source": m.get("source"),
+            "similarity": round(float(m.get("score") or 0), 2),
+            "prior_notes": content[:180],
         })
     return out
 
@@ -374,18 +376,15 @@ async def recall_kb_for_pattern(
     example_message: str,
     *,
     limit: int = 2,
-    threshold: float = 0.58,
 ) -> List[Dict[str, Any]]:
-    """Recall similar log_patterns from the knowledge base."""
+    """Recall similar known issues / log patterns from the OKF ``kb`` bank (FTS)."""
     query = f"{example_message[:220]} {normalized_pattern[:120]}".strip()
     if len(query) < 8:
         return []
     try:
-        from app.services.knowledge_base import knowledge_base
+        from app.services.semantic_memory import semantic_memory
 
-        hits = await knowledge_base.search_similar_patterns(
-            query, limit=limit, threshold=threshold,
-        )
+        hits = await semantic_memory.recall(query, bank="kb", k=limit)
         return compact_kb_patterns(hits)
     except Exception as exc:
         logger.debug("recall_kb_for_pattern failed (non-fatal): %s", exc)
@@ -393,16 +392,14 @@ async def recall_kb_for_pattern(
 
 
 async def recall_kb_for_log_groups(log_groups: List[str]) -> List[Dict[str, Any]]:
-    """Recall patterns associated with configured log group names."""
+    """Recall knowledge associated with configured log group names (FTS)."""
     query = " ".join(g for g in log_groups if g)[:300]
     if not query:
         return []
     try:
-        from app.services.knowledge_base import knowledge_base
+        from app.services.semantic_memory import semantic_memory
 
-        hits = await knowledge_base.search_similar_patterns(
-            query, limit=2, threshold=0.55,
-        )
+        hits = await semantic_memory.recall(query, bank="kb", k=2)
         return compact_kb_patterns(hits)
     except Exception as exc:
         logger.debug("recall_kb_for_log_groups failed (non-fatal): %s", exc)

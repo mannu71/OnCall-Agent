@@ -42,10 +42,6 @@ export const BEDROCK_MODEL_OPTIONS = [
     'anthropic.claude-3-haiku-20240307-v1:0',
     'meta.llama3-1-70b-instruct-v1:0',
     'meta.llama3-1-8b-instruct-v1:0',
-    'amazon.titan-embed-text-v1',
-    'amazon.titan-embed-text-v2:0',
-    'cohere.embed-english-v3',
-    'cohere.embed-multilingual-v3',
 ];
 
 export const REASONING_MODELS = ['o1', 'o1-mini', 'o1-preview', 'o3', 'o3-mini', 'o4-mini'];
@@ -121,24 +117,9 @@ export const findBedrockKey = (modelKeys) =>
 export const keyIsConfigured = (mk) =>
     mk && (mk.has_api_key || mk.has_secret_key || mk.has_access_credentials || mk.endpoint);
 
-export const providerBadgeVariant = (p) => {
-    switch (p) {
-        case 'OpenAI':
-            return 'info';
-        case 'Anthropic':
-            return 'violet';
-        case 'Google':
-            return 'success';
-        case 'Azure OpenAI':
-            return 'info';
-        case 'AWS Bedrock':
-            return 'warning';
-        case 'Groq':
-            return 'warning';
-        default:
-            return 'muted';
-    }
-};
+// AWS Bedrock is the only provider — generation is Bedrock-only.
+export const providerBadgeVariant = (p) =>
+    (p === 'AWS Bedrock' ? 'warning' : 'muted');
 
 export const formatCommandPreview = (command, args) => {
     const list = Array.isArray(args) ? args : [];

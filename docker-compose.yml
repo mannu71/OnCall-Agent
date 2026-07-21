@@ -99,6 +99,19 @@ services:
     ports:
       # Loopback-only. Override HEADROOM_HOST_PORT in .env if 48787 is taken.
       - "127.0.0.1:${HEADROOM_HOST_PORT:-48787}:8787"
+    # Override the image's baked-in probe, which hits /readyz. That endpoint
+    # 503s unless headroom can reach https://api.anthropic.com — an upstream we
+    # never use (Bedrock-only) and which fails under corporate TLS interception
+    # anyway. We use headroom purely as a local compression sidecar over
+    # /v1/compress (COMPRESSION_ENDPOINT), so /livez is the signal that actually
+    # matches our dependency: process up and serving. Keeps a red status
+    # meaningful instead of permanently red.
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8787/livez"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
     restart: unless-stopped
     networks:
       - oncall-agent

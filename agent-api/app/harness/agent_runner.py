@@ -12,6 +12,13 @@ from app.core.resilience.retry import with_retry
 from app.core.observability.telemetry import agent_span, get_current_trace_id
 from app.harness.helpers import compact_input_state, looks_like_midthought
 from app.harness.hitl import emit_hitl_pause
+from app.harness.run_budget import (
+    BUDGET_SYNTHESIS_NUDGE,
+    RunBudgetExhausted,
+    build_run_budget,
+    reset_run_budget,
+    set_run_budget,
+)
 from app.workflow.strategies.react.streaming import StreamCallback
 from app.workflow.execution_port import ExecutionPort
 
@@ -60,11 +67,14 @@ _EMPTY_TOOL_PLACEHOLDER = "(no tool output)"
 # A small fixed budget is enough: at most one pending tool plus a synthesis turn.
 _CONTINUATION_RECURSION_LIMIT = 10
 
+# How many "resume the truncated answer" turns are allowed before we stop and
+# label the result partial. A genuinely long synthesis can hit the output-token
+# ceiling more than once, so one resume is not always enough.
+_TRUNCATION_RESUME_LIMIT = 3
+
 # Synthetic recovery nudges injected mid-run as HumanMessages (recursion-limit
-# forced synthesis / truncation continuation). The native engine
-# (app.harness.engine.turn_loop / recovery) imports these rather than
-# duplicating the literal text, so both engines' recovery turns stay in sync.
-# app.harness.chat_history's turn segmentation also needs these verbatim: a
+# forced synthesis / truncation continuation / budget synthesis).
+# app.harness.chat_history's turn segmentation needs these verbatim: a
 # saved trajectory can contain one of these as a mid-run HumanMessage, and
 # that must never be mistaken for a new user turn boundary.
 FORCED_SYNTHESIS_NUDGE = (
@@ -76,7 +86,9 @@ CONTINUE_TRUNCATED_NUDGE = (
     "Continue and COMPLETE your previous answer. Do not repeat what you "
     "already wrote; finish it, citing concrete file:line evidence."
 )
-SYNTHETIC_NUDGE_PREFIXES = (FORCED_SYNTHESIS_NUDGE, CONTINUE_TRUNCATED_NUDGE)
+SYNTHETIC_NUDGE_PREFIXES = (
+    FORCED_SYNTHESIS_NUDGE, CONTINUE_TRUNCATED_NUDGE, BUDGET_SYNTHESIS_NUDGE,
+)
 
 
 def sanitize_messages_for_model(messages: list) -> list:
@@ -140,7 +152,7 @@ def build_initial_messages(
 ) -> list:
     """Replay prior chat turns (if any) then append this turn's query.
 
-    Shared by both agent engines (LangGraph and the native turn loop) so a
+    Shared by every agent entry point so a
     resumed/follow-up conversation looks identical regardless of which one
     ran. Compaction downstream trims this when it grows large.
 
@@ -252,6 +264,7 @@ async def execute_agent(
     recursion_limit: Optional[int] = None,
     model_name: Optional[str] = None,
     durability: Optional[str] = None,
+    agent_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Execute the LangGraph ReAct agent with the user's query.
@@ -273,6 +286,9 @@ async def execute_agent(
             token_usage_delta events to include context-window fields
             (window size / used tokens / used %). Omitted → live events still
             carry raw token counts, just without context sizing.
+        agent_config: The agent node's config, read only for per-workflow run
+            budget overrides (``run_deadline_seconds`` / ``run_token_budget``).
+            Omitted → the global settings defaults apply.
 
     Returns:
         Dict with:
@@ -285,9 +301,9 @@ async def execute_agent(
 
     logger_instance.info("ReactStrategy: invoking agent with query: %.100s", user_query)
 
-    # Terminal-state / trajectory-event inputs (parity with the native turn
-    # loop — see app.harness.terminal_state, app.harness.step_recorder,
-    # app.harness.verify_tracking). _stop_reason/_did_forced_synthesis are
+    # Terminal-state / trajectory-event inputs (see app.harness.terminal_state,
+    # app.harness.step_recorder, app.harness.verify_tracking).
+    # _stop_reason/_did_forced_synthesis are
     # set at the recovery branches below; the recorder/verify_state are
     # populated once, post-hoc, right before the result dict is built.
     from app.harness.step_recorder import build_step_recorder
@@ -296,6 +312,7 @@ async def execute_agent(
     _verify_state = VerifyState()
     _stop_reason = "completed"
     _did_forced_synthesis = False
+    _budget_stopped: Optional[str] = None  # set when a run budget ran out
 
     input_state = {
         "messages": build_initial_messages(conversation_history, user_query, logger_instance)
@@ -396,6 +413,12 @@ async def execute_agent(
     run_config.setdefault("callbacks", [])
     run_config["callbacks"].append(token_cb)
 
+    # Engine-level run budget (wall-clock deadline / token ceiling). Bound to the
+    # context so the pre-model hook can consult it before every model call; None
+    # when neither knob is configured, so an unbudgeted run pays nothing.
+    _budget = build_run_budget(agent_config, token_cb=token_cb)
+    _budget_token = set_run_budget(_budget)
+
     try:
         async with agent_span("react_agent", execution_id=execution_id):
             trace_id = get_current_trace_id()
@@ -424,6 +447,32 @@ async def execute_agent(
                     max_retries=3,
                     retry_on=retry_predicate,
                 )
+    except RunBudgetExhausted as _budget_exc:
+        # The run consumed its wall-clock deadline or token ceiling. The hook
+        # raised BEFORE a model call, so the graph state is clean — recover what
+        # was gathered and synthesize nothing further: the ~90% nudge already
+        # gave the model its chance to conclude. Answering honestly-partial
+        # beats both a raw error and burning more of a budget already spent.
+        logger_instance.warning(
+            "ReactStrategy: run budget exhausted (%s) — returning partial "
+            "findings (execution_id=%s)", _budget_exc.reason, execution_id,
+        )
+        _stop_reason = _budget_exc.reason
+        _budget_stopped = _budget_exc.reason
+        result_state = {"messages": []}
+        try:
+            if run_config.get("configurable"):
+                snap = await agent.aget_state(run_config)
+                result_state = {
+                    "messages": _strip_dangling_tool_calls(
+                        list((getattr(snap, "values", None) or {}).get("messages", []))
+                    )
+                }
+        except Exception as _rec_exc:  # noqa: BLE001 — recovery is best-effort
+            logger_instance.warning(
+                "ReactStrategy: budget-stop recovery failed (%s); execution_id=%s",
+                _rec_exc, execution_id,
+            )
     except Exception as exc:
         # Handle LangGraph HITL interrupt — surface to caller as a structured pause.
         try:
@@ -554,19 +603,38 @@ async def execute_agent(
                     )
             else:
                 raise
+    finally:
+        # Unbind the budget: the continuation/synthesis calls below deliberately
+        # run outside it, and a leaked ContextVar would leak into the next run.
+        reset_run_budget(_budget_token)
 
     parsed = _serialize_agent_result(result_state)
+
+    if _budget_stopped:
+        # Label the recovered partial honestly. The continuation rungs below are
+        # skipped entirely for this path (see their guards): every one of them
+        # spends another model call, which is exactly what the exhausted budget
+        # forbids.
+        parsed["final_answer"] = (
+            "Investigation was stopped at its configured "
+            + ("time limit" if _budget_stopped == "deadline" else "token budget")
+            + " before it could finish. Findings so far:\n\n"
+            + (parsed.get("final_answer") or "")
+        ).strip()
+        parsed["truncated"] = True
 
     # Detect a turn cut off by the output-token limit right before the model
     # could emit a tool_use (stop_reason=max_tokens/length, no tool_calls). Left
     # alone, LangGraph treats the truncated reasoning as "done" and we would
     # return a half-thought (e.g. "Now let me search for more context...") as the
-    # final answer. Continue the turn once so the agent can finish; if it still
-    # truncates or errors, surface the result as incomplete instead of confident.
-    if parsed["last_ai_truncated"] and not parsed["last_ai_had_tool_calls"]:
+    # final answer. Resume the turn so the agent can finish; a long answer can
+    # hit the ceiling more than once, so allow a few resumes (the former
+    # escalation ladder) before giving up. If it still truncates or errors,
+    # surface the result as incomplete instead of confident.
+    if not _budget_stopped and parsed["last_ai_truncated"] and not parsed["last_ai_had_tool_calls"]:
         logger_instance.warning(
             "ReactStrategy: agent turn truncated (stop_reason=%s, output_tokens=%s) with no "
-            "tool call; attempting one continuation — execution_id=%s",
+            "tool call; attempting continuation — execution_id=%s",
             parsed["last_stop_reason"], parsed["fallback_output_tokens"], execution_id,
         )
         try:
@@ -576,22 +644,30 @@ async def execute_agent(
             # end with a user message"), so we must append a user turn to continue.
             # The nudge both satisfies that constraint and tells the model to finish.
             from langchain_core.messages import HumanMessage
-            _cont_msgs = list(result_state.get("messages", [])) + [HumanMessage(content=CONTINUE_TRUNCATED_NUDGE)]
-            cont_state = await invoke_agent(
-                agent,
-                {"messages": _cont_msgs},
-                {**run_config, "recursion_limit": _CONTINUATION_RECURSION_LIMIT},
-                durability=_durability,
-            )
-            cont_parsed = _serialize_agent_result(cont_state)
-            if cont_parsed["last_ai_truncated"] and not cont_parsed["last_ai_had_tool_calls"]:
-                # Still truncated after one retry — be honest rather than passing a
-                # partial thought off as a finished analysis.
+            cont_parsed = parsed
+            cont_state = result_state
+            for _attempt in range(_TRUNCATION_RESUME_LIMIT):
+                _cont_msgs = list(cont_state.get("messages", [])) + [
+                    HumanMessage(content=CONTINUE_TRUNCATED_NUDGE)
+                ]
+                cont_state = await invoke_agent(
+                    agent,
+                    {"messages": _cont_msgs},
+                    {**run_config, "recursion_limit": _CONTINUATION_RECURSION_LIMIT},
+                    durability=_durability,
+                )
+                cont_parsed = _serialize_agent_result(cont_state)
+                if not (cont_parsed["last_ai_truncated"] and not cont_parsed["last_ai_had_tool_calls"]):
+                    break
                 logger_instance.warning(
-                    "ReactStrategy: continuation still truncated (stop_reason=%s) — flagging "
-                    "result as incomplete (execution_id=%s)",
+                    "ReactStrategy: continuation %d/%d still truncated (stop_reason=%s) "
+                    "— execution_id=%s",
+                    _attempt + 1, _TRUNCATION_RESUME_LIMIT,
                     cont_parsed["last_stop_reason"], execution_id,
                 )
+            if cont_parsed["last_ai_truncated"] and not cont_parsed["last_ai_had_tool_calls"]:
+                # Still truncated after every resume — be honest rather than
+                # passing a partial thought off as a finished analysis.
                 cont_parsed["final_answer"] = (
                     "Investigation was cut off by the model output limit before it could "
                     "complete. Partial findings so far:\n\n"
@@ -620,7 +696,8 @@ async def execute_agent(
     # fragment with no pending tool call, give the agent one more turn to
     # actually act and synthesize; keep it only if it yields a fuller answer.
     elif (
-        not parsed.get("truncated")
+        not _budget_stopped
+        and not parsed.get("truncated")
         and looks_like_midthought(parsed.get("final_answer") or "")
         and len((parsed.get("final_answer") or "").strip()) < 400
     ):
@@ -700,7 +777,7 @@ async def execute_agent(
         except Exception:  # noqa: BLE001
             pass
 
-    # Post-hoc instrumentation (4.1/3.2/3.1 parity with the native engine —
+    # Post-hoc instrumentation (4.1/3.2/3.1 —
     # see _instrument_langgraph_result's docstring for why this runs once,
     # here, rather than live during each invocation path). Best-effort.
     try:
@@ -901,7 +978,7 @@ async def _instrument_langgraph_result(
     skip_first_n: int = 0,
 ) -> None:
     """Post-hoc instrumentation over the FINAL serialized LangGraph message
-    list — brings the LangGraph engine to parity with the native turn loop's
+    list — gives the agent the same trajectory telemetry as the former
     per-step trajectory events (4.1), live failure->governance fingerprinting
     (3.2), and edit->verify tracking (3.1).
 
@@ -922,7 +999,7 @@ async def _instrument_langgraph_result(
     when computing it. LangGraph's message state is append-only, so the
     initial messages are always an intact prefix of the final list.
 
-    Trade-off vs the native engine: no live per-tool latency (this walks the
+    Known trade-off: no live per-tool latency (this walks the
     final message list, not a live event stream) — an honest, documented
     gap in exchange for covering every LangGraph code path uniformly
     instead of instrumenting each one separately. Best-effort: any failure
@@ -962,8 +1039,8 @@ async def _instrument_langgraph_result(
             )
             if is_failed:
                 try:
-                    from app.harness.engine.tool_exec import _record_failure_fingerprint
-                    await _record_failure_fingerprint(tool_name, content, execution_id)
+                    from app.harness.failure_hook import record_failure_fingerprint
+                    await record_failure_fingerprint(tool_name, content, execution_id)
                 except Exception:  # noqa: BLE001 — governance must never break a run
                     pass
             scan_tool_calls(verify_state, [{"name": tool_name}], [content])
@@ -1465,6 +1542,11 @@ async def execute_agent_stream_v2(
     except Exception as exc:  # noqa: BLE001 — surface then re-raise for retry/recovery
         # GraphInterrupt / GraphRecursionError must propagate to execute_agent's
         # handler unchanged; only report other errors on the stream.
+        # RunBudgetExhausted is likewise a control-flow signal, not a failure:
+        # execute_agent turns it into an honest partial answer, so showing the
+        # user a raw error here would contradict the answer they then receive.
+        if isinstance(exc, RunBudgetExhausted):
+            raise
         try:
             from langgraph.errors import GraphInterrupt, GraphRecursionError
             if isinstance(exc, (GraphInterrupt, GraphRecursionError)):

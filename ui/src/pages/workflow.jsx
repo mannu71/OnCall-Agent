@@ -410,7 +410,7 @@ function WorkflowPage() {
     const { nodes, edges, enabled } = editorRef.current.getWorkflowData();
     if (!nodes?.length) { showMessage('Add at least one node', 'error'); return; }
     // Skip strict type-specific validation for the Langflow visual editor —
-    // its node types (schedule, anthropic_model, etc.) differ from the legacy
+    // its node types (schedule, language_model, etc.) differ from the legacy
     // ReactFlow schema that validateWorkflow was written for.
     try {
       const { schedule, startTime, recurrence, createdAt, updatedAt, ...base } = currentWfData || {};

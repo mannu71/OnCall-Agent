@@ -19,6 +19,7 @@ from app.core import skills as skills_pkg
 from app.core.skills.manager import Skill, SkillManager
 from app.harness.skill_tools import (
     build_skill_search_tool, build_skill_tool, expand_slash_command,
+    install_load_guard, reset_load_guard,
 )
 
 
@@ -207,6 +208,37 @@ def test_select_for_query_ranks_when_to_use_only_match(tmp_path: Path):
     assert [s.name for s in hits] == ["alpha"]
 
 
+def test_select_for_query_none_vs_empty_allowed(manager: SkillManager):
+    """allowed=None is unscoped (search everything); allowed=set() is scoped to
+    nothing (empty result) — the two must NOT be conflated, or a scoped agent
+    with no invocable skills would see the whole library."""
+    unscoped = manager.select_for_query("triage errors in logs", k=5, allowed=None)
+    assert any(s.name == "log-error-triage" for s in unscoped)
+    empty = manager.select_for_query("triage errors in logs", k=5, allowed=set())
+    assert empty == []
+    scoped = manager.select_for_query(
+        "triage errors in logs", k=5, allowed={"log-error-triage"})
+    assert [s.name for s in scoped] == ["log-error-triage"]
+
+
+def test_body_overlap_capped(tmp_path: Path):
+    """A long runbook must not outrank a name/description match on verbosity: the
+    body-overlap term is capped, so a short skill whose NAME matches wins over a
+    verbose skill that merely mentions the query words in its body."""
+    # 'gamma' matches the query only through a long body stuffed with the words.
+    stuffed = " ".join(["latency", "timeout", "database", "spike", "error"] * 40)
+    _write_skill(tmp_path, "gamma", "name: gamma\ndescription: Unrelated.",
+                 body=stuffed)
+    # 'latency-timeout' matches by NAME (weight 2.0 each token) — should win.
+    _write_skill(tmp_path, "latency-timeout",
+                 "name: latency-timeout\ndescription: Handle latency timeouts.",
+                 body="Short.")
+    m = SkillManager(skills_dir=tmp_path)
+    m.scan_skills()
+    hits = m.select_for_query("latency timeout", k=5)
+    assert hits[0].name == "latency-timeout"
+
+
 # ── $ARGUMENTS substitution ──────────────────────────────────────────────────
 
 def test_arguments_substituted_inline(manager: SkillManager):
@@ -269,7 +301,85 @@ async def test_skill_tool_body_cap(manager: SkillManager, monkeypatch):
     monkeypatch.setattr(settings, "skill_body_inject_chars", 20, raising=False)
     tool = build_skill_tool(allowed_skills=None)
     out = await tool.ainvoke({"skill": "log-error-triage"})
-    assert "runbook truncated" in out
+    # A too-long runbook is windowed, not silently cut on disk: the notice must
+    # point at the recoverable next-part call, not "continues on disk".
+    assert "part 1/" in out
+    assert 'part=2' in out
+    assert "on disk" not in out
+
+
+async def test_skill_tool_part_continuation(manager: SkillManager, monkeypatch):
+    """part=N returns later windows of a long runbook; out-of-range is an error."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "skill_body_inject_chars", 20, raising=False)
+    tool = build_skill_tool(allowed_skills=None)
+    p1 = await tool.ainvoke({"skill": "log-error-triage", "part": 1})
+    p2 = await tool.ainvoke({"skill": "log-error-triage", "part": 2})
+    # Distinct windows, and a continuation is not stubbed by the re-invoke guard.
+    assert "<skill_instructions" in p2
+    assert "already loaded" not in p2
+    assert "Continuation" in p2
+    # Out-of-range part → clear error, never a raise.
+    huge = await tool.ainvoke({"skill": "log-error-triage", "part": 999})
+    assert huge.startswith("[skill error]") and "does not exist" in huge
+
+
+async def test_skill_tool_reinvocation_guard_is_per_instance(manager: SkillManager):
+    """With no context guard installed, the guard is per tool INSTANCE — a load
+    on one instance must not stub a load on another sharing the same sink. This
+    is the decoupling of the guard from the (shared) badge sink."""
+    sink: list = []
+    a = build_skill_tool(allowed_skills=None, invoked_sink=sink)
+    b = build_skill_tool(allowed_skills=None, invoked_sink=sink)
+    out_a = await a.ainvoke({"skill": "log-error-triage"})
+    assert "<skill_instructions" in out_a
+    # b shares the sink (so the badge already lists the skill) but has its own
+    # guard — it must still emit the full runbook, not the "already loaded" stub.
+    out_b = await b.ainvoke({"skill": "log-error-triage"})
+    assert "<skill_instructions" in out_b
+    assert "already loaded" not in out_b
+    # Re-loading on the SAME instance is stubbed.
+    out_a2 = await a.ainvoke({"skill": "log-error-triage"})
+    assert "already loaded in this context" in out_a2
+
+
+async def test_skill_tool_guard_isolated_across_contexts(manager: SkillManager):
+    """The SAME tool object (as a subagent shares the parent's) must not leak its
+    load state across execution contexts: a load under one installed guard does
+    not stub a load under a freshly installed guard."""
+    tool = build_skill_tool(allowed_skills=None, invoked_sink=[])
+
+    tok_child = install_load_guard()
+    try:
+        child_out = await tool.ainvoke({"skill": "log-error-triage"})
+        assert "<skill_instructions" in child_out
+    finally:
+        reset_load_guard(tok_child)
+
+    # A new context (e.g. the parent, after the child returned) — same tool
+    # object — must get the full runbook, not the stub.
+    tok_parent = install_load_guard()
+    try:
+        parent_out = await tool.ainvoke({"skill": "log-error-triage"})
+        assert "<skill_instructions" in parent_out
+        assert "already loaded" not in parent_out
+        # But a second load within the SAME parent context is stubbed.
+        parent_out2 = await tool.ainvoke({"skill": "log-error-triage"})
+        assert "already loaded in this context" in parent_out2
+    finally:
+        reset_load_guard(tok_parent)
+
+
+async def test_skill_tool_guard_seeded_by_preloaded(manager: SkillManager):
+    """install_load_guard(preloaded) seeds the guard so a /slash-preloaded skill
+    (runbook already in the turn) is stubbed if the model also calls it."""
+    tool = build_skill_tool(allowed_skills=None, invoked_sink=[])
+    tok = install_load_guard(["log-error-triage"])
+    try:
+        out = await tool.ainvoke({"skill": "log-error-triage"})
+        assert "already loaded in this context" in out
+    finally:
+        reset_load_guard(tok)
 
 
 async def test_skill_tool_disabled_model_invocation(tmp_path: Path, monkeypatch):
@@ -444,6 +554,21 @@ def test_delete_missing_skill_returns_false(tmp_path: Path):
     m = SkillManager(skills_dir=tmp_path)
     m.scan_skills()
     assert m.delete_skill("does-not-exist") is False
+
+
+def test_rename_via_edit_drops_stale_entry(tmp_path: Path):
+    """Editing a skill's frontmatter `name` rewrites the SAME directory but loads
+    under a new name — the old cache key must not linger as a ghost pointing at
+    the rewritten file (it would double-list in the map until a full rescan)."""
+    m = SkillManager(skills_dir=tmp_path)
+    m.write_skill("orig", "---\nname: orig\ndescription: The original runbook.\n---\n\nBody.")
+    assert m.get_skill("orig") is not None
+    # Same slug/dir ("orig"), but the frontmatter name changes to "renamed".
+    m.write_skill("orig", "---\nname: renamed\ndescription: The renamed runbook.\n---\n\nBody.")
+    assert m.get_skill("renamed") is not None
+    assert m.get_skill("orig") is None
+    names = m.build_map()
+    assert "renamed" in names and "orig" not in names
 
 
 async def test_search_skills_limit_defaults_to_configured_k(manager: SkillManager, monkeypatch):

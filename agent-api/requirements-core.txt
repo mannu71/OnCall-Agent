@@ -2,7 +2,6 @@
 # CORE runtime dependencies — everything needed to run an agent (LLM + tools +
 # chat + persistence + CloudWatch). Optional feature deps live in sibling files:
 #   requirements-semantic.txt  — ONNX code-embedding semantic search
-# and the `openai` extra (langchain-openai) is added only by requirements.txt.
 # Keep this list as the minimal footprint; pyproject.toml is the source of truth.
 # ─────────────────────────────────────────────────────────────────────────────
 

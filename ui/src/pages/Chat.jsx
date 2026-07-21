@@ -116,20 +116,6 @@ function Chat() {
   const [showToolsList, setShowToolsList] = useState(false);
   const [agentSheetOpen, setAgentSheetOpen] = useState(false);
 
-  // Agent turn-loop engine for this chat — langgraph (ReAct, default) or the
-  // native hand-rolled turn loop (app.harness.engine). Overrides whatever the
-  // agent's own workflow node is configured with for just this session,
-  // persisted locally so a refresh keeps the last choice.
-  const [engineMode, setEngineMode] = useState(() => {
-    if (typeof localStorage === 'undefined') return 'langgraph';
-    const v = localStorage.getItem('chatEngineMode');
-    return v === 'native' ? 'native' : 'langgraph';
-  });
-  const changeEngineMode = (m) => {
-    setEngineMode(m);
-    try { localStorage.setItem('chatEngineMode', m); } catch { /* ignore */ }
-  };
-
   // Persistent chat sessions (migration 022). `sessionId` is created lazily on
   // the first message of a fresh chat; resuming hydrates messages from the API.
   const [sessions, setSessions] = useState([]);
@@ -618,7 +604,6 @@ function Chat() {
       const result = await agentApiClient.runAgentStream(agent.name, question, {
         history,
         sessionId: sid,
-        engine: engineMode,
         signal: controller.signal,
         onToken,
         onToolCall: (name, args, agent, model) => {
@@ -1275,32 +1260,6 @@ function Chat() {
             {/* Input Footer row — tools wrap; actions stay grouped on the right */}
             <div className="flex flex-col gap-2 border-t border-slate-50 dark:border-white/[0.06] pt-2.5 sm:flex-row sm:items-center">
               <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 sm:gap-2">
-                {/* Agent turn-loop engine — ReAct (langgraph, default) vs the
-                    native hand-rolled loop. Per-session override, sent as the
-                    `engine` param on each turn (see resolve_engine). */}
-                <div
-                  className="flex items-center h-7 shrink-0 rounded-lg bg-slate-100 dark:bg-white/[0.06] p-0.5 gap-0.5"
-                  title="Agent turn-loop engine for this chat"
-                >
-                  {[
-                    { value: 'langgraph', label: 'ReAct' },
-                    { value: 'native', label: 'Native' },
-                  ].map((opt) => (
-                    <button
-                      key={opt.value}
-                      type="button"
-                      onClick={() => changeEngineMode(opt.value)}
-                      className={cn(
-                        'h-6 px-2 rounded-md text-[10.5px] font-semibold transition-colors',
-                        engineMode === opt.value
-                          ? 'bg-white dark:bg-[#2c2c2e] text-primary shadow-sm'
-                          : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-300'
-                      )}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
               </div>
 
               <div className="flex shrink-0 items-center justify-end gap-2 sm:ml-2">

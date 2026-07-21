@@ -208,11 +208,8 @@ def _build_transport(cfg: Dict[str, Any]):
 
         return BedrockTransport(region=region)
 
-    if provider == "anthropic":
-        from app.core.transport.anthropic_transport import AnthropicTransport
-        return AnthropicTransport(api_key=cfg.get("api_key", ""))
-
-    # Generic fallback via the existing factory
+    # Bedrock-only. Anything else goes through the factory, which raises a clear
+    # error rather than silently constructing a non-Bedrock transport.
     from app.core.transport.factory import get_transport
     return get_transport(provider=provider)
 

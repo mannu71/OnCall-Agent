@@ -78,7 +78,7 @@ export default function BedrockCredentialsDialog({
                         )}
                     </div>
                     <div className="mt-0.5 text-[13px] text-slate-500">
-                        Anthropic, Llama, Titan embeddings
+                        Anthropic, Llama
                     </div>
                 </div>
             </div>

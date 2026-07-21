@@ -17,6 +17,11 @@ _STOPWORDS = frozenset({
 })
 
 
+# Ceiling on how many body-token matches can count toward a skill's score, so a
+# long runbook can't win on verbosity alone (see ``select_for_query``).
+_BODY_OVERLAP_CAP = 4
+
+
 def _tokenize(text: str):
     """Lowercase word tokens (≥3 chars, non-stopword) as a set, for overlap scoring."""
     if not text:
@@ -291,10 +296,12 @@ class SkillManager:
         path. A future upgrade can swap in the Titan embeddings used by semantic
         memory; the call site is stable.
 
-        ``allowed``: when given (non-empty), only skills whose name is in this
-        set are considered — used for per-agent skill scoping (Skills picker on
-        the Agent node). ``None`` = no scoping, every loaded skill is a
-        candidate (the global-default behavior).
+        ``allowed`` scopes the candidate set (per-agent Skills picker):
+        ``None`` = no scoping, every loaded skill is a candidate (the
+        global-default behavior); an explicit ``set()`` = nothing is invocable,
+        so the result is empty. The empty-set case must NOT read as "no scoping"
+        — a scoped agent whose effective set is empty would otherwise see every
+        skill. Callers therefore pass the exact invocable set, not a falsy stand-in.
         """
         if not self._loaded:
             self.scan_skills()
@@ -302,8 +309,9 @@ class SkillManager:
         if not q_tokens or not self._skills:
             return []
         candidates = (
-            [s for s in self._skills.values() if s.name in allowed]
-            if allowed else list(self._skills.values())
+            list(self._skills.values())
+            if allowed is None
+            else [s for s in self._skills.values() if s.name in allowed]
         )
         scored: List[tuple] = []
         for skill in candidates:
@@ -318,12 +326,16 @@ class SkillManager:
             # placeholder (the body carries the real trigger vocabulary).
             body_tokens = _tokenize(skill.content)
             # Name = strong signal; description/when_to_use = supporting; body =
-            # weak but wide.
+            # weak but wide. The body term is CLAMPED: overlap is a set
+            # intersection, so a long runbook has a wide token set and would
+            # otherwise accrue body points from incidental word matches — enough
+            # to outvote a genuine name/description hit purely by being verbose.
+            # Capping it keeps the body a tie-breaker, not a length reward.
             score = (
                 2.0 * len(q_tokens & name_tokens)
                 + 1.0 * len(q_tokens & desc_tokens)
                 + 1.0 * len(q_tokens & wtu_tokens)
-                + 0.5 * len(q_tokens & body_tokens)
+                + 0.5 * min(len(q_tokens & body_tokens), _BODY_OVERLAP_CAP)
             )
             if score > 0:
                 scored.append((score, skill))
@@ -436,13 +448,19 @@ class SkillManager:
         return "\n".join(message_parts)
 
     def _invocable_skills(self, allowed: Optional[Set[str]] = None) -> List["Skill"]:
-        """Loaded skills the model may invoke, honouring per-agent ``allowed`` scoping."""
+        """Loaded skills the model may invoke, honouring per-agent ``allowed`` scoping.
+
+        ``allowed=None`` = unscoped (all non-hidden skills); an explicit
+        ``set()`` = nothing invocable (empty result). Distinguishing the two
+        matters for a scoped agent whose effective set is empty — it must see
+        no skills, not every skill.
+        """
         if not self._loaded:
             self.scan_skills()
         return [
             s for s in self._skills.values()
             if not s.disable_model_invocation
-            and (not allowed or s.name in allowed)
+            and (allowed is None or s.name in allowed)
         ]
 
     def model_invocable_names(self, allowed: Optional[Set[str]] = None) -> Set[str]:
@@ -615,6 +633,20 @@ class SkillManager:
         if loaded.name in disabled:
             disabled.discard(loaded.name)
             self._write_disabled(disabled)
+
+        # Rename guard: an edit that changes the frontmatter ``name`` writes the
+        # SAME directory but loads under a NEW name. Drop any other cached entry
+        # backed by this directory, or the old name lingers in the map as a ghost
+        # pointing at the rewritten file until the next full rescan.
+        for _stale in [
+            n for n, s in self._skills.items()
+            if n != loaded.name and s.skill_dir == loaded.skill_dir
+        ]:
+            del self._skills[_stale]
+            logger.info(
+                "SkillManager: dropped stale entry '%s' after rename to '%s'",
+                _stale, loaded.name,
+            )
 
         self._skills[loaded.name] = loaded
         self._loaded = True

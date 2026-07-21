@@ -566,7 +566,7 @@ async def _run_child(
     uniform JSON envelope capped at output_max.
     """
     from app.harness import AgentSpec
-    from app.harness.engine import resolve_engine, run_agent_once
+    from app.harness.engine import run_agent_once
     from app.harness.hitl import make_checkpointer
 
     q = (task or "").strip()
@@ -597,7 +597,6 @@ async def _run_child(
         getattr(_settings, "subagent_compiled_cache_enabled", False)
         and _explicit_model
         and not _override
-        and resolve_engine(agent_config if isinstance(agent_config, dict) else {}) == "langgraph"
     )
     _cache_key: Optional[tuple] = None
     _cached_compiled: Optional[Any] = None
@@ -695,9 +694,6 @@ async def _run_child(
         # ~2 LangGraph steps per ReAct turn (agent + tool node) — see
         # agent_runner.execute_agent's own recursion_limit comment. Coerce
         # defensively since defs may arrive from raw API calls, not just the UI.
-        # The native engine's dispatcher halves this back into a turn count
-        # (run_agent_once._run_native), so this stays the one shared unit
-        # passed to either engine.
         recursion_limit: Optional[int] = None
         if max_turns:
             try:
@@ -721,8 +717,6 @@ async def _run_child(
             _child_model = _override or ("" if (not model_name or inherit) else str(model_name))
             child_cb = _ChildStreamCallback(_pcb, name, model=_child_model)
 
-        child_engine = resolve_engine(sub_agent_config)
-
         # Detach the child from the parent's LangChain callback context. When the
         # parent runs via LangGraph ``astream_events`` (e.g. HITL forces it), that
         # stream otherwise ALSO captures the child's nested tool calls and tags
@@ -744,7 +738,7 @@ async def _run_child(
                     run_agent_once(
                         sub_spec, sub_llm, sub_tools, q,
                         logger_instance=logger, execution_id=sub_id, thread_id=sub_id,
-                        recursion_limit=recursion_limit, checkpointer=cp, engine=child_engine,
+                        recursion_limit=recursion_limit, checkpointer=cp,
                         stream_callback=child_cb, compiled_agent=_cached_compiled,
                     ),
                     timeout=timeout_s,
@@ -753,7 +747,7 @@ async def _run_child(
                 result = await run_agent_once(
                     sub_spec, sub_llm, sub_tools, q,
                     logger_instance=logger, execution_id=sub_id, thread_id=sub_id,
-                    recursion_limit=recursion_limit, checkpointer=cp, engine=child_engine,
+                    recursion_limit=recursion_limit, checkpointer=cp,
                     stream_callback=child_cb, compiled_agent=_cached_compiled,
                 )
         finally:

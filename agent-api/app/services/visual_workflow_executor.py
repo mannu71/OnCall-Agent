@@ -133,7 +133,7 @@ class VisualWorkflowExecutor:
         """Push a ``token_usage_delta`` SSE event with current ledger totals.
 
         Strategies that wire up a per-execution ``TokenLedger`` via the
-        ``on_usage`` callback (see ``app/core/transport/anthropic_transport.py``)
+        ``on_usage`` callback (see ``app/core/transport/bedrock_transport.py``)
         call this helper after each LLM round so the UI shows live spend
         — closing the loop on plan §2.6.
 
@@ -217,6 +217,7 @@ class VisualWorkflowExecutor:
                 # input the user might separately name "session_id").
                 _chat_session_id = (inputs or {}).get("_chat_session_id")
 
+                node_error: str | None = None
                 if failed_nodes:
                     error_messages = []
                     for node_id in failed_nodes:
@@ -224,10 +225,11 @@ class VisualWorkflowExecutor:
                         error_msg = node_result.get('error', 'Unknown error')
                         error_messages.append(f"{node_id}: {error_msg}")
 
+                    node_error = f"Node(s) failed: {'; '.join(error_messages)}"
                     result = build_result(
                         execution_id, "failed", start_time, len(executed),
                         sanitized_results=sanitize_results(execution_results),
-                        error=f"Node(s) failed: {'; '.join(error_messages)}",
+                        error=node_error,
                         chat_session_id=_chat_session_id,
                     )
                 else:
@@ -237,22 +239,43 @@ class VisualWorkflowExecutor:
                         chat_session_id=_chat_session_id,
                     )
 
-                self._execution_state.mirror_status(
-                    execution_id,
-                    "success",
-                    end_time=result['end_time'],
-                    duration=result['duration'],
-                )
+                # A node can report status='failed' without raising, so this
+                # branch is the only place a partial failure is visible. Both
+                # the runtime cache and the SSE event must agree with the
+                # persisted row — and the UI keys off the event *name*, not the
+                # payload status, so a failed run has to emit workflow_failed.
+                if failed_nodes:
+                    self._execution_state.mirror_status(
+                        execution_id,
+                        "failed",
+                        error=node_error,
+                        end_time=result['end_time'],
+                        duration=result['duration'],
+                    )
 
-                await self._publish_event(execution_id, "workflow_completed", {
-                    "execution_id": execution_id,
-                    "status": "success",
-                    "duration": result['duration'],
-                    "nodes_executed": len(executed),
-                    "input_tokens":  result['input_tokens'],
-                    "output_tokens": result['output_tokens'],
-                    "total_tokens":  result['total_tokens'],
-                })
+                    await self._publish_event(execution_id, "workflow_failed", {
+                        "execution_id": execution_id,
+                        "error": node_error,
+                        "duration": result['duration'],
+                        "nodes_executed": len(executed),
+                    })
+                else:
+                    self._execution_state.mirror_status(
+                        execution_id,
+                        "success",
+                        end_time=result['end_time'],
+                        duration=result['duration'],
+                    )
+
+                    await self._publish_event(execution_id, "workflow_completed", {
+                        "execution_id": execution_id,
+                        "status": "success",
+                        "duration": result['duration'],
+                        "nodes_executed": len(executed),
+                        "input_tokens":  result['input_tokens'],
+                        "output_tokens": result['output_tokens'],
+                        "total_tokens":  result['total_tokens'],
+                    })
 
             except Exception as e:
                 result = build_result(

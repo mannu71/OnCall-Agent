@@ -1,6 +1,7 @@
 """Workflow graph config extraction for ReAct agents."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -300,6 +301,15 @@ async def connect_agent_mcp_nodes(
     lock-guarded and coalesces, so whichever path connects first wins and the
     other returns immediately. Mirrors the reference client awaiting the whole
     MCP batch before turn 1.
+
+    Servers are connected CONCURRENTLY: cold starts are dominated by each
+    subprocess's own package-resolve/handshake (CloudWatch alone is ~7s), so a
+    sequential loop made the pre-LLM barrier cost the SUM of every wired server's
+    cold start on every turn. The barrier guarantee is unaffected — the gather is
+    awaited before this function returns, so all connections are still settled
+    before the caller snapshots tools. ``connect_server`` is per-server-id
+    lock-guarded and coalescing, so concurrent connects for distinct keys are
+    safe and duplicate requests for one key collapse.
     """
     from app.infrastructure.persistence import mcp_config_repository
 
@@ -308,7 +318,8 @@ async def connect_agent_mcp_nodes(
     if not mcp_node_ids:
         return []
 
-    failed: List[str] = []
+    # Pass 1 — collect the work. Cheap and sequential; no I/O.
+    pending: List[Tuple[str, str, List[str]]] = []  # (conn_key, server_name, tool_patterns)
     for node in nodes:
         if node.get("id") not in mcp_node_ids or node.get("type") != "mcp_server":
             continue
@@ -320,37 +331,57 @@ async def connect_agent_mcp_nodes(
             conn_key = f"{node.get('id')}__{server_name}"
             if mcp_manager.is_connected(conn_key):
                 continue
+            pending.append((conn_key, server_name, tool_patterns))
+
+    if not pending:
+        return []
+
+    # Pass 2 — connect them all at once. Each coroutine owns its own try/except
+    # and returns the server name on failure (never raises), so one dead server
+    # cannot cancel its siblings mid-handshake the way an escaping exception
+    # under ``gather`` would.
+    async def _connect_one(
+        conn_key: str, server_name: str, tool_patterns: List[str],
+    ) -> Optional[str]:
+        try:
             db_config = await mcp_config_repository.get_by_name(server_name)
             if not db_config:
                 logger.warning(
                     "MCP barrier: server '%s' not found in settings — skipping",
                     server_name,
                 )
-                failed.append(server_name)
-                continue
+                return server_name
             mcp_config = {
                 "command": db_config.get("command", ""),
                 "args": db_config.get("args", []),
                 "env": db_config.get("env", {}),
             }
             ok = await mcp_manager.connect_server(conn_key, mcp_config)
-            if ok:
-                if tool_patterns:
-                    mcp_manager.set_tool_filter(conn_key, tool_patterns)
-                logger.info(
-                    "MCP barrier: pre-connected '%s' as '%s' before agent build",
-                    server_name, conn_key,
-                    extra={"execution_id": execution_id},
-                )
-            else:
-                failed.append(server_name)
+            if not ok:
                 logger.warning(
                     "MCP barrier: failed to pre-connect '%s' (%s)",
                     server_name,
                     mcp_manager.last_errors.get(conn_key, "connection failed"),
                     extra={"execution_id": execution_id},
                 )
-    return failed
+                return server_name
+            if tool_patterns:
+                mcp_manager.set_tool_filter(conn_key, tool_patterns)
+            logger.info(
+                "MCP barrier: pre-connected '%s' as '%s' before agent build",
+                server_name, conn_key,
+                extra={"execution_id": execution_id},
+            )
+            return None
+        except Exception as _conn_err:  # noqa: BLE001 — one server never kills the batch
+            logger.warning(
+                "MCP barrier: error pre-connecting '%s' (%s)",
+                server_name, _conn_err, extra={"execution_id": execution_id},
+            )
+            return server_name
+
+    results = await asyncio.gather(*(_connect_one(*item) for item in pending))
+    return [name for name in results if name]
 
 
 def wired_mcp_server_names(workflow: Dict[str, Any]) -> List[str]:

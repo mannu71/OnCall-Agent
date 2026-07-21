@@ -1,12 +1,13 @@
-"""The agent turn-loop engine — dispatch point between the LangGraph ReAct
-agent (``langgraph.prebuilt.create_react_agent``, today's default) and the
-native hand-rolled turn loop being built out incrementally behind the
-``AGENT_ENGINE`` flag.
+"""The agent turn runner — one entry point for running an agent to completion.
+
+The agent loop is ``langgraph.prebuilt.create_react_agent``; this module owns
+the run-level concerns wrapped around it (checkpoint durability, the wall-clock
+backstop, partial-state recovery).
 
 Every call site that runs an agent turn (the main workflow node, subagent
-delegation) should go through :func:`run_agent_once` rather than choosing
-between ``build_agent_from_spec``/``execute_agent`` and the native loop
-directly — that keeps engine selection in one place.
+delegation) should go through :func:`run_agent_once` rather than calling
+``build_agent_from_spec``/``execute_agent`` directly — that keeps those
+run-level concerns in one place.
 """
 from __future__ import annotations
 
@@ -18,15 +19,15 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-ENGINE_LANGGRAPH = "langgraph"
-ENGINE_NATIVE = "native"
-_VALID_ENGINES = (ENGINE_LANGGRAPH, ENGINE_NATIVE)
+#: Grace beyond the configured deadline before the outer wait_for gives up. The
+#: in-loop budget stop (app.harness.run_budget) should always finish first; this
+#: only fires when a single model/tool call hangs, where no hook can run.
+_DEADLINE_BACKSTOP_GRACE_S = 60.0
 
 
 def _resolve_run_deadline(agent_config: Optional[Dict[str, Any]]) -> float:
     """Per-workflow override (agent_config / params mirror) over the global
-    ``agent_run_deadline_seconds``. Absent/invalid → global default. Mirrors
-    TurnLoop._resolve_budget_knob so both engines read the same knob."""
+    ``agent_run_deadline_seconds``. Absent/invalid → global default."""
     cfg = agent_config or {}
     params = cfg.get("params") if isinstance(cfg.get("params"), dict) else {}
     raw = cfg.get("run_deadline_seconds")
@@ -63,55 +64,6 @@ async def _recover_partial_from_checkpointer(
         return {"answer": "", "n_calls": 0}
 
 
-def resolve_engine(
-    agent_config: Optional[Dict[str, Any]] = None,
-    context: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Resolve which engine should drive this run.
-
-    Precedence (highest first): an explicit per-request override — passed as
-    ``context["engine"]`` or ``context["inputs"]["engine"]``, same pattern as
-    :func:`app.harness.spec_factory.resolve_permission_mode` — lets a single
-    chat turn pick ReAct/Native without touching the saved workflow. Falling
-    back from there: per-workflow ``agent_config["engine"]`` (or its
-    ``params`` mirror, same coercion pattern as ``supervisor_enabled``), then
-    the global ``AGENT_ENGINE`` setting.
-
-    HITL runs are clamped to ``langgraph`` by design: durable pause/resume and
-    partial-state recovery ride on the LangGraph Postgres checkpointer, and the
-    decision is to keep LangGraph as the sole durable/HITL path rather than port
-    a second checkpointer into the native loop (the native loop stays the fast,
-    stateless engine). So a HITL-enabled run always resolves to LangGraph.
-    """
-    agent_config = agent_config or {}
-    ctx = context or {}
-    params = agent_config.get("params") if isinstance(agent_config.get("params"), dict) else {}
-
-    raw = (
-        ctx.get("engine")
-        or (ctx.get("inputs") or {}).get("engine")
-        or agent_config.get("engine")
-        or params.get("engine")
-    )
-    engine = str(raw).strip().lower() if raw else settings.agent_engine
-
-    if engine not in _VALID_ENGINES:
-        logger.warning(
-            "resolve_engine: unknown engine '%s', falling back to '%s'",
-            engine, ENGINE_LANGGRAPH,
-        )
-        engine = ENGINE_LANGGRAPH
-
-    if engine == ENGINE_NATIVE and agent_config.get("hitl_enabled", False):
-        logger.warning(
-            "resolve_engine: HITL is not yet supported on the native engine — "
-            "forcing '%s' for this run", ENGINE_LANGGRAPH,
-        )
-        engine = ENGINE_LANGGRAPH
-
-    return engine
-
-
 async def run_agent_once(
     spec: Any,
     llm: Any,
@@ -128,35 +80,25 @@ async def run_agent_once(
     recursion_limit: Optional[int] = None,
     model_name: Optional[str] = None,
     checkpointer: Any = None,
-    engine: Optional[str] = None,
     compiled_agent: Any = None,
+    preloaded_skills: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Run one agent turn-loop to completion, routed by ``engine``.
+    """Run one agent to completion.
 
-    ``engine`` defaults to ``resolve_engine(spec.agent_config)`` when omitted.
-    Both branches return the same result-dict contract as
-    ``app.harness.agent_runner.execute_agent``
+    Returns the result-dict contract of ``app.harness.agent_runner.execute_agent``
     (``final_answer``, ``messages``, ``tool_calls``, token counts, ...).
 
-    ``compiled_agent`` (LangGraph engine only): a pre-built agent graph to run
-    instead of building one from ``spec`` — used by the subagent compiled-agent
-    cache to skip ``build_agent_from_spec`` on repeated delegations.
+    ``compiled_agent``: a pre-built agent graph to run instead of building one
+    from ``spec`` — used by the subagent compiled-agent cache to skip
+    ``build_agent_from_spec`` on repeated delegations.
+
+    ``preloaded_skills``: skills whose runbook is already in this run's context
+    before the model's first call (deterministic ``/slash`` expansion). Seeds the
+    per-context skill re-invocation guard so the model isn't handed the same
+    runbook twice. Subagents pass nothing — their guard starts empty, which is
+    exactly what isolates a child's skill loads from the parent's.
     """
     agent_config = getattr(spec, "agent_config", None) or {}
-    resolved = engine or resolve_engine(agent_config)
-
-    if resolved == ENGINE_NATIVE:
-        return await _run_native(
-            spec, llm, tools, user_query,
-            logger_instance=logger_instance or logger,
-            execution_id=execution_id,
-            stream_callback=stream_callback,
-            execution_port=execution_port,
-            conversation_history=conversation_history,
-            retry_predicate=retry_predicate,
-            recursion_limit=recursion_limit,
-            model_name=model_name,
-        )
 
     from app.harness import build_agent_from_spec
     from app.harness.agent_runner import execute_agent
@@ -176,117 +118,71 @@ async def run_agent_once(
         )
         _durability = "async"
 
-    _run = execute_agent(
-        agent,
-        user_query,
-        logger_instance or logger,
-        execution_id,
-        stream_callback,
-        thread_id=thread_id,
-        execution_port=execution_port,
-        conversation_history=conversation_history,
-        retry_predicate=retry_predicate,
-        recursion_limit=recursion_limit,
-        model_name=model_name,
-        durability=_durability,
-    )
-
-    # Engine-level wall-clock deadline (Phase 1). The native loop enforces this
-    # per-turn with a graceful synthesis nudge; the LangGraph path can only be
-    # bounded coarsely from the outside — a hard wait_for that returns an honest
-    # partial envelope (recovered from the checkpointer when possible) instead of
-    # letting a single run overrun unboundedly. 0 disables.
-    _deadline = _resolve_run_deadline(agent_config)
-    if _deadline <= 0:
-        return await _run
+    # Install a fresh per-context skill re-invocation guard for THIS run (parent
+    # or subagent), seeded with any /slash-preloaded skills. Isolates each
+    # context's "already loaded" bookkeeping — see app.harness.skill_tools.
+    from app.harness.skill_tools import install_load_guard, reset_load_guard
+    _guard_token = install_load_guard(preloaded_skills)
     try:
-        return await asyncio.wait_for(_run, timeout=_deadline)
-    except asyncio.TimeoutError:
-        (logger_instance or logger).warning(
-            "run_agent_once: LangGraph run exceeded the %.0fs wall-clock deadline "
-            "— returning partial (execution_id=%s)", _deadline, execution_id,
+        _run = execute_agent(
+            agent,
+            user_query,
+            logger_instance or logger,
+            execution_id,
+            stream_callback,
+            thread_id=thread_id,
+            execution_port=execution_port,
+            conversation_history=conversation_history,
+            retry_predicate=retry_predicate,
+            recursion_limit=recursion_limit,
+            model_name=model_name,
+            durability=_durability,
+            agent_config=agent_config,
         )
-        _partial = await _recover_partial_from_checkpointer(checkpointer, thread_id)
-        _prefix = (
-            "Investigation was stopped at its time budget before it could "
-            "complete. Partial findings so far:\n\n"
-        )
-        _answer = (_prefix + _partial["answer"]).strip() if _partial["answer"] else (
-            _prefix + "(no partial answer was recovered)"
-        ).strip()
-        return {
-            "final_answer": _answer,
-            "messages": [],
-            "tool_calls": [],
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "cache_read_tokens": 0,
-            "cache_creation_tokens": 0,
-            "stop_reason": "deadline",
-            "truncated": True,
-        }
+
+        # Engine-level wall-clock deadline — BACKSTOP ONLY.
+        #
+        # The graceful path lives in the pre-model hook (app.harness.run_budget):
+        # it nudges for synthesis at ~90% and stops with a recovered partial at
+        # 100%, which is a far better answer than anything reconstructible from
+        # outside. But that hook only fires BETWEEN model calls, so it cannot
+        # observe a single model or tool call that hangs. This wait_for covers
+        # exactly that case, and sits a grace period beyond the deadline so a run
+        # concluding gracefully always wins the race. 0 disables.
+        _deadline = _resolve_run_deadline(agent_config)
+        if _deadline <= 0:
+            return await _run
+        try:
+            return await asyncio.wait_for(_run, timeout=_deadline + _DEADLINE_BACKSTOP_GRACE_S)
+        except asyncio.TimeoutError:
+            (logger_instance or logger).warning(
+                "run_agent_once: LangGraph run exceeded the %.0fs wall-clock deadline "
+                "by more than %.0fs of grace (a single model/tool call is hung) — "
+                "returning partial (execution_id=%s)",
+                _deadline, _DEADLINE_BACKSTOP_GRACE_S, execution_id,
+            )
+            _partial = await _recover_partial_from_checkpointer(checkpointer, thread_id)
+            _prefix = (
+                "Investigation was stopped at its time budget before it could "
+                "complete. Partial findings so far:\n\n"
+            )
+            _answer = (_prefix + _partial["answer"]).strip() if _partial["answer"] else (
+                _prefix + "(no partial answer was recovered)"
+            ).strip()
+            return {
+                "final_answer": _answer,
+                "messages": [],
+                "tool_calls": [],
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "stop_reason": "deadline",
+                "truncated": True,
+            }
+    finally:
+        reset_load_guard(_guard_token)
 
 
-async def _run_native(
-    spec: Any,
-    llm: Any,
-    tools: List[Any],
-    user_query: str,
-    *,
-    logger_instance: Any,
-    execution_id: Optional[str],
-    stream_callback: Any,
-    execution_port: Any,
-    conversation_history: Optional[list],
-    retry_predicate: Optional[Any] = None,
-    recursion_limit: Optional[int],
-    model_name: Optional[str],
-) -> Dict[str, Any]:
-    from app.harness.engine.turn_loop import TurnLoop
-    from app.harness.agent_builder import compose_system_prompt
-    from app.harness.agent_runner import build_initial_messages
-
-    agent_config = spec.agent_config or {}
-    system_prompt = compose_system_prompt(
-        tools=tools,
-        agent_config=agent_config,
-        has_cloudwatch=spec.has_cloudwatch,
-        has_code_analyzer=spec.has_code_analyzer,
-        capabilities=spec.capabilities,
-        role_prompt=spec.role_prompt,
-        planning=spec.planning,
-        filesystem=spec.filesystem,
-        sandbox=spec.sandbox,
-        verify=bool(spec.verify_command),
-        subagents=spec.subagents,
-    )
-    # Native loop's turn budget is turn-based, not LangGraph-step-based; a
-    # caller-supplied recursion_limit (e.g. a subagent's max_turns*2) is
-    # halved back to turns so both engines get an equivalent bound.
-    max_turns = (recursion_limit // 2) if recursion_limit is not None else None
-
-    loop = TurnLoop(
-        llm, tools, system_prompt,
-        agent_config=agent_config,
-        permission_mode=spec.permission_mode,
-        session_id=spec.session_id,
-        execution_id=execution_id,
-        execution_port=execution_port,
-        policies=spec.policies,
-        stream_callback=stream_callback,
-        model_name=model_name,
-        max_turns=max_turns,
-        logger_instance=logger_instance,
-        retry_predicate=retry_predicate,
-    )
-    initial_messages = build_initial_messages(conversation_history, user_query, logger_instance)
-    return await loop.run(initial_messages)
-
-
-__all__ = [
-    "ENGINE_LANGGRAPH",
-    "ENGINE_NATIVE",
-    "resolve_engine",
-    "run_agent_once",
-]
+__all__ = ["run_agent_once"]

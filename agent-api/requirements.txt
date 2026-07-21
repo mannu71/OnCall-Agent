@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# FULL dependency set = core + semantic + openai extra.
+# FULL dependency set = core + semantic.
 # For a lighter footprint install only `requirements-core.txt` (no ONNX
-# semantic-search deps, no langchain-openai).
+# semantic-search deps).
 #
 # Source of truth is pyproject.toml; these requirements files mirror it for the
 # Docker build (which installs via pip -r).
@@ -9,7 +9,3 @@
 
 -r requirements-core.txt
 -r requirements-semantic.txt
-
-# openai extra — only needed for provider="openai"/"azure" LLM nodes (Bedrock is
-# primary). Imported lazily in app/workflow/strategies/react/llm_factory.py.
-langchain-openai>=1.1.0

@@ -64,6 +64,60 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ── retrievability lint ──────────────────────────────────────────────────────
+# Recall is FTS-only over the ``kb`` bank (no vector fallback), so a concept's
+# findability by a *reworded* query depends entirely on its title terms plus its
+# tags (document-side synonyms, weighted into search_vector at rank A/B). A doc
+# with no tags and a thin title is effectively unfindable by paraphrase — the
+# exact failure mode the FTS-only retrieval benchmark flagged. These checks are
+# advisory: they surface such docs (warn on write, report on scan) but never
+# block a write.
+_MIN_DESCRIPTION_CHARS = 12
+_MIN_TITLE_CHARS = 6
+
+
+def lint_frontmatter(
+    frontmatter: Dict[str, Any], *, min_tags: Optional[int] = None
+) -> List[str]:
+    """Return a list of retrievability issues for one concept's frontmatter.
+
+    Empty list = the doc is well-authored for FTS recall. ``min_tags`` defaults
+    to ``settings.knowledge_min_tags`` (fall back to 3 if settings unavailable).
+    """
+    if min_tags is None:
+        try:
+            from app.config import settings
+            min_tags = int(getattr(settings, "knowledge_min_tags", 3))
+        except Exception:  # noqa: BLE001 — a bad/absent setting must not break lint
+            min_tags = 3
+
+    fm = frontmatter or {}
+    issues: List[str] = []
+
+    title = str(fm.get("title") or "").strip()
+    if len(title) < _MIN_TITLE_CHARS:
+        issues.append(f"title too short ({len(title)} chars) — hurts FTS ranking")
+
+    desc = str(fm.get("description") or "").strip()
+    if len(desc) < _MIN_DESCRIPTION_CHARS:
+        issues.append(
+            "description missing or too short — the description leg of the FTS "
+            "vector (weight B) is empty"
+        )
+
+    raw_tags = fm.get("tags") or []
+    if isinstance(raw_tags, str):
+        raw_tags = [raw_tags]
+    tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+    if min_tags > 0 and len(tags) < min_tags:
+        issues.append(
+            f"only {len(tags)} tag(s), want >= {min_tags} — tags are the "
+            "paraphrase-synonym mechanism for FTS-only recall"
+        )
+
+    return issues
+
+
 class KnowledgeBundle:
     """Read/write an OKF knowledge bundle rooted at *root*.
 
@@ -124,6 +178,13 @@ class KnowledgeBundle:
             for k, v in extra_frontmatter.items():
                 frontmatter.setdefault(k, v)
         frontmatter["timestamp"] = _now_iso()
+
+        # Retrievability lint — advisory, never blocks the write. Surfaces docs
+        # that FTS-only recall will struggle to find by a reworded query.
+        for issue in lint_frontmatter(frontmatter):
+            logger.warning(
+                "KnowledgeBundle: retrievability lint %s/%s — %s", section, slug, issue
+            )
 
         with self._lock:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,14 +247,58 @@ class KnowledgeBundle:
                 out.append(p)
         return out
 
-    def concept_text_for_index(self, doc: Dict[str, Any]) -> str:
-        """Flatten a parsed concept into the text stored in the ``kb`` memory bank."""
+    def lint(self, *, min_tags: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Scan every concept and return retrievability issues per doc.
+
+        Returns a list of ``{section, slug, path, issues}`` for docs with at
+        least one issue (well-authored docs are omitted). Feeds a nightly/CI
+        retrievability check — the write-time warning only catches new writes,
+        so this covers git-shipped / human-authored docs too.
+        """
+        out: List[Dict[str, Any]] = []
+        for section in SECTION_TYPES:
+            for path in self.list_concepts(section):
+                doc = self.read_concept(path)
+                if not doc:
+                    out.append({"section": section, "slug": path.stem,
+                                "path": str(path), "issues": ["unparseable OKF doc"]})
+                    continue
+                issues = lint_frontmatter(doc.get("frontmatter") or {}, min_tags=min_tags)
+                if issues:
+                    out.append({"section": section, "slug": path.stem,
+                                "path": str(path), "issues": issues})
+        return out
+
+    def concept_fields_for_index(self, doc: Dict[str, Any]) -> Dict[str, Any]:
+        """Structured fields for weighted FTS indexing into the ``kb`` bank.
+
+        Returns ``{title, tags, description, body, flat}``. ``flat`` is the
+        displayable content stored in the ``content`` column (title+desc+body,
+        as before); ``title``/``tags``/``description`` drive the weighted
+        ``search_vector`` (title+tags = weight A, description = B). Tags are the
+        document-side synonym mechanism for paraphrase recall, so they must be
+        carried here even though they are not part of ``flat``.
+        """
         fm = doc.get("frontmatter") or {}
         title = str(fm.get("title") or "").strip()
         desc = str(fm.get("description") or "").strip()
         body = str(doc.get("body") or "").strip()
+        raw_tags = fm.get("tags") or []
+        if isinstance(raw_tags, str):
+            raw_tags = [raw_tags]
+        tags = [str(t).strip() for t in raw_tags if str(t).strip()]
         parts = [p for p in (title, desc, body) if p]
-        return "\n".join(parts)
+        return {
+            "title": title,
+            "tags": tags,
+            "description": desc,
+            "body": body,
+            "flat": "\n".join(parts),
+        }
+
+    def concept_text_for_index(self, doc: Dict[str, Any]) -> str:
+        """Flat displayable text stored in the ``kb`` memory bank (title+desc+body)."""
+        return str(self.concept_fields_for_index(doc)["flat"])
 
     # ── index.md / log.md maintenance ─────────────────────────────────────────
 
@@ -264,19 +369,24 @@ def get_default_bundle() -> KnowledgeBundle:
 
 # ── recall indexing (bundle concept → ``kb`` memory bank) ────────────────────
 
-async def index_concept_into_kb(bundle: KnowledgeBundle, path: Path) -> Optional[int]:
-    """Index one OKF concept into the ``kb`` memory bank for recall.
+async def index_concept_into_kb(
+    bundle: KnowledgeBundle, path: Path, *, bank: str = "kb"
+) -> Optional[int]:
+    """Index one OKF concept into a memory *bank* (default ``kb``) for recall.
 
     Idempotent: ``semantic_memory.remember`` dedupes on (bank, repo, content
     sha), so re-indexing an unchanged doc is a no-op and an edited doc updates
-    the same row.
+    the same row. Title/tags/description are passed through so the FTS vector is
+    weighted (tags = paraphrase synonyms). *bank* is overridable so eval suites
+    can index into an isolated corpus (e.g. ``kb_eval``).
     """
     doc = bundle.read_concept(path)
     if not doc:
         return None
     from app.services.semantic_memory import semantic_memory
 
-    content = bundle.concept_text_for_index(doc)
+    fields = bundle.concept_fields_for_index(doc)
+    content = str(fields["flat"])
     if not content.strip():
         return None
     fm = doc.get("frontmatter") or {}
@@ -289,22 +399,42 @@ async def index_concept_into_kb(bundle: KnowledgeBundle, path: Path) -> Optional
         source=str(fm.get("source") or "kb"),
         importance=importance,
         veracity=1.0,
-        bank="kb",
+        bank=bank,
+        title=fields["title"],
+        tags=fields["tags"],
+        description=fields["description"],
     )
 
 
-async def reconcile_kb_index(bundle: Optional[KnowledgeBundle] = None) -> int:
-    """Index every bundle concept into the ``kb`` bank. Returns count indexed.
+async def reconcile_kb_index(
+    bundle: Optional[KnowledgeBundle] = None, *, bank: str = "kb"
+) -> int:
+    """Rebuild the ``kb`` bank from the bundle. Returns count indexed.
 
-    Run at startup so human-authored / git-shipped docs are recalled even if they
-    were never written through the app. Best-effort; never raises.
+    The ``kb`` bank is **derived data**: the OKF files on disk are the source of
+    truth. Changing the indexed text (e.g. adding tag weighting) orphans old
+    rows, and deleted docs would leave stale rows behind — so this drops every
+    row in *bank* first, then re-indexes every current concept. Run at startup so
+    human-authored / git-shipped docs are recalled even if they were never
+    written through the app. Best-effort; never raises.
     """
     bundle = bundle or get_default_bundle()
     n = 0
     try:
+        from app.core.database import AsyncSessionLocal
+        from sqlalchemy import text as _sql_text
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                _sql_text("DELETE FROM semantic_memory WHERE bank = :bank"),
+                {"bank": bank},
+            )
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 — a failed purge must not abort reindex
+        logger.warning("reconcile_kb_index: bank purge failed (%s)", exc)
+    try:
         for p in bundle.list_concepts():
             try:
-                if await index_concept_into_kb(bundle, p) is not None:
+                if await index_concept_into_kb(bundle, p, bank=bank) is not None:
                     n += 1
             except Exception as exc:  # noqa: BLE001 — one bad doc must not abort
                 logger.debug("reconcile_kb_index: skip %s (%s)", p, exc)

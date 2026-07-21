@@ -24,9 +24,34 @@ built (they need the model), so they are intentionally NOT part of this base set
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from app.core.privacy.redact import redact
+
+
+# Short-lived memo of NEGATIVE (credentials-are-fine) STS probes, keyed by the
+# exact identity probed. One turn can probe the same AWS identity several times
+# over (the CloudWatch node's creds, the model's creds, and every wired AWS MCP
+# server's env often resolve to ONE profile), and each probe is a real network
+# round-trip on the pre-LLM critical path.
+#
+# Only the "not expired" outcome is cached, deliberately. That is where the win
+# is — the common path where everything is valid and the duplicate round-trips
+# are pure waste — and a stale "not expired" degrades into the same mid-run tool
+# error the probe exists to pre-empt, never a wrong answer. Caching a CONFIRMED
+# expiry would instead break the workflow the expiry message itself prescribes:
+# the user runs `aws sso login` and retries straight away, and must not be told
+# their freshly-refreshed session is still dead.
+_STS_CACHE_TTL_S = 60.0
+_STS_CACHE: Dict[Tuple[Any, ...], float] = {}
+
+
+def _reset_sts_cache() -> None:
+    """Drop the probe memo. For tests that exercise several outcomes for one
+    identity; production has no reason to call this."""
+    _STS_CACHE.clear()
 
 
 async def _sts_expired(
@@ -41,7 +66,36 @@ async def _sts_expired(
     ``ExpiredTokenException`` — any other probe failure (network blip, no
     creds configured, missing botocore) is "cannot confirm expiry", never
     treated as a reason to abort a turn.
+
+    A recent "credentials are fine" verdict for the same identity is reused for
+    ``_STS_CACHE_TTL_S`` so the several callers sharing one AWS identity pay a
+    single round-trip per turn; a confirmed expiry is never cached.
     """
+    _cache_key = (tuple(sorted((creds or {}).items())), region)
+    _verified_at = _STS_CACHE.get(_cache_key)
+    if _verified_at is not None:
+        if (time.monotonic() - _verified_at) < _STS_CACHE_TTL_S:
+            return False
+        _STS_CACHE.pop(_cache_key, None)
+
+    _result = await _sts_expired_uncached(
+        creds, region,
+        logger_instance=logger_instance, execution_id=execution_id, label=label,
+    )
+    if not _result:
+        _STS_CACHE[_cache_key] = time.monotonic()
+    return _result
+
+
+async def _sts_expired_uncached(
+    creds: Dict[str, Any],
+    region: str,
+    *,
+    logger_instance: Any,
+    execution_id: Optional[str],
+    label: str,
+) -> bool:
+    """The real probe behind :func:`_sts_expired`'s memo."""
     try:
         import boto3
         from botocore.exceptions import ClientError as _BotoClientError
@@ -236,10 +290,12 @@ async def collect_backend_degradations(
             from app.infrastructure.persistence import mcp_config_repository
         except Exception:  # noqa: BLE001 — no repo (tests) → skip deeper probe
             mcp_config_repository = None  # type: ignore[assignment]
-        for name in wired_mcp_servers:
+
+        async def _check_one(name: str) -> Optional[str]:
+            """One server's config load + credential probe. Never raises."""
             verifier = next((v for v in _MCP_CRED_VERIFIERS if v.matches(name)), None)
             if verifier is None:
-                continue  # connection was the verification
+                return None  # connection was the verification
             env: Dict[str, Any] = {}
             if mcp_config_repository is not None:
                 try:
@@ -250,23 +306,33 @@ async def collect_backend_degradations(
                         "ReactStrategy: pre-LLM gate could not load env for '%s' (%s)",
                         name, redact(str(_cfg_err)), extra={"execution_id": execution_id},
                     )
-                    continue
+                    return None
             creds, region = verifier.extract(env)
             msg = await _run(verifier, creds, region, f"the '{name}' MCP server")
-            if msg:
-                # `msg` is the abort-phrased probe result ("No answer was
-                # generated…"); in the degrade path an answer WILL be produced,
-                # so emit a self-contained note instead of embedding it.
-                where = creds.get("aws_profile")
-                hint = (
-                    f"refresh with `aws sso login --profile {where}`"
-                    if where else
-                    "refresh with `aws sso login` or update the server's env"
-                )
-                notes.append(
-                    f"The '{name}' MCP server's {verifier.name.upper()} credentials are "
-                    f"expired — its tools may fail this turn ({hint})."
-                )
+            if not msg:
+                return None
+            # `msg` is the abort-phrased probe result ("No answer was
+            # generated…"); in the degrade path an answer WILL be produced,
+            # so emit a self-contained note instead of embedding it.
+            where = creds.get("aws_profile")
+            hint = (
+                f"refresh with `aws sso login --profile {where}`"
+                if where else
+                "refresh with `aws sso login` or update the server's env"
+            )
+            return (
+                f"The '{name}' MCP server's {verifier.name.upper()} credentials are "
+                f"expired — its tools may fail this turn ({hint})."
+            )
+
+        # Probe every server at once — each is a DB read plus a network probe,
+        # and they are independent. ``gather`` preserves input order, so the
+        # notes stay deterministic. The ``probed_signatures`` dedupe inside
+        # ``_run`` stays exact under concurrency: its check-and-add pair has no
+        # await between them, so no two coroutines can interleave there.
+        notes = [n for n in await asyncio.gather(
+            *(_check_one(name) for name in wired_mcp_servers)
+        ) if n]
 
     return notes
 

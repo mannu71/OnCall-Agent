@@ -4,10 +4,7 @@ fallback-chain failover on throttles.
 
 Split out of the former ``ReactStrategy.execute`` god-orchestrator (see
 :mod:`preflight` for the setup half and :mod:`finalizer` for the post-run
-half). This module is the SOLE engine-routing point: the actual agent turn
-runs via ``app.harness.engine.run_agent_once``, which dispatches to either
-the LangGraph ReAct agent (default) or the native turn loop, keyed off
-``AGENT_ENGINE`` / the per-workflow ``engine`` override.
+half). The actual agent turn runs via ``app.harness.engine.run_agent_once``.
 """
 from __future__ import annotations
 
@@ -17,7 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 from app.config import settings
 from app.core.quality.supervisor import InvestigationSupervisor, SupervisorConfig
 from app.harness import build_agent_from_spec
-from app.harness.engine import resolve_engine, run_agent_once
+from app.harness.engine import run_agent_once
 from app.harness.spec_factory import _as_bool
 from app.harness.supervisor_loop import run_supervised
 from app.workflow.execution_port import ExecutionPort
@@ -113,8 +110,6 @@ async def run_plan(
         if len(_fallback_chain) > 1 else None
     )
 
-    _engine = resolve_engine(agent_config, context)
-
     async def _run_agent(_agent, _query):
         # plan.conversation_history is the tool-inclusive replay built in
         # preflight (app.harness.chat_history) — None for non-chat runs or
@@ -157,7 +152,7 @@ async def run_plan(
                     retry_predicate=_retry_predicate,
                     model_name=llm_config.get("model"),
                     checkpointer=checkpointer,
-                    engine=_engine,
+                    preloaded_skills=plan.slash_preloaded_skills,
                 )
             except Exception as _exc:  # noqa: BLE001 — decide failover vs raise
                 from app.core.llm.error_classifier import classify_error as _classify

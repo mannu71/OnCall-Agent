@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Prompt-edit gate (pre-push). Runs the trajectory accuracy suite when this push
+# contains changes to the system-prompt assembly code, blocking the push on a
+# regression. Install with:  scripts/hooks/install.sh
+#
+# Skip once (e.g. offline / container down):  PROMPT_GATE_SKIP=1 git push
+set -euo pipefail
+
+if [ "${PROMPT_GATE_SKIP:-0}" = "1" ]; then
+  echo "[prompt-gate] skipped (PROMPT_GATE_SKIP=1)."
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+base="origin/$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+# Fall back to the default branch if this branch has no upstream yet.
+if ! git rev-parse --verify "$base" >/dev/null 2>&1; then
+  base="origin/main"
+fi
+
+python "$repo_root/agent-api/scripts/prompt_gate.py" --base "$base"

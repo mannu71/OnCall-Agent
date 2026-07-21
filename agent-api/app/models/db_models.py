@@ -16,7 +16,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import declarative_base
-from pgvector.sqlalchemy import Vector
 
 # Import Base from database module
 from app.core.database import Base
@@ -29,29 +28,14 @@ def _utcnow() -> datetime:
 # ---------------------------------------------------------------------------
 # Migration note
 # ---------------------------------------------------------------------------
-# If upgrading an existing deployment, run the following SQL once:
+# Schema is applied from ``agent-api/migrations/`` — ``001_schema.sql`` is the
+# squashed baseline, ``002_fts_only_retrieval.sql`` moves retrieval to FTS-only.
+# Do not hand-write DDL for the tables below; add a numbered migration instead.
 #
-#   ALTER TABLE known_issues RENAME TO knowledge_entries;
-#   CREATE INDEX IF NOT EXISTS ix_knowledge_entries_source
-#       ON knowledge_entries(source);
-#
-#   CREATE TABLE IF NOT EXISTS skills (
-#       id              SERIAL PRIMARY KEY,
-#       name            VARCHAR(255) UNIQUE NOT NULL,
-#       title           VARCHAR(255) NOT NULL,
-#       description     TEXT,
-#       trigger_patterns JSON,
-#       steps           JSON,
-#       workflow_name   VARCHAR(255),
-#       source          VARCHAR(50) DEFAULT 'distilled',
-#       status          VARCHAR(50) DEFAULT 'active',
-#       success_count   INTEGER DEFAULT 0,
-#       recall_count    INTEGER DEFAULT 0,
-#       last_used_at    TIMESTAMPTZ,
-#       promoted_from_id INTEGER,
-#       created_at      TIMESTAMPTZ,
-#       updated_at      TIMESTAMPTZ
-#   );
+# The former ``known_issues`` → ``knowledge_entries`` rename and the ``skills``
+# table are both obsolete: knowledge_entries was dropped in 002 (see the note
+# further down this file) and skills are markdown SKILL.md files on disk, owned
+# by :mod:`app.core.skills.manager`, not a table.
 # ---------------------------------------------------------------------------
 
 
@@ -117,11 +101,6 @@ class LLMConfigModel(Base):
     aws_profile = Column(String(100))
     created_at = Column(DateTime(timezone=True))
     updated_at = Column(DateTime(timezone=True))
-    # Flags this config as the active embedding model — Settings page sets
-    # this through ``llm_config_repository.save``; the code indexer's
-    # embedder reads the flagged row at runtime. Column already exists in
-    # ``llm_configs`` (see migrations/add_use_for_embeddings_to_llm_configs.sql).
-    use_for_embeddings = Column(Boolean, default=False)
 
 
 class ModelKeyModel(Base):
@@ -172,7 +151,6 @@ class SemanticMemoryModel(Base):
     repo_name = Column(String(255))
     content = Column(Text, nullable=False)
     content_sha256 = Column(String(64), nullable=False)
-    embedding = Column(Vector(1024))
     search_vector = Column(TSVECTOR)
     source = Column(String(32), nullable=False, default="agent")
     importance = Column(Float, nullable=False, default=0.5)
@@ -251,41 +229,10 @@ class MCPServerModel(Base):
     updated_at = Column(DateTime(timezone=True))
 
 
-class LogPatternModel(Base):
-    """Log pattern database model for RAG."""
-    __tablename__ = "log_patterns"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(255), nullable=False)
-    pattern = Column(Text, nullable=False)
-    pattern_type = Column(String(50), nullable=False)
-    severity = Column(Integer, default=1)
-    description = Column(Text)
-    embedding = Column(Vector(1024))
-    created_at = Column(DateTime(timezone=True))
-    updated_at = Column(DateTime(timezone=True))
-
-
-class KnowledgeEntryModel(Base):
-    """Knowledge entry — generic RAG store for resolutions, playbooks, and findings."""
-    __tablename__ = "knowledge_entries"
-    # title is the natural upsert key — IncidentKBSink (auto-learn) upserts with
-    # ON CONFLICT (title), which requires this unique constraint (migration 032).
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    title = Column(String(255), nullable=False, unique=True)
-    description = Column(Text, nullable=False)
-    symptoms = Column(JSON)          # Array of symptom/trigger strings
-    solution = Column(Text)          # Resolution text
-    category = Column(String(100))   # Workflow domain or topic
-    source = Column(String(50), default="manual")  # manual | agent | verified | skill
-    embedding = Column(Vector(1024))
-    created_at = Column(DateTime(timezone=True))
-    updated_at = Column(DateTime(timezone=True))
-
-
-# Backward-compat alias — remove once all import sites are updated
-KnownIssueModel = KnowledgeEntryModel
+# NOTE: the ``log_patterns`` and ``knowledge_entries`` tables were removed
+# (migration 002). Durable operational knowledge now lives in the OKF knowledge
+# bundle (``data/knowledge/``) and is recalled via Postgres FTS over the ``kb``
+# memory bank — see :mod:`app.core.knowledge` and :mod:`app.services.semantic_memory`.
 
 
 class BaselineMetricModel(Base):

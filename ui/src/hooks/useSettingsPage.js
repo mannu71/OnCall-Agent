@@ -346,7 +346,6 @@ export function useSettingsPage() {
                 model: llm.model || '',
                 icon: llm.icon || '🧠',
                 temperature: llm.temperature ?? 0,
-                use_for_embeddings: Boolean(llm.use_for_embeddings ?? llm.useForEmbeddings ?? false),
             });
         } else {
             setEditingLLM(null);
@@ -362,7 +361,6 @@ export function useSettingsPage() {
                 model: llmFormData.model,
                 icon: llmFormData.icon,
                 ...(!isReasoningModel(llmFormData.model) && { temperature: llmFormData.temperature }),
-                use_for_embeddings: Boolean(llmFormData.use_for_embeddings),
             };
 
             if (editingLLM) {

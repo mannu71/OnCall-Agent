@@ -13,8 +13,6 @@ from app.models.db_models import (
     AnalysisHistoryModel,
     BaselineMetricModel,
     ExecutionModel,
-    KnowledgeEntryModel,
-    LogPatternModel,
 )
 
 logger = logging.getLogger(__name__)
@@ -22,6 +20,55 @@ logger = logging.getLogger(__name__)
 
 def _cutoff(days: int) -> datetime:
     return datetime.now(timezone.utc) - timedelta(days=days)
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    """Parse an OKF frontmatter ``timestamp`` (ISO 8601) to an aware datetime."""
+    if not value:
+        return None
+    try:
+        s = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def _week_start(dt: datetime) -> str:
+    """Monday-anchored ISO date of the week containing *dt* (mirrors date_trunc)."""
+    monday = (dt - timedelta(days=dt.weekday())).date()
+    return monday.isoformat()
+
+
+def _load_bundle_docs() -> List[Dict[str, Any]]:
+    """Load OKF known-issue + log-pattern concepts as analytics rows.
+
+    Replaces the dropped ``knowledge_entries`` / ``log_patterns`` tables — the
+    bundle files on disk are the source of truth. Best-effort; returns [] on any
+    error so a dashboard never breaks.
+    """
+    try:
+        from app.core.knowledge import get_default_bundle
+    except Exception:  # noqa: BLE001
+        return []
+    bundle = get_default_bundle()
+    rows: List[Dict[str, Any]] = []
+    for section in ("known-issues", "log-patterns"):
+        for p in bundle.list_concepts(section):
+            doc = bundle.read_concept(p)
+            if not doc:
+                continue
+            fm = doc.get("frontmatter") or {}
+            tags = list(fm.get("tags") or [])
+            rows.append({
+                "section": section,
+                "slug": p.stem,
+                "title": fm.get("title") or p.stem,
+                "source": fm.get("source") or "manual",
+                "category": (tags[0] if tags else None),
+                "created_at": _parse_ts(fm.get("timestamp")),
+            })
+    return rows
 
 
 class InsightsService:
@@ -84,48 +131,37 @@ class InsightsService:
         self, *, days: int = 30, limit: int = 20
     ) -> Dict[str, Any]:
         since = _cutoff(days)
+        docs = _load_bundle_docs()
+        issues = [d for d in docs if d["section"] == "known-issues"]
 
-        async with AsyncSessionLocal() as session:
-            source_counts_result = await session.execute(
-                select(KnowledgeEntryModel.source, func.count(KnowledgeEntryModel.id))
-                .group_by(KnowledgeEntryModel.source)
-            )
-            issue_by_source = {row[0] or "manual": row[1] for row in source_counts_result}
+        issue_by_source: Dict[str, int] = {}
+        for d in issues:
+            issue_by_source[d["source"]] = issue_by_source.get(d["source"], 0) + 1
 
-            pattern_count_result = await session.execute(
-                select(func.count(LogPatternModel.id))
-            )
-            total_patterns = pattern_count_result.scalar() or 0
+        total_patterns = sum(1 for d in docs if d["section"] == "log-patterns")
 
-            category_result = await session.execute(
-                select(KnowledgeEntryModel.category, func.count(KnowledgeEntryModel.id))
-                .group_by(KnowledgeEntryModel.category)
-                .order_by(func.count(KnowledgeEntryModel.id).desc())
-                .limit(10)
-            )
-            top_categories = [
-                {"category": row[0] or "uncategorized", "count": row[1]}
-                for row in category_result
-            ]
+        cat_counts: Dict[str, int] = {}
+        for d in issues:
+            key = d["category"] or "uncategorized"
+            cat_counts[key] = cat_counts.get(key, 0) + 1
+        top_categories = [
+            {"category": k, "count": v}
+            for k, v in sorted(cat_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        ]
 
-            recent_agent_result = await session.execute(
-                select(KnowledgeEntryModel)
-                .where(
-                    KnowledgeEntryModel.source == "agent",
-                    KnowledgeEntryModel.created_at >= since,
-                )
-                .order_by(KnowledgeEntryModel.created_at.desc())
-                .limit(limit)
-            )
-            recent_agent = [
-                {
-                    "id": issue.id,
-                    "title": issue.title,
-                    "category": issue.category,
-                    "created_at": issue.created_at.isoformat() if issue.created_at else None,
-                }
-                for issue in recent_agent_result.scalars().all()
-            ]
+        recent_agent = [
+            {
+                "id": d["slug"],
+                "title": d["title"],
+                "category": d["category"],
+                "created_at": d["created_at"].isoformat() if d["created_at"] else None,
+            }
+            for d in sorted(
+                (d for d in issues
+                 if d["source"] == "agent" and d["created_at"] and d["created_at"] >= since),
+                key=lambda d: d["created_at"], reverse=True,
+            )[:limit]
+        ]
 
         return {
             "issues_by_source": issue_by_source,
@@ -225,13 +261,11 @@ class InsightsService:
         )
         total_executions = total_result.scalar() or 0
 
-        agent_entries_result = await session.execute(
-            select(func.count(KnowledgeEntryModel.id)).where(
-                KnowledgeEntryModel.source == "agent",
-                KnowledgeEntryModel.created_at >= since,
-            )
+        agent_entries = sum(
+            1 for d in _load_bundle_docs()
+            if d["section"] == "known-issues" and d["source"] == "agent"
+            and d["created_at"] and d["created_at"] >= since
         )
-        agent_entries = agent_entries_result.scalar() or 0
 
         rate = (
             round((agent_entries / total_executions) * 100, 1)
@@ -246,36 +280,28 @@ class InsightsService:
         }
 
     async def _kb_growth(self, session: Any, since: datetime) -> Dict[str, Any]:
-        weekly_result = await session.execute(
-            select(
-                KnowledgeEntryModel.source,
-                func.date_trunc("week", KnowledgeEntryModel.created_at).label("week"),
-                func.count(KnowledgeEntryModel.id).label("count"),
-            )
-            .where(KnowledgeEntryModel.created_at >= since)
-            .group_by(
-                KnowledgeEntryModel.source,
-                func.date_trunc("week", KnowledgeEntryModel.created_at),
-            )
-            .order_by(func.date_trunc("week", KnowledgeEntryModel.created_at).desc())
-        )
+        docs = _load_bundle_docs()
+        issues = [d for d in docs if d["section"] == "known-issues"]
+
+        # Weekly new issues by source (Monday-anchored, mirrors date_trunc('week')).
+        weekly_counts: Dict[tuple, int] = {}
+        for d in issues:
+            if not d["created_at"] or d["created_at"] < since:
+                continue
+            key = (d["source"], _week_start(d["created_at"]))
+            weekly_counts[key] = weekly_counts.get(key, 0) + 1
         weekly = [
-            {
-                "source": row.source or "manual",
-                "week": row.week.isoformat() if row.week else None,
-                "new_issues": int(row.count or 0),
-            }
-            for row in weekly_result
+            {"source": src, "week": week, "new_issues": count}
+            for (src, week), count in sorted(
+                weekly_counts.items(), key=lambda kv: kv[0][1], reverse=True
+            )
         ]
 
-        totals_result = await session.execute(
-            select(KnowledgeEntryModel.source, func.count(KnowledgeEntryModel.id))
-            .group_by(KnowledgeEntryModel.source)
-        )
-        totals = {row[0] or "manual": row[1] for row in totals_result}
+        totals: Dict[str, int] = {}
+        for d in issues:
+            totals[d["source"]] = totals.get(d["source"], 0) + 1
 
-        patterns_result = await session.execute(select(func.count(LogPatternModel.id)))
-        total_patterns = patterns_result.scalar() or 0
+        total_patterns = sum(1 for d in docs if d["section"] == "log-patterns")
 
         return {
             "total_issues_by_source": totals,
