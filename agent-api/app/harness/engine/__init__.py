@@ -82,6 +82,7 @@ async def run_agent_once(
     checkpointer: Any = None,
     compiled_agent: Any = None,
     preloaded_skills: Optional[List[str]] = None,
+    chat_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one agent to completion.
 
@@ -138,6 +139,7 @@ async def run_agent_once(
             model_name=model_name,
             durability=_durability,
             agent_config=agent_config,
+            chat_session_id=chat_session_id,
         )
 
         # Engine-level wall-clock deadline — BACKSTOP ONLY.

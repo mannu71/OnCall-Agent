@@ -74,6 +74,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.harness.usage_ledger import record_child_usage
+
 logger = logging.getLogger(__name__)
 
 
@@ -757,6 +759,12 @@ async def _run_child(
                 except Exception:  # noqa: BLE001
                     pass
 
+        # Bank the child's token usage on the run ledger. Its counters live under
+        # the child's own execution_id, so without this the parent's record, the
+        # UI context bar and the supervisor's token budget all see 0 for it —
+        # historically the bulk of a delegating run's real spend.
+        record_child_usage(result, child_id=sub_id)
+
         answer = (result.get("final_answer") or "").strip()
         if not answer:
             answer = _extract_fallback_answer(result)
@@ -792,6 +800,10 @@ async def _run_child(
             n_calls = sum(1 for _m in _msgs if getattr(_m, "type", "") == "tool")
         except Exception:  # noqa: BLE001 — partial recovery must never mask the timeout
             partial, n_calls = "", 0
+        # A child that timed out ran to its FULL time budget, so it is the most
+        # expensive kind to lose track of. Outside the try above so a failure to
+        # read the partial ANSWER never also costs us the accounting.
+        await _salvage_child_usage(cp, sub_id, "timed out")
         # Steer the parent away from concluding the TOOLS are unavailable: they
         # responded (n_calls completed) but the queries are slow on a large repo
         # and the subagent hit its time budget. This is a partial/slow result.
@@ -810,7 +822,52 @@ async def _run_child(
         })
     except Exception as exc:  # noqa: BLE001
         logger.warning("delegation: child %s failed: %s", sub_id, exc)
+        # A child that raised still burned everything it spent before failing.
+        # Recover it from the checkpointer exactly as the timeout branch does —
+        # otherwise a crash makes tokens vanish from the run's accounting.
+        await _salvage_child_usage(cp, sub_id, "failed")
         return json.dumps({"subagent": name, "task": task, "status": "error", "error": str(exc)})
+
+
+async def _salvage_child_usage(cp: Any, sub_id: str, why: str) -> int:
+    """Book a non-completing child's usage from its checkpointed messages.
+
+    A child that timed out or crashed never produced a result dict, so its
+    counters are only recoverable from the messages the checkpointer persisted.
+    ``usage_metadata`` on those AI messages is the same source
+    ``agent_runner``'s fallback path uses. Returns the input tokens recovered
+    (0 when nothing was); never raises.
+    """
+    try:
+        snap = await cp.aget_tuple({"configurable": {"thread_id": sub_id}})
+        msgs = (
+            ((snap.checkpoint or {}).get("channel_values", {}) or {}).get("messages", [])
+            if snap else []
+        )
+        t_in = t_out = 0
+        for m in msgs:
+            usage = getattr(m, "usage_metadata", None) or {}
+            if isinstance(usage, dict):
+                t_in += int(usage.get("input_tokens", 0) or 0)
+                t_out += int(usage.get("output_tokens", 0) or 0)
+        if t_in or t_out:
+            record_child_usage(
+                {"input_tokens": t_in, "output_tokens": t_out},
+                child_id=f"{sub_id} ({why})",
+            )
+            logger.info(
+                "delegation: salvaged %d input / %d output tokens from %s child %s",
+                t_in, t_out, why, sub_id,
+            )
+        else:
+            logger.warning(
+                "delegation: no usage recoverable from %s child %s — its tokens "
+                "are NOT in the run total", why, sub_id,
+            )
+        return t_in
+    except Exception as exc:  # noqa: BLE001 — salvage must never mask the original failure
+        logger.debug("delegation: usage salvage failed for %s (%s)", sub_id, exc)
+        return 0
 
 
 # ── Serial delegate_to_<name> tools (existing behaviour) ─────────────────────

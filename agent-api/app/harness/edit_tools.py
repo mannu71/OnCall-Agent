@@ -179,8 +179,10 @@ def build_edit_tools() -> List[Any]:
             "repeated snippets. WHEN TO USE: you have LOCATED the bug and want to apply the fix. "
             "This MODIFIES code on disk and REQUIRES operator approval. WHEN NOT TO USE: for "
             "investigation — use the read-only codegraph/repo tools; to create a brand-new file — "
-            "use create_file. After editing, tell the user to build/test (the agent cannot run "
-            "the build itself)."
+            "use create_file. READ the surrounding code first so your change matches the "
+            "existing conventions, and keep the change minimal — no drive-by refactors. "
+            "After editing, summarize exactly what changed (file and lines) and tell the user "
+            "to build/test (the agent cannot run the build itself)."
         ),
         args_schema=_EditInput,
     )

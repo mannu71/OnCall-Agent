@@ -53,14 +53,11 @@ src/
 
   hooks/queries/              ← useQuery hooks (workflows, settings, health, …)
 
-  _deprecated/                ← Unused modules (see README); not in bundle
-
   components/
     logwatch/
       LogWatchConfig.jsx      ← CloudWatch log watch configuration UI
 
     monitoring/
-      ExecutionLog.jsx        ← Raw execution log display
       StatusBadge.jsx         ← Execution status indicator component
 
     releases/
@@ -73,8 +70,7 @@ src/
     scheduler/
       AddScheduleDialog.jsx   ← Add new scheduled run dialog
       EditScheduleDialog.jsx  ← Edit existing schedule dialog
-      ScheduleCard.jsx        ← Individual schedule display card
-      ScheduleList.jsx        ← List of all schedules
+      ScheduleList.jsx        ← List of all schedules (renders cards inline)
 
     settings/
       BedrockCredentialsDialog.jsx  ← AWS Bedrock credential management
@@ -89,13 +85,11 @@ src/
       ← Never hand-edit files in this directory
 
     workflow/                 ← Langflow-style canvas — CORE
-      LangflowEditor.jsx      ← MAIN: custom canvas, node management, save/run
-      NodeSidebar.jsx         ← Left panel: draggable node palette
-      HITLPanel.jsx           ← Tool approval gate UI
-      AgentAdvancedConfig.jsx ← Advanced per-agent configuration
-      nodes/
-        OrchestratorNode.jsx  ← Legacy node components (orchestrator/output)
-        OutputNode.jsx
+      LangflowEditor.jsx      ← MAIN: custom canvas, palette, node mgmt, save/run
+      TemplateGallery.jsx     ← Starter-workflow picker
+      portValidation.js       ← Port/slot connection rules
+      editor/constants/
+        nodeDefinitions.js    ← Node type catalog (slots, colors, categories)
 
   context/
     SchedulerContext.jsx      ← Scheduler state shared across components
@@ -154,8 +148,8 @@ public/                       ← Static assets
 
 ## What is working — do not refactor without explicit instruction
 
-- `LangflowEditor.jsx` — custom workflow canvas, node drag/drop, edge wiring
-- `NodeSidebar.jsx` — draggable node palette
+- `LangflowEditor.jsx` — custom workflow canvas, node drag/drop, edge wiring,
+  and the node palette (all in-file; there is no separate sidebar component)
 - TanStack Query hooks — server state caching, dedup, route-scoped polling
 - `useWorkflowStream.js` — SSE live event streaming
 - `WorkflowStatusContext.jsx` — live status shared state
@@ -169,23 +163,24 @@ public/                       ← Static assets
 ## Known gaps — production readiness work in progress
 
 ### Critical
-- [ ] HITL approval panel — unified tool request queue not yet built
-      Reference: openswarm-ai/openswarm frontend HITL components
-      Build as: `src/components/workflow/HITLPanel.jsx`
+- [ ] HITL approval queue — single-gate approval works inline in `Chat.jsx`
+      (`onHitlPause` → `handleApproval` → `agentApiClient.approveHITL`), but
+      there is no unified queue when several tool calls gate at once, and the
+      workflow canvas has no HITL surface at all.
 
-- [ ] Per-tool permission model — always-allow / ask / deny config UI
-      Build as: part of HITLPanel.jsx
+- [ ] Per-tool permission model — always-allow / ask / deny config UI.
+      Backend already has it (`app/harness/tool_permissions.py`).
 
 ### High
-- [ ] Agent node status badges — real-time status colour updates
-      on ReactFlow nodes during execution not fully wired
+- [ ] Agent node status badges — real-time status colour updates on canvas
+      nodes during execution not fully wired
       Needs: SSE events → node style updates in LangflowEditor.jsx
 
 - [ ] Cost tracking display — per-agent USD cost not shown live
-      Needs: cost events from SSE → display in ExecutionMonitor.jsx
+      Needs: cost events from SSE → a live surface on the canvas or Dashboard
 
-- [ ] Error boundary — no error boundaries around ReactFlow canvas
-      Build as: wrap WorkflowEditor.jsx in React ErrorBoundary
+- [ ] Error boundary — no error boundary around the workflow canvas
+      Build as: wrap `LangflowEditor.jsx` in a React ErrorBoundary
 
 ### Medium
 - [ ] Suggestion feedback UI — thumbs up/down on each suggestion
@@ -233,11 +228,14 @@ When building new components that need live updates, always use
 
 ## LangflowEditor specifics
 
-- Workflow canvas lives in `LangflowEditor.jsx`
+- Workflow canvas lives in `LangflowEditor.jsx` — a hand-rolled SVG canvas
+  (its own node, edge, port and drag handling). ReactFlow is NOT a dependency.
 - Node types defined in `editor/constants/nodeDefinitions.js`
 - Workflow JSON saved to backend via `agentApiClient.js`
-- Format: ReactFlow's native `{ nodes: [...], edges: [...] }`
-  which `workflow/workflow_translator.py` (backend) translates to agent graph
+- Format: `{ nodes: [...], edges: [...] }`, built by `buildExportedWorkflow()`
+  in `LangflowEditor.jsx`. The backend consumes it in
+  `workflow/schema/node_catalog.py` (type/dialect resolution) and
+  `services/visual_workflow_executor.py` (execution).
 
 ---
 
@@ -313,7 +311,7 @@ npx shadcn-ui add [component-name]
 4. Change ONE component at a time
 5. After changes, verify: `npm run build` completes without errors
 6. For any new API call, check the backend schema first
-7. For ReactFlow changes, always test: drag node, connect edge, save, run
+7. For canvas changes, always test: drag node, connect edge, save, run
 8. Update "Known gaps" above when a gap is closed
 9. Never modify `src/components/ui/` — use shadcn CLI instead
 10. If unsure about SSE event shape, read `agent-api/app/workflow/event_schema.py`

@@ -10,9 +10,9 @@ same bridge tools.
 
 Core/family tools (CloudWatch, codegraph, DB, playbook, delegate, edit,
 planning, filesystem — see ``tool_disclosure._is_core_tool``) are exempt
-from the cap, exactly as they already are in ``tool_disclosure`` and
-``tool_router``: an agent's core investigation primitives must always be
-directly callable every turn. The budget governs the long tail — mostly
+from the cap, exactly as they already are in ``tool_disclosure``: an agent's
+core investigation primitives must always be directly callable every turn.
+The budget governs the long tail — mostly
 MCP-server tools — which is also where tool-count-driven selection-accuracy
 loss actually comes from.
 
@@ -43,14 +43,28 @@ class ToolExposureManager:
     """
 
     def __init__(self, catalog: List[Any], *, max_direct: int = 12) -> None:
-        from app.harness.tool_disclosure import _is_core_tool, build_disclosure_tools
+        from app.harness.tool_disclosure import (
+            _is_core_tool,
+            below_direct_bind_threshold,
+            build_disclosure_tools,
+        )
 
         self.max_direct = max(0, max_direct)
         keep_prefixes = _keep_prefixes()
         self._core: List[Any] = [t for t in catalog if _is_core_tool(t, keep_prefixes)]
         self._rankable: List[Any] = [t for t in catalog if t not in self._core]
+        # Legacy-parity floor, decided ONCE (depends only on the catalog, not the
+        # query): when the rankable tail is small enough that legacy would bind it
+        # all directly, window mode does too — same set, no bridge, no ranking.
+        # This keeps enabling window mode a no-op for the common small-MCP case.
+        self._fits_directly: bool = bool(self._rankable) and below_direct_bind_threshold(
+            self._rankable
+        )
+        # Below the floor the bridge is never used, so don't pay to build it.
         self._bridge: List[Any] = (
-            build_disclosure_tools(self._rankable) if self._rankable else []
+            build_disclosure_tools(self._rankable)
+            if self._rankable and not self._fits_directly
+            else []
         )
 
     def window(
@@ -59,6 +73,12 @@ class ToolExposureManager:
         """Return this window's bound tool list: core + bridge + top-ranked tail."""
         if not self._rankable:
             return list(self._core)
+
+        # Legacy-parity no-op: the rankable tail fits under legacy's direct-bind
+        # threshold, so bind it all directly (no bridge, no ranking) — exactly
+        # what legacy does below the same threshold.
+        if self._fits_directly:
+            return list(self._core) + list(self._rankable)
 
         from app.core.tools.router import rank_tools
 

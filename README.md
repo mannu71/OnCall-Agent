@@ -28,15 +28,35 @@ compose files.
 
 ## Prerequisites
 
-Install these before setting up the project:
+**To run the app, you need Docker and Git. That is the whole list.** The UI and
+the backend are each compiled inside their own container, so no Node or Python
+is installed on your machine.
 
-| Tool | Version | Purpose |
-|------|---------|---------|
-| **Node.js** | 18+ | UI dev server and MCP servers (`npx`) |
-| **npm** | 9+ | Frontend package management |
-| **Python** | 3.12+ | Backend API |
-| **Docker Desktop** | Latest | PostgreSQL (pgvector) and optional containerized backend |
+| Tool | Version | Why |
+|------|---------|-----|
+| **Docker Engine** | 23+ (or Docker Desktop) | Builds and runs the whole stack |
+| **Docker Compose** | **v2** (`docker compose`, with a space) | See the note below |
 | **Git** | Latest | Clone the repository |
+
+> **Compose v2 is required, not just preferred.** `agent-api/Dockerfile` is a
+> BuildKit Dockerfile — it uses `RUN --mount=type=cache` to keep rebuilds fast.
+> The legacy `docker-compose` v1 binary drives the old builder, which cannot
+> parse that syntax, so it fails part-way through the build with an error that
+> does not mention the real cause. Check yours with `docker compose version`; if
+> that command is not found but `docker-compose --version` reports 1.x, install
+> Compose v2: <https://docs.docker.com/compose/install/>.
+>
+> Not sure? Run `./setup.sh --check` (Linux/macOS) — it diagnoses Docker, the
+> daemon, your Compose version and host-port conflicts, and changes nothing.
+
+Only needed if you want **local hot-reload development** (`--dev` / `-DevSetup`);
+skip them otherwise:
+
+| Tool | Version | Why |
+|------|---------|-----|
+| **Node.js** | 18+ | Vite dev server, and `npx`-based MCP servers |
+| **npm** | 9+ | Frontend package management |
+| **Python** | 3.12+ | Running the backend outside its container |
 
 Optional but recommended:
 
@@ -79,6 +99,7 @@ chmod +x setup.sh
 
 | Flag | Windows | Linux / macOS | Description |
 |------|---------|---------------|-------------|
+| Diagnose only | _(n/a)_ | `--check` | Check Docker, Compose version and host ports, then exit. Changes nothing — run this first if setup fails. |
 | Skip Docker | `-SkipDocker` | `--skip-docker` | Use your own PostgreSQL instance (apply `migrations/001_schema.sql` yourself) |
 | Skip migrations | `-SkipMigrations` | `--skip-migrations` | Skip the SQL migration |
 | Dev setup | `-DevSetup` | `--dev` | Also set up local dev: create the Python venv, `pip install`, and UI `npm install`. Off by default. |
@@ -229,18 +250,13 @@ cd agent-api
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000
 ```
 
-Or use the helper script on Windows:
-
-```bash
-cd agent-api
-run.bat dev
-```
-
 **Docker (backend + database together):**
 
+Compose runs from the **repo root** — `docker-compose.yml` lives there and the
+build context is the root, so `agent-api/` is not a valid working directory for it.
+
 ```bash
-cd agent-api
-docker-compose up --build
+docker compose up --build -d agent-api
 ```
 
 Verify the API is running:
@@ -388,8 +404,7 @@ Useful Docker commands (from repo root):
 | `python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000` | Dev server with reload |
 | `pytest tests/ -v` | Run unit tests |
 | `pytest -m eval -v` | Run eval harness (see `agent-api/evals/README.md`) |
-| `run.bat start` | Start via Docker (Windows) |
-| `run.bat test` | Run tests via venv (Windows) |
+| `python -m evals.harness_selftest` | Deterministic harness regression checks |
 
 ---
 
@@ -480,7 +495,7 @@ Top level:
 | `memory/` | durable-fact extraction + memory curator |
 | `privacy/`, `streaming/`, `tools/`, `improvement/`, `transport/`, `policy/`, `sandbox/`, `skills/`, `vfs/`, `knowledge/`, `governance/`, `supervision/`, `code_semantic/` | Focused capability packages |
 
-Foundational modules (`database`, `exceptions`, `dependencies`, `logging`, `feature_flags`, `security`) stay at the `core/` top level. Subpackages have docstring-only `__init__` — import submodules directly (e.g. `from app.core.llm.model_router import ...`).
+Foundational modules (`database`, `exceptions`, `dependencies`, `logging`, `feature_flags`, `security`) stay at the `core/` top level. Subpackages have docstring-only `__init__` — import submodules directly (e.g. `from app.core.llm.call_llm import ...`).
 
 ## Documentation
 

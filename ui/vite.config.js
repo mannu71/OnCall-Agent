@@ -47,7 +47,6 @@ export default defineConfig(({ mode }) => {
       output: {
         manualChunks: {
           'react-vendor': ['react', 'react-dom', 'react-router-dom'],
-          'reactflow': ['reactflow'],
           'markdown': ['react-markdown', 'remark-gfm'],
           // Radix primitives are ~300-500KB combined; split out of the main bundle.
           'radix': [
@@ -77,7 +76,7 @@ export default defineConfig(({ mode }) => {
     },
   },
   optimizeDeps: {
-    include: ['react', 'react-dom', 'react-router-dom', 'reactflow'],
+    include: ['react', 'react-dom', 'react-router-dom'],
   },
   }
 })

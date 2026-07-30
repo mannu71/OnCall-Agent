@@ -36,22 +36,26 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 def test_import_order_no_cycles() -> None:
     """Fresh-interpreter import checks for known circular-import trip wires.
 
-    router_classify <-> strategies.router was a latent cycle: whichever of
-    the two loaded FIRST determined whether the process worked or every
-    workflow run silently broke (the failed first import poisoned the
-    executor handler registry — agent/language_model/cloudwatch nodes became
-    "Unknown node type" skips and the chat surfaced a feeder node's output
-    as the answer). These must run in SUBPROCESSES: the current interpreter
-    already has everything cached, which is exactly how the bug hides.
+    The original trip wire was a router_classify <-> strategies.router cycle:
+    whichever loaded FIRST decided whether the process worked or every workflow
+    run silently broke, because the failed first import poisoned the executor
+    handler registry — agent/language_model/cloudwatch nodes became "Unknown
+    node type" skips and the chat surfaced a feeder node's output as the answer.
+    Both of those modules are gone with the Semantic Router, but the registry
+    probe stays: that poisoned-registry failure mode is what actually hurt, and
+    any future import cycle would reproduce it. Must run in a SUBPROCESS — the
+    current interpreter has everything cached, which is exactly how it hides.
     """
     import subprocess
     env = {**os.environ, "PYTHONPATH": ".", "PYTHONIOENCODING": "utf-8"}
     probes = {
-        "router_classify imported first": "import app.workflow.router_classify",
         "handler registry imported first (all core handlers registered)": (
             "from app.workflow.executor.handlers import HANDLERS; "
-            "missing = {'agent','language_model','cloudwatch_tool','router'} - set(HANDLERS); "
+            "missing = {'agent','language_model','cloudwatch_tool'} - set(HANDLERS); "
             "assert not missing, f'missing handlers: {missing}'"
+        ),
+        "strategies package imports cleanly": (
+            "from app.workflow.strategies import ReactStrategy, BatchReactStrategy"
         ),
     }
     for label, code in probes.items():
@@ -85,27 +89,6 @@ def test_envelopes() -> None:
     check("envelopes.NodeOutput ok passthrough", ok["status"] == "ok")
 
 
-# ── tool_router ──────────────────────────────────────────────────────────────
-def test_tool_router() -> None:
-    import os
-    from app.harness.tool_router import filter_tools
-
-    class T:
-        def __init__(self, n, d=""):
-            self.name = n
-            self.description = d
-
-    os.environ["TOOL_ROUTER_TOP_K"] = "2"
-    specials = [T("cloudwatch_search_logs"), T("code_find"), T("db_list_tables")]
-    mcps = [T("alpha_query", "alpha"), T("beta_thing", "beta"), T("gamma_io", "gamma")]
-    out = filter_tools(specials + mcps, query="alpha")
-    names = [t.name for t in out]
-    check("tool_router keeps special prefixes", all(s.name in names for s in specials))
-    kept_mcp = [n for n in names if n in {"alpha_query", "beta_thing", "gamma_io"}]
-    check("tool_router caps MCP at top_k", len(kept_mcp) <= 2, f"kept={kept_mcp}")
-    check("tool_router passthrough when no MCP", filter_tools(specials, "x") == specials)
-
-
 # ── tool_exposure (Phase 1: window mode) ──────────────────────────────────────
 def test_tool_exposure() -> None:
     from app.harness.tool_exposure import ToolExposureManager
@@ -118,9 +101,14 @@ def test_tool_exposure() -> None:
     # codegraph_ is a core family prefix (see tool_disclosure._DEFAULT_KEEP_PREFIXES);
     # the older crawler_ name was renamed to codegraph_ in the code-intelligence pass.
     core = [T("cloudwatch_search_logs"), T("codegraph_find"), T("fs_write"), T("write_todos")]
+
+    # ── ABOVE the floor: >25 rankable tools clears the legacy count threshold,
+    # so window mode ranks, caps at max_direct, and defers the rest behind the
+    # bridge. (below_direct_bind_threshold: 30 > 25 -> not a no-op.)
     _words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
               "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
-              "quebec", "romeo", "sierra", "tango"]
+              "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey",
+              "xray", "yankee", "zulu", "amber", "basil", "cobalt", "denim"]
     rankable = [T(f"srv_tool_{i}", f"handles {w} widgets") for i, w in enumerate(_words)]
 
     mgr = ToolExposureManager(core + rankable, max_direct=5)
@@ -128,14 +116,30 @@ def test_tool_exposure() -> None:
     names = [t.name for t in bound]
 
     check("tool_exposure: core always kept", all(c.name in names for c in core))
-    check("tool_exposure: bridge present when rankable non-empty",
+    check("tool_exposure: bridge present above floor",
           "search_tools" in names and "call_tool" in names)
     rankable_bound = [n for n in names if n.startswith("srv_tool_")]
     check("tool_exposure: rankable capped at max_direct", len(rankable_bound) <= 5,
           f"bound={rankable_bound}")
     check("tool_exposure: query-relevant tool ranked into window",
           "srv_tool_16" in rankable_bound, f"bound={rankable_bound}")
-    check("tool_exposure: counts exposed", mgr.core_count == 4 and mgr.rankable_count == 20)
+    check("tool_exposure: counts exposed", mgr.core_count == 4 and mgr.rankable_count == 30)
+
+    # ── BELOW the floor: a small rankable tail is bound directly with NO bridge
+    # and NO ranking — window mode is a legacy-parity no-op (the safe-enablement
+    # floor added alongside below_direct_bind_threshold). Same set as core+tail.
+    small_tail = rankable[:10]                     # 10 <= 25 tools, tiny schema
+    mgr_small = ToolExposureManager(core + small_tail, max_direct=5)
+    bound_small = mgr_small.window("handles quebec widgets")
+    small_names = [t.name for t in bound_small]
+    check("tool_exposure: below floor binds directly (no bridge)",
+          "search_tools" not in small_names and "call_tool" not in small_names)
+    check("tool_exposure: below floor binds the WHOLE tail (no cap)",
+          len([n for n in small_names if n.startswith("srv_tool_")]) == 10,
+          f"bound={small_names}")
+    check("tool_exposure: below floor set == core + tail",
+          set(small_names) == {t.name for t in core + small_tail})
+    check("tool_exposure: below floor exposes no bridge names", mgr_small.bridge_names == ())
 
     # No rankable tools at all -> no bridge (nothing to search for), core only.
     mgr_core_only = ToolExposureManager(core, max_direct=5)
@@ -759,6 +763,252 @@ def test_compression_split_preserved_tail_empty() -> None:
     )
 
 
+async def test_compact_tail_is_pairing_safe() -> None:
+    """compact() itself must land on the pairing-safe boundary.
+
+    Regression guard for a live bug: the safe walk existed only behind
+    force_compact (reachable via reactive_compact, which has no production
+    caller), while compact() — the path EVERY proactive compaction takes —
+    used a raw backward walk. On a tool-heavy transcript that walk started the
+    tail on an orphaned ToolMessage essentially every time, so the next model
+    call died on Bedrock's INVALID_CHAT_HISTORY check.
+    """
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+    from app.core.context.compaction import compact
+
+    class _FakeTransport:
+        async def complete(self, messages, model=None, max_tokens=None):
+            return '{"goals":"g","progress":"p","decisions":[],' \
+                   '"symbols_resolved":[],"files_touched":[],"open_questions":[]}'
+
+    messages = [HumanMessage(content="q" * 400)]
+    for k in range(6):
+        messages.append(AIMessage(
+            content="x" * 400,
+            tool_calls=[{"name": "t", "args": {}, "id": f"c{k}a"},
+                        {"name": "t", "args": {}, "id": f"c{k}b"}],
+        ))
+        messages.append(ToolMessage(content="r" * 4000, tool_call_id=f"c{k}a"))
+        messages.append(ToolMessage(content="r" * 4000, tool_call_id=f"c{k}b"))
+
+    # Budget must sit BELOW the transcript (~12.7K tokens) or compact() takes
+    # its under-budget no-op path and never reaches the tail split at all.
+    compacted, _summary = await compact(
+        messages,
+        transport=_FakeTransport(),
+        window_size=10_000,
+        reserve_tokens=1_000,
+        keep_recent_tokens=3_000,
+        summarization_model="test-model",
+    )
+    check(
+        "compact: result starts with the summary SystemMessage",
+        bool(compacted) and isinstance(compacted[0], SystemMessage),
+        f"first={type(compacted[0]).__name__ if compacted else None}",
+    )
+    tail = compacted[1:]
+    check(
+        "compact: tail never starts on an orphaned ToolMessage",
+        not (tail and isinstance(tail[0], ToolMessage)),
+        f"tail[0]={type(tail[0]).__name__ if tail else None}",
+    )
+    satisfied = {
+        m.tool_call_id for m in tail if isinstance(m, ToolMessage)
+    }
+    requested = {
+        tc["id"] for m in tail if isinstance(m, AIMessage)
+        for tc in (m.tool_calls or [])
+    }
+    check(
+        "compact: every tool_result in the tail has its tool_use in the tail",
+        all(
+            isinstance(m, ToolMessage) and m.tool_call_id in requested
+            for m in tail if isinstance(m, ToolMessage)
+        ),
+        f"requested={len(requested)} satisfied={len(satisfied)}",
+    )
+
+
+def test_compact_enforces_budget() -> None:
+    """compact() had no post-condition: an oversized tail was returned as-is,
+    so compaction 'succeeded' and the caller still overflowed the window."""
+    from langchain_core.messages import AIMessage, ToolMessage
+    from app.core.context.compaction import _enforce_budget, _msg_token_estimate
+
+    tail = []
+    for k in range(5):
+        tail.append(AIMessage(
+            content="x" * 200,
+            tool_calls=[{"name": "t", "args": {}, "id": f"c{k}"}],
+        ))
+        tail.append(ToolMessage(content="r" * 40000, tool_call_id=f"c{k}"))
+    total = sum(_msg_token_estimate(m) for m in tail)
+
+    under = _enforce_budget(list(tail), total + 1000)
+    check("compact: a tail already under budget is untouched", under == tail)
+
+    trimmed = _enforce_budget(list(tail), 30_000)
+    got = sum(_msg_token_estimate(m) for m in trimmed)
+    check("compact: oversized tail is trimmed to fit", got <= 30_000, f"got={got}")
+    check(
+        "compact: trimmed tail still starts on a safe boundary",
+        bool(trimmed) and not isinstance(trimmed[0], ToolMessage),
+    )
+    # An indivisible final round larger than the budget keeps that round whole
+    # rather than returning an empty tail (which would strip the live turn).
+    floor = _enforce_budget(list(tail), 10)
+    check("compact: never returns an empty tail", len(floor) > 0)
+    check(
+        "compact: last-resort tail is still pairing-safe",
+        not isinstance(floor[0], ToolMessage),
+    )
+
+
+def test_msg_token_estimate_memo() -> None:
+    """The estimate is recomputed on every model call over an append-only
+    history; memoizing it is what keeps that from being O(n^2)."""
+    from langchain_core.messages import AIMessage
+    from app.core.context.compaction import (
+        _msg_token_estimate, reset_estimate_cache, _ESTIMATE_CACHE,
+    )
+
+    reset_estimate_cache()
+    msg = AIMessage(content="x" * 4000, id="stable-id-1")
+    first = _msg_token_estimate(msg)
+    check("estimate memo: value is cached after first call", "stable-id-1" in _ESTIMATE_CACHE)
+    check("estimate memo: repeat call agrees", _msg_token_estimate(msg) == first)
+
+    # In-place mutation without a new id must NOT serve the stale estimate.
+    msg.content = "y" * 40
+    check(
+        "estimate memo: content change invalidates the entry",
+        _msg_token_estimate(msg) != first,
+    )
+    # A message with no id is simply not cached (never mis-keyed).
+    reset_estimate_cache()
+    _msg_token_estimate(AIMessage(content="z" * 100))
+    check("estimate memo: id-less messages are not cached", not _ESTIMATE_CACHE)
+
+
+def test_json_extract_is_not_greedy() -> None:
+    """`re.search(r"\\{.*\\}", ..., DOTALL)` spans first-brace to LAST-brace, so
+    one stray brace in the surrounding prose broke the whole extraction."""
+    from app.core.llm.json_extract import extract_json_object
+
+    check(
+        "json_extract: trailing prose braces don't break the parse",
+        extract_json_object('verdict: {"score": 0.9} (see {above})') == {"score": 0.9},
+    )
+    check(
+        "json_extract: skips an earlier non-JSON balanced span",
+        extract_json_object('thinking {not json} then {"a": 1}') == {"a": 1},
+    )
+    check(
+        "json_extract: braces inside strings are not structural",
+        extract_json_object('{"s": "brace } inside"}') == {"s": "brace } inside"},
+    )
+    check("json_extract: no object -> None", extract_json_object("no json") is None)
+    check("json_extract: empty -> None", extract_json_object("") is None)
+
+
+def test_grader_evidence_keeps_the_newest() -> None:
+    """build_evidence joined oldest-first then sliced [:max_chars], handing the
+    judge the opening broad searches and cutting the findings the answer
+    actually rests on — which scored grounded answers as unfaithful."""
+    from app.core.quality.grader import build_evidence
+
+    msgs = [{"role": "tool", "content": "noise " * 2000} for _ in range(3)]
+    msgs.append({"role": "tool", "content": "ROOT CAUSE: null deref at foo.py:42"})
+    ev = build_evidence(msgs, max_chars=2000)
+    check(
+        "grader evidence: the decisive final output survives truncation",
+        "ROOT CAUSE: null deref at foo.py:42" in ev,
+    )
+    check(
+        "grader evidence: elision is disclosed to the judge",
+        "omitted" in ev,
+    )
+    check("grader evidence: no tool messages -> empty", build_evidence([]) == "")
+
+
+def test_prompt_cache_gates_on_prefix_not_message() -> None:
+    """Anthropic's ~1024-token floor applies to the cached PREFIX. Gating on
+    each message's own length meant an agent loop — whose newest messages are a
+    short tool call and a short result — placed no rolling breakpoints, so the
+    whole accumulated history was re-read uncached every turn."""
+    from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+    from app.core.llm.prompt_caching import apply_anthropic_cache_control
+
+    msgs = [SystemMessage(content="S" * 20000), HumanMessage(content="investigate")]
+    for k in range(8):
+        msgs.append(AIMessage(
+            content="calling tool",
+            tool_calls=[{"name": "t", "args": {}, "id": f"c{k}"}],
+        ))
+        msgs.append(ToolMessage(content="ok, 12 rows", tool_call_id=f"c{k}"))
+
+    out = apply_anthropic_cache_control(msgs, cache_ttl="5m")
+    marked = [
+        i for i, m in enumerate(out)
+        if isinstance(m.content, list) and m.content
+        and isinstance(m.content[-1], dict) and "cache_control" in m.content[-1]
+    ]
+    check(
+        "prompt cache: all 4 breakpoints placed on a realistic agent loop",
+        len(marked) == 4, f"placed={len(marked)} at {marked}",
+    )
+    check("prompt cache: the system prompt keeps its breakpoint", 0 in marked)
+    check(
+        "prompt cache: rolling breakpoints land on the newest messages",
+        marked[1:] == [len(out) - 3, len(out) - 2, len(out) - 1],
+        f"marked={marked} n={len(out)}",
+    )
+    # Short prefix (nothing to cache yet) must still place nothing.
+    tiny = [HumanMessage(content="hi"), AIMessage(content="hello")]
+    tiny_out = apply_anthropic_cache_control(tiny, cache_ttl="5m")
+    check(
+        "prompt cache: a sub-floor prefix places no breakpoints",
+        not any(isinstance(m.content, list) for m in tiny_out),
+    )
+
+
+def test_tool_ranker_beats_a_verbose_decoy() -> None:
+    """The old scorer, `(1 + log(tf)) * idf`, was unbounded in term frequency
+    and ignored document length, so a padded description that merely REPEATED a
+    query word outranked the short tool that word names. It also matched only
+    whole tokens, so "log group name" could not reach `logGroupName`."""
+    from app.core.tools.router import rank_tools, _tokens
+
+    toks = _tokens("get_log_events")
+    check(
+        "tool ranker: snake_case names are split for matching",
+        "log" in toks and "get_log_events" in toks, f"tokens={toks}",
+    )
+    check(
+        "tool ranker: camelCase names are split for matching",
+        "group" in _tokens("logGroupName"), f"tokens={_tokens('logGroupName')}",
+    )
+
+    schemas = [
+        {"name": "get_log_events", "description": "Return log events.",
+         "parameters": {"properties": {"logGroupName": {}}}},
+        {"name": "describe_alarms",
+         "description": "Alarms. " + "log group events metrics " * 60},
+        {"name": "find_symbol", "description": "Find a code symbol by name."},
+    ]
+    for query in ("get log events", "log group name"):
+        top = rank_tools(schemas, query)[0][0]["name"]
+        check(
+            f"tool ranker: '{query}' beats the verbose decoy",
+            top == "get_log_events", f"top={top}",
+        )
+    check(
+        "tool ranker: an empty query preserves catalog order",
+        [s["name"] for s, _ in rank_tools(schemas, "")]
+        == [s["name"] for s in schemas],
+    )
+
+
 async def test_compression_pipeline_delegates() -> None:
     """CompressionPipeline is a thin dispatcher — verify it calls through to
     the manager's compact_if_needed / force_compact, not its own logic."""
@@ -867,7 +1117,7 @@ async def test_metamemory_read_context_block_caps_milestones() -> None:
 
     try:
         await vfs_write("mm-cap-test", _mm2.SUMMARY_PATH, "OBJECTIVE: cap test\nSTATE: ok")
-        # 500 lines * ~20 chars each = far beyond _MILESTONES_INJECT_MAX_CHARS.
+        # 500 lines * ~20 chars each = far beyond settings.metamemory_inject_max_chars.
         big_milestones = "\n".join(f"<ts> DONE S{i} evidence=/x/{i}" for i in range(500))
         await vfs_write("mm-cap-test", _mm2.MILESTONES_PATH, big_milestones)
         block = await _mm2.read_context_block("mm-cap-test")
@@ -1240,6 +1490,49 @@ def test_spec_and_facade() -> None:
         ab.build_agent = orig
 
 
+async def test_grader_no_signal_on_unparseable() -> None:
+    """An unparseable judge verdict must be NO SIGNAL, not a fabricated 0.5.
+
+    The supervisor blends the grader 80/20 into its composite score, so a made-up
+    0.5 could flip the retry decision — and a spurious RETRY re-runs the whole
+    agent loop. Callers already treat None as "no grader signal".
+    """
+    import importlib
+
+    from app.core.quality import grader as _grader
+
+    # NOTE: `import app.core.llm.call_llm as m` yields the FUNCTION, not the
+    # module — app/core/llm/__init__.py re-exports `call_llm` and the attribute
+    # shadows the submodule. import_module returns the real module object.
+    _call_llm_mod = importlib.import_module("app.core.llm.call_llm")
+
+    def _returns(text):
+        async def _fake(prompt, tier=None, max_tokens=None):
+            return text, 0, 0, 0
+        return _fake
+
+    _orig = _call_llm_mod.call_llm
+    try:
+        _call_llm_mod.call_llm = _returns("I think the answer looks broadly fine.")
+        out = await _grader.grade_answer(final_answer="a", evidence="e")
+        check("grader: prose with no JSON -> None (no signal, not 0.5)", out is None, repr(out))
+
+        _call_llm_mod.call_llm = _returns('{"score": "not-a-number", "verdict": "faithful"}')
+        out = await _grader.grade_answer(final_answer="a", evidence="e")
+        check("grader: non-numeric score -> None (no signal, not 0.5)", out is None, repr(out))
+
+        _call_llm_mod.call_llm = _returns('{"score": 0.9, "verdict": "faithful", "reasoning": "ok"}')
+        out = await _grader.grade_answer(final_answer="a", evidence="e")
+        check("grader: a valid verdict still parses", (out or {}).get("score") == 0.9, repr(out))
+
+        # The truncation-recovery path must survive the stricter parsing.
+        _call_llm_mod.call_llm = _returns('{"score": 0.4, "verdict": "partial", "reason')
+        out = await _grader.grade_answer(final_answer="a", evidence="e")
+        check("grader: truncated JSON still recovers a score", (out or {}).get("score") == 0.4, repr(out))
+    finally:
+        _call_llm_mod.call_llm = _orig
+
+
 # ── supervisor_loop ──────────────────────────────────────────────────────────
 async def test_supervisor_loop() -> None:
     from app.harness.supervisor_loop import run_supervised
@@ -1292,6 +1585,141 @@ async def test_supervisor_loop() -> None:
     await run_supervised(agent="a0", run_agent=ra3, rebuild_agent=lambda: "a", supervisor=None,
         base_query="Q", execution_id="e", logger_instance=log, wall_clock_budget=900)
     check("supervisor_loop no-supervisor = 1 run", runs["n"] == 1)
+
+    # ── delegated subagent usage is folded into the run totals ───────────────
+    # A child runs under its own execution_id and TokenUsageCallback, so its
+    # tokens used to be dropped: execution 240 (2026-07-23) recorded 119,078
+    # while the tree actually spent ~1.05M. The ledger closes that gap, and the
+    # supervisor's budget now measures the whole tree rather than ~10% of it.
+    from app.harness.usage_ledger import record_child_usage, drain_child_usage
+
+    async def ra_delegating(a, q):
+        # Children run under asyncio.wait_for (a COPIED context) — the ledger
+        # must survive that boundary, which it does by being mutated in place.
+        async def child(i, o):
+            record_child_usage({"input_tokens": i, "output_tokens": o,
+                                "cache_read_tokens": i // 2, "cache_creation_tokens": i // 4})
+        for i, o in ((300, 40), (200, 30)):
+            await asyncio.wait_for(child(i, o), timeout=5)
+        return {"final_answer": "done", "input_tokens": 100, "output_tokens": 10, "tool_calls": []}
+
+    res, ti, to, tc, tcc = await run_supervised(agent="a0", run_agent=ra_delegating,
+        rebuild_agent=lambda: "a", supervisor=None, base_query="Q", execution_id="e",
+        logger_instance=log, wall_clock_budget=900)
+    check("supervisor_loop folds subagent tokens into run totals",
+          ti == 100 + 300 + 200 and to == 10 + 40 + 30 and tc == 250 and tcc == 125)
+
+    # Each turn banks only ITS children — a second turn must not re-count the first's.
+    res, ti2, to2, _, _ = await run_supervised(agent="a0", run_agent=ra_delegating,
+        rebuild_agent=lambda: (rebuilds.__setitem__("n", 0) or "a"),
+        supervisor=FakeSup([V(SupervisorAction.RETRY), V(SupervisorAction.PASS)]),
+        base_query="Q", execution_id="e", logger_instance=log, wall_clock_budget=900)
+    check("supervisor_loop subagent tokens are drained per turn (no double count)",
+          ti2 == 2 * 600 and to2 == 2 * 80)
+
+    # A run with no delegation is unaffected, and a stale ledger cannot leak in.
+    check("usage_ledger drains empty after a fold", drain_child_usage().runs == 0)
+
+    # ── auxiliary (non-agent) LLM calls are folded in too ────────────────────
+    # Compaction, the grader and the fact extractor call transport.complete /
+    # call_llm directly, so no TokenUsageCallback ever sees them. Compaction is
+    # the one that matters: it summarises ~20K tokens of history and fires on
+    # exactly the long runs where cost is being questioned.
+    from app.harness.usage_ledger import record_auxiliary_usage
+
+    async def ra_aux(a, q):
+        # RAW Bedrock counters are EXCLUSIVE of the cache fields; the ledger is
+        # inclusive. 1000 + 4000 + 200 = 5200.
+        record_auxiliary_usage(input_tokens=1000, output_tokens=500,
+                               cache_read_tokens=4000, cache_creation_tokens=200,
+                               source="compaction", exclusive=True)
+        return {"final_answer": "x", "input_tokens": 100, "output_tokens": 10,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0, "tool_calls": []}
+
+    res_a, ti_a, to_a, tcr_a, tcc_a = await run_supervised(agent="a0", run_agent=ra_aux,
+        rebuild_agent=lambda: "a", supervisor=None, base_query="Q", execution_id="e",
+        logger_instance=log, wall_clock_budget=900)
+    check("supervisor_loop folds auxiliary LLM calls into the run totals",
+          ti_a == 100 + 5200 and to_a == 10 + 500)
+    check("usage_ledger: exclusive Bedrock counters are normalized to inclusive",
+          tcr_a == 4000 and tcc_a == 200)
+    check("supervisor_loop reports auxiliary usage by source",
+          res_a["auxiliary_usage"][0]["source"] == "compaction"
+          and res_a["auxiliary_usage"][0]["input_tokens"] == 5200)
+
+    # An INCLUSIVE caller (already-normalized counters) must not be double-added.
+    async def ra_incl(a, q):
+        record_auxiliary_usage(input_tokens=5200, output_tokens=500,
+                               cache_read_tokens=4000, cache_creation_tokens=200,
+                               source="already_inclusive")
+        return {"final_answer": "x", "input_tokens": 0, "output_tokens": 0,
+                "tool_calls": []}
+
+    _r, ti_i, _o, _cr, _cc = await run_supervised(agent="a0", run_agent=ra_incl,
+        rebuild_agent=lambda: "a", supervisor=None, base_query="Q", execution_id="e",
+        logger_instance=log, wall_clock_budget=900)
+    check("usage_ledger: inclusive callers are not double-counted", ti_i == 5200)
+
+    # ── a child that TIMES OUT or CRASHES still burned tokens ────────────────
+    # Neither produces a result dict, so the only record is what the
+    # checkpointer persisted. A timed-out child ran to its FULL budget, so it is
+    # the most expensive kind to lose.
+    from app.harness.subagent_factory import _salvage_child_usage
+    from app.harness.usage_ledger import open_ledger, drain_usage
+
+    class _Msg:
+        def __init__(self, i, o):
+            self.usage_metadata = {"input_tokens": i, "output_tokens": o}
+
+    class _Snap:
+        def __init__(self, msgs):
+            self.checkpoint = {"channel_values": {"messages": msgs}}
+
+    class _CP:
+        def __init__(self, msgs):
+            self._m = msgs
+        async def aget_tuple(self, _cfg):
+            return _Snap(self._m)
+
+    open_ledger()
+    await _salvage_child_usage(_CP([_Msg(40_000, 900), _Msg(35_000, 700)]), "c1", "timed out")
+    salvaged = drain_usage()
+    check("subagent salvage: recovers a non-completing child's usage",
+          salvaged.input_tokens == 75_000 and salvaged.output_tokens == 1600)
+    check("subagent salvage: labels the child by why it did not complete",
+          "timed out" in salvaged.per_child[0].child_id)
+
+    # A checkpointer that itself fails must not mask the original error.
+    class _BadCP:
+        async def aget_tuple(self, _cfg):
+            raise RuntimeError("checkpointer unavailable")
+
+    open_ledger()
+    got = await _salvage_child_usage(_BadCP(), "c2", "failed")
+    check("subagent salvage: a broken checkpointer degrades to 0, never raises",
+          got == 0 and drain_usage().empty())
+
+    # The budget now trips on tree-wide spend the parent alone would never reach.
+    class TinyCfg:
+        max_retries = 2; token_budget = 500
+
+    class TinySup(FakeSup):
+        def __init__(self, v):
+            super().__init__(v); self._cfg = TinyCfg()
+
+    turns = {"n": 0}
+    async def ra_expensive(a, q):
+        turns["n"] += 1
+        async def child():
+            record_child_usage({"input_tokens": 5_000, "output_tokens": 100})
+        await asyncio.wait_for(child(), timeout=5)
+        return {"final_answer": "x", "input_tokens": 50, "output_tokens": 5, "tool_calls": []}
+
+    res_b, _, _, _, _ = await run_supervised(agent="a0", run_agent=ra_expensive,
+        rebuild_agent=lambda: "a", supervisor=TinySup([V(SupervisorAction.RETRY)]),
+        base_query="Q", execution_id="e", logger_instance=log, wall_clock_budget=900)
+    check("supervisor_loop token budget sees subagent spend (stops after 1 turn)",
+          res_b.get("supervisor_token_budget_exhausted") is True and turns["n"] == 1)
 
     # ── late-bound reward: a PASS/RETRY verdict best-effort records its
     #    score against the run's trajectory_events, gated on step_events_enabled ──
@@ -2249,6 +2677,45 @@ def test_privacy_pseudonymization() -> None:
     check("privacy drop clears vault", privacy.redaction_summary("sess-A") == [])
 
 
+def test_mcp_error_paths_are_sanitized() -> None:
+    """An MCP tool's FAILURE output must be scrubbed like its success output.
+
+    Every MCP call funnels through ``MCPClientManager.execute_tool``, which
+    sanitizes the success payload — so a newly wired server inherits credential
+    redaction and PII pseudonymization with no per-server config. The error
+    branches did not: ``except Exception`` returned a bare ``str(e)``, and the
+    adapter hands that to the model as "[Tool Error] …" on exactly the same path.
+    A strict-schema server typically echoes the offending value back ("invalid
+    email: ada@example.com"), so this leaked precisely the payload the boundary
+    exists to catch. Connection failures had the same shape via ``last_errors``,
+    which ``_ensure_connected`` re-raises OUTSIDE execute_tool's try.
+    """
+    from app.core import privacy
+    from app.services.mcp_client_manager import _sanitize_credential
+    from app.core.privacy.redact import redact as _redact
+
+    privacy.bind_session("sess-mcp")
+    try:
+        # The tool-error branch: server text with both a credential and PII.
+        raw = "ValidationError: invalid email ada@example.com (token ghp_" + "a" * 36 + ")"
+        safe = _sanitize_credential(raw)
+        check("mcp error: PII pseudonymized", "ada@example.com" not in safe, safe)
+        check("mcp error: credential redacted", "ghp_" + "a" * 36 not in safe, safe)
+        check("mcp error: still legible to the model", "ValidationError" in safe, safe)
+        check("mcp error: rehydrates for the operator",
+              privacy.rehydrate(safe, "sess-mcp").startswith(
+                  "ValidationError: invalid email ada@example.com"))
+    finally:
+        privacy.drop_vault("sess-mcp")
+
+    # The connect branch stores into last_errors BEFORE any session is bound, so
+    # it is credential-only by design — routing it through the vault would file
+    # values under the shared "__anon__" session that no run ever drops.
+    _dsn_err = "OperationalError: could not connect to postgres://svc:hunter2@db:5432/kyc"
+    check("mcp connect error: DSN credential redacted",
+          "hunter2" not in _redact(_dsn_err), _redact(_dsn_err))
+
+
 # ── pinned-facts memory tier ──────────────────────────────────────────────────
 def test_pinned_facts_budget() -> None:
     """Pinned-facts block formatting + per-turn token-budget assembly. DB-free."""
@@ -2637,6 +3104,333 @@ def test_persona_and_supervisor_toggle() -> None:
     check("supervisor 'true' string coerces to True", _as_bool("true") is True)
 
 
+def test_rds_capability_requires_cloudwatch() -> None:
+    """rds_performance (~942 tok of pg_stat_statements runbook) must NOT ride
+    along with every db_* binding.
+
+    It used to: any db tool activated both `database` and `rds_performance`, so
+    a plain business-data agent — the stored "test case generator" workflow is
+    exactly that, a database node with no CloudWatch — paid for a performance
+    protocol it could never use. The pairing with CloudWatch is not a guess:
+    a database *performance* investigation here starts from a CloudWatch alarm.
+
+    This is easy to undo by accident (one line in the activation block), and the
+    cost is silent — the prompt just gets longer. Hence the lock.
+    """
+    from types import SimpleNamespace
+    from app.harness.agent_builder import compose_system_prompt
+
+    _db_tool = SimpleNamespace(name="db_list_tables")
+    _cw_tool = SimpleNamespace(name="cloudwatch_search_logs")
+    _marker = "RDS / Postgres performance investigation"
+
+    db_only = compose_system_prompt(
+        tools=[_db_tool], agent_config={"instructions": ""},
+        has_cloudwatch=False, has_code_analyzer=False,
+    )
+    # Activation is keyed on cloudwatch TOOLS now, not the node flag alone, so
+    # the tool has to be in the list as well as the flag being set.
+    db_and_cw = compose_system_prompt(
+        tools=[_db_tool, _cw_tool], agent_config={"instructions": ""},
+        has_cloudwatch=True, has_code_analyzer=False,
+    )
+    check("rds cap: db tools alone do NOT pull in the perf runbook",
+          _marker not in db_only)
+    check("rds cap: db + cloudwatch DOES pull it in",
+          _marker in db_and_cw)
+    # The database section itself must still be there in both — decoupling the
+    # perf runbook must not have taken the SQL discipline with it.
+    check("rds cap: the database section survives without cloudwatch",
+          "SQL discipline" in db_only)
+    # The runbook body (five embedded pg_stat_* queries, ~942 tok) now lives in
+    # the `rds-performance-investigation` seed skill and loads on demand. What
+    # activates here is the pointer to it — so the old "worth >3000 chars"
+    # assertion no longer holds; that WAS the saving. Lock the new shape instead:
+    # the pointer must name the skill, and the body must stay out of the prefix.
+    check("rds cap: the pointer names the skill that holds the runbook",
+          "rds-performance-investigation" in db_and_cw)
+    check("rds cap: the runbook body stays out of the cached prompt",
+          "pg_stat_statements s" not in db_and_cw)
+    # Explicit opt-in remains available for a perf workflow with no CW node.
+    opt_in = compose_system_prompt(
+        tools=[_db_tool], agent_config={"instructions": ""},
+        has_cloudwatch=False, has_code_analyzer=False,
+        capabilities=["rds_performance"],
+    )
+    check("rds cap: explicit capabilities=[] opt-in still works",
+          _marker in opt_in)
+
+
+def test_cache_hit_rate_metric() -> None:
+    """cache_read is a SUBSET of input_tokens, so the denominator is
+    input_tokens ALONE.
+
+    This is the trap: Bedrock's raw wire format IS exclusive, and several
+    comments in this repo asserted for a long time that the counters were
+    additive. langchain_aws folds them back in (input = bedrock_input +
+    cache_read + cache_write) and callbacks._parse_llm_output normalizes the raw
+    branches to match. Dividing by (input + cache_read) double-counts and
+    reported 0.436 for a cache that was really running at 0.775. Verified
+    against a live Bedrock call 2026-07-21.
+    """
+    from app.core.observability.cache_metrics import (
+        cache_hit_rate, annotate_cache_metrics, CACHE_HIT_RATE_FLOOR,
+    )
+
+    # Measured over 26 real sessions — the regression baseline.
+    check("cache metric: matches the 0.775 measured baseline",
+          abs(cache_hit_rate(4_436_160, 3_436_225) - 0.7746) < 0.001)
+    check("cache metric: denominator is input alone, NOT input+read",
+          cache_hit_rate(1000, 500) == 0.5)
+    check("cache metric: a fully cached prompt is 1.0",
+          cache_hit_rate(1000, 1000) == 1.0)
+    check("cache metric: nothing to divide is 0.0, not a crash",
+          cache_hit_rate(0, 0) == 0.0)
+    check("cache metric: None inputs are 0.0", cache_hit_rate(None, None) == 0.0)
+    # Exclusive-convention data (legacy row / unnormalized provider) must not
+    # produce a nonsense rate above 1.0.
+    check("cache metric: read>input falls back to the additive denominator",
+          cache_hit_rate(100, 300) == 0.75)
+    check("cache metric: never exceeds 1.0",
+          all(cache_hit_rate(a, b) <= 1.0
+              for a, b in ((0, 500), (-5, 100), (1, 10_000), (10, 10))))
+
+    d: dict = {}
+    annotate_cache_metrics(d, 100_000, 500)
+    check("cache metric: annotate writes the rate onto the target",
+          d.get("cache_hit_rate") == cache_hit_rate(100_000, 500))
+    check("cache metric: a collapsed cache lands under the warn floor",
+          d["cache_hit_rate"] < CACHE_HIT_RATE_FLOOR)
+    check("cache metric: the healthy baseline is ABOVE the warn floor",
+          cache_hit_rate(4_436_160, 3_436_225) > CACHE_HIT_RATE_FLOOR)
+    # A tiny run must still annotate (0.0) — the floor governs the WARNING only,
+    # never whether the field exists.
+    small: dict = {}
+    annotate_cache_metrics(small, 10, 0)
+    check("cache metric: small runs still get the field", "cache_hit_rate" in small)
+
+
+def test_billed_units_weighting() -> None:
+    """Raw token totals are a poor optimization target: the four components are
+    billed at up to 50x different rates, so the naive sum points at the wrong
+    lever. Locked against execution 240's parent (2026-07-23, exact DB figures).
+    """
+    from app.core.observability.cache_metrics import billed_units
+
+    r = billed_units(
+        input_tokens=115_415, cache_read_tokens=93_768,
+        cache_creation_tokens=21_635, output_tokens=3_663,
+    )
+    # input_tokens is INCLUSIVE of both cache counters, so fresh is the
+    # remainder — not a fourth independent counter.
+    check("billed_units: fresh input is derived as input - read - creation",
+          r["fresh_input_tokens"] == 12)
+    check("billed_units: cache writes dominate the weighted cost",
+          max(r["billed_shares"], key=r["billed_shares"].get) == "cache_creation")
+    # The headline finding: 119,078 raw tokens are really ~54,748 billed units,
+    # and cache_read — 79% of the raw tokens — is only 17% of the cost.
+    check("billed_units: matches the measured execution-240 total",
+          abs(r["billed_units"] - 54_747.6) < 0.1)
+    check("billed_units: cache_read is a minority of cost despite dominating tokens",
+          r["billed_shares"]["cache_read"] < 0.2)
+    check("billed_units: raw token total is preserved alongside the weighting",
+          r["raw_tokens"] == 119_078)
+    # Counters that do not reconcile (legacy row, unnormalized provider) must
+    # never yield a negative component.
+    z = billed_units(100, 900, 900, 0)
+    check("billed_units: non-reconciling counters clamp instead of going negative",
+          z["fresh_input_tokens"] == 0 and z["billed_units"] > 0)
+    check("billed_units: an empty run is 0.0, not a crash",
+          billed_units(0, 0, 0, 0)["billed_units"] == 0.0)
+
+
+def test_compression_stats_and_memo() -> None:
+    """Compression fails SILENTLY USEFUL: the sidecar answers 200 OK and hands
+    the text straight back for content it cannot shrink (measured 2026-07-23:
+    code output is unchanged 100% of the time, because the pinned image has no
+    tree-sitter). Without outcome counters that is invisible, and without the
+    memo every such call pays a ~100ms round-trip for a guaranteed no-op.
+    """
+    from app.core.context.tool_output import (
+        start_stats, get_stats, reset_tool_memo, _memo_should_skip, _memo_record,
+        _record, _UNCOMPRESSIBLE_STREAK, _REPROBE_EVERY,
+    )
+
+    start_stats()
+    reset_tool_memo()
+
+    # A tool only earns a skip after a STREAK of unchanged results.
+    for _ in range(_UNCOMPRESSIBLE_STREAK):
+        check("compression memo: no skip before the streak is met",
+              not _memo_should_skip("codegraph__search"))
+        _record("codegraph__search", "unchanged", 1000, 1000)
+        _memo_record("codegraph__search", changed=False)
+    check("compression memo: skips after the unchanged streak",
+          _memo_should_skip("codegraph__search"))
+
+    # Per-tool, NOT per-family: the MCP adapter passes self.name precisely so
+    # codegraph (0% compressible) cannot suppress a JSON tool (52%).
+    check("compression memo: is keyed per tool, not shared across MCP",
+          not _memo_should_skip("db__query"))
+
+    # It must re-probe, or a tool whose output shape later changes stays skipped
+    # for the life of the process.
+    for _ in range(_REPROBE_EVERY - 2):
+        _memo_should_skip("codegraph__search")
+    check("compression memo: re-probes periodically instead of skipping forever",
+          _memo_should_skip("codegraph__search") is False)
+
+    # A successful compression clears the streak.
+    _record("codegraph__search", "compressed", 1000, 400,
+            tokens_before=250, tokens_after=100)
+    _memo_record("codegraph__search", changed=True)
+    check("compression memo: a real compression resets the streak",
+          not _memo_should_skip("codegraph__search"))
+
+    stats = get_stats()
+    check("compression stats: counts unchanged results", stats.unchanged == 3)
+    check("compression stats: reports the saved share", stats.saved_pct() == 0.15)
+    check("compression stats: attributes outcomes per tool",
+          stats.per_tool["codegraph__search"].compressed == 1
+          and stats.per_tool["codegraph__search"].unchanged == 3)
+
+    # A discard (CCR) and a sidecar error say nothing about the CONTENT, so
+    # neither may train the memo into skipping a compressible tool.
+    reset_tool_memo()
+    for _ in range(_UNCOMPRESSIBLE_STREAK + 1):
+        _record("db__query", "discarded", 5000, 5000)
+        _record("db__query", "errors", 5000, 5000)
+    check("compression memo: discards and errors do not train the skip",
+          not _memo_should_skip("db__query"))
+
+    # Stats must be inert when no run opened an accumulator (unit tests, scripts).
+    import app.core.context.tool_output as _to
+    _to._stats_var.set(None)
+    _record("x", "unchanged", 10, 10)  # must not raise
+    check("compression stats: a no-op without an open accumulator", get_stats() is None)
+
+
+async def test_tool_result_store() -> None:
+    """Large tool results are PERSISTED, not truncated, on their way into
+    executions.trajectory.
+
+    The old flat ``[:2000]`` cut the evidence at WRITE time, into the very store
+    a follow-up chat turn replays from — so the read-side budget
+    (chat_tool_history_max_tokens) had nothing left to budget. Measured on
+    session f84da222 (2026-07-23): turn 1's entire delegated investigation was
+    one 2,000-char tool entry, and turn 2 spent 191,457 tokens re-deriving it.
+    """
+    from app.harness import tool_result_store as trs
+
+    big = "ROW " * 6000  # 24,000 chars
+
+    check("tool_result_store: offloads output over the threshold",
+          trs.should_store("postgres__query", big, 6000) is True)
+    check("tool_result_store: leaves small output inline",
+          trs.should_store("postgres__query", "x" * 100, 6000) is False)
+    # A subagent envelope is ALREADY a distilled summary bounded by
+    # delegation_output_max_chars. Storing a pointer to a summary just buys a
+    # fetch round-trip, and it is the thing the next turn most wants to read.
+    check("tool_result_store: delegation envelopes stay inline",
+          trs.should_store("delegate_to_code_db", big, 6000) is False)
+
+    ptr = trs.render_pointer("245:call_1", big)
+    # A bare character slice is indistinguishable from a complete result — the
+    # model answers from it as though it were whole. The pointer must say both
+    # what was lost and how to get it back.
+    check("tool_result_store: pointer states the true size",
+          "24000 chars" in ptr)
+    check("tool_result_store: pointer carries a usable read_tool_result call",
+          'read_tool_result("245:call_1")' in ptr)
+    check("tool_result_store: pointer is cheaper to replay than the old inline cap",
+          len(ptr) < 2000)
+    check("tool_result_store: pointer keeps a preview for relevance judgement",
+          big[:trs.PREVIEW_CHARS] in ptr and len(ptr) > trs.PREVIEW_CHARS)
+
+    check("tool_result_store: handles are session-unique per tool call",
+          trs.make_handle(245, "call_1") == "245:call_1")
+
+    # No chat session ⇒ the run is never replayed ⇒ storing its output would be
+    # pure PII cost with no benefit. Must fall back to the inline cap.
+    msgs = [
+        {"role": "tool", "tool_call_id": "c1", "content": big},
+        {"role": "assistant", "content": "unchanged"},
+    ]
+    out = await trs.offload_messages(
+        msgs, chat_session_id=None, execution_id=1, threshold=6000, inline_cap=2000,
+    )
+    check("tool_result_store: no chat session falls back to the inline cap",
+          len(out[0]["content"]) == 2000)
+    check("tool_result_store: non-tool entries are untouched",
+          out[1]["content"] == "unchanged")
+
+    # Same degradation when the durable store is unavailable (no Postgres in the
+    # selftest process): storage must never be load-bearing for correctness.
+    out2 = await trs.offload_messages(
+        msgs, chat_session_id="s1", execution_id=1, threshold=6000, inline_cap=2000,
+        tool_names_by_id={"c1": "postgres__query"},
+    )
+    check("tool_result_store: an unavailable store degrades to the inline cap",
+          len(out2[0]["content"]) == 2000)
+
+    check("tool_result_store: purge with no store is a no-op, not an error",
+          await trs.purge_session("s1") == 0)
+    check("tool_result_store: get with no store returns None, never raises",
+          await trs.get("s1", "1:c1") is None)
+
+
+def test_cache_token_normalization() -> None:
+    """Lock the two callback-level reconciliations that make the numbers real.
+
+    1. cache_creation is recoverable from ephemeral_1h/5m_input_tokens.
+       langchain_aws zeroes `cache_creation` whenever a TTL is set (we always
+       set ttl="1h"), so reading only that field reported ZERO cache writes in
+       every session ever recorded.
+    2. Raw Bedrock/Anthropic usage dicts are EXCLUSIVE and must be normalized to
+       the inclusive standard, or _parse_llm_output and the usage_metadata
+       fallback disagree about what input_tokens means depending on which fires.
+    """
+    from types import SimpleNamespace
+    from app.core.streaming.callbacks import TokenUsageCallback as _TUC
+
+    def _resp(details):
+        msg = SimpleNamespace(usage_metadata={"input_token_details": details})
+        return SimpleNamespace(generations=[[SimpleNamespace(message=msg)]])
+
+    # Real shape observed on a live Bedrock WRITE turn.
+    read, create = _TUC._parse_cache_tokens(
+        _resp({"cache_read": 0, "cache_creation": 0,
+               "ephemeral_1h_input_tokens": 4962}), {})
+    check("cache norm: write recovered from ephemeral_1h", create == 4962)
+    check("cache norm: write turn reports no read", read == 0)
+
+    # Real shape observed on the following READ turn.
+    read, create = _TUC._parse_cache_tokens(
+        _resp({"cache_read": 4962, "cache_creation": 0}), {})
+    check("cache norm: read turn reports the read", read == 4962)
+    check("cache norm: read turn invents no write", create == 0)
+
+    # A provider that reports cache_creation properly must be untouched.
+    _, create = _TUC._parse_cache_tokens(
+        _resp({"cache_read": 0, "cache_creation": 77,
+               "ephemeral_1h_input_tokens": 4962}), {})
+    check("cache norm: an explicit cache_creation wins over ephemeral",
+          create == 77)
+
+    # Raw Bedrock usage is exclusive -> must come back inclusive.
+    inp, out = _TUC._parse_llm_output(
+        {"usage": {"inputTokens": 3, "outputTokens": 52,
+                   "cacheReadInputTokens": 4962, "cacheWriteInputTokens": 0}})
+    check("cache norm: raw Bedrock input normalized to inclusive", inp == 4965)
+    check("cache norm: output tokens untouched", out == 52)
+
+    inp, _ = _TUC._parse_llm_output(
+        {"usage": {"input_tokens": 3, "output_tokens": 1,
+                   "cache_read_input_tokens": 100,
+                   "cache_creation_input_tokens": 50}})
+    check("cache norm: raw Anthropic input normalized to inclusive", inp == 153)
+
+
 def test_skill_prompt_ordering_contract() -> None:
     """Guard the two prompt-ordering constraints that were MEASURED to make or
     break skill usage (traj-skill-locate), and are otherwise protected only by
@@ -2691,6 +3485,261 @@ def test_skill_prompt_ordering_contract() -> None:
           "# Skills" not in prompt_no_skill)
     check("compose: no STEP ZERO without skill tool",
           "STEP ZERO" not in prompt_no_skill)
+
+
+def test_prompt_names_only_bound_tools() -> None:
+    """No system-prompt section may NAME a tool the agent cannot call.
+
+    Four sections shipped this bug, each caught only by hand-reading the file:
+      - '# Scratch filesystem' was appended unconditionally while fs_* bind on
+        AgentSpec.filesystem (default False);
+      - the '# Using your tools' routing bullet pointed at search_tools, which
+        exists only when progressive disclosure fires (a no-op below the
+        count/token threshold, and tool_exposure_mode defaults to "legacy");
+      - '# Sandboxed shell' and '# Verify your changes' gate on operator intent
+        (a toggle / a verify_command) while tool_assembler ALSO requires a
+        sandbox backend and otherwise binds nothing.
+
+    Naming an unbound tool costs a hallucinated call at best; the verify section
+    sets a completion criterion ("don't claim a fix works until run_verify is
+    green") the agent then cannot satisfy at all. Per-section checks kept missing
+    these, so walk every flag combination instead.
+    """
+    import re as _re
+    from types import SimpleNamespace
+    from app.harness.agent_builder import compose_system_prompt
+    from app.harness.tool_disclosure import _ALWAYS_KEEP_NAMES
+
+    # Bound in _finish_build_agent (react_agent.build_playbook_tools), after
+    # compose runs — legitimately absent from the `tools` list it sees.
+    # ``pin_fact`` still binds for every profile; the two KB writers now gate on
+    # the Auto-learn toggle, so they are asserted through the `auto_learn` flag
+    # axis below instead of being exempted here.
+    _unconditional = {"pin_fact"}
+    # 'skill' is prose-ambiguous ("a matching skill"); its gating is asserted by
+    # test_skill_prompt_ordering_contract check (3).
+    _candidates = (_ALWAYS_KEEP_NAMES | {"create_file", "run_verify"}) - {"skill"}
+    # What tool_assembler binds for a given profile flag.
+    _implied = {
+        "filesystem": {"fs_write", "fs_read", "fs_ls", "fs_grep",
+                       "fs_append", "fs_upsert", "fs_prune"},
+        "planning": {"write_todos", "update_todo"},
+        # build_playbook_tools binds the KB writers only when auto-learn is on.
+        "auto_learn": {"save_playbook", "patch_playbook"},
+    }
+
+    _flag_sets = [
+        {},
+        {"planning": True},
+        {"filesystem": True},
+        {"sandbox": True},                 # intent only: no run_command bound
+        {"verify": True},                  # intent only: no run_verify bound
+        {"auto_learn": True},              # binds save_playbook / patch_playbook
+        {"planning": True, "filesystem": True, "sandbox": True, "verify": True},
+    ]
+    # Second axis: nothing bound / the disclosure bridge bound / the shell+edit
+    # family bound (which is what makes the sandbox and verify sections legal).
+    _tool_sets = [
+        [],
+        [SimpleNamespace(name="search_tools"), SimpleNamespace(name="call_tool")],
+        [SimpleNamespace(name=_n) for _n in
+         ("run_command", "run_verify", "edit_file", "create_file")],
+    ]
+    for _flags in _flag_sets:
+        for _tools in _tool_sets:
+            bound = {t.name for t in _tools}
+            for _flag, _implies in _implied.items():
+                if _flags.get(_flag):
+                    bound |= _implies
+            prompt = compose_system_prompt(
+                tools=list(_tools), agent_config={"instructions": ""}, **_flags)
+            _label = "+".join(sorted(_flags)) or "no-flags"
+            _label += "/bridge" if bound & {"search_tools"} else "/no-bridge"
+            for _name in sorted(_candidates):
+                if not _re.search(rf"\b{_re.escape(_name)}\b", prompt):
+                    continue
+                check(f"compose[{_label}]: names only bound tools ({_name})",
+                      _name in bound or _name in _unconditional,
+                      f"prompt names '{_name}' but nothing binds it for this profile")
+
+    # The positive direction: when the tool IS bound the guidance must appear,
+    # or the gates above have silently muted a real capability.
+    _fs_prompt = compose_system_prompt(
+        tools=[], agent_config={"instructions": ""}, filesystem=True)
+    check("compose: scratch-fs section present when filesystem on",
+          "# Scratch filesystem" in _fs_prompt)
+    _bridge_prompt = compose_system_prompt(
+        tools=[SimpleNamespace(name="search_tools")], agent_config={"instructions": ""})
+    check("compose: search_tools guidance present when the bridge is bound",
+          "search_tools" in _bridge_prompt)
+    _learn_prompt = compose_system_prompt(
+        tools=[], agent_config={"instructions": ""}, auto_learn=True)
+    check("compose: save_playbook guidance present when auto-learn is on",
+          "save_playbook" in _learn_prompt)
+    _verify_prompt = compose_system_prompt(
+        tools=[SimpleNamespace(name="run_verify"), SimpleNamespace(name="edit_file")],
+        agent_config={"instructions": ""}, verify=True)
+    check("compose: verify section present when run_verify + edit tools are bound",
+          "# Verify your changes" in _verify_prompt)
+    check("compose: no verify loop without the edit tools it loops over",
+          "# Verify your changes" not in compose_system_prompt(
+              tools=[SimpleNamespace(name="run_verify")],
+              agent_config={"instructions": ""}, verify=True))
+    _sandbox_prompt = compose_system_prompt(
+        tools=[SimpleNamespace(name="run_command")], agent_config={"instructions": ""},
+        sandbox=True)
+    check("compose: sandbox section present when run_command is bound",
+          "# Sandboxed shell" in _sandbox_prompt)
+
+    # Delegation names only the delegates that were actually built.
+    _deleg = compose_system_prompt(
+        tools=[SimpleNamespace(name="delegate_to_data_specialist")],
+        agent_config={"instructions": ""},
+        subagents=[{"name": "Data Specialist"}, {"name": "Ghost Squad"}])
+    check("compose: delegation names the built subagent",
+          "delegate_to_data_specialist" in _deleg)
+    check("compose: delegation omits the subagent whose tool failed to build",
+          "delegate_to_ghost_squad" not in _deleg)
+
+    # Exactly one planning mechanism, never both.
+    _multi = {"agentMode": "multi", "instructions": ""}
+    _both = compose_system_prompt(tools=[], agent_config=_multi, planning=True)
+    check("compose: planning tools replace the markdown-checklist block",
+          ("# Planning" in _both) and ("# Plan, then execute, then verify" not in _both))
+    _generic = compose_system_prompt(tools=[], agent_config=_multi)
+    check("compose: multi-mode without planning tools keeps the checklist block",
+          "# Plan, then execute, then verify" in _generic)
+
+
+def test_capability_sections_follow_bound_tools() -> None:
+    """The capability sections must gate on TOOLS, not on the node being wired.
+
+    ``test_prompt_names_only_bound_tools`` walks a fixed candidate list, so it
+    could never see this: the four capability sections named ~20 domain tools
+    (codegraph__get_code_snippet, cloudwatch_correlate_logs, …) and nothing
+    checked any of them existed. Activation came from ``bool(<node>_config)`` —
+    operator intent — while tool_assembler binds nothing on three live paths:
+    expired AWS credentials, a codegraph build that raises, and
+    build_codegraph_tools returning [] when the engine won't start. Each left up
+    to ~2.4K tokens describing tools absent from the schema, on a run that was
+    already degraded.
+
+    So: scan the composed prompt for ANY domain-tool-shaped name and require it
+    to be bound. This catches a renamed tool and a re-widened gate alike.
+    """
+    import re as _re
+    from types import SimpleNamespace
+    from app.harness.agent_builder import compose_system_prompt
+
+    _DOMAIN_RE = _re.compile(r"\b(?:codegraph__|cloudwatch_|repo_|db_)[a-z_]+\b")
+    # Named in prose as a data source / concept, not as a callable tool.
+    _NOT_TOOLS = {"db_server_map", "repo_path"}
+
+    _cw = [SimpleNamespace(name=n) for n in
+           ("cloudwatch_search_logs", "cloudwatch_correlate_logs")]
+    _code = [SimpleNamespace(name=n) for n in
+             ("codegraph__find_symbol", "codegraph__get_code_snippet", "repo_grep")]
+    _db = [SimpleNamespace(name="db_list_tables")]
+
+    _cases = [
+        # (label, tools, has_cloudwatch, has_code_analyzer)
+        ("full-trio", _cw + _code + _db, True, True),
+        ("cw-only", _cw, True, False),
+        ("code-only", _code, False, True),
+        ("db-only", _db, False, False),
+        # The degraded paths: the node is wired but nothing bound.
+        ("cw-wired-creds-expired", _db, True, False),
+        ("code-wired-engine-down", _db, False, True),
+        ("both-wired-nothing-bound", [], True, True),
+    ]
+    for _label, _tools, _cw_flag, _code_flag in _cases:
+        bound = {t.name for t in _tools}
+        prompt = compose_system_prompt(
+            tools=list(_tools), agent_config={"instructions": ""},
+            has_cloudwatch=_cw_flag, has_code_analyzer=_code_flag,
+        )
+        for _name in sorted(set(_DOMAIN_RE.findall(prompt)) - _NOT_TOOLS):
+            check(f"compose[{_label}]: capability text names only bound tools ({_name})",
+                  _name in bound,
+                  f"prompt names '{_name}' but it is not in the bound tool list")
+
+    # The degraded cases must drop the SECTION, not merely the tool names.
+    _degraded = compose_system_prompt(
+        tools=[], agent_config={"instructions": ""},
+        has_cloudwatch=True, has_code_analyzer=True)
+    check("compose: no cloudwatch section when no cloudwatch tool bound",
+          "data_quality" not in _degraded)
+    check("compose: no code section when no code tool bound",
+          "MANDATORY source confirmation" not in _degraded)
+    check("compose: no rds pointer when no cloudwatch tool bound",
+          "rds-performance-investigation" not in _degraded)
+
+
+def test_system_prompt_size_budget() -> None:
+    """A ceiling on the cached prefix, so a new section cannot silently re-inflate it.
+
+    The prompt reached ~3,438 tok (13.7K chars) for a full CloudWatch+code+DB
+    agent, 59% of it in two capability sections. Nothing measured it, so growth
+    was invisible: every addition looked small on its own. The ceilings below are
+    set ~25% above the post-restructure sizes — room to edit, not room to undo.
+    """
+    from types import SimpleNamespace
+    from app.harness.agent_builder import compose_system_prompt
+
+    _tools = [SimpleNamespace(name=n) for n in (
+        "cloudwatch_search_logs", "codegraph__find_symbol", "repo_grep",
+        "db_list_tables", "skill",
+    )]
+    _cases = [
+        ("full-trio", _tools, True, True, 7000),
+        ("db-only", [SimpleNamespace(name="db_list_tables")], False, False, 3000),
+        ("no-capability", [], False, False, 2500),
+    ]
+    for _label, _t, _cw, _code, _ceiling in _cases:
+        prompt = compose_system_prompt(
+            tools=list(_t), agent_config={"instructions": ""},
+            has_cloudwatch=_cw, has_code_analyzer=_code,
+        )
+        check(f"prompt size[{_label}]: within budget",
+              len(prompt) <= _ceiling,
+              f"{len(prompt)} chars (~{len(prompt)//4} tok) exceeds the "
+              f"{_ceiling}-char ceiling — a section grew or a new one was added")
+
+
+def test_skill_section_requires_a_real_library() -> None:
+    """No skills in the library ⇒ no skill tools ⇒ no '# Skills' section.
+
+    The skill tools bound on ``skill_tool_enabled`` alone, so an empty library
+    still made ``skill`` a bound tool and turned on the whole '# Skills' section
+    plus the STEP ZERO routing clause (~250 tok in the prefix, ~490 with the two
+    tool schemas). That text asserts "the user turn carries a 'Skill map'" while
+    ``build_map`` returns "" for an empty library, and calls loading a skill "a
+    blocking requirement" with nothing to load. preflight now binds on
+    ``model_invocable_names()`` being non-empty; this locks the prompt half.
+    """
+    from types import SimpleNamespace
+    from app.harness.agent_builder import compose_system_prompt
+    from app.core.skills import get_default_skill_manager
+
+    _no_skill = compose_system_prompt(
+        tools=[SimpleNamespace(name="db_list_tables")],
+        agent_config={"instructions": ""})
+    check("skills: no '# Skills' section when the skill tool is unbound",
+          "# Skills" not in _no_skill)
+    check("skills: no STEP ZERO clause when the skill tool is unbound",
+          "STEP ZERO" not in _no_skill)
+
+    # NO skills ship with the app and there is no seeding mechanism — the
+    # library is entirely user-authored under skills_dir (Skills page). Assert
+    # the seeding code stays gone; asserting on model_invocable_names() content
+    # would be brittle since it reflects whatever the operator authored, not
+    # anything the repo controls.
+    from app.core.skills.manager import SkillManager as _SM
+    check("skills: no bundled-seed mechanism remains",
+          not hasattr(_SM, "_SEED_DIR") and not hasattr(_SM, "_DISABLED_FILE"))
+    _names = get_default_skill_manager().model_invocable_names()
+    check("skills: user-only library resolves without error",
+          isinstance(_names, set), f"model_invocable_names() = {sorted(_names)}")
 
 
 # ── chat sessions ─────────────────────────────────────────────────────────────
@@ -2817,8 +3866,13 @@ async def test_skill_tool_wiring() -> None:
     check("scoped map drops others", "service-restart-checklist" not in scoped)
 
     # Over budget the map degrades to a count hint — search still reaches them all.
+    # Nothing ships with the app (no seeding), so the invocable set is exactly the
+    # skills authored into this tmp skills_dir — no production content can drift in.
     tiny = m.build_map(char_budget=10)
-    check("over-budget map → count hint", tiny == f"{len(_SEEDS)} skills available", tiny)
+    _invocable = len(m.model_invocable_names())
+    check("over-budget map → count hint", tiny == f"{_invocable} skills available", tiny)
+    check("over-budget map counts exactly the authored skills", _invocable == len(_SEEDS),
+          f"{_invocable} invocable vs {len(_SEEDS)} authored here")
 
     # ── Stage two, part one: search_skills turns an intent into a name.
     search = build_skill_search_tool(allowed_skills=None, execution_id="selftest")
@@ -5393,6 +6447,74 @@ async def test_run_budget_stops_real_graph() -> None:
           (result.get("final_answer") or "")[:120])
 
 
+async def test_hitl_graph_preserves_transcript() -> None:
+    """The HITL graph must return the run's messages on BOTH branches.
+
+    Regression guard for a silent state-schema bug: the wrapper was built with
+    ``StateGraph(dict)``, and a bare dict schema has no reducer, so every write
+    to `messages` overwrote the channel instead of appending.
+
+      - approve  -> `_hitl_synthesis` returns {} (no write), so the final state
+                    came back EMPTY: final_answer was "" and the approved answer
+                    was discarded outright.
+      - reject   -> the single "[HITL Rejected]" note REPLACED the whole
+                    transcript, so the persisted history was one message.
+
+    Neither failure raises, and the reject branch still produced the right
+    final_answer (_serialize_agent_result reads the last terminal AIMessage),
+    which is why this went unnoticed. The fix is the `add_messages` reducer that
+    MessagesState carries; these checks assert message COUNTS, not just the
+    answer, because the answer alone never caught it.
+    """
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.types import Command
+    from app.harness.react_agent import _finish_build_agent
+
+    async def _run(decision: dict):
+        llm = _FakeChatModel([AIMessage(content="the drafted root cause")])
+        agent = _finish_build_agent(
+            llm, [], {"hitl_enabled": True}, "sys", "single",
+            checkpointer=MemorySaver(), session_id="hitl-transcript",
+        )
+        cfg = {"configurable": {"thread_id": f"t-hitl-{decision.get('approved')}"}}
+        await agent.ainvoke({"messages": [HumanMessage(content="why did it fail?")]}, cfg)
+        snap = await agent.aget_state(cfg)
+        drafted = (
+            snap.tasks[0].interrupts[0].value.get("draft_answer")
+            if snap.tasks and snap.tasks[0].interrupts else None
+        )
+        out = await agent.ainvoke(Command(resume=decision), cfg)
+        return out.get("messages", []), drafted
+
+    _approved, _draft = await _run({"approved": True})
+    check("hitl: reviewer is shown the drafted answer",
+          _draft == "the drafted root cause", repr(_draft))
+    check("hitl approve: transcript survives (not an empty state)",
+          len(_approved) >= 2, f"n={len(_approved)}")
+    check("hitl approve: the agent's answer is returned",
+          any(isinstance(m, AIMessage) and m.content == "the drafted root cause"
+              for m in _approved),
+          repr([getattr(m, "content", "") for m in _approved]))
+    check("hitl approve: the human turn is not duplicated",
+          sum(isinstance(m, HumanMessage) for m in _approved) == 1,
+          f"n_human={sum(isinstance(m, HumanMessage) for m in _approved)}")
+
+    _rejected, _ = await _run({"approved": False, "reason": "insufficient evidence"})
+    check("hitl reject: rejection APPENDS, never replaces the transcript",
+          len(_rejected) > 1, f"n={len(_rejected)}")
+    check("hitl reject: the pre-rejection draft is still in the history",
+          any(isinstance(m, AIMessage) and m.content == "the drafted root cause"
+              for m in _rejected),
+          repr([getattr(m, "content", "") for m in _rejected]))
+    check("hitl reject: rejection note is the last terminal AIMessage",
+          "[HITL Rejected] insufficient evidence" == next(
+              (m.content for m in reversed(_rejected)
+               if isinstance(m, AIMessage) and m.content
+               and not getattr(m, "tool_calls", None)), ""),
+          repr(getattr(_rejected[-1], "content", "")))
+
+
 async def test_tool_call_timeout() -> None:
     """Per-tool wall-clock cap: a hung tool returns an honest error ToolMessage
     instead of consuming the run, the wrapped tool is still a real BaseTool
@@ -5544,8 +6666,8 @@ async def test_token_calibration_feed() -> None:
 
             # Provider reports the real prompt size; the NEXT hook entry
             # attributes it to the estimate parked above.
-            cb.input_tokens = 900
-            cb.cache_read_tokens = 100        # cached prompt still occupies context
+            cb.input_tokens = 900             # WHOLE prompt (inclusive of cache)
+            cb.cache_read_tokens = 100        # ...of which 100 came from cache
             await agent.ainvoke({"messages": [("user", "second turn")]},
                                 {"configurable": {"thread_id": "calib"}})
         finally:
@@ -5555,8 +6677,16 @@ async def test_token_calibration_feed() -> None:
               str(recorded))
         if recorded:
             _model, _est, _act = recorded[0]
-            check("token calibration: actual counts include the cache counters",
-                  _act == 1000, str(_act))
+            # The calibration compares an estimate of the prompt against the
+            # provider's real prompt size, so "actual" must be the WHOLE prompt.
+            # It still is — but input_tokens already INCLUDES cache_read, so the
+            # whole prompt is 900, not 900+100. This asserted 1000 while the
+            # codebase believed the counters were additive; that belief was
+            # checked against live Bedrock on 2026-07-21 and was wrong, and the
+            # same addition was inflating the run token budget and the Chat UI
+            # context bar. Keeping the assertion at 900 locks the correction.
+            check("token calibration: actual is the whole prompt, cache included",
+                  _act == 900, str(_act))
             check("token calibration: estimate is the parked chars/4 figure",
                   _est > 0, str(_est))
     finally:
@@ -5730,11 +6860,11 @@ async def _main() -> int:
     await test_run_budget_hook_and_retry()
     await test_mcp_barrier_parallel_connect()
     await test_run_budget_stops_real_graph()
+    await test_hitl_graph_preserves_transcript()
     await test_tool_call_timeout()
     await test_token_calibration_feed()
     await test_truncation_resume_loop()
     await test_midthought_and_overflow_recovery()
-    test_tool_router()
     test_tool_exposure()
     test_boto_context_overflow_classifier()
     await test_phase0_substrate()
@@ -5751,6 +6881,13 @@ async def _main() -> int:
     test_token_calibration()
     test_compression_split_preserved_tail()
     test_compression_split_preserved_tail_empty()
+    await test_compact_tail_is_pairing_safe()
+    test_compact_enforces_budget()
+    test_msg_token_estimate_memo()
+    test_json_extract_is_not_greedy()
+    test_grader_evidence_keeps_the_newest()
+    test_prompt_cache_gates_on_prefix_not_message()
+    test_tool_ranker_beats_a_verbose_decoy()
     await test_compression_pipeline_delegates()
     await test_compression_metamemory_precheck()
     await test_metamemory_read_context_block_caps_milestones()
@@ -5765,6 +6902,7 @@ async def _main() -> int:
     test_policy_engine()
     test_sandbox()
     test_privacy_pseudonymization()
+    test_mcp_error_paths_are_sanitized()
     test_pinned_facts_budget()
     test_agent_spec()
     test_memory_capability_and_autolearn()
@@ -5773,8 +6911,19 @@ async def _main() -> int:
     test_okf_knowledge_bundle()
     await test_autolearn_learn_flow()
     test_persona_and_supervisor_toggle()
+    test_rds_capability_requires_cloudwatch()
+    test_cache_hit_rate_metric()
+    test_billed_units_weighting()
+    test_compression_stats_and_memo()
+    await test_tool_result_store()
+    test_cache_token_normalization()
     test_skill_prompt_ordering_contract()
+    test_prompt_names_only_bound_tools()
+    test_capability_sections_follow_bound_tools()
+    test_system_prompt_size_budget()
+    test_skill_section_requires_a_real_library()
     await test_supervisor_loop()
+    await test_grader_no_signal_on_unparseable()
     await test_trajectory_export_step_events()
     await test_tool_result_failed_flag_threading()
     test_context_builder()

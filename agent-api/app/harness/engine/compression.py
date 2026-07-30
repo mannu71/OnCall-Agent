@@ -19,47 +19,17 @@ logger = logging.getLogger(__name__)
 def split_preserved_tail(messages: List[Any], keep_recent_tokens: int) -> Tuple[List[Any], List[Any]]:
     """Split ``messages`` into (head-to-summarize, preserved-tail).
 
-    Walks backward accumulating token estimates until ``keep_recent_tokens``
-    is reached (same walk ``compaction.compact()`` does internally), then
-    extends the boundary further back so the tail never starts mid-pair: not
-    on an orphaned ``ToolMessage``, and not on an ``AIMessage`` whose
-    ``tool_calls`` aren't all resolved within the tail. A tail that split a
-    tool_use/tool_result pair would make the very retry this exists for fail
-    Bedrock's INVALID_CHAT_HISTORY check.
+    Thin re-export of :func:`app.core.context.compaction.split_preserved_tail`.
+    The implementation moved down into ``compaction`` because ``compact()``
+    itself needs it: this pairing-safe walk used to live only up here, reachable
+    only through ``force_compact``, while ``compact()`` — the path every
+    proactive compaction actually takes — used a raw backward walk that could
+    start the tail on an orphaned ``ToolMessage``. Keeping the boundary logic in
+    one place is what stops those two from drifting apart again.
     """
-    from langchain_core.messages import AIMessage, ToolMessage
-    from app.core.context.compaction import _msg_token_estimate
+    from app.core.context.compaction import split_preserved_tail as _split
 
-    if not messages:
-        return [], []
-
-    accumulated = 0
-    tail_start_idx = 0
-    for i in range(len(messages) - 1, -1, -1):
-        accumulated += _msg_token_estimate(messages[i])
-        if accumulated >= keep_recent_tokens:
-            tail_start_idx = i
-            break
-
-    while tail_start_idx > 0:
-        candidate = messages[tail_start_idx]
-        if isinstance(candidate, ToolMessage):
-            tail_start_idx -= 1
-            continue
-        if isinstance(candidate, AIMessage) and getattr(candidate, "tool_calls", None):
-            ids_needed = {
-                tc.get("id") for tc in candidate.tool_calls if isinstance(tc, dict)
-            }
-            ids_in_tail = {
-                getattr(m, "tool_call_id", None) for m in messages[tail_start_idx:]
-                if isinstance(m, ToolMessage)
-            }
-            if not ids_needed.issubset(ids_in_tail):
-                tail_start_idx -= 1
-                continue
-        break
-
-    return messages[:tail_start_idx], messages[tail_start_idx:]
+    return _split(messages, keep_recent_tokens)
 
 
 async def maybe_metamemory_summary(

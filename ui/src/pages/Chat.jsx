@@ -31,8 +31,7 @@ import {
   Copy,
   Check,
   RotateCcw,
-  ListTree,
-  Square
+  ListTree
 } from 'lucide-react';
 import { isAgentWorkflowValid } from '../utils/workflowValidation.js';
 import agentApiClient, { isAbortError } from '../services/agentApiClient.js';
@@ -1275,28 +1274,17 @@ function Chat() {
                     still running…
                   </span>
                 )}
-                {isLoading && (
-                  <button
-                    type="button"
-                    onClick={handleStop}
-                    disabled={isStopping}
-                    title={watchdogStale ? 'Force stop (no response in 90s+)' : 'Stop agent'}
-                    className={cn(
-                      "flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold border transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
-                      watchdogStale
-                        ? "bg-amber-50 text-amber-700 border-amber-300 hover:bg-amber-100 animate-pulse"
-                        : "bg-red-50 text-red-600 border-red-200 hover:bg-red-100 hover:border-red-300"
-                    )}
-                  >
-                    <Square className="size-3 fill-current" />
-                    {isStopping ? 'Stopping…' : watchdogStale ? 'Force stop' : 'Stop'}
-                  </button>
-                )}
+                {/* One control: it sends when idle and stops while a run is
+                    live — see SendButton for why the separate Stop button that
+                    used to sit here was redundant. */}
                 <SendButton
                   onClick={handleSendClick}
-                  disabled={!inputValue.trim() || isLoading}
+                  onStop={handleStop}
+                  disabled={!inputValue.trim()}
                   phase={sendPhase}
                   launching={sendLaunching}
+                  stopping={isStopping}
+                  stale={watchdogStale}
                 />
               </div>
             </div>

@@ -2,12 +2,46 @@ import asyncio
 import functools
 import boto3
 import json
+import re
 import time
 from datetime import datetime
 from typing import List
 
 from . import handle_exceptions
 from .utils import get_time_range
+
+# Hard ceiling on rows returned from a single Insights query. Raising this is a
+# cost decision, not a correctness one — the row payload is the dominant token
+# cost of a search, and callers budget against it.
+MAX_QUERY_LIMIT = 100
+
+# `| limit N` as a pipeline stage (also matches a leading `limit N`). The
+# fix-up path appends "\n| limit 100", so the newline has to be tolerated.
+_LIMIT_RE = re.compile(r"(?:^|\|)\s*limit\s+(\d+)\s*(?=\||$)", re.IGNORECASE)
+
+
+def parse_query_limit(query: str, ceiling: int = MAX_QUERY_LIMIT) -> int:
+    """Return the row limit to request, honouring the query's own `| limit N`.
+
+    ``start_query`` takes a ``limit`` parameter that bounds the rows returned,
+    and it was pinned at the ceiling regardless of what the caller's query asked
+    for. An agent that deliberately requested a small sample still paid for a
+    full-size payload, which the token budget then discarded by position —
+    measured live 2026-07-27, a query ending ``| limit 5`` returned 100 rows of
+    40,733 matching, ~23,700 tokens against a 1,500-token budget.
+
+    When several `limit` stages are present the last one governs the output, so
+    that is the one used. Missing, malformed, or non-positive values fall back
+    to *ceiling*, and an over-large request is clamped to it.
+    """
+    found = _LIMIT_RE.findall(query or "")
+    if not found:
+        return ceiling
+    try:
+        requested = int(found[-1])
+    except (TypeError, ValueError):
+        return ceiling
+    return min(requested, ceiling) if requested > 0 else ceiling
 
 
 class CloudWatchLogsSearchTools:
@@ -86,7 +120,7 @@ class CloudWatchLogsSearchTools:
                 startTime=start_ts,
                 endTime=end_ts,
                 queryString=query,
-                limit=100,
+                limit=parse_query_limit(query),
             ),
         )
         query_id = start_query_response["queryId"]

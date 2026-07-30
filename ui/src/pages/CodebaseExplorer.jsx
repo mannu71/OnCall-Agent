@@ -5,6 +5,8 @@ import {
   RefreshCw,
   Trash2,
   Loader2,
+  GitBranch,
+  DownloadCloud,
 } from 'lucide-react';
 import { agentApiClient } from '../services/agentApiClient';
 
@@ -24,11 +26,22 @@ export default function CodebaseExplorer() {
   // this otherwise-empty left panel instead of overlaying the graph.
   const [cgSidebarEl, setCgSidebarEl] = useState(null);
 
+  // Branch state for the selected repo (the git checkout the index is built
+  // from). branchInfo is the /branches payload; selectedBranch is the dropdown
+  // value the user wants to switch to.
+  const [branchInfo, setBranchInfo] = useState(null);
+  const [selectedBranch, setSelectedBranch] = useState('');
+  const [branchLoading, setBranchLoading] = useState(false);
+  const [isFetching, setIsFetching] = useState(false);
+
   // Data adapter over the codegraph store's REST shim.
   const api = useMemo(() => ({
     listRepos: () => agentApiClient.listCodegraphRepos(),
     reindex: (repo) => agentApiClient.reindexCodegraphRepo(repo),
     deleteIndex: (repo) => agentApiClient.deleteCodegraphIndex(repo),
+    getBranches: (repo) => agentApiClient.getRepoBranches(repo),
+    fetchBranches: (repo) => agentApiClient.fetchRepoBranches(repo),
+    checkoutBranch: (repo, branch) => agentApiClient.checkoutRepoBranch(repo, branch),
   }), []);
 
   // Fetch available indexed repositories. Returns the repo list so callers
@@ -95,8 +108,98 @@ export default function CodebaseExplorer() {
     }
   }, [selectedRepo, isMutating, loadRepos, api]);
 
+  // Load the selected repo's git branches whenever the repo changes. A non-git
+  // dir returns { is_git: false } and simply hides the picker.
+  const loadBranches = useCallback(async (repo) => {
+    if (!repo) {
+      setBranchInfo(null);
+      setSelectedBranch('');
+      return;
+    }
+    setBranchLoading(true);
+    try {
+      const info = await api.getBranches(repo);
+      setBranchInfo(info);
+      setSelectedBranch(info?.current || '');
+    } catch (err) {
+      console.error('Failed to load branches', err);
+      setBranchInfo(null);
+      setSelectedBranch('');
+    } finally {
+      setBranchLoading(false);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    loadBranches(selectedRepo);
+  }, [selectedRepo, loadBranches]);
+
+  // git fetch --prune, then repopulate the branch list. Fetch never hard-fails
+  // the request: a creds/offline problem comes back as { ok: false, error }.
+  const handleFetchBranches = useCallback(async () => {
+    if (!selectedRepo || isFetching) return;
+    setIsFetching(true);
+    setActionError('');
+    try {
+      const info = await api.fetchBranches(selectedRepo);
+      setBranchInfo(info);
+      setSelectedBranch(info?.current || '');
+      if (info && info.ok === false) {
+        setActionError(`Fetch could not reach the remote: ${info.error || 'unknown error'}. Showing local branches.`);
+      }
+    } catch (err) {
+      console.error('Fetch failed', err);
+      setActionError(`Fetch failed: ${err?.message || 'unknown error'}`);
+    } finally {
+      setIsFetching(false);
+    }
+  }, [selectedRepo, isFetching, api]);
+
+  // Switch the repo to the chosen branch, then reindex so the graph reflects it.
+  // A dirty working tree is refused server-side (409) — surface the file list.
+  const handleSwitchBranch = useCallback(async () => {
+    if (!selectedRepo || isMutating || !selectedBranch) return;
+    if (branchInfo?.current === selectedBranch) return;
+    setIsMutating(true);
+    setActionError('');
+    try {
+      await api.checkoutBranch(selectedRepo, selectedBranch);
+      await api.reindex(selectedRepo);
+      await loadBranches(selectedRepo);
+      await loadRepos({ preferRepo: selectedRepo });
+    } catch (err) {
+      const detail = err?.response?.data?.detail;
+      if (err?.response?.status === 409 && detail) {
+        const files = (detail.dirty_files || []).slice(0, 10).join(', ');
+        setActionError(
+          `${detail.message || 'Repo has uncommitted changes.'}${files ? ` Modified: ${files}` : ''}`
+        );
+      } else {
+        const msg = typeof detail === 'string' ? detail : (err?.message || 'unknown error');
+        setActionError(`Switch failed: ${msg}`);
+      }
+      // Refresh branch state so the dropdown snaps back to the actual branch.
+      await loadBranches(selectedRepo);
+    } finally {
+      setIsMutating(false);
+    }
+  }, [selectedRepo, isMutating, selectedBranch, branchInfo, api, loadBranches, loadRepos]);
+
   return (
-    <div className="flex h-screen max-h-screen bg-background text-foreground overflow-hidden font-sans">
+    // Dark shell. The canvas is a starfield, and a light chrome wrapped around
+    // it read as two unrelated apps. Sidebar/FilterPanel already use semantic
+    // tokens, so they flip for free. bg-slate-950 is explicit because
+    // index.css sets `body { bg-slate-50 }` at element level, which `.dark`
+    // does not override.
+    //
+    // --primary is #dc2626 in BOTH themes and drives every selection state;
+    // against a starfield red reads as an error and collides with the
+    // red-dwarf star colour. Overriding it here scopes the change to this
+    // page only.
+    <div
+      className="dark flex h-screen max-h-screen bg-slate-950 text-foreground overflow-hidden font-sans"
+      style={{ '--primary': '#38bdf8', '--ring': '#38bdf8' }}
+    >
       {/* LEFT SIDEBAR: repo selection + index lifecycle. codegraph portals its
           own filters + file tree into the panel below. */}
       <div className="w-64 border-r border-border bg-card flex flex-col flex-shrink-0">
@@ -130,8 +233,90 @@ export default function CodebaseExplorer() {
             </select>
           )}
 
+          {/* Branch selector — only for repos that are real git checkouts. The
+              index is built from whatever branch is checked out on disk, so
+              switching here checks out the branch and reindexes. */}
+          {selectedRepo && branchInfo && (
+            branchInfo.is_git ? (
+              <div className="mt-3">
+                <div className="flex items-center gap-1.5 mb-1">
+                  <GitBranch className="w-3.5 h-3.5 text-muted-foreground" />
+                  <span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
+                    Branch
+                  </span>
+                </div>
+                {branchInfo.detached ? (
+                  <p className="text-[11px] text-muted-foreground italic px-1 py-1">
+                    Detached HEAD — check out a branch on disk to switch.
+                  </p>
+                ) : (
+                  <>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={selectedBranch}
+                        onChange={(e) => setSelectedBranch(e.target.value)}
+                        disabled={branchLoading || isMutating}
+                        className="flex-1 min-w-0 bg-background border border-border text-foreground rounded-md py-1.5 px-2 text-sm focus:outline-none focus:border-primary transition-colors disabled:opacity-50"
+                      >
+                        {branchInfo.local?.length > 0 && (
+                          <optgroup label="Local">
+                            {branchInfo.local.map((b) => (
+                              <option key={`l-${b}`} value={b}>
+                                {b === branchInfo.current ? `${b} (current)` : b}
+                              </option>
+                            ))}
+                          </optgroup>
+                        )}
+                        {branchInfo.remote?.length > 0 && (
+                          <optgroup label="Remote">
+                            {branchInfo.remote.map((b) => (
+                              <option key={`r-${b}`} value={b}>{b}</option>
+                            ))}
+                          </optgroup>
+                        )}
+                      </select>
+                      <button
+                        onClick={handleFetchBranches}
+                        disabled={isFetching || isMutating}
+                        title="Fetch remote branches from the origin (git fetch)"
+                        className="inline-flex items-center justify-center rounded-md border border-border bg-background p-1.5 text-muted-foreground transition-colors hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isFetching
+                          ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          : <DownloadCloud className="w-3.5 h-3.5" />}
+                      </button>
+                    </div>
+                    {!branchInfo.remote_loaded && (
+                      <p className="mt-1 text-[10px] text-muted-foreground leading-snug">
+                        Showing local branches. Fetch <DownloadCloud className="inline w-2.5 h-2.5 -mt-0.5" /> to load remote branches.
+                      </p>
+                    )}
+                    <button
+                      onClick={handleSwitchBranch}
+                      disabled={
+                        isMutating || branchLoading || !selectedBranch ||
+                        selectedBranch === branchInfo.current
+                      }
+                      title="Check out this branch and rebuild the index"
+                      className="mt-2 w-full inline-flex items-center justify-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1.5 text-xs font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {isMutating
+                        ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        : <GitBranch className="w-3.5 h-3.5" />}
+                      Switch &amp; reindex
+                    </button>
+                  </>
+                )}
+              </div>
+            ) : (
+              <p className="mt-3 text-[11px] text-muted-foreground italic px-1">
+                Not a git checkout — branch switching unavailable.
+              </p>
+            )
+          )}
+
           {/* Index lifecycle actions */}
-          <div className="mt-2 flex items-center gap-2">
+          <div className="mt-3 flex items-center gap-2">
             <button
               onClick={handleReindex}
               disabled={!selectedRepo || isMutating}

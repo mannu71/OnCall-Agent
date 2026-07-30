@@ -144,11 +144,15 @@ def _install_skill_fixture(
     prompt's ``# Skills`` section (auto-added when the skill tool is bound) and
     the map both reach the model exactly as in production.
     """
+    import tempfile
     from pathlib import Path
     import app.core.skills as _skills_pkg
     from app.core.skills.manager import SkillManager
     from app.harness.skill_tools import build_skill_search_tool, build_skill_tool
 
+    # No skills ship with the app, so skills_dir is the single source and the
+    # eval library is exactly the declared fixtures — nothing from production
+    # can drift in.
     mgr = SkillManager(skills_dir=Path(SKILLS_FIXTURE_DIR))
     mgr.scan_skills()
     prev = _skills_pkg._default_manager

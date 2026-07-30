@@ -104,12 +104,25 @@ async def setup_tools(
         extra={"execution_id": execution_id},
     )
     return deduped
-def build_playbook_tools() -> List[Any]:
+def build_playbook_tools(*, auto_learn: bool = True) -> List[Any]:
     """Build LangChain StructuredTool instances that let the agent write
     and update investigation playbooks in the knowledge base.
 
     These are appended to the MCP tools list before the ReAct agent is
     constructed so the agent can call them like any other tool.
+
+    ``auto_learn`` mirrors the Agent node's Auto-learn toggle and gates the two
+    KB *writers* (``save_playbook`` / ``patch_playbook``). They used to bind
+    unconditionally, so an agent on a workflow with auto-learn OFF still wrote
+    playbooks — and, since ``save_playbook`` is the first entry in
+    ``DEFAULT_ASK_PATTERNS``, stalled every unattended scheduled run for the
+    full 300s approval timeout. ``pin_fact`` is deliberately NOT gated here: it
+    belongs to the pinned-facts memory tier and has its own
+    ``pinned_facts_enabled`` gate.
+
+    The default stays ``True`` so the registry's catalog scan
+    (``registry_loader._register_introspected_builtins``) still enumerates all
+    three tools.
     """
     from langchain_core.tools import StructuredTool
     from pydantic import BaseModel, Field as PydanticField
@@ -223,6 +236,20 @@ def build_playbook_tools() -> List[Any]:
         except Exception as exc:
             return f"pin_fact failed: {exc}"
 
+    pin_fact_tool = StructuredTool.from_function(
+        coroutine=_pin_fact,
+        name="pin_fact",
+        description=(
+            "Pin a durable, high-value fact so it is injected into EVERY future "
+            "investigation's context (the always-on memory tier). Use sparingly "
+            "for facts that stay true across runs — not run-specific findings "
+            "(use save_playbook for those)."
+        ),
+        args_schema=PinFactInput,
+    )
+    if not auto_learn:
+        return [pin_fact_tool]
+
     return [
         StructuredTool.from_function(
             coroutine=_save_playbook,
@@ -243,15 +270,5 @@ def build_playbook_tools() -> List[Any]:
             ),
             args_schema=PatchPlaybookInput,
         ),
-        StructuredTool.from_function(
-            coroutine=_pin_fact,
-            name="pin_fact",
-            description=(
-                "Pin a durable, high-value fact so it is injected into EVERY future "
-                "investigation's context (the always-on memory tier). Use sparingly "
-                "for facts that stay true across runs — not run-specific findings "
-                "(use save_playbook for those)."
-            ),
-            args_schema=PinFactInput,
-        ),
+        pin_fact_tool,
     ]

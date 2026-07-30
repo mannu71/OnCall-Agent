@@ -54,18 +54,34 @@ class SteerResponse(BaseModel):
 async def list_executions(
     workflow_name: Optional[str] = Query(None, description="Filter by workflow name"),
     limit: int = Query(50, ge=1, le=500, description="Maximum number of executions to return"),
+    exclude_chat: bool = Query(
+        False,
+        description=(
+            "Return only real workflow runs, excluding ad-hoc chat turns. "
+            "Filtered in SQL so `limit` bounds the rows you actually wanted."
+        ),
+    ),
     execution_repo: ExecutionRepository = Depends(get_execution_repo)
 ):
     """List execution history with workflow outputs."""
     if workflow_name:
         executions = await execution_repo.list_by_workflow(workflow_name, limit=limit)
     else:
-        executions = await execution_repo.list_all()
-        # Apply limit
-        executions = executions[:limit]
-    
+        # `limit` goes to SQL. It used to be applied as a post-fetch slice over
+        # list_all()'s own default of 100, which silently capped every request
+        # at 100 rows however large a limit was asked for.
+        executions = await execution_repo.list_all(
+            limit=limit, exclude_chat=exclude_chat
+        )
+
     # Add output field to each execution for easy access
-    return [extract_workflow_output(exec) for exec in executions]
+    rows = [extract_workflow_output(exec) for exec in executions]
+    # `results` exists only so extract_workflow_output can read it; it is a
+    # third verbatim copy of the `output` blob and no client reads it. Drop it
+    # after extraction rather than shipping every run's output three times.
+    for row in rows:
+        row.pop("results", None)
+    return rows
 
 
 @router.get("/active", response_model=List[str])

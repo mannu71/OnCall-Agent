@@ -23,14 +23,20 @@ async def run_selftest_guard() -> Dict[str, Any]:
         ``{"passed": bool, "detail": str}``
     """
     try:
+        import asyncio
         import subprocess
         import sys
 
-        proc = subprocess.run(
-            [sys.executable, "-m", "evals.harness_selftest"],
-            capture_output=True,
-            text=True,
-            timeout=120,
+        # Off the event loop: this is a synchronous child process with a 120s
+        # timeout, and running it inline froze every other request — SSE runs
+        # included — for as long as the selftest took.
+        proc = await asyncio.to_thread(
+            lambda: subprocess.run(
+                [sys.executable, "-m", "evals.harness_selftest"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
         )
         passed = proc.returncode == 0
         detail = (proc.stdout or "") + (proc.stderr or "")

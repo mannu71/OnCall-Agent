@@ -244,35 +244,6 @@ async def execute_nodes_bfs(
             if ran:
                 execution_results[node_id] = result
 
-                # ── Router node: skip non-selected downstream agent nodes ──
-                # The router returns routing.target_agent_id telling us which
-                # ONE agent should run. Mark every other agent that is a direct
-                # child of this router as executed+skipped so the BFS never
-                # launches them — otherwise all connected agents would run.
-                if result and isinstance(result, dict) and result.get("routing"):
-                    target_id = result["routing"].get("target_agent_id")
-                    if target_id:
-                        for child_id in adjacency.get(node_id, []):
-                            child_node = node_map.get(child_id, {})
-                            if (
-                                child_node.get("type") == "agent"
-                                and child_id != target_id
-                                and child_id not in executed
-                            ):
-                                executed.add(child_id)
-                                execution_results[child_id] = {
-                                    "status": "skipped",
-                                    "output": (
-                                        f"Skipped by Semantic Router — "
-                                        f"selected route: '{result['routing'].get('selected_category')}' "
-                                        f"→ agent '{target_id}'"
-                                    ),
-                                }
-                                logger.info(
-                                    "Router skipped non-selected agent '%s' (exec=%s)",
-                                    child_id, execution_id,
-                                )
-
             for child_id in adjacency.get(node_id, []):
                 if child_id not in executed and child_id not in next_frontier:
                     next_frontier.append(child_id)

@@ -83,6 +83,14 @@ services:
       # on every call, so only compress meaningfully large results.
       - COMPRESSION_MIN_CHARS=2000
       - COMPRESSION_TIMEOUT_MS=2000
+      # Extend compression past the MCP adapter to the native tool families
+      # (CloudWatch, db, repo file tools), which previously reached the sidecar
+      # never and carry a 16000-char cap — double the MCP path's 8000. Measured
+      # 2026-07-23 against the live sidecar, those are exactly the shapes that
+      # compress: raw log lines 98%, db result sets 52%, CloudWatch event JSON
+      # 31%. Failure is a byte-identical fallback to the plain cap, so the only
+      # cost of being wrong is sidecar latency.
+      - COMPRESSION_ALL_TOOLS=true
     depends_on:
       postgres:
         condition: service_healthy
@@ -96,6 +104,19 @@ services:
     image: ghcr.io/chopratejas/headroom@sha256:50b85d8e320cfcdf1b38919bb7ae067b93ff7a8de0a93f05b2c1246370200d1c
     container_name: kyc-agent-headroom
     command: ["--port", "8787"]
+    environment:
+      # CCR ("content reference") replaces spans with opaque <ccr:hash,...>
+      # handles and returns only the hash LIST — there is no resolution map in
+      # the /v1/compress response, so a handle that reaches the model can never
+      # be dereferenced. app/core/context/tool_output.py therefore discards any
+      # CCR-marked result and falls back to the original text, which meant
+      # compression saved NOTHING on exactly the large outputs it exists for
+      # (measured 2026-07-23: the 32K/28K/24K/23K/17K/16K-char MCP results all
+      # discarded). Disabling the markers keeps every non-CCR transform — the
+      # ones that actually pay: ~38% on JSON, ~97% on log lines.
+      - HEADROOM_NO_CCR_MARKER=1
+      # Belt and braces: we never expose headroom's retrieve tool to the model.
+      - HEADROOM_NO_CCR_INJECT_TOOL=1
     ports:
       # Loopback-only. Override HEADROOM_HOST_PORT in .env if 48787 is taken.
       - "127.0.0.1:${HEADROOM_HOST_PORT:-48787}:8787"

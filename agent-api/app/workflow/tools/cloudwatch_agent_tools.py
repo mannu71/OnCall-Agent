@@ -36,6 +36,7 @@ from app.workflow.tools.cloudwatch_summarizers import (
     summarise_patterns,
 )
 from app.workflow.tools.cloudwatch_drilldown import (
+    _DEFAULT_FIXUP_LIMIT,
     build_insights_query_for_anomaly,
     build_insights_query_for_pattern,
     cap_drill_preview,
@@ -68,17 +69,18 @@ def _has_events(raw: Any) -> bool:
     )
 
 
-def _budget_json(payload: Any, tool_name: str, token_budget: Optional[int] = None) -> str:
-    """Serialize *payload* to JSON and enforce a per-call token budget.
+def _budget_text(text: str, tool_name: str, budget: int) -> str:
+    """Enforce a per-call token budget on *text* by positional truncation.
 
     Uses a single encode → slice token IDs → decode pass (O(N)) when tiktoken
     is available, avoiding the O(N log N) binary-search approach.
+
+    This is the LAST resort, not the first: truncation keeps the head of the
+    response and discards the tail regardless of what is in it, so run
+    ``_compress_then_budget`` ahead of it wherever the caller can await.
     """
-    import json
-    from app.workflow.tools.cloudwatch_sanitizer import _get_encoder
-    budget = token_budget if token_budget is not None else _NON_EVENT_TOKEN_BUDGET
-    text = json.dumps(payload, default=str)  # compact (no indent) — replayed each ReAct turn
-    enc = _get_encoder()
+    from app.core.llm.token_estimate import get_encoder
+    enc = get_encoder()
     if enc is not None:
         token_ids = enc.encode(text)
         if len(token_ids) <= budget:
@@ -105,6 +107,274 @@ def _budget_json(payload: Any, tool_name: str, token_budget: Optional[int] = Non
         text[:char_budget]
         + f"\n...[truncated by token budget: capped at ~{budget} tokens]"
     )
+
+
+async def _compress_then_budget(text: str, tool_name: str, budget: int) -> str:
+    """Compress an over-budget CloudWatch response, THEN enforce the budget.
+
+    CloudWatch responses were the one large tool family the compression sidecar
+    never saw. Each tool truncated to its own token budget first and stamped a
+    ``[truncated…]`` suffix, which the shared ``compress_then_cap`` treats as an
+    idempotency marker and skips — so the sidecar was handed nothing but
+    already-shrunk text. Measured 2026-07-23 on a live analyze run, a single
+    ``cloudwatch_search_logs`` call returned 138,972 tokens against a 2,500
+    budget: 98.2% of it was dropped by POSITION, which is how error lines sitting
+    past the cut vanish from an investigation.
+
+    Log lines are the sidecar's single best shape (measured 5,128 → 223 tokens,
+    95.6%, on a realistic sample) and its `search` transform is content-selective
+    — it kept both seeded ERROR lines while collapsing repetitive INFO noise, so
+    the same 2,500-token budget now carries far more signal than its head-slice
+    ever did. Uniform JSON goes through `smart_crusher`, which is lossless: rows
+    are re-encoded as a typed header plus CSV (measured 9,559 → 5,260 tokens with
+    all 180 rows intact).
+
+    Under-budget responses return untouched without a round-trip, and any sidecar
+    failure falls back to ``_budget_text`` — byte-identical to the old behaviour.
+    """
+    if _count_tokens(text) <= budget:
+        return text  # already fits — don't pay sidecar latency to shrink it further
+
+    def _cap(t: str) -> str:
+        return _budget_text(t, tool_name, budget)
+
+    from app.config import settings as _settings
+    if not _settings.compression_all_tools:
+        return _cap(text)
+
+    from app.core.context.tool_output import compress_then_cap
+    # Distinct memo key: `wrap_tools_with_output_cap` also runs compress_then_cap
+    # on this tool's (already compressed + budgeted) return value under the bare
+    # tool name. Sharing one key would let those necessarily-unchanged outer
+    # results advance the uncompressible streak and switch OFF the inner call
+    # that does the real work.
+    return await compress_then_cap(text, _cap, tool_name=f"{tool_name}:pre_budget")
+
+
+async def _budget_json(payload: Any, tool_name: str, token_budget: Optional[int] = None) -> str:
+    """Serialize *payload* to JSON, compress if over budget, then enforce it."""
+    import json
+    budget = token_budget if token_budget is not None else _NON_EVENT_TOKEN_BUDGET
+    text = json.dumps(payload, default=str)  # compact (no indent) — replayed each ReAct turn
+    return await _compress_then_budget(text, tool_name, budget)
+
+
+# Severity label → budget class. Anything unlabelled is treated as info.
+_SEV_CLASS = {"critical": "error", "high": "error", "medium": "warn", "low": "info", "none": "info"}
+
+# Example-shedding tiers, cheapest concession first. A pattern seen thousands of
+# times is fully described by its template — the example message adds a sample of
+# something the model already knows recurs. A pattern seen twice is the opposite:
+# the raw text *is* the evidence. So spend the example budget on the rare ones.
+_SHED_TIERS = (
+    (50, 200),   # count > 50  → clip example to 200 chars
+    (50, 0),     # count > 50  → drop example entirely
+    (5, 200),    # count > 5   → clip example to 200 chars
+)
+
+
+def _shed_examples(patterns: List[Any], summary: Dict[str, Any], budget: int) -> List[Any]:
+    """Trade example verbosity for pattern coverage, cheapest concession first.
+
+    ``example_message`` dominates per-entry cost (~180 of ~200 tokens on a live
+    sample), so dropping whole patterns to fit the budget throws away distinct
+    findings to preserve sample text the model mostly doesn't need. Shedding
+    examples from high-volume patterns first keeps more *distinct* patterns in
+    front of the model, which is what an investigation actually needs.
+
+    Returns the original list untouched once the summary fits, so a payload
+    that was already within budget is never degraded.
+    """
+    import json
+
+    def fits(ps: List[Any]) -> bool:
+        probe = dict(summary)
+        probe["unique_patterns"] = ps
+        return _count_tokens(json.dumps(probe, default=str)) <= budget
+
+    current = patterns
+    for min_count, keep_chars in _SHED_TIERS:
+        if fits(current):
+            return current
+        shed = []
+        for p in current:
+            if not isinstance(p, dict):
+                shed.append(p)
+                continue
+            try:
+                occ = float(p.get("occurrence_count") or 0)
+            except (TypeError, ValueError):
+                occ = 0.0
+            example = p.get("example_message")
+            if occ <= min_count or not example or len(example) <= keep_chars:
+                shed.append(p)
+                continue
+            entry = dict(p)
+            if keep_chars <= 0:
+                entry.pop("example_message", None)
+                entry["example_omitted"] = "high-volume pattern; template above"
+            else:
+                entry["example_message"] = example[: keep_chars - 1] + "…"
+            shed.append(entry)
+        current = shed
+    return current
+
+
+def _note_query_fixup(original: str, fixed: str) -> str:
+    """Describe a silently-applied query fix-up, or '' when nothing changed.
+
+    ``fixup_insights_query`` injects a missing ``| limit`` so an almost-correct
+    agent query still runs. That bound was invisible in the result, so a model
+    that asked an unbounded question got a bounded answer and no way to know it —
+    the same failure mode as a positional truncation, one layer up. Saying so
+    costs a line and lets the agent re-query with an explicit limit.
+    """
+    if not fixed or fixed == original:
+        return ""
+    if "limit" in fixed.lower() and "limit" not in (original or "").lower():
+        return (f"no `| limit` was given, so `| limit {_DEFAULT_FIXUP_LIMIT}` "
+                f"was applied")
+    return "query auto-corrected before running"
+
+
+def _note_result_bounds(raw_result: Any, fixup_note: str) -> str:
+    """Tell the model how much of the matching result set it is actually seeing.
+
+    Insights reports ``statistics.recordsMatched`` alongside the rows it returns,
+    and ``search_logs_multi`` caps every query at 100 rows at the API level —
+    independently of any ``| limit`` in the query. So an agent asking "how many
+    auth errors?" can receive 100 rows out of tens of thousands and, with no
+    disclosure, reasonably conclude it saw them all. Surfacing matched-vs-shown
+    turns a silent cap into a fact the model can act on (narrow the window, or
+    use stats aggregation instead of raw rows).
+    """
+    import json
+
+    parts: List[str] = []
+    if fixup_note:
+        parts.append(fixup_note)
+
+    try:
+        payload = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+        if isinstance(payload, dict):
+            shown = len(payload.get("results") or [])
+            matched = int(float((payload.get("statistics") or {}).get("recordsMatched") or 0))
+            if matched > shown > 0:
+                parts.append(
+                    f"showing {shown} of {matched:,} matching rows — this is a "
+                    f"capped sample, not the full result set"
+                )
+    except (ValueError, TypeError):
+        pass  # not JSON, or an unexpected shape — the fix-up note still stands
+
+    return "\n[" + "; ".join(parts) + "]" if parts else ""
+
+
+def _fit_patterns_to_budget(
+    summary: Dict[str, Any], budget: int, tool_name: str,
+) -> Dict[str, Any]:
+    """Fit ``unique_patterns`` into *budget* by severity share, not by position.
+
+    ``_budget_text`` is a positional cut — it keeps the head and discards the
+    tail regardless of content, so a rare root-cause exception that ranking
+    correctly promoted into the payload can still be deleted at serialisation
+    time. Here the scaffold (buckets, data_quality, time_range, drill preview) is
+    measured first, and whatever budget remains is split across severity classes
+    (error / warn / info) so overflow drops the least diagnostic entries instead
+    of the last ones. Unused share is redistributed, so a summary with no
+    warnings still spends the full budget on errors.
+
+    Returns *summary* unchanged when it already fits. Deterministic: the input
+    order is preserved within each class, so ranking decides priority and this
+    only decides how many survive.
+    """
+    import json
+
+    patterns = summary.get("unique_patterns")
+    if not isinstance(patterns, list) or not patterns:
+        return summary
+    if _count_tokens(json.dumps(summary, default=str)) <= budget:
+        return summary  # fits already — nothing to allocate
+
+    patterns = _shed_examples(patterns, summary, budget)
+
+    scaffold = {k: v for k, v in summary.items() if k != "unique_patterns"}
+    scaffold["unique_patterns"] = []
+    overhead = _count_tokens(json.dumps(scaffold, default=str))
+    # 5% headroom absorbs the separators and the truncation-note keys added below.
+    available = int((budget - overhead) * 0.95)
+    if available <= 0:
+        logger.warning(
+            "CW tool [%s]: scaffold alone (%d tokens) exhausts budget %d — "
+            "falling back to positional truncation.", tool_name, overhead, budget,
+        )
+        return summary
+
+    from app.config import settings as _s
+    shares = {
+        "error": max(0.0, _s.cloudwatch_budget_share_error),
+        "warn": max(0.0, _s.cloudwatch_budget_share_warn),
+    }
+    shares["info"] = max(0.0, 1.0 - shares["error"] - shares["warn"])
+
+    buckets: Dict[str, List[Any]] = {"error": [], "warn": [], "info": []}
+    for p in patterns:
+        cls = _SEV_CLASS.get(str((p or {}).get("severity") or "").lower(), "info")
+        buckets[cls].append(p)
+
+    # Cost each entry once; the +1 covers the comma joining it to the previous.
+    costs = {
+        cls: [_count_tokens(json.dumps(p, default=str)) + 1 for p in items]
+        for cls, items in buckets.items()
+    }
+
+    # Pass 1: spend each class's own share. Pass 2: hand leftover to classes that
+    # ran out, strongest severity first, so an all-error summary isn't capped at
+    # 70% of the budget just because there were no warnings to spend the rest.
+    kept: Dict[str, int] = {}
+    spent = 0
+    for cls in ("error", "warn", "info"):
+        allowance = int(available * shares[cls])
+        used = 0
+        n = 0
+        for cost in costs[cls]:
+            if used + cost > allowance:
+                break
+            used += cost
+            n += 1
+        kept[cls] = n
+        spent += used
+
+    leftover = available - spent
+    for cls in ("error", "warn", "info"):
+        if leftover <= 0:
+            break
+        for cost in costs[cls][kept[cls]:]:
+            if cost > leftover:
+                break
+            leftover -= cost
+            kept[cls] += 1
+
+    survivors = {id(p) for cls in buckets for p in buckets[cls][: kept[cls]]}
+    out = dict(summary)
+    # NB: `patterns` here is the *shed* list, not summary["unique_patterns"] —
+    # returning the original would hand back the full-example payload that
+    # didn't fit in the first place.
+    out["unique_patterns"] = [p for p in patterns if id(p) in survivors]
+    dropped = len(patterns) - len(out["unique_patterns"])
+    if not dropped:
+        return out  # shedding alone got it under budget; every pattern survives
+    # Tell the model the list is partial — an agent that thinks it saw every
+    # pattern will happily conclude a root cause from an incomplete set.
+    out["unique_patterns_truncated"] = True
+    out["unique_patterns_dropped_for_budget"] = dropped
+    logger.info(
+        "CW tool [%s]: severity-allocated %d/%d patterns into %d tokens "
+        "(kept error=%d warn=%d info=%d).",
+        tool_name, len(out["unique_patterns"]), len(patterns), available,
+        kept["error"], kept["warn"], kept["info"],
+    )
+    return out
 
 
 # ------------------------------------------------------------------
@@ -654,7 +924,7 @@ def build_cloudwatch_agent_tools(
                 {"log_groups": log_group_names, "time_range_minutes": time_range_minutes},
                 drill_down=drill_down,
             )
-        return _budget_json(_summarise_watch_logs(result), "cloudwatch_watch_logs")
+        return await _budget_json(_summarise_watch_logs(result), "cloudwatch_watch_logs")
 
     # -- analyse patterns --
     async def _analyze_patterns(
@@ -677,7 +947,11 @@ def build_cloudwatch_agent_tools(
             tool_name="cloudwatch_analyze_patterns",
         )
         budget = 3200 if summary.get("auto_drill_down") else _NON_EVENT_TOKEN_BUDGET
-        return _budget_json(summary, "cloudwatch_analyze_patterns", token_budget=budget)
+        from app.config import settings as _pat_settings
+        if _pat_settings.cloudwatch_pattern_budget_allocation:
+            summary = _fit_patterns_to_budget(
+                summary, budget, "cloudwatch_analyze_patterns")
+        return await _budget_json(summary, "cloudwatch_analyze_patterns", token_budget=budget)
 
     # -- detect anomalies --
     async def _detect_anomalies(
@@ -703,7 +977,7 @@ def build_cloudwatch_agent_tools(
             tool_name="cloudwatch_detect_anomalies",
         )
         budget = 3200 if summary.get("auto_drill_down") else _NON_EVENT_TOKEN_BUDGET
-        return _budget_json(summary, "cloudwatch_detect_anomalies", token_budget=budget)
+        return await _budget_json(summary, "cloudwatch_detect_anomalies", token_budget=budget)
 
     # -- correlate logs --
     async def _correlate_logs(
@@ -721,7 +995,7 @@ def build_cloudwatch_agent_tools(
             region=_region,
             credentials=_creds if _creds else None,
         )
-        return _budget_json(summarise_correlation(result), "cloudwatch_correlate_logs")
+        return await _budget_json(summarise_correlation(result), "cloudwatch_correlate_logs")
 
     # -- search logs (Insights query) --
     async def _search_logs(
@@ -740,11 +1014,14 @@ def build_cloudwatch_agent_tools(
         # missing `| limit` clause is injected rather than rejected; genuinely
         # broken queries still hard-fail with a hint.
         from app.config import settings as _settings
+        _fixup_note = ""
         if _settings.cloudwatch_insights_query_fixup:
             from app.workflow.tools.cloudwatch_drilldown import fixup_insights_query
+            _original_query = query
             query, _err = fixup_insights_query(query)
             if _err:
                 return f"Query not run — fix the Insights query first. {_err}"
+            _fixup_note = _note_query_fixup(_original_query, query)
         else:
             _lint = lint_insights_query(query)
             if _lint:
@@ -769,8 +1046,11 @@ def build_cloudwatch_agent_tools(
                     "cloudwatch_search_logs",
                     {"log_groups": log_group_names, "query": query, "hours": hours},
                     drill_down=drill_down,
-                )
-            return _budget_json(result, "cloudwatch_search_logs", token_budget=budget)
+                ) + _note_result_bounds(result, _fixup_note)
+            _b = _note_result_bounds(result, _fixup_note)
+            if _b and isinstance(result, dict):
+                result = {**result, "result_bounds": _b.strip("\n[]")}
+            return await _budget_json(result, "cloudwatch_search_logs", token_budget=budget)
         search = CloudWatchLogsSearchTools(
             profile_name=_creds.get("aws_profile"),
             region_name=_region,
@@ -781,22 +1061,26 @@ def build_cloudwatch_agent_tools(
             hours=hours,
         )
         if isinstance(result, str):
-            tokens = _count_tokens(result)
-            if tokens <= budget:
-                return result
-            logger.warning(
-                "CW tool [cloudwatch_search_logs]: string response %d tokens > %d budget — truncating.",
-                tokens, budget,
-            )
-            return result[: budget * 4] + "\n...[truncated to token budget]"
+            # Raw Insights output — the single largest tool result the agent
+            # sees (138,972 tokens against a 2,500 budget, measured 2026-07-23)
+            # and pure log lines, which the sidecar compresses ~96% while
+            # keeping the ERROR rows a head-slice would have thrown away.
+            # Read the bounds off the raw payload before compression rewrites it.
+            _bounds = _note_result_bounds(result, _fixup_note)
+            return await _compress_then_budget(
+                result, "cloudwatch_search_logs", budget
+            ) + _bounds
         if _has_events(result):
             return _sanitizer.sanitize(
                 result,
                 "cloudwatch_search_logs",
                 {"log_groups": log_group_names, "query": query, "hours": hours},
                 drill_down=drill_down,
-            )
-        return _budget_json(result, "cloudwatch_search_logs", token_budget=budget)
+            ) + _note_result_bounds(result, _fixup_note)
+        _b2 = _note_result_bounds(result, _fixup_note)
+        if _b2 and isinstance(result, dict):
+            result = {**result, "result_bounds": _b2.strip("\n[]")}
+        return await _budget_json(result, "cloudwatch_search_logs", token_budget=budget)
 
     # -- discover log groups --
     async def _discover_log_groups(
@@ -814,7 +1098,7 @@ def build_cloudwatch_agent_tools(
             region=_region,
             credentials=_creds if _creds else None,
         )
-        return _budget_json(result, "cloudwatch_discover_log_groups")
+        return await _budget_json(result, "cloudwatch_discover_log_groups")
 
     # -- get metric data --
     async def _get_metric_data(
@@ -830,7 +1114,7 @@ def build_cloudwatch_agent_tools(
             credentials=_creds if _creds else None,
             include_series=include_series,
         )
-        return _budget_json(result, "cloudwatch_get_metric_data")
+        return await _budget_json(result, "cloudwatch_get_metric_data")
 
     # -- get metric statistics --
     async def _get_metric_statistics(
@@ -852,7 +1136,7 @@ def build_cloudwatch_agent_tools(
             region=_region,
             credentials=_creds if _creds else None,
         )
-        return _budget_json(result, "cloudwatch_get_metric_statistics")
+        return await _budget_json(result, "cloudwatch_get_metric_statistics")
 
     # -- discover metrics --
     async def _discover_metrics(
@@ -867,7 +1151,7 @@ def build_cloudwatch_agent_tools(
             credentials=_creds if _creds else None,
             limit=limit,
         )
-        return _budget_json(result, "cloudwatch_discover_metrics")
+        return await _budget_json(result, "cloudwatch_discover_metrics")
 
     # -- list alarms --
     async def _list_alarms(
@@ -885,7 +1169,7 @@ def build_cloudwatch_agent_tools(
             max_records=max_records,
             include_history=_settings.cloudwatch_alarm_history,
         )
-        return _budget_json(_summarise_alarms(result), "cloudwatch_list_alarms")
+        return await _budget_json(_summarise_alarms(result), "cloudwatch_list_alarms")
 
     tools = [
         StructuredTool.from_function(

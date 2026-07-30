@@ -15,41 +15,40 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Token counting (Phase 5)
 # ---------------------------------------------------------------------------
-# Prefer tiktoken's `cl100k_base` encoding for accurate token counts. The
-# char/4 heuristic drifts 15-40% on JSON-heavy log payloads, causing silent
-# truncation or context overflow. Fall back gracefully if tiktoken is not
-# installed so the sanitizer path keeps working in minimal environments.
-_TIKTOKEN_ENCODER = None
-_TIKTOKEN_TRIED = False
+# These budgets drive HARD truncation, so they use a real BPE count rather than
+# the chars/4 heuristic, which drifts 15-40% on JSON-heavy log payloads and
+# causes silent truncation or context overflow. Both helpers are thin aliases
+# for the shared implementation in :mod:`app.core.llm.token_estimate`, which
+# owns the single lazily-built cl100k_base encoder and the graceful fallback
+# for environments without tiktoken.
+from app.core.llm.token_estimate import count_tokens_exact as _count_tokens
+from app.core.llm.token_estimate import get_encoder as _get_encoder
 
 
-def _get_encoder():
-    """Lazily load the cl100k_base encoder. Returns None on failure."""
-    global _TIKTOKEN_ENCODER, _TIKTOKEN_TRIED
-    if _TIKTOKEN_TRIED:
-        return _TIKTOKEN_ENCODER
-    _TIKTOKEN_TRIED = True
-    try:
-        import tiktoken  # type: ignore
-        _TIKTOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
-    except Exception as exc:  # pragma: no cover - import-time fallback
-        logger.info(
-            "cloudwatch_sanitizer: tiktoken unavailable (%s); "
-            "falling back to char/4 token estimation.", exc,
-        )
-        _TIKTOKEN_ENCODER = None
-    return _TIKTOKEN_ENCODER
+# ---------------------------------------------------------------------------
+# Severity classification
+# ---------------------------------------------------------------------------
+def severity_rank(message: str) -> int:
+    """Lower rank = higher priority when capping events under token budget.
 
-
-def _count_tokens(text: str) -> int:
-    """Return an accurate token count via tiktoken, or char/4 estimate."""
-    enc = _get_encoder()
-    if enc is not None:
-        try:
-            return len(enc.encode(text))
-        except Exception:  # pragma: no cover - encoder fault is non-fatal
-            pass
-    return len(text) // 4
+    Module-level so the pattern ranker in ``cloudwatch_summarizers`` derives
+    severity the same way the event sanitizer prioritises it — one keyword
+    table, not two that drift apart.
+    """
+    low = (message or "").lower()
+    # Structured JSON level field (common in Lambda / app logs)
+    if '"level"' in low or '"severity"' in low:
+        if any(x in low for x in ('"error"', '"critical"', '"fatal"', '"severe"')):
+            return 0
+        if '"warn' in low:
+            return 2
+    if any(x in low for x in ("fatal", "critical", "panic", "exception", "traceback")):
+        return 0
+    if "error" in low or "failed" in low:
+        return 1
+    if "warn" in low:
+        return 2
+    return 3
 
 
 class CloudWatchToolSanitizer:
@@ -243,20 +242,7 @@ class CloudWatchToolSanitizer:
     @staticmethod
     def _severity_rank(message: str) -> int:
         """Lower rank = higher priority when capping events under token budget."""
-        low = (message or "").lower()
-        # Structured JSON level field (common in Lambda / app logs)
-        if '"level"' in low or '"severity"' in low:
-            if any(x in low for x in ('"error"', '"critical"', '"fatal"', '"severe"')):
-                return 0
-            if '"warn' in low:
-                return 2
-        if any(x in low for x in ("fatal", "critical", "panic", "exception", "traceback")):
-            return 0
-        if "error" in low or "failed" in low:
-            return 1
-        if "warn" in low:
-            return 2
-        return 3
+        return severity_rank(message)
 
     def _filter_noise(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Filter out routine/noise events (health checks, 200s, etc.)."""

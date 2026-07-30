@@ -90,11 +90,14 @@ class RunBudget:
         if cb is None:
             return 0
         try:
-            return (
-                int(getattr(cb, "input_tokens", 0) or 0)
-                + int(getattr(cb, "cache_read_tokens", 0) or 0)
-                + int(getattr(cb, "cache_creation_tokens", 0) or 0)
-            )
+            # input_tokens is INCLUSIVE of cache_read + cache_creation, so it is
+            # the full prompt cost on its own. Summing all three (as this used
+            # to) roughly doubled the figure on a cache-warm run and could trip
+            # the TOKEN_BUDGET stop at ~half the real budget — cutting an
+            # investigation short and returning a partial answer for no reason.
+            # Verified against live Bedrock 2026-07-21; see
+            # app.core.observability.cache_metrics.
+            return int(getattr(cb, "input_tokens", 0) or 0)
         except (TypeError, ValueError):
             return 0
 

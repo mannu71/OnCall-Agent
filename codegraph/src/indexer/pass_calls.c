@@ -12,6 +12,10 @@
 #include "base/constants.h"
 
 enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
+/* Confidence for a route-registration edge synthesised from the callee name
+ * alone (the callee itself never resolved). Matches PP_HALF_CONF on the
+ * parallel path — both paths must agree. */
+#define PC_HALF_CONF 0.5
 #include "indexer/pipeline.h"
 #include <stdint.h>
 #include "indexer/pipeline_internal.h"
@@ -181,164 +185,14 @@ static void free_import_map(const char **keys, const char **vals, int count) {
     }
 }
 
-/* Handle a route registration call: create Route node + HANDLES edge. */
-static void handle_route_registration(cg_pipeline_ctx_t *ctx, const CGCall *call,
-                                      const cg_gbuf_node_t *source_node, const char *module_qn,
-                                      const char **imp_keys, const char **imp_vals, int imp_count) {
-    const char *method = cg_service_pattern_route_method(call->callee_name);
-    char route_qn[CG_ROUTE_QN_SIZE];
-    char cpath[CG_SZ_256];
-    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method ? method : "ANY",
-             cg_route_canon_path(call->first_string_arg, cpath, sizeof(cpath)));
-    char route_props[CG_SZ_256];
-    snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", method ? method : "ANY");
-    int64_t route_id = cg_gbuf_upsert_node(ctx->gbuf, "Route", call->first_string_arg, route_qn,
-                                            "", 0, 0, route_props);
-    char esc_cn[CG_SZ_256]; /* sliced source text: escape quotes/newlines */
-    char esc_fa[CG_SZ_256];
-    cg_json_escape(esc_cn, sizeof(esc_cn), call->callee_name);
-    cg_json_escape(esc_fa, sizeof(esc_fa), call->first_string_arg);
-    char props[CG_SZ_512];
-    snprintf(props, sizeof(props),
-             "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
-             esc_fa);
-    cg_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
-    if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
-        cg_resolution_t hres = cg_registry_resolve(ctx->registry, call->second_arg_name,
-                                                     module_qn, imp_keys, imp_vals, imp_count);
-        if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
-            const cg_gbuf_node_t *handler = cg_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
-            if (handler != NULL) {
-                char hprops[CG_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
-                                           closing brace */
-                char esc_h[CG_SZ_512];
-                cg_json_escape(esc_h, sizeof(esc_h), hres.qualified_name);
-                snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
-                cg_gbuf_insert_edge(ctx->gbuf, handler->id, route_id, "HANDLES", hprops);
-            }
-        }
-    }
-}
-
-/* Emit an HTTP/async route edge for a service call. */
-/* Build route QN and upsert Route node for HTTP/async edge. */
-static int64_t create_svc_route_node(cg_pipeline_ctx_t *ctx, const char *url, cg_svc_kind_t svc,
-                                     const char *method, const char *broker) {
-    char route_qn[CG_ROUTE_QN_SIZE];
-    const char *prefix;
-    char cpath[CG_SZ_256];
-    const char *qpath = url;
-    if (svc == CG_SVC_HTTP) {
-        prefix = method ? method : "ANY";
-        qpath = cg_route_canon_path(url, cpath, sizeof(cpath));
-    } else {
-        prefix = broker ? broker : "async";
-    }
-    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix, qpath);
-    const char *rp;
-    if (svc == CG_SVC_HTTP) {
-        rp = method ? method : "{}";
-    } else {
-        rp = broker ? broker : "{}";
-    }
-    return cg_gbuf_upsert_node(ctx->gbuf, "Route", url, route_qn, "", 0, 0, rp);
-}
-
-/* Insert an edge, splicing the call-site line (,"line":N) in before the closing
- * brace when one was captured. Mirrors finalize_and_emit() on the parallel path
- * so CALLS edges carry their source line regardless of resolution path. Restricted
- * to CALLS: route/config edge props feed full-only predump passes
- * (create_route_nodes/create_data_flows), so altering them desyncs full vs
- * incremental indexing. */
-static void calls_emit_edge(cg_gbuf_t *gbuf, int64_t src, int64_t tgt, const char *type,
-                            char *props, size_t cap, const CGCall *call) {
-    if (call && call->start_line > 0 && strcmp(type, "CALLS") == 0) {
-        size_t len = strlen(props);
-        if (len >= SKIP_ONE && props[len - SKIP_ONE] == '}' && len + CG_SZ_32 < cap) {
-            snprintf(props + len - SKIP_ONE, cap - (len - SKIP_ONE), ",\"line\":%d}",
-                     call->start_line);
-        }
-    }
-    cg_gbuf_insert_edge(gbuf, src, tgt, type, props);
-}
-
-static void emit_http_async_edge(cg_pipeline_ctx_t *ctx, const CGCall *call,
-                                 const cg_gbuf_node_t *source, const cg_gbuf_node_t *target,
-                                 const cg_resolution_t *res, cg_svc_kind_t svc) {
-    const char *url_or_topic = call->first_string_arg;
-    bool is_url = (url_or_topic && url_or_topic[0] != '\0' &&
-                   (url_or_topic[0] == '/' || strstr(url_or_topic, "://") != NULL));
-    bool is_topic = (url_or_topic && url_or_topic[0] != '\0' && svc == CG_SVC_ASYNC &&
-                     strlen(url_or_topic) > PAIR_LEN);
-    if (!is_url && !is_topic) {
-        char esc_callee[CG_SZ_256];
-        cg_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
-        char props[CG_SZ_512];
-        snprintf(props, sizeof(props),
-                 "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
-                 esc_callee, res->confidence, res->strategy ? res->strategy : "unknown",
-                 res->candidate_count);
-        calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call);
-        return;
-    }
-    const char *edge_type = (svc == CG_SVC_HTTP) ? "HTTP_CALLS" : "ASYNC_CALLS";
-    const char *method =
-        (svc == CG_SVC_HTTP) ? cg_service_pattern_http_method(call->callee_name) : NULL;
-    const char *broker =
-        (svc == CG_SVC_ASYNC) ? cg_service_pattern_broker(res->qualified_name) : NULL;
-    int64_t route_id = create_svc_route_node(ctx, url_or_topic, svc, method, broker);
-    char esc_callee[CG_SZ_256];
-    char esc_url[CG_SZ_256];
-    cg_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
-    cg_json_escape(esc_url, sizeof(esc_url), url_or_topic);
-    char props[CG_SZ_512];
-    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s}", esc_callee,
-             esc_url, method ? ",\"method\":\"" : "", method ? method : "", method ? "\"" : "",
-             broker ? ",\"broker\":\"" : "", broker ? broker : "");
-    if (broker) {
-        size_t plen = strlen(props);
-        if (plen > 0 && props[plen - SKIP_ONE] != '}') {
-            snprintf(props + plen - 1, sizeof(props) - plen + SKIP_ONE, "\"}");
-        }
-    }
-    calls_emit_edge(ctx->gbuf, source->id, route_id, edge_type, props, sizeof(props), call);
-}
-
-/* Classify a resolved call and emit the appropriate edge. */
-static void emit_classified_edge(cg_pipeline_ctx_t *ctx, const CGCall *call,
-                                 const cg_gbuf_node_t *source, const cg_gbuf_node_t *target,
-                                 const cg_resolution_t *res, const char *module_qn,
-                                 const char **imp_keys, const char **imp_vals, int imp_count) {
-    cg_svc_kind_t svc = cg_service_pattern_match(res->qualified_name);
-    if (svc == CG_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
-        handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
-        return;
-    }
-    if (svc == CG_SVC_HTTP || svc == CG_SVC_ASYNC) {
-        emit_http_async_edge(ctx, call, source, target, res, svc);
-        return;
-    }
-    if (svc == CG_SVC_CONFIG) {
-        char esc_c[CG_SZ_256];
-        char esc_k[CG_SZ_256];
-        cg_json_escape(esc_c, sizeof(esc_c), call->callee_name);
-        cg_json_escape(esc_k, sizeof(esc_k), call->first_string_arg ? call->first_string_arg : "");
-        char props[CG_SZ_512];
-        snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"key\":\"%s\",\"confidence\":%.2f}",
-                 esc_c, esc_k, res->confidence);
-        calls_emit_edge(ctx->gbuf, source->id, target->id, "CONFIGURES", props, sizeof(props),
-                        call);
-        return;
-    }
-    char esc_c2[CG_SZ_256];
-    cg_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
-    char props[CG_SZ_512];
-    snprintf(props, sizeof(props),
-             "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
-             esc_c2, res->confidence, res->strategy ? res->strategy : "unknown",
-             res->candidate_count);
-    calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call);
-}
+/* Edge emission is NOT duplicated here. This pass used to carry its own
+ * reduced classifier (ROUTE_REG / HTTP / ASYNC / CONFIG only), which meant the
+ * graph's shape depended on which resolve path ran — and since the path is
+ * chosen purely by file count (>50), an ordinary one-file incremental re-index
+ * always landed here and silently dropped that file's gRPC / GraphQL / tRPC
+ * edges, skipped detect_url_in_args, used a narrower route-path rule, and
+ * emitted malformed JSON for ASYNC broker props. Both paths now emit through
+ * cg_pp_emit_service_edge (pass_parallel.c). */
 
 /* Find source node for a call: enclosing function or file node. */
 static const cg_gbuf_node_t *calls_find_source(cg_pipeline_ctx_t *ctx, const char *rel,
@@ -378,15 +232,36 @@ static int resolve_single_call(cg_pipeline_ctx_t *ctx, CGCall *call,
             res.confidence = lsp->confidence;
             res.strategy = lsp->strategy;
             res.candidate_count = 1;
-            emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
-                                 imp_vals, imp_count);
+            cg_pp_emit_service_edge(ctx->gbuf, source_node, target_node, call, &res, module_qn,
+                                     ctx->registry, ctx->gbuf, imp_keys, imp_vals, imp_count);
             return SKIP_ONE;
         }
     }
 
-    cg_resolution_t res = cg_registry_resolve(ctx->registry, call->callee_name, module_qn,
-                                                imp_keys, imp_vals, imp_count);
+    /* Enclosing-type scope lets `self.m()` / bare `m()` bind to THIS class's
+     * member rather than collapsing onto whichever same-named definition was
+     * registered first. Mirrors resolve_file_calls on the parallel path. */
+    char class_buf[CG_SZ_512];
+    const char *class_qn =
+        call->enclosing_func_qn
+            ? cg_pipeline_parent_qn(call->enclosing_func_qn, class_buf, sizeof(class_buf))
+            : NULL;
+    cg_resolution_t res = cg_registry_resolve_scoped(ctx->registry, call->callee_name, module_qn,
+                                                       class_qn, imp_keys, imp_vals, imp_count);
+
+    cg_pp_try_field_type_hint(ctx->registry, ctx->gbuf, &res, call->callee_name, source_node->id);
+
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
+        /* Route registration on an unresolved callee (app.include_router and
+         * friends) — same fallback the parallel path applies. */
+        if (cg_service_pattern_route_method(call->callee_name) != NULL) {
+            cg_resolution_t fake_res = {.qualified_name = call->callee_name,
+                                         .confidence = PC_HALF_CONF,
+                                         .strategy = "callee_suffix"};
+            cg_pp_emit_service_edge(ctx->gbuf, source_node, source_node, call, &fake_res,
+                                     module_qn, ctx->registry, ctx->gbuf, imp_keys, imp_vals,
+                                     imp_count);
+        }
         return 0;
     }
 
@@ -406,8 +281,8 @@ static int resolve_single_call(cg_pipeline_ctx_t *ctx, CGCall *call,
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
-    emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
-                         imp_count);
+    cg_pp_emit_service_edge(ctx->gbuf, source_node, target_node, call, &res, module_qn,
+                             ctx->registry, ctx->gbuf, imp_keys, imp_vals, imp_count);
     return SKIP_ONE;
 }
 

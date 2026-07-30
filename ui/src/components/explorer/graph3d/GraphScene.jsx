@@ -1,150 +1,118 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
-import { Canvas, useThree, useFrame } from '@react-three/fiber';
+import { useState, useRef, useMemo } from 'react';
+import { Canvas } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
-import { EffectComposer, Bloom } from '@react-three/postprocessing';
-import * as THREE from 'three';
-import { NodeCloud } from './NodeCloud';
-import { EdgeLines } from './EdgeLines';
+import { StarPoints } from './stars/StarPoints';
+import { ArmEdges } from './edges/ArmEdges';
 import { NodeLabels } from './NodeLabels';
 import { NodeTooltip } from './NodeTooltip';
+import { CameraRig } from './CameraRig';
+import { PostFX } from './PostFX';
+import { useReducedMotion } from './useReducedMotion';
+import { Disc } from './galaxy/Disc';
+import { GalacticField } from './galaxy/GalacticField';
+import { Nebulae } from './galaxy/Nebulae';
+import { DustLanes } from './galaxy/DustLanes';
+import { Starfield } from './space/Starfield';
+import { DeepField } from './space/DeepField';
+import { DustMotes } from './space/DustMotes';
 
-// Camera fly-to animation
-
-function CameraAnimator({ target }) {
-  const { camera } = useThree();
-  const targetRef = useRef(null);
-  const progress = useRef(1);
-
-  useEffect(() => {
-    if (target) {
-      targetRef.current = target;
-      progress.current = 0;
-    }
-  }, [target]);
-
-  useFrame(() => {
-    if (!targetRef.current || progress.current >= 1) return;
-
-    progress.current = Math.min(1, progress.current + 0.02);
-    const t = 1 - Math.pow(1 - progress.current, 3); // ease-out cubic
-
-    camera.position.lerp(targetRef.current.position, t * 0.08);
-    camera.lookAt(targetRef.current.lookAt);
-  });
-
-  return null;
-}
-
-// Idle auto-rotation
-
-const IDLE_TIMEOUT_MS = 60_000;
-
-function IdleAutoRotate({ controlsRef }) {
-  const lastInteraction = useRef(null);
-
-  const resetTimer = useCallback(() => {
-    lastInteraction.current = Date.now();
-    if (controlsRef.current) {
-      controlsRef.current.autoRotate = false;
-    }
-  }, [controlsRef]);
-
-  useEffect(() => {
-    resetTimer();
-    const canvas = document.querySelector('canvas');
-    if (!canvas) return;
-
-    canvas.addEventListener('pointerdown', resetTimer);
-    canvas.addEventListener('wheel', resetTimer);
-    return () => {
-      canvas.removeEventListener('pointerdown', resetTimer);
-      canvas.removeEventListener('wheel', resetTimer);
-    };
-  }, [resetTimer]);
-
-  useFrame(() => {
-    if (!controlsRef.current || lastInteraction.current === null) return;
-    const idle = Date.now() - lastInteraction.current > IDLE_TIMEOUT_MS;
-    controlsRef.current.autoRotate = idle;
-  });
-
-  return null;
-}
-
-// Main scene
-
-export function GraphScene({ data, highlightedIds, cameraTarget, showLabels, onNodeClick }) {
+export function GraphScene({ data, galaxy, highlightedIds, cameraTarget, showLabels, showLinks, onNodeClick }) {
   const [hovered, setHovered] = useState(null);
   const controlsRef = useRef(null);
+  const discRef = useRef(null);
+  const reducedMotion = useReducedMotion();
+
+  const R = galaxy?.R ?? 1200;
+
+  // Scale the decorative field with how much code there actually is. A full
+  // 90k-particle galaxy painted over a 13-node index would imply a large
+  // codebase that does not exist — the scenery must not overstate the data.
+  const fieldCount = useMemo(() => {
+    const n = galaxy?.nodes?.length ?? 0;
+    return Math.round(Math.max(2500, Math.min(90000, n * 45)));
+  }, [galaxy]);
+
+  // Adjacency built once per dataset so hovering can resolve a node's
+  // neighbours without scanning every edge on each pointer move.
+  const adjacency = useMemo(() => {
+    const m = new Map();
+    for (const e of data.edges) {
+      let a = m.get(e.source); if (!a) m.set(e.source, (a = new Set()));
+      a.add(e.target);
+      let b = m.get(e.target); if (!b) m.set(e.target, (b = new Set()));
+      b.add(e.source);
+    }
+    return m;
+  }, [data.edges]);
+
+  const hoverIds = useMemo(() => {
+    if (!hovered) return null;
+    const s = new Set([hovered.id]);
+    for (const id of adjacency.get(hovered.id) ?? []) s.add(id);
+    return s;
+  }, [hovered, adjacency]);
+
+  // folder index -> hue, so intra-arm edges can take their segment's colour.
+  const folderHues = useMemo(() => {
+    const out = {};
+    for (const f of galaxy?.folders ?? []) out[f.index] = f.hue;
+    return out;
+  }, [galaxy]);
 
   return (
     <Canvas
-      camera={{ position: [0, 0, 800], fov: 50, near: 0.1, far: 100000 }}
+      camera={{ position: [0, 0, 800], fov: 55, near: 1, far: 250000 }}
       style={{ background: '#06090f' }}
       dpr={[1, 2]}
       gl={{ antialias: true, alpha: false }}
     >
       <color attach="background" args={['#06090f']} />
-      <ambientLight intensity={0.5} />
-      <pointLight position={[500, 500, 500]} intensity={0.6} />
-      <pointLight position={[-300, -200, -300]} intensity={0.4} color="#6040ff" />
 
-      <EdgeLines nodes={data.nodes} edges={data.edges} highlightedIds={highlightedIds} />
-      <NodeCloud
-        nodes={data.nodes}
-        highlightedIds={highlightedIds}
-        onHover={setHovered}
-        onClick={onNodeClick}
-      />
-      {showLabels && <NodeLabels nodes={data.nodes} highlightedIds={highlightedIds} />}
+      {/* Deep space. Outside the rotating disc: the sky must not spin with
+          the galaxy. */}
+      <Starfield />
+      <DeepField />
+      <DustMotes />
 
-      {/* Satellite galaxies for cross-repo linked projects */}
-      {data.linked_projects?.map((lp) => {
-        const offsetNodes = lp.nodes.map((n) => ({
-          ...n,
-          x: n.x + lp.offset.x,
-          y: n.y + lp.offset.y,
-          z: n.z + lp.offset.z,
-        }));
-        return (
-          <group key={lp.project}>
-            <EdgeLines nodes={offsetNodes} edges={lp.edges} highlightedIds={null} opacity={0.3} />
-            <NodeCloud
-              nodes={offsetNodes}
-              highlightedIds={null}
-              onHover={setHovered}
-              onClick={onNodeClick}
-              opacity={0.5}
-            />
-            {/* Inter-galaxy CROSS_* edges: source is in primary, target in
-             * this linked project's offset nodes. */}
-            {lp.cross_edges && lp.cross_edges.length > 0 && (
-              <EdgeLines
-                nodes={data.nodes}
-                targetNodes={offsetNodes}
-                edges={lp.cross_edges}
-                highlightedIds={highlightedIds}
-                opacity={0.85}
-              />
-            )}
-          </group>
-        );
-      })}
-
-      {hovered && <NodeTooltip node={hovered} />}
-
-      <CameraAnimator target={cameraTarget} />
-      <IdleAutoRotate controlsRef={controlsRef} />
-
-      <EffectComposer>
-        <Bloom
-          luminanceThreshold={0.3}
-          luminanceSmoothing={0.7}
-          intensity={1.2}
-          mipmapBlur
-          radius={0.6}
+      {/* Everything the layout positions rides the rotating disc, so its
+          geometry stays static in local space. */}
+      {/* Render order inside the disc is load-bearing:
+          edges (0) -> gas (1) -> dust lanes (2) -> stars (3). See DustLanes
+          for why the lanes sit between the gas and the stars. */}
+      <Disc ref={discRef} paused={reducedMotion}>
+        {/* The luminous sheet the whole illusion rests on. Drawn first so the
+            dust lanes have something to silhouette against. */}
+        <GalacticField galaxy={galaxy} count={fieldCount} />
+        <ArmEdges
+          nodes={data.nodes}
+          edges={data.edges}
+          highlightedIds={highlightedIds}
+          hoverIds={hoverIds}
+          folderHues={folderHues}
+          R={R}
+          showAmbient={showLinks}
         />
-      </EffectComposer>
+        <Nebulae galaxy={galaxy} />
+        <DustLanes galaxy={galaxy} />
+        <StarPoints
+          nodes={data.nodes}
+          highlightedIds={highlightedIds}
+          onHover={setHovered}
+          onClick={onNodeClick}
+        />
+        {showLabels && <NodeLabels nodes={data.nodes} highlightedIds={highlightedIds} />}
+        {hovered && <NodeTooltip node={hovered} />}
+      </Disc>
+
+      <CameraRig
+        target={cameraTarget}
+        nodes={data.nodes}
+        discRef={discRef}
+        controlsRef={controlsRef}
+        R={R}
+      />
+
+      <PostFX />
 
       <OrbitControls
         ref={controlsRef}
@@ -152,9 +120,8 @@ export function GraphScene({ data, highlightedIds, cameraTarget, showLabels, onN
         dampingFactor={0.08}
         rotateSpeed={0.5}
         zoomSpeed={1.5}
-        minDistance={10}
-        maxDistance={50000}
-        autoRotateSpeed={0.4}
+        minDistance={5}
+        maxDistance={R * 8}
       />
     </Canvas>
   );

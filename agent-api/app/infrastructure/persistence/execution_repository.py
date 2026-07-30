@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
 from sqlalchemy import select, delete
+from sqlalchemy.orm import defer
 
 from app.core.database import AsyncSessionLocal
 from app.infrastructure.persistence.base import BaseAsyncRepository
@@ -228,12 +229,37 @@ class ExecutionRepository(BaseAsyncRepository):
             for row in rows
         ]
 
-    async def list_all(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """List all executions (newest first)."""
-        executions = await self._all(
-            select(ExecutionModel).order_by(ExecutionModel.started_at.desc()).limit(limit)
+    async def list_all(
+        self,
+        limit: int = 100,
+        *,
+        exclude_chat: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """List executions (newest first), optionally excluding chat turns.
+
+        ``exclude_chat`` filters to real workflow runs (``chat_session_id IS
+        NULL``) in SQL. Every chat message reuses the same execute path as a
+        scheduled run, so without this the newest N rows are dominated by chat
+        turns and a caller that filters client-side ends up computing over a
+        near-empty remnant of the window it asked for.
+
+        The heavy ``input`` / ``logs`` / ``trajectory`` JSONB columns are
+        deferred — a list view renders none of them, and ``trajectory`` alone
+        can carry a whole agent tool-call trace per row. ``output`` is loaded
+        because the list surfaces run errors from it. Rows returned here are
+        therefore "lean": use :meth:`get_by_id` when the full record is needed.
+        """
+        stmt = select(ExecutionModel).options(
+            defer(ExecutionModel.input),
+            defer(ExecutionModel.logs),
+            defer(ExecutionModel.trajectory),
         )
-        return [self._execution_to_dict(e) for e in executions]
+        if exclude_chat:
+            stmt = stmt.where(ExecutionModel.chat_session_id.is_(None))
+        executions = await self._all(
+            stmt.order_by(ExecutionModel.started_at.desc()).limit(limit)
+        )
+        return [self._execution_to_dict(e, lean=True) for e in executions]
     
     async def save(self, execution_data: Dict[str, Any]) -> Dict[str, Any]:
         """Save (insert or update) an execution record.
@@ -499,12 +525,26 @@ class ExecutionRepository(BaseAsyncRepository):
             await session.commit()
             return result.rowcount
     
-    def _execution_to_dict(self, execution: ExecutionModel) -> Dict[str, Any]:
-        """Convert execution model to dictionary."""
+    def _execution_to_dict(
+        self, execution: ExecutionModel, *, lean: bool = False
+    ) -> Dict[str, Any]:
+        """Convert execution model to dictionary.
+
+        ``lean`` omits the ``input`` and ``logs`` blobs. It is not merely a
+        payload trim: :meth:`list_all` DEFERS those columns, and touching a
+        deferred attribute on an async session raises ``MissingGreenlet``
+        rather than silently lazy-loading. Any caller that defers a column
+        must pass ``lean=True``.
+        """
         started = execution.started_at.isoformat() if execution.started_at else None
         completed = execution.completed_at.isoformat() if execution.completed_at else None
         duration_secs = (execution.duration_ms / 1000) if execution.duration_ms else None
+        heavy: Dict[str, Any] = {} if lean else {
+            "input": execution.input,
+            "logs": execution.logs,
+        }
         return {
+            **heavy,
             "id": execution.id,
             "execution_id": str(execution.id),      # alias for Dashboard
             "workflow_id": execution.workflow_id,
@@ -517,13 +557,11 @@ class ExecutionRepository(BaseAsyncRepository):
             "end_time": completed,                    # alias used by Dashboard
             "duration_ms": execution.duration_ms,
             "duration": duration_secs,               # seconds, used by Dashboard
-            "input": execution.input,
             # Expose node results under both 'output' (DB name) and 'results'/'result'
             "output": execution.output,
             "results": execution.output,             # alias for _extract_workflow_output
             "result": execution.output,              # alias for Dashboard detail view
             "error": execution.error,
-            "logs": execution.logs,
             # Token telemetry — preserved so the UI token panel keeps working
             "input_tokens": getattr(execution, "input_tokens", 0) or 0,
             "output_tokens": getattr(execution, "output_tokens", 0) or 0,

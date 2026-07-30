@@ -3,11 +3,21 @@ import { Component } from 'react';
 export class ErrorBoundary extends Component {
   constructor(props) {
     super(props);
-    this.state = { hasError: false, error: null };
+    this.state = { hasError: false, error: null, resetKey: props.resetKey };
   }
 
   static getDerivedStateFromError(error) {
     return { hasError: true, error };
+  }
+
+  // Clear a latched error whenever the thing being rendered changes — a new
+  // repo, or a hot-module update. Without this, one transient failure leaves a
+  // dead panel until the user finds the Retry button.
+  static getDerivedStateFromProps(props, state) {
+    if (props.resetKey !== state.resetKey) {
+      return { hasError: false, error: null, resetKey: props.resetKey };
+    }
+    return null;
   }
 
   componentDidCatch(error, info) {

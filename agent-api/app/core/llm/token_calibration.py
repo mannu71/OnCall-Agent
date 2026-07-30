@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 _EWMA_ALPHA = 0.2   # weight of the newest sample
 _FACTOR_MIN = 0.7
 _FACTOR_MAX = 1.6
+# Smallest factor movement worth paying a full estimate-cache rebuild for. At
+# chars/4 scale a delta this size shifts a 100K-token estimate by <100 tokens —
+# far inside the heuristic's own error — so absorbing it costs nothing and keeps
+# the memo warm.
+_FACTOR_EPS = 0.001
 
 _lock = threading.Lock()
 _factors: Dict[str, float] = {}   # model -> clamped EWMA factor
@@ -43,6 +48,21 @@ def _clamp(x: float) -> float:
     return max(_FACTOR_MIN, min(_FACTOR_MAX, x))
 
 
+def _invalidate_estimate_cache() -> None:
+    """Drop compaction's per-message estimate memo.
+
+    That memo caches the OUTPUT of ``_estimate_tokens``, which is scaled by the
+    factor this module owns — so every cached value goes stale the moment a
+    factor moves. Imported lazily: compaction reads ``current_factor`` the same
+    way, and a module-level import either direction would be a cycle.
+    """
+    try:
+        from app.core.context.compaction import reset_estimate_cache
+        reset_estimate_cache()
+    except Exception:  # noqa: BLE001 — calibration must never break estimation
+        pass
+
+
 def record(model: Optional[str], estimated_tokens: int, actual_tokens: int) -> None:
     """Fold one (estimated, actual) prompt-token observation into a model's EWMA.
 
@@ -56,8 +76,19 @@ def record(model: Optional[str], estimated_tokens: int, actual_tokens: int) -> N
     with _lock:
         prev = _factors.get(key)
         blended = ratio if prev is None else (1 - _EWMA_ALPHA) * prev + _EWMA_ALPHA * ratio
-        _factors[key] = _clamp(blended)
+        new_factor = _clamp(blended)
+        model_switched = _last_model != key
+        _factors[key] = new_factor
         _last_model = key
+
+    # Only drop the memo when the factor it feeds ACTUALLY moved. This is called
+    # once per model turn, and the memo it clears is what keeps history
+    # estimation linear — blanket-invalidating here made every turn re-walk the
+    # whole transcript, reinstating the O(N^2) the memo exists to prevent. Once
+    # the EWMA converges, successive factors differ by far less than _FACTOR_EPS
+    # and the memo survives, so calibration costs one arithmetic update a turn.
+    if model_switched or prev is None or abs(new_factor - prev) >= _FACTOR_EPS:
+        _invalidate_estimate_cache()
 
 
 def factor_for(model: Optional[str]) -> float:
@@ -84,6 +115,7 @@ def reset() -> None:
     with _lock:
         _factors.clear()
         _last_model = None
+    _invalidate_estimate_cache()
 
 
 __all__ = ["is_enabled", "record", "factor_for", "current_factor", "reset"]

@@ -24,6 +24,13 @@ import { LazyMarkdown } from '../components/markdown/LazyMarkdown.jsx';
 import { cleanLlmText } from '../components/markdown/markdownUtils.js';
 
 const DAY_MS = 86400000;
+// Rows pulled for the stats tiles. They compare the last 24h against the
+// preceding 24-48h, so the fetch has to reach at least two days back; at 100
+// rows a busy day pushed the older window off the end and the trend read as
+// null. Chat turns are excluded server-side, so this budget is spent entirely
+// on real workflow runs, and the rows come back without their input/logs
+// blobs. Capped by the API at 500.
+const STATS_ROW_BUDGET = 500;
 
 /** @param {string} [s] "HH:mm" */
 function parseHmToMinutes(s) {
@@ -316,12 +323,19 @@ export default function Dashboard() {
 
   const loadExecutions = useCallback(async () => {
     try {
-      const history = await agentApiClient.listAllExecutions(100);
       // Every chat message reuses the same /workflows/{name}/execute endpoint
       // as a real scheduled/manual workflow run, so ad-hoc chat turns
       // (chat_session_id set) would otherwise flood "Recent runs" and skew
       // the stats tiles. Real workflow runs have chat_session_id == null.
-      setExecutions(history.filter(e => !e.chat_session_id));
+      //
+      // The exclusion happens in SQL: filtering client-side spent the row
+      // budget on chat turns first, so the tiles below — which compare the
+      // last 24h against the preceding 24-48h — were computed over whatever
+      // few workflow runs survived, and the older window was routinely empty.
+      const history = await agentApiClient.listAllExecutions(
+        STATS_ROW_BUDGET, { excludeChat: true },
+      );
+      setExecutions(history);
     } catch (error) {
       console.error('Error loading executions:', error);
     } finally {
@@ -1170,20 +1184,33 @@ export default function Dashboard() {
               const totalTok  = selectedRun?.total_tokens  || _agentTok?.total_tokens  || (inputTok + outputTok) || 0;
               if (!totalTok) return null;
 
-              // Bedrock/Anthropic report cache_read / cache_creation as SEPARATE,
-              // ADDITIVE counters — input_tokens is already the non-cached
-              // (full-price) portion, it is NOT inclusive of them. True total
-              // input actually processed = input + cache_read + cache_creation.
-              // cache_read bills at ~10% of fresh input; cache_creation bills at
-              // a premium (~125% for Anthropic models) for the write.
+              // cache_read / cache_creation are a SUBSET of input_tokens, NOT
+              // additive to it. Bedrock's raw wire counters ARE exclusive, but
+              // langchain_aws folds them back in (input = bedrock_input +
+              // cache_read + cache_write) and callbacks._parse_llm_output
+              // normalizes the raw branches to match — so everything reaching
+              // this page is inclusive. This block asserted the opposite and
+              // therefore showed the whole input as "non-cached", a hit rate
+              // against an input double-counted twice over, and a billed-equiv
+              // total ~4x too high. Verified against live Bedrock 2026-07-21;
+              // rates/derivation mirror app.core.observability.cache_metrics
+              // (RATE_CACHE_READ 0.1, RATE_CACHE_WRITE 1.25, fresh = input -
+              // read - write).
               const cacheReadTok = selectedRun?.cache_read_tokens || _agentTok?.cache_read_tokens || 0;
               const cacheCreationTok = selectedRun?.cache_creation_tokens || _agentTok?.cache_creation_tokens || 0;
-              const nonCachedTok = inputTok;
-              const trueInputTok = inputTok + cacheReadTok + cacheCreationTok;
-              const cacheHitPct = trueInputTok > 0 ? Math.round((cacheReadTok / trueInputTok) * 100) : 0;
-              const effInputTok = Math.round(inputTok + cacheReadTok * 0.1 + cacheCreationTok * 1.25);
-              const savedTok = Math.max(0, trueInputTok - effInputTok);
-              const savedPct = trueInputTok > 0 ? Math.round((savedTok / trueInputTok) * 100) : 0;
+              // Defensive, matching cache_metrics.cache_hit_rate: a row whose
+              // cache_read exceeds input came from an un-normalized (exclusive)
+              // source, so treat the counters as disjoint rather than emit a
+              // nonsense rate above 100% or a clamped-to-zero fresh figure.
+              const exclusiveData = cacheReadTok > inputTok;
+              const promptTok = exclusiveData
+                ? inputTok + cacheReadTok + cacheCreationTok
+                : inputTok;
+              const freshTok = Math.max(0, promptTok - cacheReadTok - cacheCreationTok);
+              const cacheHitPct = promptTok > 0 ? Math.round((cacheReadTok / promptTok) * 100) : 0;
+              const effInputTok = Math.round(freshTok + cacheReadTok * 0.1 + cacheCreationTok * 1.25);
+              const savedTok = Math.max(0, promptTok - effInputTok);
+              const savedPct = promptTok > 0 ? Math.round((savedTok / promptTok) * 100) : 0;
 
               return (
                 <div className="bg-white rounded-lg border border-slate-200 p-6">
@@ -1211,17 +1238,24 @@ export default function Dashboard() {
                   </div>
                   {cacheReadTok > 0 && (
                     <div className="mt-4 pt-4 border-t border-slate-100">
-                      <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-3">Input Breakdown</p>
-                      <div className="grid grid-cols-3 gap-4 text-center">
+                      <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-3">
+                        Input Breakdown — fresh + cache-read + cache-write = {promptTok.toLocaleString()} input
+                      </p>
+                      <div className="grid grid-cols-4 gap-4 text-center">
                         <div>
-                          <p className="text-xs font-medium text-slate-500 mb-1">Non-cached</p>
-                          <p className="text-lg font-bold text-amber-600">{nonCachedTok.toLocaleString()}</p>
+                          <p className="text-xs font-medium text-slate-500 mb-1">Fresh</p>
+                          <p className="text-lg font-bold text-amber-600">{freshTok.toLocaleString()}</p>
                           <p className="text-[10px] text-slate-400">full price</p>
                         </div>
                         <div>
                           <p className="text-xs font-medium text-slate-500 mb-1">Cache-read</p>
                           <p className="text-lg font-bold text-emerald-600">{cacheReadTok.toLocaleString()}</p>
                           <p className="text-[10px] text-slate-400">~10% price</p>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-slate-500 mb-1">Cache-write</p>
+                          <p className="text-lg font-bold text-sky-600">{cacheCreationTok.toLocaleString()}</p>
+                          <p className="text-[10px] text-slate-400">~125% price</p>
                         </div>
                         <div>
                           <p className="text-xs font-medium text-slate-500 mb-1">Effective</p>

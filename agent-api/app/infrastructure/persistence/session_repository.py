@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import delete, select, update
 
 from app.core.database import AsyncSessionLocal
+from app.core.observability.cache_metrics import cache_hit_rate
 from app.infrastructure.persistence.base import BaseAsyncRepository
 from app.models.db_models import ChatMessageModel, ChatSessionModel
 
@@ -121,7 +122,23 @@ class SessionRepository(BaseAsyncRepository):
                 delete(ChatSessionModel).where(ChatSessionModel.id == session_id)
             )
             await session.commit()
-            return result.rowcount > 0
+            deleted = result.rowcount > 0
+
+        # Stored tool results live in the LangGraph KV store, not this schema, so
+        # no FK cascades them. They are written WITHOUT a TTL — their lifetime is
+        # the session — which makes this purge the thing that keeps that promise
+        # true. Skipping it would leave raw production rows at rest indefinitely.
+        if deleted:
+            try:
+                from app.harness.tool_result_store import purge_session
+                await purge_session(session_id)
+            except Exception as exc:  # noqa: BLE001 — never fail a delete over cleanup
+                logger.warning(
+                    "session_repository: stored tool results for session %s were "
+                    "not purged (%s) — they will outlive the session",
+                    session_id, exc,
+                )
+        return deleted
 
     async def cleanup_empty(
         self,
@@ -312,6 +329,15 @@ class SessionRepository(BaseAsyncRepository):
             "total_output_tokens": row.total_output_tokens or 0,
             "total_cache_read_tokens": row.total_cache_read_tokens or 0,
             "total_cache_creation_tokens": row.total_cache_creation_tokens or 0,
+            # Lifetime prompt-cache efficiency for this session. Computed on
+            # read rather than stored so it can never drift from the counters
+            # it summarizes. Pure function — no WARNING here; the tripwire
+            # belongs on the run path (workflow.executor.result), not on every
+            # session list request.
+            "cache_hit_rate": cache_hit_rate(
+                row.total_input_tokens or 0,
+                row.total_cache_read_tokens or 0,
+            ),
         }
 
     @staticmethod

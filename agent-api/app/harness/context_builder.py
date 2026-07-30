@@ -49,12 +49,11 @@ def build_skill_map_block(skill_map: str) -> str:
     # adding a blocking-requirement clause to this block was measured and did not
     # stop the agent skipping a matching skill; placing "# Skills" AFTER the
     # capability sections in agent_builder is what actually binds it.
-    return (
-        "# Skill map\n"
-        f"Proven runbooks you can load, by name: {skill_map}\n"
-        "Call `search_skills(query)` to find the right one, then "
-        "`skill(skill=\"<name>\")` to load it; `/<name>` invokes directly."
-    )
+    # The how-to line that used to close this block ("call search_skills, then
+    # skill(...), /<name> invokes directly") is already in the cached "# Skills"
+    # section and in both tool descriptions. Here it was re-bought at full rate on
+    # every turn; the map only needs to carry the names.
+    return f"# Skill map\nLoadable runbooks, by name: {skill_map}"
 
 
 async def build_recall_query(
@@ -268,17 +267,19 @@ async def build_recall_query(
 def _assemble_within_budget(blocks: list, user_query: str, *, budget_tokens: int) -> str:
     """Prepend memory *blocks* (priority order) to the query within a token budget.
 
-    Greedily include whole blocks until the budget (chars/4 heuristic) is reached;
-    a partially-fitting block is truncated rather than dropped so the highest
-    item still contributes (bounded per-turn memory injection).
+    Greedily include whole blocks until the budget is reached; a partially-fitting
+    block is truncated rather than dropped so the highest item still contributes
+    (bounded per-turn memory injection). Sizing uses the shared calibrated
+    estimator so this budget agrees with compaction's.
     """
+    from app.core.llm.token_estimate import estimate_tokens
     augmented = user_query
     if not blocks:
         return augmented
     used = 0
     kept: list[str] = []
     for block in blocks:
-        cost = len(block) // 4
+        cost = estimate_tokens(block)
         if not budget_tokens or used + cost <= budget_tokens:
             kept.append(block)
             used += cost
@@ -290,6 +291,22 @@ def _assemble_within_budget(blocks: list, user_query: str, *, budget_tokens: int
     for block in reversed(kept):  # reversed → first block ends up on top
         augmented = f"{block}\n\n---\n\n{augmented}"
     return augmented
+
+
+#: How to work a pre-computed scan. This used to sit in the cached
+#: ``_CLOUDWATCH_SECTION`` — roughly half of it — and was paid on every CloudWatch
+#: run even though it only makes sense when a block was actually seeded, which is
+#: per-turn state the cached prefix cannot know. It rides with the block instead,
+#: so the two are never out of step and a run with no pre-computed scan pays zero.
+_PRECOMPUTED_CW_GUIDANCE = (
+    "[A deterministic log scan has ALREADY run for this turn. Its results — alarms, "
+    "anomalies, error patterns, any drill-down, and a data_quality coverage block — "
+    "are in the block below. Treat that as your starting evidence and do NOT re-run "
+    "the full scan. Use the live tools only to VERIFY or DRILL DEEPER into specific "
+    "findings: cloudwatch_search_logs (drill_down=true) for the raw events behind a "
+    "pattern or anomaly, cloudwatch_correlate_logs to trace one request across "
+    "groups, cloudwatch_discover_log_groups only if a referenced group is missing.]\n\n"
+)
 
 
 def seed_context_blocks(
@@ -309,7 +326,7 @@ def seed_context_blocks(
     cw_synthesis: str = ""
     if cw_context:
         block = cap_context_block("Pre-computed CloudWatch Analysis", cw_context)
-        augmented_query = f"{block}{augmented_query}"
+        augmented_query = f"{_PRECOMPUTED_CW_GUIDANCE}{block}{augmented_query}"
         try:
             if isinstance(cw_context, dict):
                 for _entry in cw_context.values():

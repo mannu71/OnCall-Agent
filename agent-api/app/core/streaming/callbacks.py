@@ -590,7 +590,26 @@ class TokenUsageCallback:
 
     @staticmethod
     def _parse_cache_tokens(response: Any, llm_output: Dict[str, Any]) -> tuple:
-        """Extract (cache_read, cache_creation) tokens across provider shapes."""
+        """Extract (cache_read, cache_creation) tokens across provider shapes.
+
+        ``cache_creation`` needs a workaround. langchain_aws >=1.6 builds
+        ``input_token_details`` from the Bedrock usage dict, and when the
+        response carries a per-TTL ``cacheDetails`` breakdown — which it does
+        whenever a TTL is set, and react_agent always sets ttl="1h" — it emits
+        the write under ``ephemeral_1h_input_tokens`` / ``ephemeral_5m_...``
+        and then explicitly sets ``cache_creation`` back to **0**
+        (bedrock_converse._parse_usage_metadata). So reading only
+        ``cache_creation`` reports zero writes forever, which is what made
+        cache-write cost invisible in every session to date.
+
+        Verified against live Bedrock (Claude Haiku 4.5, 2026-07-21):
+          call 1 (write): cache_read=0     cache_creation=0 ephemeral_1h=4962
+          call 2 (read):  cache_read=4962  cache_creation=0 ephemeral_1h absent
+        i.e. on this provider ``cacheDetails`` describes the WRITE, so the
+        ephemeral_* sum IS the creation count. Taking it only when the reported
+        ``cache_creation`` is falsy keeps this a no-op on providers that report
+        the field properly.
+        """
         usage = (llm_output or {}).get("usage", {}) or {}
         # Bedrock Converse usage / Anthropic usage key variants.
         read = (
@@ -613,23 +632,49 @@ class TokenUsageCallback:
                 ) or {}
                 read = read or details.get("cache_read", 0) or 0
                 create = create or details.get("cache_creation", 0) or 0
+                if not create:
+                    create = (
+                        (details.get("ephemeral_1h_input_tokens", 0) or 0)
+                        + (details.get("ephemeral_5m_input_tokens", 0) or 0)
+                    )
         return int(read or 0), int(create or 0)
 
     @staticmethod
     def _parse_llm_output(llm_output: Dict[str, Any]) -> tuple:
-        """Return (input_tokens, output_tokens) from provider llm_output dict."""
-        # ChatBedrockConverse: usage.inputTokens / outputTokens
+        """Return (input_tokens, output_tokens) from provider llm_output dict.
+
+        INPUT TOKENS ARE INCLUSIVE OF CACHE READ + WRITE. That is the standard
+        LangChain ``usage_metadata`` uses, and the fallback in ``_accumulate``
+        reads it straight from there, so the raw-provider branches below must
+        normalize to the same convention or the two paths silently disagree
+        about what ``input_tokens`` means.
+
+        Raw Bedrock reports them EXCLUSIVELY (``inputTokens`` counts neither),
+        so cache read+write are added back here. langchain_aws does exactly this
+        when it builds usage_metadata (``bedrock_converse._parse_usage_metadata``:
+        ``input_tokens = bedrock_input + cache_read + cache_write``). Anthropic's
+        raw shape is exclusive the same way.
+
+        Getting this backwards is not cosmetic: anything dividing cache_read by
+        input_tokens (see app.core.observability.cache_metrics) reports a wrong
+        hit rate in whichever direction the mismatch falls.
+        """
+        # ChatBedrockConverse: usage.inputTokens / outputTokens (exclusive)
         usage = llm_output.get("usage", {}) or {}
         if "inputTokens" in usage or "outputTokens" in usage:
             return (
-                usage.get("inputTokens",  0) or 0,
+                (usage.get("inputTokens", 0) or 0)
+                + (usage.get("cacheReadInputTokens", 0) or 0)
+                + (usage.get("cacheWriteInputTokens", 0) or 0),
                 usage.get("outputTokens", 0) or 0,
             )
 
-        # ChatAnthropic: usage.input_tokens / output_tokens
+        # ChatAnthropic: usage.input_tokens / output_tokens (also exclusive)
         if "input_tokens" in usage or "output_tokens" in usage:
             return (
-                usage.get("input_tokens",  0) or 0,
+                (usage.get("input_tokens", 0) or 0)
+                + (usage.get("cache_read_input_tokens", 0) or 0)
+                + (usage.get("cache_creation_input_tokens", 0) or 0),
                 usage.get("output_tokens", 0) or 0,
             )
 

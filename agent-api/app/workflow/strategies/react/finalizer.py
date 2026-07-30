@@ -15,8 +15,10 @@ from typing import Any, Dict, Optional
 
 from app.core import privacy
 from app.core.llm.model_metadata import window_size_for_model
+from app.core.observability.cache_metrics import billed_units
 from app.core.privacy.redact import redact
 from app.harness.context_builder import apply_synthesis_floor
+from app.harness.usage_ledger import drain_usage
 from app.workflow.strategies.react.learning import auto_learn
 from app.workflow.strategies.react.preflight import RunPlan
 
@@ -254,19 +256,62 @@ async def finalize(
     except Exception:  # noqa: BLE001
         pass
 
-    # Context-window usage (for the Chat UI's context bar): how full
-    # the model's context window is RIGHT NOW, based on this turn's
-    # true total input (fresh + cache_read + cache_creation — see
-    # agent_runner.py's TokenUsageCallback notes on why these three
-    # are additive, not overlapping). Current-turn fullness, not the
-    # session's cumulative spend (that's tracked separately per
-    # chat_sessions.total_* — see session_repository.append_message).
+    # Context-window usage (for the Chat UI's context bar): how full the
+    # model's context window is RIGHT NOW. Current-turn fullness, not the
+    # session's cumulative spend (that's chat_sessions.total_* — see
+    # session_repository.append_message).
+    #
+    # accum_input_tokens ALREADY includes cache_read + cache_creation, so it is
+    # the whole prompt on its own. This used to add all three together, which
+    # roughly DOUBLED the reported figure on a cache-warm turn (a session with
+    # input=119,839 / cache_read=91,825 reported 211,664 used) and drove the
+    # context bar toward 100% while the window was closer to half full.
+    # See app.core.observability.cache_metrics for the verification.
     _context_window_size = window_size_for_model(llm_config.get("model", ""))
-    _context_used_tokens = accum_input_tokens + accum_cache_read_tokens + accum_cache_creation_tokens
+    _context_used_tokens = accum_input_tokens
     _context_used_pct = (
         min(100, round(_context_used_tokens / _context_window_size * 100))
         if _context_window_size else 0
     )
+
+    # FINAL drain. Everything above (auto_learn, the grader, fact extraction)
+    # runs AFTER run_supervised has returned, and its own drains cannot see
+    # those calls. A plain `await` does not copy the context, so the ledger
+    # opened inside run_supervised is still the live one here — this is the last
+    # point at which a run's tokens can still be booked.
+    _post = drain_usage()
+    if not _post.empty():
+        accum_input_tokens += _post.input_tokens
+        accum_output_tokens += _post.output_tokens
+        accum_cache_read_tokens += _post.cache_read_tokens
+        accum_cache_creation_tokens += _post.cache_creation_tokens
+        logger_instance.info(
+            "finalizer: folded in %d post-loop auxiliary LLM call(s) "
+            "(input=%d output=%d) — %s",
+            _post.aux_calls, _post.input_tokens, _post.output_tokens,
+            _post.aux_breakdown(),
+            extra={"execution_id": execution_id},
+        )
+
+    # Cost-weighted view of the same counters. Raw totals are a poor
+    # optimization target — the four components differ by up to 50x in price —
+    # so this is what a cap/verbosity A/B should actually be judged on.
+    _cost = billed_units(
+        accum_input_tokens, accum_cache_read_tokens,
+        accum_cache_creation_tokens, accum_output_tokens,
+    )
+
+    # Merge the post-loop auxiliary rows into whatever the loop already reported.
+    _aux_rows = list(result.get("auxiliary_usage", []) or [])
+    for _row in _post.aux_breakdown():
+        _match = next((r for r in _aux_rows if r["source"] == _row["source"]), None)
+        if _match is None:
+            _aux_rows.append(dict(_row))
+        else:
+            _match["calls"] += _row["calls"]
+            _match["input_tokens"] += _row["input_tokens"]
+            _match["output_tokens"] += _row["output_tokens"]
+    _aux_rows.sort(key=lambda r: r["input_tokens"], reverse=True)
 
     # terminal_state was derived above (before auto_learn, which consumes it).
     return {
@@ -294,6 +339,14 @@ async def finalize(
         "context_window_size": _context_window_size,
         "context_used_tokens": _context_used_tokens,
         "context_used_pct": _context_used_pct,
+        "billed_units": _cost["billed_units"],
+        "billed_breakdown": _cost["billed_breakdown"],
+        "billed_shares": _cost["billed_shares"],
+        # Per-subagent attribution, auxiliary (non-agent) LLM calls, and
+        # compression outcomes, when the run produced any.
+        "subagent_usage": result.get("subagent_usage", []),
+        "auxiliary_usage": _aux_rows,
+        "compression_stats": result.get("compression_stats", {}),
     }
 
 

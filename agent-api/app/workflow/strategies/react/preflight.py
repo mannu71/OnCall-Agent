@@ -93,6 +93,11 @@ class RunPlan:
     # re-invocation guard. Kept separate from the live ``invoked_skills`` sink so
     # a retried attempt doesn't inherit the previous attempt's model-loaded names.
     slash_preloaded_skills: List[str] = field(default_factory=list)
+    # The chat session this run belongs to, or None for a one-shot/API run.
+    # Scopes durable tool-result storage (app.harness.tool_result_store) and is
+    # NOT derivable downstream: ``thread_id`` is the execution id, a fresh value
+    # every turn. A run without one is never replayed, so it stores nothing.
+    chat_session_id: Optional[str] = None
 
 
 @dataclass
@@ -448,15 +453,23 @@ async def build_run_plan(
     # absolute date (which produced out-of-retention CloudWatch queries). This is
     # per-run data, so it belongs in the query — NEVER the cache-stable system
     # prompt (see agent_builder.compose_system_prompt cache contract).
-    from datetime import datetime as _dt, timezone as _tz
-    _now = _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    augmented_query = (
-        f"[Context] The current date and time is {_now} (UTC). Resolve any "
-        "relative time window (e.g. 'past 24 hours', 'last week', 'yesterday') "
-        "from this — never guess dates. For log/metric queries, prefer a relative "
-        "window (e.g. hours_back) over absolute timestamps when the tool offers "
-        "one.\n\n" + augmented_query
+    #
+    # Only when a time-windowed tool is actually bound. This shipped
+    # unconditionally at full per-turn rate (no cache discount), but an agent with
+    # no log/metric tools has no relative window to resolve — there is nothing the
+    # anchor can steer. The window-preference sentence is likewise only meaningful
+    # to a tool that offers hours_back.
+    _has_time_tools = any(
+        str(getattr(_t, "name", "") or "").startswith("cloudwatch_") for _t in tools
     )
+    if _has_time_tools:
+        from datetime import datetime as _dt, timezone as _tz
+        _now = _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        augmented_query = (
+            f"[Context] Now is {_now} (UTC) — resolve any relative time window from "
+            "this, never guess dates. Prefer a relative window (e.g. hours_back) over "
+            "absolute timestamps when the tool offers one.\n\n" + augmented_query
+        )
 
     # Prepend any pre-computed analysis blocks the executor seeded
     # (CloudWatch synthesis, code analysis, anomaly↔code correlation).
@@ -486,9 +499,31 @@ async def build_run_plan(
     # ``_invoked_skills`` sink records which skills the model actually loads,
     # for the post-run UI badge — searching isn't invoking, so only the ``skill``
     # tool feeds it.
+    #
+    # Gated on the library actually having something in it. The tools used to
+    # bind on the flag alone, so an empty library still made ``skill`` a bound
+    # tool — which turns on the whole "# Skills" section in the cached prompt
+    # (plus the STEP ZERO routing clause and both tool schemas, ~490 tokens).
+    # That text asserts "the user turn carries a 'Skill map'" and calls loading a
+    # skill "a blocking requirement", while ``build_map`` returns "" for an empty
+    # library so no map is ever injected. Binding on content instead of intent
+    # makes the whole feature appear the moment a SKILL.md exists and cost
+    # nothing until then.
     if getattr(settings, "skill_tool_enabled", True):
         try:
+            from app.core.skills import get_default_skill_manager
             from app.harness.skill_tools import build_skill_search_tool, build_skill_tool
+            _invocable = get_default_skill_manager().model_invocable_names(_allowed_skills)
+        except Exception as _skill_scan_err:  # noqa: BLE001 — never block a run
+            logger_instance.warning(
+                "ReactStrategy: skill library scan failed, skipping skill tools (%s)",
+                redact(str(_skill_scan_err)), extra={"execution_id": execution_id},
+            )
+            _invocable = set()
+    else:
+        _invocable = set()
+    if _invocable:
+        try:
             tools = list(tools) + [
                 build_skill_search_tool(
                     allowed_skills=_allowed_skills,
@@ -517,6 +552,7 @@ async def build_run_plan(
         code_analyzer_config=code_analyzer_config,
         execution_id=execution_id,
         logger_instance=logger_instance,
+        chat_session_id=_chat_session_id,
     )
     # Metamemory: hydrate this execution's VFS from the chat session's
     # persisted metamemory (opt-in, postgres-backend only — a no-op
@@ -565,11 +601,11 @@ async def build_run_plan(
         has_cloudwatch=bool(cloudwatch_config),
         has_code_analyzer=bool(code_analyzer_config),
         session_id=execution_id,
-        # ``spec.memory`` = the agent has a learnable SEMANTIC memory (drives the
-        # prompt affordance + post-run capture in the finalizer). Pinned/KB/session
-        # tiers inject as context independently and don't need this flag. For a
-        # back-compat node (all tiers) or no node this matches the old signal, so
-        # the cached system prompt is byte-identical for existing workflows.
+        # ``spec.memory`` = the agent has a learnable SEMANTIC memory. Its only
+        # consumer is the post-run capture in the finalizer — there is no memory
+        # section in the system prompt, so the "prompt affordance" this comment
+        # used to claim does not exist. Pinned/KB/session tiers inject as context
+        # independently and don't need this flag.
         has_memory=memory_config.has("semantic"),
         logger_instance=logger_instance,
     )
@@ -602,6 +638,7 @@ async def build_run_plan(
         # At this point only /slash names are in _invoked_skills (the model
         # hasn't run yet); snapshot them for the guard seed.
         slash_preloaded_skills=list(_invoked_skills),
+        chat_session_id=_chat_session_id,
     )
 
 

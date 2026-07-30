@@ -40,6 +40,21 @@ class ActionSpace:
     playbook_tool_count: int
 
 
+def _auto_learn_enabled(agent_config: Dict[str, Any]) -> bool:
+    """The Agent node's Auto-learn toggle (same parse as ``spec_factory``).
+
+    One source of truth for the toggle: it gates the post-run learning pass
+    (``finalizer``), the KB-writer tools, and the prompt bullet that tells the
+    agent to call ``save_playbook``.
+    """
+    try:
+        from app.harness.spec_factory import resolve_profile_fields
+        return bool(resolve_profile_fields(agent_config or {}).get("auto_learn"))
+    except Exception as exc:  # noqa: BLE001 — never break a build on a config read
+        logger.warning("ReactAgent: auto_learn read failed (%s); defaulting off", exc)
+        return False
+
+
 def prepare_action_space(
     llm: Any,
     tools: List[Any],
@@ -49,15 +64,18 @@ def prepare_action_space(
     session_id: Optional[str] = None,
     execution_port: Any = None,
     policies: Optional[List[Dict[str, Any]]] = None,
+    auto_learn: bool = True,
 ) -> ActionSpace:
     """Governance (policy engine) + provider-aware prompt caching.
 
     Appends agent-writable playbook tools, applies the declarative policy engine
     (single evaluation point), and binds provider-native prompt caching
     (Bedrock ``cachePoint`` / Anthropic ``cache_control`` blocks).
+
+    ``auto_learn`` gates the KB writers — see :func:`build_playbook_tools`.
     """
     # Add agent-writable playbook tools so the agent can persist resolutions.
-    playbook_tools = build_playbook_tools()
+    playbook_tools = build_playbook_tools(auto_learn=auto_learn)
     all_tools = list(tools) + playbook_tools
 
     # ── Governance: declarative policy engine (single evaluation point) ───
@@ -109,16 +127,27 @@ def prepare_action_space(
         )
     elif _is_anthropic:
         from langchain_core.messages import SystemMessage
-        from app.core.llm.prompt_caching import split_system_prompt
-        head, tail = split_system_prompt(system_prompt)
-        blocks: list = [{"type": "text", "text": head, "cache_control": {"type": "ephemeral"}}]
-        if tail:
-            blocks.append({"type": "text", "text": tail})
-        prompt_arg = SystemMessage(content=blocks)
+        # The WHOLE system prompt is cacheable — compose_system_prompt is
+        # deterministic given agent_config (see its CACHE CONTRACT), and every
+        # per-run element (timestamp, [System notice] degradations, recalled
+        # memory, skill map) is deliberately routed into the user turn instead.
+        #
+        # This used to call split_system_prompt() to peel off a "volatile tail"
+        # at a \n<!--VOLATILE-->\n delimiter. Nothing ever inserted that
+        # delimiter, so the tail was always "" and the branch was unreachable —
+        # a safety net that looked real but caught nothing. Worse, it invited the
+        # assumption that volatile content could safely be appended here; it
+        # could not, and would have landed inside the cache boundary. Keeping the
+        # prompt cache-clean is enforced upstream in compose_system_prompt, which
+        # is the only place it can actually be enforced.
+        prompt_arg = SystemMessage(content=[{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }])
         logger.info(
-            "ReactAgent: Anthropic prompt caching ENABLED "
-            "(system_prompt=%d chars, volatile_tail=%d chars)",
-            len(head), len(tail),
+            "ReactAgent: Anthropic prompt caching ENABLED (system_prompt=%d chars)",
+            len(system_prompt),
         )
 
     return ActionSpace(
@@ -168,6 +197,7 @@ def build_agent(
         sandbox=sandbox,
         verify=verify,
         subagents=subagents,
+        auto_learn=_auto_learn_enabled(agent_config),
     )
     return _finish_build_agent(
         llm, tools, agent_config, system_prompt, agent_mode,
@@ -201,6 +231,7 @@ def _finish_build_agent(
         llm, tools, system_prompt,
         permission_mode=permission_mode, session_id=session_id,
         execution_port=execution_port, policies=policies,
+        auto_learn=_auto_learn_enabled(agent_config),
     )
     all_tools = action_space.all_tools
     model_for_agent = action_space.model_for_agent
@@ -344,17 +375,13 @@ def _finish_build_agent(
 
     if hitl_enabled and checkpointer is not None:
         from langchain_core.messages import AIMessage
-        from langgraph.graph import StateGraph, END
+        from langgraph.graph import StateGraph, END, MessagesState
         from langgraph.types import interrupt
 
         inner_agent = create_react_agent(
             model=model_for_agent, tools=all_tools, prompt=prompt_arg,
             pre_model_hook=pre_model_hook,
         )
-
-        async def _run_inner(state: Dict[str, Any]) -> Dict[str, Any]:
-            result = await inner_agent.ainvoke({"messages": state.get("messages", [])})
-            return {"messages": result["messages"]}
 
         def _hitl_synthesis(state: Dict[str, Any]) -> Dict[str, Any]:
             msgs = state.get("messages", [])
@@ -374,8 +401,30 @@ def _finish_build_agent(
                 return {"messages": [AIMessage(content=f"[HITL Rejected] {rejection_note}")]}
             return {}
 
-        builder: Any = StateGraph(dict)
-        builder.add_node("run_agent", _run_inner)
+        # ``MessagesState``, not ``dict``: a bare dict schema has no reducer, so
+        # every write to `messages` OVERWRITES the channel. That broke BOTH
+        # branches above:
+        #   approve → `_hitl_synthesis` returns {} (no write), so the final state
+        #             came back EMPTY — final_answer was "" and the approved
+        #             answer was discarded.
+        #   reject  → the single `[HITL Rejected]` note REPLACED the whole
+        #             transcript, leaving a one-message history.
+        # Neither raises, and reject still yielded the right final_answer
+        # (_serialize_agent_result reads the last terminal AIMessage), which is
+        # why this stayed invisible. MessagesState carries `add_messages`, so
+        # writes append; that reducer dedupes by message id, so the human turn is
+        # not duplicated. Covered by test_hitl_graph_preserves_transcript, which
+        # asserts message COUNTS — the answer alone never caught it.
+        #
+        # ``inner_agent`` goes in directly rather than wrapped in a function that
+        # calls .ainvoke() — the shared-state-schema subgraph form. Both sides key
+        # on `messages`, so the child reads/writes the parent's channel with no
+        # mapping code. This is a readability change ONLY: thread_id,
+        # recursion_limit and callbacks already reached the inner graph through
+        # LangChain's ambient runnable-config contextvar even when wrapped — the
+        # same mechanism subagent_factory.py nulls out to detach its children.
+        builder: Any = StateGraph(MessagesState)
+        builder.add_node("run_agent", inner_agent)
         builder.add_node("hitl_synthesis", _hitl_synthesis)
         builder.set_entry_point("run_agent")
         builder.add_edge("run_agent", "hitl_synthesis")

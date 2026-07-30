@@ -16,6 +16,7 @@
 #define CG_PIPELINE_H
 
 #include <stdbool.h>
+#include <stddef.h> /* size_t — cg_pipeline_parent_qn */
 #include <stdint.h>
 
 /* Forward declarations */
@@ -103,6 +104,12 @@ char *cg_pipeline_fqn_module(const char *project, const char *rel_path);
 /* Folder QN: project.dir.parts. Caller must free(). */
 char *cg_pipeline_fqn_folder(const char *project, const char *rel_dir);
 
+/* Parent scope QN: everything before the last dot segment.
+ * "proj.svc.UserService.save" → "proj.svc.UserService". Writes into `buf` and
+ * returns it, or NULL when `qn` has no parent segment or does not fit. Used to
+ * derive the enclosing-type scope of a call site from its enclosing_func_qn. */
+const char *cg_pipeline_parent_qn(const char *qn, char *buf, size_t cap);
+
 /* Resolve an import specifier that uses a relative path (./foo, ../bar, .foo,
  * or an unqualified local name like "foo.h") against the importing file's
  * path.  Returns a malloc'd normalized relative path without extension
@@ -144,6 +151,21 @@ cg_resolution_t cg_registry_resolve(const cg_registry_t *r, const char *callee_n
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count);
 
+/* Scope-aware resolve. `class_qn` is the QN of the type enclosing the call
+ * site (typically cg_pipeline_parent_qn(call->enclosing_func_qn)) or NULL.
+ * When it names a registered Class/Interface, two extra strategies fire:
+ *   1.5 self_scope  — `self.m()` / `this.m()` → that type's member (before
+ *                     same_module, so it can never bind to a module-level m)
+ *   2.5 class_scope — bare `m()` inside a type body → that type's member
+ *                     (after same_module, exact hits only)
+ * Without this, two classes in one file that share a method name both collapse
+ * onto whichever definition was registered first. Passing NULL reproduces the
+ * pre-existing behaviour exactly; cg_registry_resolve is that wrapper. */
+cg_resolution_t cg_registry_resolve_scoped(const cg_registry_t *r, const char *callee_name,
+                                            const char *module_qn, const char *class_qn,
+                                            const char **import_map_keys,
+                                            const char **import_map_vals, int import_map_count);
+
 /* Per-file memoization cache for is_import_reachable. Thread-local —
  * each resolve worker owns its own cache. Call _begin at the start
  * of resolve_file_calls (or any per-file resolve loop) and _end at
@@ -164,7 +186,10 @@ void cg_registry_import_map_cache_end(void);
  * is constant per file so each name resolves identically. First
  * lookup does the full strategy chain; repeats are O(1) hash hits.
  * This eliminates ~75% of the resolve-chain work on K8s where the
- * same names ("Get", "Add", "New", etc) appear hundreds of times. */
+ * same names ("Get", "Add", "New", etc) appear hundreds of times.
+ * NOTE: the cache key is (class_qn, callee_name), not callee_name
+ * alone — class_qn varies WITHIN a file, so a name-only key would
+ * force every class in a file to share one answer per callee. */
 void cg_registry_resolve_cache_begin(int estimated_capacity);
 void cg_registry_resolve_cache_end(void);
 

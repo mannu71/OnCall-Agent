@@ -1,6 +1,5 @@
 import React, { memo, lazy, Suspense } from 'react';
 import {
-  Loader2,
   XCircle,
   Brain,
   Wrench,
@@ -17,6 +16,7 @@ import { Badge } from '@/components/ui/badge';
 import PlanChecklist from '../markdown/PlanChecklist.jsx';
 import PrivacyInsightsPanel from '../privacy/PrivacyInsightsPanel.jsx';
 import AgentThread from './AgentThread.jsx';
+import AgentOrb from './AgentOrb.jsx';
 import CollapsibleSection from './CollapsibleSection.jsx';
 import { formatClock } from '../../lib/formatTime.js';
 
@@ -78,6 +78,14 @@ const ChatMessage = memo(function ChatMessage({
   const isUser = message.type === MESSAGE_TYPES.USER;
   const isSystem = message.type === MESSAGE_TYPES.SYSTEM;
   const textContent = message.content || message.text || '';
+  // Before the first token or tool call lands, an agent message holds nothing
+  // but the status pill — which draws its own rounded, bordered container. The
+  // bubble around it is then a second box around a box, so it is dropped until
+  // the message has real content to hold.
+  const isBareLoading = !isUser && message.isLoading && !textContent
+    && !(message.steps && message.steps.length > 0)
+    && !(message.todos && message.todos.length > 0)
+    && !message.structured;
 
   if (isSystem) {
     return (
@@ -106,9 +114,11 @@ const ChatMessage = memo(function ChatMessage({
         </div>
 
         <div
-          style={{ padding: 'var(--msg-pad)' }}
+          style={isBareLoading ? undefined : { padding: 'var(--msg-pad)' }}
           className={`w-full transition-all duration-300 leading-relaxed font-sans text-[13.5px] select-text ${
-            isUser
+            isBareLoading
+              ? 'text-slate-900 dark:text-slate-100'
+              : isUser
               ? 'bg-primary text-primary-foreground rounded-xl rounded-tr-sm shadow-sm shadow-primary/35'
               : 'bg-white text-slate-900 border border-black/[0.07] rounded-xl rounded-tl-sm shadow-[0_1px_2px_rgb(0_0_0/0.06)] dark:bg-[#1c1c1e] dark:text-slate-100 dark:border-white/10 dark:shadow-none'
           }`}
@@ -238,8 +248,13 @@ const ChatMessage = memo(function ChatMessage({
           )}
 
           {message.isLoading && (
-            <div className="mt-3 animate-in fade-in duration-300">
-              {message.statusHistory && message.statusHistory.length > 0 && (
+            <div className={cn('animate-in fade-in duration-300', !isBareLoading && 'mt-3')}>
+              {/* Once the timeline has rows it carries the same information in a
+                  better form — the status lines are literally "[agent] Calling
+                  <tool>…" for the calls already listed above — so the Reasoning
+                  panel only earns its space before the first tool call lands. */}
+              {message.statusHistory && message.statusHistory.length > 0
+                && !(message.steps && message.steps.length > 0) && (
                 <CollapsibleSection
                   icon={Brain}
                   title="Reasoning"
@@ -269,8 +284,11 @@ const ChatMessage = memo(function ChatMessage({
                 </CollapsibleSection>
               )}
               {!message.streaming && !(message.steps && message.steps.length > 0) && (
-                <div className="mt-2 flex items-center gap-2 bg-slate-50 dark:bg-white/[0.04] border border-slate-100 dark:border-white/10 rounded-lg p-2.5">
-                  <Loader2 className="size-4 animate-spin text-primary" />
+                <div className={cn(
+                  'flex items-center gap-2 bg-slate-50 dark:bg-white/[0.04] border border-slate-100 dark:border-white/10 rounded-lg p-2.5',
+                  !isBareLoading && 'mt-2',
+                )}>
+                  <AgentOrb hint={message.currentStatus?.message} size={20} />
                   <span className="text-xs text-slate-500 dark:text-slate-400 font-medium">
                     {message.currentStatus?.message || 'Executing agent workflows'}
                     <span className="chat-thinking-dots" />

@@ -118,14 +118,18 @@ def repair_tool_pairing(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def estimate_entry_tokens(entries: List[Dict[str, Any]]) -> int:
-    """Rough token estimate for trajectory-shaped dicts (chars/4 — consistent
-    with ``app.core.context.compaction._msg_token_estimate``)."""
+    """Rough token estimate for trajectory-shaped dicts.
+
+    Routes through :func:`app.core.llm.token_estimate.estimate_tokens` so chat
+    replay is sized on the same calibrated heuristic as history compaction.
+    """
+    from app.core.llm.token_estimate import estimate_tokens
     total = 0
     for entry in entries:
-        total += len(str(entry.get("content") or "")) // 4
+        total += estimate_tokens(str(entry.get("content") or ""))
         for tc in (entry.get("tool_calls") or []):
             if isinstance(tc, dict):
-                total += len(str(tc)) // 4
+                total += estimate_tokens(str(tc))
     return total
 
 

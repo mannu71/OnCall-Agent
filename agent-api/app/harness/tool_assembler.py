@@ -426,16 +426,25 @@ async def assemble_base_tools(
             from app.workflow.tools.codegraph_tools import build_codegraph_tools
             from app.workflow.tools.repo_file_tools import build_repo_file_tools
 
-            tools.extend(
-                await build_codegraph_tools(
-                    mcp_manager, repos=code_analyzer_config.get("repos")
-                )
+            _cg_tools = await build_codegraph_tools(
+                mcp_manager, repos=code_analyzer_config.get("repos")
             )
+            tools.extend(_cg_tools)
             tools.extend(build_repo_file_tools(repos=code_analyzer_config.get("repos")))
             logger_instance.info(
                 "ReactStrategy: code-analyzer backend=codegraph",
                 extra={"execution_id": execution_id},
             )
+            # build_codegraph_tools swallows an engine that won't start and
+            # returns [] (logged only), so this path produced no degrade note at
+            # all — the agent kept repo_grep/repo_read_file but lost every graph
+            # tool with nothing in the turn to say so.
+            if not _cg_tools:
+                degraded.append(
+                    "Code graph tools (symbol/graph/semantic search) are unavailable "
+                    "this turn — the codegraph engine did not start. File-level "
+                    "search and reads still work."
+                )
         except Exception as _cr_err:
             logger_instance.warning(
                 "ReactStrategy: failed to build code-analyzer tools (non-fatal): %s",
@@ -503,7 +512,7 @@ async def assemble_base_tools(
     # invokes tools on demand — instead of keyword-pruning the catalog (which
     # silently dropped tools the agent needed). Core families + operator-pinned
     # tools stay directly bound; small toolsets pass through unchanged. This
-    # supersedes the old tool_router.filter_tools prune.
+    # superseded the old keyword-prune (since removed).
     #
     # tool_exposure_mode="window" (opt-in) replaces the binary defer-everything-
     # or-nothing threshold gate with a per-assembly budget on the non-core tail
@@ -547,6 +556,7 @@ def add_extension_tools(
     code_analyzer_config: Optional[Dict[str, Any]],
     execution_id: Optional[str],
     logger_instance: Any,
+    chat_session_id: Optional[str] = None,
 ) -> List[Any]:
     """Append the LLM-dependent extension tools (delegate + edit), in place.
 
@@ -728,6 +738,46 @@ def add_extension_tools(
                 )
         except Exception as _vte:  # noqa: BLE001
             logger_instance.warning("ReactStrategy: verify tool skipped (%s)", _vte)
+
+    # Read-back for tool results persisted by app.harness.tool_result_store.
+    # Only useful when there IS a session to read from — a one-shot run stores
+    # nothing, so the tool would only ever return "not found". Its handles come
+    # from pointers in the replayed history, so this matters most on follow-up
+    # turns, where it is the difference between reading the prior turn's actual
+    # evidence and re-deriving it from scratch.
+    if chat_session_id:
+        try:
+            from langchain_core.tools import StructuredTool
+            from app.harness import tool_result_store as _trs
+
+            async def _read_tool_result(handle: str) -> str:
+                """Fetch the full text of a previously stored tool result."""
+                rec = await _trs.get(chat_session_id, (handle or "").strip())
+                if not rec:
+                    return (
+                        f"No stored tool result for handle '{handle}'. Handles come "
+                        "from '[stored tool result — …]' markers in this "
+                        "conversation and expire with the session. Re-run the "
+                        "original tool if you need the data."
+                    )
+                return str(rec.get("content") or "")
+
+            tools.append(StructuredTool.from_function(
+                coroutine=_read_tool_result,
+                name="read_tool_result",
+                description=(
+                    "Retrieve the FULL text of a tool result that was stored and "
+                    "summarised in this conversation. Pass the handle shown in a "
+                    "'[stored tool result — N chars; … read_tool_result(\"<handle>\")]' "
+                    "marker. Use it when a prior turn's evidence is truncated and "
+                    "you need the exact rows, IDs or lines rather than re-running "
+                    "the original tool."
+                ),
+            ))
+        except Exception as _rte:  # noqa: BLE001 — never block a run over this
+            logger_instance.warning(
+                "ReactStrategy: read_tool_result tool skipped (%s)", _rte
+            )
 
     # Automatic result offload (profile-gated on filesystem, off by default).
     # Applied LAST so it wraps every tool assembled above (base + code/edit +

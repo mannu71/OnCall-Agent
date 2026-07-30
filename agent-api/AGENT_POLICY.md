@@ -22,7 +22,7 @@ whether it applies.
 
 ## Rules
 
-## R-001 [tools: edit_file,create_file] Never edit or create a file without first reading it (fs_read / codegraph__get_code_snippet / repo_read_file) to confirm the change matches the actual current content — old_string must be copied verbatim, not reconstructed from memory.
+## R-001 [tools: edit_file,create_file] Never edit or create a file without first reading it (codegraph__get_code_snippet / repo_read_file) to confirm the change matches the actual current content — old_string must be copied verbatim, not reconstructed from memory.
 ## R-002 [tools: edit_file,create_file] After a successful edit, call run_verify (if available) before reporting the change as done — an edit that hasn't been verified is not a confirmed fix.
 ## R-003 [tools: cw_logs_insights,cloudwatch_search_logs] Always bound a Logs Insights / log-search query with an explicit time window — an unbounded query risks scanning far more data than the task needs.
 ## R-004 [tools: run_command] Treat sandboxed shell commands as untrusted by default — never pipe their raw output back into another shell command without inspecting it first.

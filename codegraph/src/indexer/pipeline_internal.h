@@ -445,6 +445,30 @@ int cg_parallel_resolve(cg_pipeline_ctx_t *ctx, const cg_file_info_t *files, int
                           * problem — pass_parallel.c casts back to CGCrossLspRegistries*. */
                          void *cross_registries);
 
+/* ── Shared call-edge emission (pass_parallel.c) ─────────────────
+ *
+ * Both resolve paths MUST emit through these so the graph does not depend on
+ * which one ran. Path selection is purely a file-count threshold (>50 files
+ * full / >50 changed files incremental), so an ordinary one-file re-index
+ * takes the sequential path — when it had its own reduced emitter, touching a
+ * file silently dropped that file's gRPC/GraphQL/tRPC edges until the next
+ * full re-index. */
+
+/* Classify a resolved call and emit the appropriate edge kind. `gbuf` receives
+ * the new nodes/edges; `main_gbuf` is read-only lookup (same buffer on the
+ * sequential path). */
+void cg_pp_emit_service_edge(cg_gbuf_t *gbuf, const cg_gbuf_node_t *source,
+                              const cg_gbuf_node_t *target, const CGCall *call,
+                              const cg_resolution_t *res, const char *module_qn,
+                              const cg_registry_t *registry, const cg_gbuf_t *main_gbuf,
+                              const char **imp_keys, const char **imp_vals, int imp_count);
+
+/* Upgrade an ambiguous obj.Method() resolution using the receiver name as a
+ * type hint (C# _field / m_field prefixes, ITypeName interfaces). Mutates
+ * `res` in place when a better candidate exists. */
+void cg_pp_try_field_type_hint(const cg_registry_t *registry, const cg_gbuf_t *gbuf,
+                                cg_resolution_t *res, const char *callee_name, int64_t source_id);
+
 /* Post-merge: create Route nodes for HTTP_CALLS/ASYNC_CALLS edges that
  * have url_path in properties but point to library functions instead of routes.
  * Re-targets these edges to Route nodes for cross-service traversal. */

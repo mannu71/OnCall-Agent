@@ -90,7 +90,7 @@ def _truncate_output(text: str, max_chars: int = MCP_TOOL_OUTPUT_MAX_CHARS) -> s
     return text[:max_chars] + suffix
 
 
-async def _compress_or_truncate(text: str) -> str:
+async def _compress_or_truncate(text: str, tool_name: str = "mcp") -> str:
     """Compress large tool output when enabled, then ALWAYS apply the char cap.
 
     Compression raises information density under the ``mcp_tool_output_max_chars``
@@ -98,8 +98,14 @@ async def _compress_or_truncate(text: str) -> str:
     on every subsequent ReAct iteration, so an uncapped (even compressed) result
     silently inflates input cost across the whole loop. ``compress_then_cap``
     guarantees the returned text is capped whether compression ran or not.
+
+    Pass the wrapper's REAL ``self.name``, not the "mcp" family label: it keys
+    both the per-tool stats and the uncompressible memo, and the families differ
+    sharply (measured 2026-07-23 — codegraph code output compresses 0%, a
+    JSON-returning MCP tool 52%). One shared key would let the former's misses
+    suppress compression for the latter.
     """
-    return await compress_then_cap(text, _truncate_output, tool_name="mcp")
+    return await compress_then_cap(text, _truncate_output, tool_name=tool_name)
 
 
 def _build_input_schema(tool_schema: Optional[Dict[str, Any]]) -> Type[BaseModel]:
@@ -192,8 +198,8 @@ class MCPToolWrapper(BaseTool):
     read_only_hint: Optional[bool] = None
     destructive_hint: Optional[bool] = None
     # True when this tool came from a node with an explicit tool filter set — an
-    # operator's deliberate allowlist. The relevance router must NOT prune these
-    # (the user already chose them); see app.harness.tool_router.filter_tools.
+    # operator's deliberate allowlist. Tool disclosure must NOT defer these
+    # (the user already chose them); see app.harness.tool_disclosure._is_core_tool.
     router_pinned: bool = False
     # Optional clean→canonical rewrite applied to the `project` arg before the
     # MCP call (e.g. codegraph's "compliance-api" → "app-data-indexed_repos-
@@ -287,9 +293,12 @@ class MCPToolWrapper(BaseTool):
                     parts.append(item.get("text", json.dumps(item)))
                 else:
                     parts.append(str(item))
-            return await _compress_or_truncate("\n".join(parts))
+            return await _compress_or_truncate("\n".join(parts), self.name)
 
-        return await _compress_or_truncate(str(content)) if content else "Tool executed successfully (no output)"
+        return (
+            await _compress_or_truncate(str(content), self.name)
+            if content else "Tool executed successfully (no output)"
+        )
 
 
 def build_langchain_tools(

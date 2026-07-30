@@ -57,8 +57,13 @@ const char *cg_confidence_band(double score) {
 /* Strategy 1: import_map — direct import → high confidence */
 #define CONF_IMPORT_MAP 0.95
 #define CONF_IMPORT_MAP_SUFFIX 0.85
+/* Strategy 1.5: self_scope — explicit self/this receiver → enclosing type's
+ * member. Guaranteed by language semantics, so it outranks everything else. */
+#define CONF_SELF_SCOPE 0.97
 /* Strategy 2: same_module — same file/package → high confidence */
 #define CONF_SAME_MODULE 0.90
+/* Strategy 2.5: class_scope — unqualified callee inside a type body */
+#define CONF_CLASS_SCOPE 0.88
 /* Strategy 3: unique_name — only one candidate project-wide */
 #define CONF_UNIQUE_NAME 0.75
 /* Strategy 4: suffix_match — multiple candidates, filtered */
@@ -132,16 +137,135 @@ static int common_prefix_len(const char *a, const char *b) {
 
 enum { REG_TEST_PENALTY = 1000 };
 
-/* Check if a qualified name looks like a test/mock path. */
+static char ascii_lower(char c) {
+    return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+}
+
+static bool seg_ieq(const char *seg, size_t len, const char *word) {
+    if (len != strlen(word)) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (ascii_lower(seg[i]) != ascii_lower(word[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool seg_iprefix(const char *seg, size_t len, const char *pre) {
+    size_t pl = strlen(pre);
+    if (len < pl) {
+        return false;
+    }
+    for (size_t i = 0; i < pl; i++) {
+        if (ascii_lower(seg[i]) != ascii_lower(pre[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool seg_isuffix(const char *seg, size_t len, const char *suf) {
+    size_t sl = strlen(suf);
+    if (len < sl) {
+        return false;
+    }
+    const char *tail = seg + (len - sl);
+    for (size_t i = 0; i < sl; i++) {
+        if (ascii_lower(tail[i]) != ascii_lower(suf[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* CamelCase marker: `seg` starts with `word` (case-SENSITIVE) and the next
+ * character begins a new word (uppercase) or the segment ends there. Keeps
+ * "TestHarness"/"MockClient" matching while rejecting "Testament". */
+static bool seg_camel_prefix(const char *seg, size_t len, const char *word) {
+    size_t wl = strlen(word);
+    if (len < wl || memcmp(seg, word, wl) != 0) {
+        return false;
+    }
+    if (len == wl) {
+        return true;
+    }
+    char next = seg[wl];
+    return (next >= 'A' && next <= 'Z') || next == '_';
+}
+
+/* Whole segments that mark a test/mock/fixture scope. */
+static const char *const TESTISH_EXACT[] = {
+    "test",  "tests", "testing", "testdata", "conftest", "spec",     "specs",   "mock",
+    "mocks", "mocking", "stub",  "stubs",    "fake",     "fakes",    "fixture", "fixtures",
+    "__tests__", "__mocks__", "e2e", NULL};
+/* Snake/kebab affixes — case-insensitive because the '_' already anchors them. */
+static const char *const TESTISH_PREFIX[] = {"test_", "tests_", "spec_", "mock_",
+                                             "stub_", "fake_",  NULL};
+static const char *const TESTISH_SUFFIX[] = {"_test", "_tests", "_spec", "_specs",
+                                             "_mock", "_stub",  "_fake", NULL};
+/* CamelCase affixes — case-SENSITIVE, so "latest"/"greatest"/"contest" (which
+ * all contain a lowercase "test") and "inspect"/"respect" (which contain
+ * "spec") are NOT demoted. That substring match was the old bug: it silently
+ * pushed ordinary symbols to the bottom of every ambiguous-candidate list. */
+static const char *const TESTISH_CAMEL_PREFIX[] = {"Test", "Mock", "Stub", "Fake", NULL};
+static const char *const TESTISH_CAMEL_SUFFIX[] = {"Test",  "Tests", "Spec",    "Specs",
+                                                   "Mock",  "Mocks", "Stub",    "Stubs",
+                                                   "Fake",  "Fakes", "Fixture", NULL};
+
+static bool is_testish_segment(const char *seg, size_t len) {
+    if (len == 0) {
+        return false;
+    }
+    for (const char *const *w = TESTISH_EXACT; *w; w++) {
+        if (seg_ieq(seg, len, *w)) {
+            return true;
+        }
+    }
+    for (const char *const *w = TESTISH_PREFIX; *w; w++) {
+        if (seg_iprefix(seg, len, *w)) {
+            return true;
+        }
+    }
+    for (const char *const *w = TESTISH_SUFFIX; *w; w++) {
+        if (seg_isuffix(seg, len, *w)) {
+            return true;
+        }
+    }
+    for (const char *const *w = TESTISH_CAMEL_PREFIX; *w; w++) {
+        if (seg_camel_prefix(seg, len, *w)) {
+            return true;
+        }
+    }
+    for (const char *const *w = TESTISH_CAMEL_SUFFIX; *w; w++) {
+        size_t wl = strlen(*w);
+        if (len > wl && memcmp(seg + (len - wl), *w, wl) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Check whether a qualified name lives in a test/mock scope.
+ * Segment-aware: each dot-separated segment is matched as a whole word or via
+ * an explicit affix, never as a bare substring. */
 static bool is_test_qn(const char *qn) {
     if (!qn) {
         return false;
     }
-    return (strstr(qn, "Test") != NULL || strstr(qn, "test") != NULL ||
-            strstr(qn, "Mock") != NULL || strstr(qn, "mock") != NULL ||
-            strstr(qn, "Stub") != NULL || strstr(qn, "stub") != NULL ||
-            strstr(qn, "Fake") != NULL || strstr(qn, "fake") != NULL ||
-            strstr(qn, "Fixture") != NULL || strstr(qn, "spec") != NULL);
+    const char *seg = qn;
+    for (;;) {
+        const char *dot = strchr(seg, '.');
+        size_t len = dot ? (size_t)(dot - seg) : strlen(seg);
+        if (is_testish_segment(seg, len)) {
+            return true;
+        }
+        if (!dot) {
+            return false;
+        }
+        seg = dot + SKIP_ONE;
+    }
 }
 
 /* Score a candidate for tiebreaking. Higher = better.
@@ -299,6 +423,22 @@ void cg_registry_resolve_cache_end(void) {
     _resolve_cache = NULL;
 }
 
+/* True when `b` equals `a` or is a dot-segment descendant of it ("a" vs "a.b").
+ * A raw prefix test would make "proj.user" match "proj.users"; requiring the
+ * next character to be a separator keeps the relation on segment boundaries. */
+static bool qn_prefix_or_equal(const char *a, const char *b) {
+    size_t la = strlen(a);
+    if (strncmp(a, b, la) != 0) {
+        return false;
+    }
+    return b[la] == '\0' || b[la] == '.';
+}
+
+/* Module A is reachable from module B when one is an ancestor of the other. */
+static bool modules_related(const char *a, const char *b) {
+    return qn_prefix_or_equal(a, b) || qn_prefix_or_equal(b, a);
+}
+
 /* Check if candidate's module prefix appears in import map values.
  * Uses stack buffer to avoid malloc/free per call in hot resolution loop.
  * Per-file memoization via TLS cache: repeated lookups of the same
@@ -328,7 +468,7 @@ static bool is_import_reachable(const char *candidate_qn, const char **import_va
     }
     bool reachable = false;
     for (int i = 0; i < import_count; i++) {
-        if (strstr(cand_mod, import_vals[i]) || strstr(import_vals[i], cand_mod)) {
+        if (modules_related(cand_mod, import_vals[i])) {
             reachable = true;
             break;
         }
@@ -605,6 +745,83 @@ static cg_resolution_t resolve_import_map(const cg_registry_t *r, const char *pr
     return empty_result();
 }
 
+/* ── Enclosing-type scope (strategies 1.5 / 2.5) ──────────────────
+ *
+ * A call site's enclosing TYPE is the strongest disambiguator available for
+ * the classic ambiguity case: two classes in one file, each with a method of
+ * the same name. Without it, `self.validate()` in UserService.save and in
+ * OrderService.save both fall through to bare-name scoring, which scores
+ * every same-name candidate identically (same module prefix, neither a test)
+ * and returns whichever was registered first — so BOTH call sites wire to the
+ * SAME validate(). That is the 0.50 precision ceiling; it has nothing to do
+ * with grammar versions.
+ *
+ * The scope is free: the caller already holds enclosing_func_qn
+ * ("proj.svc.UserService.save"); its parent segment is the type QN. The
+ * registry validates that the parent really is a Class/Interface before
+ * either strategy fires, so passing a module QN (top-level function) is a
+ * safe no-op. */
+
+/* Only a registered type is a meaningful scope for `self`/implicit-this. */
+static bool is_type_scope(const cg_registry_t *r, const char *qn) {
+    if (!r || !qn || !qn[0]) {
+        return false;
+    }
+    const char *label = cg_registry_label_of(r, qn);
+    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0);
+}
+
+/* Receiver tokens that denote "the enclosing instance/type" across languages. */
+static bool is_self_receiver(const char *prefix) {
+    if (!prefix || !prefix[0]) {
+        return false;
+    }
+    return strcmp(prefix, "self") == 0 || strcmp(prefix, "this") == 0 ||
+           strcmp(prefix, "Self") == 0 || strcmp(prefix, "$self") == 0 ||
+           strcmp(prefix, "_this") == 0;
+}
+
+/* Strategy 1.5: an explicit self/this receiver binds to the ENCLOSING TYPE's
+ * member. Must run BEFORE resolve_same_module, which would otherwise bind
+ * `self.validate()` to a module-level `validate` of the same name. */
+static cg_resolution_t resolve_self_scope(const cg_registry_t *r, const char *prefix,
+                                           const char *suffix, const char *class_qn) {
+    if (!suffix || !suffix[0] || !is_self_receiver(prefix) || !is_type_scope(r, class_qn)) {
+        return empty_result();
+    }
+    char candidate[CG_SZ_512];
+    snprintf(candidate, sizeof(candidate), "%s.%s", class_qn, suffix);
+    const char *stored_key = cg_ht_get_key(r->exact, candidate);
+    if (stored_key) {
+        return (cg_resolution_t){stored_key, "self_scope", CONF_SELF_SCOPE, REG_RESOLVED};
+    }
+    return empty_result();
+}
+
+/* Strategy 2.5: an UNQUALIFIED callee inside a type body binds to that type's
+ * member in every language with an implicit `this` (Java/C#/C++/Ruby/PHP/…).
+ * Runs AFTER same_module so a module-level definition still wins where that is
+ * the language rule (Python), and only on an EXACT hit — the alternative at
+ * this point is the arbitrary first-of-N pick in resolve_name_lookup.
+ * Deliberately restricted to bare names: for a qualified callee with a
+ * non-self receiver ("other.validate") the enclosing type says nothing. */
+static cg_resolution_t resolve_class_scope(const cg_registry_t *r, const char *callee_name,
+                                            const char *class_qn) {
+    if (!is_type_scope(r, class_qn)) {
+        return empty_result();
+    }
+    if (strchr(callee_name, '.') || strstr(callee_name, "::")) {
+        return empty_result();
+    }
+    char candidate[CG_SZ_512];
+    snprintf(candidate, sizeof(candidate), "%s.%s", class_qn, callee_name);
+    const char *stored_key = cg_ht_get_key(r->exact, candidate);
+    if (stored_key) {
+        return (cg_resolution_t){stored_key, "class_scope", CONF_CLASS_SCOPE, REG_RESOLVED};
+    }
+    return empty_result();
+}
+
 /* Strategy 2: Same-module match */
 static cg_resolution_t resolve_same_module(const cg_registry_t *r, const char *callee_name,
                                             const char *suffix, const char *module_qn) {
@@ -674,7 +891,8 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     /* Normalize "::" → "." so the tail composes with dotted candidate QNs. */
     char dotted[CG_SZ_512];
     size_t w = 0;
-    for (const char *s = callee_name; *s && w + SKIP_ONE < sizeof(dotted);) {
+    const char *s = callee_name;
+    for (; *s && w + SKIP_ONE < sizeof(dotted);) {
         if (s[0] == ':' && s[1] == ':') {
             dotted[w++] = '.';
             s += 2;
@@ -683,6 +901,12 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
         }
     }
     dotted[w] = '\0';
+    /* Bail on truncation: a clipped tail can equal a DIFFERENT candidate's
+     * ending and would be reported as a confident unique match instead of the
+     * ambiguity it actually is. */
+    if (*s) {
+        return NULL;
+    }
     /* Must be qualified (contain a '.') — a bare name matches every candidate
      * and carries no disambiguating signal. */
     if (!strchr(dotted, '.')) {
@@ -756,19 +980,34 @@ static cg_resolution_t resolve_name_lookup(const cg_registry_t *r, const char *c
     return empty_result();
 }
 
-cg_resolution_t cg_registry_resolve(const cg_registry_t *r, const char *callee_name,
-                                      const char *module_qn, const char **import_map_keys,
-                                      const char **import_map_vals, int import_map_count) {
+cg_resolution_t cg_registry_resolve_scoped(const cg_registry_t *r, const char *callee_name,
+                                            const char *module_qn, const char *class_qn,
+                                            const char **import_map_keys,
+                                            const char **import_map_vals, int import_map_count) {
     if (!r || !callee_name) {
         return empty_result();
     }
 
     /* Per-file cache: same callee_name in N call sites → 1 chain walk
-     * + N-1 O(1) hash hits. module_qn is constant per file so the
-     * cache key only needs callee_name. */
-    if (_resolve_cache) {
-        resolve_cache_entry_t *cached =
-            (resolve_cache_entry_t *)cg_ht_get(_resolve_cache, callee_name);
+     * + N-1 O(1) hash hits. module_qn is constant per file, but class_qn is
+     * NOT — two methods of DIFFERENT classes in one file legitimately resolve
+     * the same callee ("self.validate") to different targets. Keying on
+     * callee_name alone would hand the first class's answer to every later
+     * class in the file, silently defeating the scope strategies below. So the
+     * key is scoped whenever a class scope is in play. */
+    char cache_key[CG_SZ_512];
+    const char *key = callee_name;
+    bool cacheable = true;
+    if (class_qn && class_qn[0]) {
+        int n = snprintf(cache_key, sizeof(cache_key), "%s|%s", class_qn, callee_name);
+        if (n > 0 && n < (int)sizeof(cache_key)) {
+            key = cache_key;
+        } else {
+            cacheable = false; /* truncated key would collide — skip the cache */
+        }
+    }
+    if (_resolve_cache && cacheable) {
+        resolve_cache_entry_t *cached = (resolve_cache_entry_t *)cg_ht_get(_resolve_cache, key);
         if (cached) {
             return cached->res;
         }
@@ -805,8 +1044,17 @@ cg_resolution_t cg_registry_resolve(const cg_registry_t *r, const char *callee_n
     cg_resolution_t res =
         resolve_import_map(r, prefix, suffix, import_map_keys, import_map_vals, import_map_count);
     if (!(res.qualified_name && res.qualified_name[0])) {
+        /* Strategy 1.5: explicit self/this receiver → enclosing type member.
+         * Before same_module: `self.x` must never bind to a module-level x. */
+        res = resolve_self_scope(r, prefix, suffix, class_qn);
+    }
+    if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 2: same module */
         res = resolve_same_module(r, callee_name, suffix, module_qn);
+    }
+    if (!(res.qualified_name && res.qualified_name[0])) {
+        /* Strategy 2.5: unqualified callee inside a type body → implicit this */
+        res = resolve_class_scope(r, callee_name, class_qn);
     }
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
@@ -815,11 +1063,11 @@ cg_resolution_t cg_registry_resolve(const cg_registry_t *r, const char *callee_n
 
     /* Cache the result (including empty — caching the negative answer
      * is just as valuable; same name asks the same question). */
-    if (_resolve_cache) {
+    if (_resolve_cache && cacheable) {
         resolve_cache_entry_t *e = (resolve_cache_entry_t *)malloc(sizeof(*e));
         if (e) {
             e->res = res;
-            char *kdup = strdup(callee_name);
+            char *kdup = strdup(key);
             if (kdup) {
                 cg_ht_set(_resolve_cache, kdup, e);
             } else {
@@ -828,6 +1076,13 @@ cg_resolution_t cg_registry_resolve(const cg_registry_t *r, const char *callee_n
         }
     }
     return res;
+}
+
+cg_resolution_t cg_registry_resolve(const cg_registry_t *r, const char *callee_name,
+                                      const char *module_qn, const char **import_map_keys,
+                                      const char **import_map_vals, int import_map_count) {
+    return cg_registry_resolve_scoped(r, callee_name, module_qn, NULL, import_map_keys,
+                                        import_map_vals, import_map_count);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */

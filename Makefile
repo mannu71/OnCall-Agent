@@ -1,4 +1,9 @@
-.PHONY: up down rebuild logs clean
+.PHONY: up down rebuild logs clean doctor
+
+# Diagnose the environment (Docker, daemon, Compose v2, host ports) without
+# changing anything. Run this first when a setup fails.
+doctor:
+	./setup.sh --check
 
 up:
 	docker compose up --build -d

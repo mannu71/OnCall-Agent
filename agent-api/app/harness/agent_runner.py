@@ -265,9 +265,15 @@ async def execute_agent(
     model_name: Optional[str] = None,
     durability: Optional[str] = None,
     agent_config: Optional[Dict[str, Any]] = None,
+    chat_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Execute the LangGraph ReAct agent with the user's query.
+
+    ``chat_session_id`` scopes durable tool-result storage (see
+    ``app.harness.tool_result_store``). It cannot be derived from ``thread_id``,
+    which is the EXECUTION id — a fresh value every turn. Absent it, oversized
+    tool results fall back to the inline cap, exactly as before.
 
     When a stream_callback is provided, uses ``agent.astream_events()`` to
     deliver LLM tokens and tool events in real time.  Falls back to
@@ -737,6 +743,41 @@ async def execute_agent(
     tool_calls_summary  = parsed["tool_calls"]
     final_answer        = parsed["final_answer"]
 
+    # Persist oversized tool results and leave a fetchable pointer behind.
+    # This runs BEFORE the trajectory is collected (executor/result.py), so what
+    # lands in executions.trajectory — the store a follow-up chat turn replays
+    # from — is a pointer plus preview rather than a blind character slice.
+    # Without a chat session nothing is ever replayed, so nothing is stored.
+    try:
+        from app.harness.tool_result_store import offload_messages
+        _names_by_id = {
+            str(c.get("tool_call_id") or ""): str(c.get("tool") or "")
+            for c in (tool_calls_summary or [])
+        }
+        serialized_messages = await offload_messages(
+            serialized_messages,
+            chat_session_id=chat_session_id,
+            execution_id=execution_id,
+            threshold=settings.tool_result_offload_chars,
+            inline_cap=settings.trajectory_tool_result_max_chars,
+            tool_names_by_id=_names_by_id,
+        )
+        parsed["messages"] = serialized_messages
+    except Exception as _off_exc:  # noqa: BLE001 — never break a run over storage
+        logger_instance.warning(
+            "tool_result_store: offload skipped (%s) — capping inline", _off_exc,
+        )
+        _cap = settings.trajectory_tool_result_max_chars
+        if _cap > 0:
+            serialized_messages = [
+                {**m, "content": m["content"][:_cap]}
+                if isinstance(m, dict) and m.get("role") == "tool"
+                and isinstance(m.get("content"), str) and len(m["content"]) > _cap
+                else m
+                for m in serialized_messages
+            ]
+            parsed["messages"] = serialized_messages
+
     # Prefer token_cb (fires via on_llm_end, works for all providers and streaming
     # modes); fall back to usage_metadata accumulation if token_cb got nothing.
     total_input_tokens  = token_cb.input_tokens  or parsed["fallback_input_tokens"]
@@ -753,12 +794,20 @@ async def execute_agent(
         " [truncated]" if parsed.get("truncated") else "",
     )
 
-    # cache_read_tokens / cache_creation_tokens: Bedrock (and Anthropic natively)
-    # report these as SEPARATE, ADDITIVE counters — input_tokens is already the
-    # non-cached (full-price) portion, it does NOT include cache reads or cache
-    # writes. True total input processed = input_tokens + cache_read_tokens +
-    # cache_creation_tokens. cache_read bills at ~10% of fresh input; cache
-    # creation bills at a premium (~125% for Anthropic models) for the write.
+    # cache_read_tokens / cache_creation_tokens are a BREAKDOWN of input_tokens,
+    # not counters to add to it. Bedrock's raw wire format is exclusive, but
+    # langchain_aws folds cache read+write back into input_tokens when it builds
+    # usage_metadata, and callbacks._parse_llm_output normalizes the raw-provider
+    # branches to match — so by the time it reaches here, input_tokens is the
+    # WHOLE prompt. Do not sum the three.
+    #
+    # This comment previously asserted the opposite, and three call sites did the
+    # addition: the context bar, the run token budget, and the cache hit rate.
+    # Corrected 2026-07-21 against a live Bedrock probe — see
+    # app.core.observability.cache_metrics for the evidence.
+    #
+    # cache_read bills at ~10% of fresh input; cache creation at a premium
+    # (~125% for Anthropic models) for the write.
     _cache_read_tokens = getattr(token_cb, "cache_read_tokens", 0) or 0
     _cache_creation_tokens = getattr(token_cb, "cache_creation_tokens", 0) or 0
 
@@ -946,10 +995,18 @@ def _serialize_agent_result(result_state: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:  # noqa: BLE001 — telemetry must never break a run
                     pass
 
+            # Keep the FULL text here. This function is deliberately pure and
+            # sync (no DB), so the size decision is made by the async caller
+            # (execute_agent → tool_result_store.offload_messages), which knows
+            # the execution and chat session and can persist before the
+            # trajectory is collected. Truncating here instead — as this used to
+            # with a flat [:2000] — destroyed the evidence a follow-up turn
+            # replays from, with no way to recover it.
             serialized_messages.append({
                 "role": "tool",
                 "tool_call_id": _tcid,
-                "content": _full[:2000],
+                "content": _full,
+                "tool_name": _summary_entry.get("tool", "") if _summary_entry else "",
             })
 
         elif isinstance(msg, SystemMessage):
@@ -1457,6 +1514,14 @@ async def execute_agent_stream_v2(
             if stream_mode == "messages":
                 # chunk is (message_chunk, metadata).
                 msg_chunk = chunk[0] if isinstance(chunk, tuple) else chunk
+                # `messages` mode yields EVERY message the graph produces, tool
+                # results included. Forwarding those as llm_tokens dumped raw
+                # tool JSON — most visibly a delegated subagent's
+                # {"subagent": …, "answer": …} envelope — into the middle of the
+                # assistant's visible answer until the final sync overwrote it.
+                # Only assistant text is the answer being streamed.
+                if getattr(msg_chunk, "type", "") not in ("ai", "AIMessageChunk"):
+                    continue
                 text = extract_text_content(getattr(msg_chunk, "content", None))
                 if text:
                     try:

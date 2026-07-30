@@ -2586,11 +2586,10 @@ function SkillsPicker({ value, onChange, skillCatalog }) {
     () => (value ? String(value).split(',').map(s => s.trim()).filter(Boolean) : []),
     [value],
   );
-  // Skills are file-based markdown (SKILL.md). The picker lists only USER-authored
-  // custom skills (origin === 'user'); bundled/global skills are hidden here since
-  // they auto-select over the whole library anyway (see build_recall_query).
-  // Selecting any chip scopes the agent to "only these"; empty = auto-select.
-  const fsSkills = (skillCatalog?.filesystem || []).filter(s => s?.origin === 'user');
+  // Skills are file-based markdown (SKILL.md) and entirely user-authored — none
+  // ship with the app — so every skill in the catalog is listed here. Selecting
+  // any chip scopes the agent to "only these"; empty = auto-select over all.
+  const fsSkills = skillCatalog?.filesystem || [];
   const toggle = (name) => {
     const next = selected.includes(name) ? selected.filter(n => n !== name) : [...selected, name];
     onChange(next.join(', '));
@@ -2621,13 +2620,13 @@ function SkillsPicker({ value, onChange, skillCatalog }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '6px 12px' }}>
       <div style={labelStyle}>
         Skills <span style={{ fontWeight: 400, textTransform: 'none', color: '#94a3b8' }}>
-          (optional — pick your custom skills; bundled skills auto-select globally)
+          (optional — none selected = auto-select from all your skills)
         </span>
       </div>
       {fsSkills.length > 0
         ? renderGroup(fsSkills, '#7c3aed')
         : <span style={{ fontSize: 10, color: '#94a3b8' }}>
-            No custom skills yet — add them on the Skills page. Bundled skills are auto-selected automatically.
+            No skills yet — create them on the Skills page.
           </span>}
     </div>
   );

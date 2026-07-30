@@ -43,8 +43,39 @@ _SEARCH_CODE_WARNING = (
 )
 
 #: Prepended to each fast index-backed search tool's description.
-_FAST_SEARCH_HINT = (
-    "[Fast — uses the prebuilt index; prefer over codegraph__search_code.] "
+#: Deliberately terse: _SEARCH_CODE_WARNING above already names all three of
+#: these tools and tells the model to prefer them, so repeating "prefer over
+#: codegraph__search_code" here carried the same instruction a fourth time (once
+#: on the slow tool + once per fast tool) in the cached prompt prefix. The steer
+#: that does the work lives on search_code, where the model is about to make the
+#: mistake; this marker only needs to pair with that warning's "SLOW" framing.
+_FAST_SEARCH_HINT = "[Fast — prebuilt index.] "
+
+#: Per-tool role in the LOCATE → READ → TRACE order. This used to be a numbered
+#: protocol in the code-analyzer system-prompt section, which paid for all of it
+#: on every run and named tools that may not exist (the codegraph tool set comes
+#: from the engine, not this repo). Stating each tool's role ON that tool costs
+#: nothing when the tool is absent and puts the guidance where the choice is made.
+_ROLE_HINTS = {
+    "find_symbol": "[LOCATE — use this FIRST when you know the symbol name: exact and fastest.] ",
+    "search_semantic": "[LOCATE by concept — use when you have a description, not a name.] ",
+    "search_graph": "[LOCATE by structure.] ",
+    "get_code_snippet": (
+        "[READ — call this to confirm the code before citing it; never conclude "
+        "from a symbol name alone.] "
+    ),
+    "query_graph": "[TRACE — follow callers/callees once you have a symbol.] ",
+    "trace_path": "[TRACE — follow callers/callees once you have a symbol.] ",
+    "index_repository": (
+        "[Only call this if another tool reports the project is missing. Do NOT "
+        "re-index an already-indexed repo — the connected repos are pre-indexed.] "
+    ),
+}
+
+#: Appended to every codegraph tool. The short repo name is what the model sees;
+#: ``project_aliases`` maps it to the engine's canonical name at call time.
+_PROJECT_ARG_HINT = (
+    " Pass project=\"<short repo name>\" exactly as shown in the connected-repo list."
 )
 
 
@@ -238,6 +269,15 @@ async def build_codegraph_tools(
                 _t.description = _FAST_SEARCH_HINT + (_t.description or "")
             except Exception:  # noqa: BLE001 — never break tool build on this
                 logger.debug("build_codegraph_tools: could not annotate %s", _suffix)
+        # Role in the LOCATE → READ → TRACE order, plus the project= convention.
+        # Both moved here out of the code-analyzer capability section.
+        try:
+            _role = _ROLE_HINTS.get(_suffix)
+            if _role:
+                _t.description = _role + (_t.description or "")
+            _t.description = (_t.description or "") + _PROJECT_ARG_HINT
+        except Exception:  # noqa: BLE001 — never break tool build on this
+            logger.debug("build_codegraph_tools: could not annotate role for %s", _suffix)
         try:
             _t.project_aliases = _project_aliases
         except Exception:  # noqa: BLE001 — never break tool build on this

@@ -80,17 +80,30 @@ function Write-Fail {
 }
 
 function Get-DockerComposeCommand {
+    # Compose v2 ONLY, deliberately: agent-api/Dockerfile is a BuildKit Dockerfile
+    # (14 `RUN --mount=type=cache` directives). Legacy docker-compose v1 drives
+    # the classic builder, which cannot parse those, so falling back to v1 does
+    # not degrade - it fails mid-build with an error that looks nothing like the
+    # real cause. Say so here instead.
     docker compose version *> $null
     if ($LASTEXITCODE -eq 0) {
         return @("docker", "compose")
     }
 
-    docker-compose version *> $null
-    if ($LASTEXITCODE -eq 0) {
-        return @("docker-compose")
+    if (Test-CommandExists "docker-compose") {
+        $composeVersion = (docker-compose version --short 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $composeVersion -match '^v?([2-9]|\d{2,})\.') {
+            # Standalone binary that is really v2+, supports BuildKit, so allow it.
+            return @("docker-compose")
+        }
+        Write-Fail @"
+Docker Compose v1 ($composeVersion) cannot build this project - it needs BuildKit.
+    Install Compose v2, then re-run: https://docs.docker.com/compose/install/
+    Docker Desktop ships it; the command becomes 'docker compose' (a space, not a hyphen).
+"@
     }
 
-    Write-Fail "Docker Compose not found. Install Docker Desktop and ensure it is running."
+    Write-Fail "Docker Compose not found. Install Docker Desktop (it includes Compose v2) and ensure it is running."
 }
 
 function Test-CommandExists {
@@ -393,18 +406,28 @@ Write-Host "OnCall Agent - initial setup" -ForegroundColor White
 
 Write-Step "Checking prerequisites"
 
-if (-not (Test-CommandExists "node")) {
-    Write-Fail "Node.js is not installed. Install Node.js 18+ from https://nodejs.org/"
-}
-Write-Ok ("Node.js " + (node --version))
+# The default path builds and runs everything INSIDE Docker: the UI is compiled
+# in ui/Dockerfile and the backend in agent-api/Dockerfile. So Node, npm and a
+# local Python are NOT prerequisites for it - they are only needed for
+# -DevSetup, which creates a host venv and runs 'npm install' for the Vite dev
+# server. Requiring them up front turned "I only have Docker" into a hard
+# failure for a toolchain the install never invoked.
+$pythonCommand = $null
 
-if (-not (Test-CommandExists "npm")) {
-    Write-Fail "npm is not installed."
-}
-Write-Ok ("npm " + (npm --version))
+if ($DevSetup) {
+    if (-not (Test-CommandExists "node")) {
+        Write-Fail "Node.js is not installed (needed for -DevSetup). Install Node.js 18+ from https://nodejs.org/"
+    }
+    Write-Ok ("Node.js " + (node --version))
 
-$pythonCommand = Resolve-PythonCommand
-Write-Ok ("Python available via: " + ($pythonCommand -join " "))
+    if (-not (Test-CommandExists "npm")) {
+        Write-Fail "npm is not installed (needed for -DevSetup)."
+    }
+    Write-Ok ("npm " + (npm --version))
+
+    $pythonCommand = Resolve-PythonCommand
+    Write-Ok ("Python available via: " + ($pythonCommand -join " "))
+}
 
 if (-not $SkipDocker) {
     if (-not (Test-CommandExists "docker")) {

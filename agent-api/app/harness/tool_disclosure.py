@@ -2,10 +2,10 @@
 
 Problem: a single MCP server can advertise many tools (Azure DevOps exposes
 ~90). Binding all of them to the model bloats every request (~5K tokens of
-schema) and trips Bedrock guardrail throttling. The previous mitigation —
-``app.harness.tool_router.filter_tools`` — keyword-ranked the catalog and kept
-only the top-K, which *silently dropped* tools the agent actually needed (e.g.
-``wit_get_work_item`` for a "generate test cases for PBI 877" task).
+schema) and trips Bedrock guardrail throttling. The previous mitigation — a
+keyword-prune that kept only the top-K (removed with ``app.harness.tool_router``)
+— *silently dropped* tools the agent actually needed (e.g. ``wit_get_work_item``
+for a "generate test cases for PBI 877" task).
 
 Solution: when the open-ended MCP tool set is large, DON'T bind every tool.
 Replace them with two bridge tools — ``search_tools`` and ``call_tool`` — and
@@ -27,7 +27,7 @@ Design rules:
   pseudonymization wrapping, truncation, and timeouts all fire identically.
 
 This module owns only the substitution logic; the strategy decides when to call
-it (replacing the old ``filter_tools`` step).
+it (replacing the old keyword-prune step).
 """
 from __future__ import annotations
 
@@ -65,6 +65,37 @@ _DEFAULT_CUTOFF_TOKENS = 20_000
 # is what trips Bedrock guardrail throttling. So we ALSO defer when the open-
 # ended tool COUNT exceeds this, regardless of token size. Override via env.
 _DEFAULT_MAX_DIRECT_TOOLS = 25
+
+
+def below_direct_bind_threshold(
+    tools: List[Any], *, context_length: Optional[int] = None
+) -> bool:
+    """True if this tool list is small enough to bind directly (no bridge).
+
+    Single source of truth for legacy's "small enough → no-op" gate, shared by
+    both disclosure modes so they can never drift: ``apply_tool_disclosure``
+    (auto mode) and ``ToolExposureManager`` (window mode) both call this.
+
+    Mirrors legacy's original inline arithmetic verbatim — the ``TOOL_DISCLOSURE_MAX_DIRECT``
+    env override and the ``context_length * 0.10`` cutoff fallback — so the two
+    modes agree below the threshold. Returns True for an empty list (nothing to
+    defer); callers already short-circuit empties before this matters.
+    """
+    if not tools:
+        return True
+    try:
+        max_direct = int(
+            os.environ.get("TOOL_DISCLOSURE_MAX_DIRECT", _DEFAULT_MAX_DIRECT_TOOLS)
+        )
+    except (TypeError, ValueError):
+        max_direct = _DEFAULT_MAX_DIRECT_TOOLS
+    cutoff = (
+        int(context_length * 0.10)
+        if context_length and context_length > 0
+        else _DEFAULT_CUTOFF_TOKENS
+    )
+    tokens = int(sum(_tool_schema_chars(t) for t in tools) / _CHARS_PER_TOKEN)
+    return len(tools) <= max_direct and tokens < cutoff
 
 
 def _tool_schema_chars(tool: Any) -> int:
@@ -303,24 +334,17 @@ def apply_tool_disclosure(
     )
 
     if mode == "auto":
-        cutoff = (
-            int(context_length * 0.10)
-            if context_length and context_length > 0
-            else _DEFAULT_CUTOFF_TOKENS
-        )
-        try:
-            max_direct = int(
-                os.environ.get("TOOL_DISCLOSURE_MAX_DIRECT", _DEFAULT_MAX_DIRECT_TOOLS)
-            )
-        except (TypeError, ValueError):
-            max_direct = _DEFAULT_MAX_DIRECT_TOOLS
         # Activate on EITHER trigger: too many tools (throttling) or too many
         # tokens (context). Small servers fail both → bind directly (no-op).
-        if deferrable_tokens < cutoff and len(deferrable) <= max_direct:
+        # Threshold arithmetic lives in below_direct_bind_threshold so window
+        # mode (ToolExposureManager) shares the exact same gate — keep this
+        # check INSIDE the auto guard: mode=="on" must still force deferral
+        # regardless of size.
+        if below_direct_bind_threshold(deferrable, context_length=context_length):
             log.info(
-                "tool_disclosure: %d deferrable tool(s) ~%d tokens (<= %d tools, "
-                "< %d tokens) — binding directly (no-op)",
-                len(deferrable), deferrable_tokens, max_direct, cutoff,
+                "tool_disclosure: %d deferrable tool(s) ~%d tokens — binding "
+                "directly (no-op)",
+                len(deferrable), deferrable_tokens,
             )
             return tools
 

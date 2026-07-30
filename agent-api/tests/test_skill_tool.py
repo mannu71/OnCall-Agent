@@ -5,10 +5,10 @@ name) then the ``skill`` tool (name → runbook). Covers the SkillManager
 additions (frontmatter fields, build_map, the search ranker, $ARGUMENTS), both
 model-invoked tools, and the ``/skill-name`` slash expander.
 
-All DB-free and hermetic: the ``manager`` fixture authors its own cookbook in a
-tmp dir and stands in for BOTH skill sources — the bundled ``seed/`` dir (via an
-instance-level ``_SEED_DIR`` override) and the user ``skills_dir`` — so these
-tests never depend on what happens to be on disk under ``data/skills``.
+All DB-free and hermetic: the ``manager`` fixture authors its own library into a
+tmp ``skills_dir``. Nothing ships with the app (there is no bundled-seed source),
+so that dir is the single skill source and these tests never depend on what
+happens to be on disk under ``data/skills``.
 """
 import textwrap
 from pathlib import Path
@@ -49,27 +49,22 @@ def _write_skill(dirpath: Path, name: str, frontmatter: str, body: str = "Body h
 
 
 @pytest.fixture
-def seed_dir(tmp_path_factory) -> Path:
-    """A hermetic stand-in for the bundled ``seed/`` cookbook."""
-    d = tmp_path_factory.mktemp("seed_skills")
+def manager(tmp_path: Path, monkeypatch) -> SkillManager:
+    """Manager over a hermetic library authored into the user skills dir.
+
+    Nothing ships with the app (no seeding), so ``skills_dir`` is the single
+    source and these fixtures ARE the whole library — no production content can
+    leak into assertions. Injected as the process-wide default so the tools
+    under test — which resolve through ``get_default_skill_manager`` — see this
+    same hermetic set.
+    """
     for name, (desc, wtu) in SEED_SPECS.items():
         _write_skill(
-            d, name,
+            tmp_path, name,
             f"name: {name}\ndescription: {desc}\nwhen-to-use: {wtu}",
             body=f"## Protocol\n\nRunbook body for {name}. $ARGUMENTS",
         )
-    return d
-
-
-@pytest.fixture
-def manager(seed_dir: Path, tmp_path: Path, monkeypatch) -> SkillManager:
-    """Manager over the stand-in cookbook (bundled) + an empty user dir.
-
-    Injected as the process-wide default so the tools under test — which resolve
-    through ``get_default_skill_manager`` — see this same hermetic set.
-    """
     m = SkillManager(skills_dir=tmp_path)
-    m._SEED_DIR = seed_dir
     m.scan_skills()
     monkeypatch.setattr(skills_pkg, "get_default_skill_manager", lambda: m)
     return m
@@ -139,7 +134,6 @@ def test_map_over_budget_degrades_to_count(manager: SkillManager):
 
 def test_map_empty_when_no_skills(tmp_path: Path):
     m = SkillManager(skills_dir=tmp_path / "nothing-here")
-    m._SEED_DIR = tmp_path / "no-seeds"
     m.scan_skills()
     assert m.build_map() == ""
 
@@ -166,15 +160,14 @@ def test_model_invocable_names_filters(tmp_path: Path):
     assert m.model_invocable_names(allowed={"shown", "hidden"}) == {"shown"}
 
 
-def test_origin_stamped_at_scan(manager: SkillManager, tmp_path: Path):
-    """Origin is stamped from the source dir at load time: seed skills → bundled,
-    skills_dir skills → user. It drives the map's bundled-first sort."""
-    for name in SEEDS:
-        assert manager.get_skill(name).origin == "bundled"
-    _write_skill(tmp_path, "user-authored", "name: user-authored\ndescription: d")
+def test_map_is_alphabetical(manager: SkillManager, tmp_path: Path):
+    """With no bundled/user split there is no origin to sort by — the map is
+    plain alphabetical so it stays stable between turns."""
+    _write_skill(tmp_path, "aaa-first", "name: aaa-first\ndescription: d")
     manager.scan_skills()
-    assert manager.get_skill("user-authored").origin == "user"
-    assert manager._skill_origin(manager.get_skill(SEEDS[0])) == "bundled"
+    names = [n.strip() for n in manager.build_map().split(",")]
+    assert names == sorted(names)
+    assert names[0] == "aaa-first"
 
 
 def test_build_map_touches_no_filesystem(manager: SkillManager, monkeypatch):
@@ -519,33 +512,30 @@ def test_delete_user_skill(tmp_path: Path):
     assert not (tmp_path / "gone").exists()
 
 
-def test_delete_bundled_skill_hides_persistently(manager: SkillManager, seed_dir: Path,
-                                                 tmp_path: Path):
-    # tmp_path is an empty user dir → only bundled skills are present.
+def test_delete_removes_from_disk_and_survives_rescan(manager: SkillManager, tmp_path: Path):
+    """Every skill is user-authored in a writable dir, so delete removes the
+    directory outright — there is no packaged/read-only case to hide around
+    (the old bundled-seed 'hide via .disabled_skills' path is gone)."""
     assert manager.get_skill("log-error-triage") is not None
-    # Bundled skill "deletes" (hides) and the marker is written.
     assert manager.delete_skill("log-error-triage") is True
     assert manager.get_skill("log-error-triage") is None
-    assert (tmp_path / ".disabled_skills").exists()
-    # Survives a fresh scan (a new manager over the same dir).
+    assert not (tmp_path / "log-error-triage").exists()
+    assert not (tmp_path / ".disabled_skills").exists()  # no marker file anymore
+    # Stays gone for a fresh manager over the same dir.
     m2 = SkillManager(skills_dir=tmp_path)
-    m2._SEED_DIR = seed_dir
     m2.scan_skills()
     assert m2.get_skill("log-error-triage") is None
     assert "log-error-triage" not in m2.build_map()
 
 
-def test_recreating_hidden_bundled_skill_re_enables(manager: SkillManager, seed_dir: Path,
-                                                    tmp_path: Path):
+def test_recreating_a_deleted_skill_restores_it(manager: SkillManager, tmp_path: Path):
     manager.delete_skill("log-error-triage")
     assert manager.get_skill("log-error-triage") is None
-    # Authoring a skill with the same name clears the hidden marker.
     manager.write_skill(
         "log-error-triage",
         "---\nname: log-error-triage\ndescription: My own triage runbook.\n---\n\nbody")
     assert manager.get_skill("log-error-triage") is not None
     m3 = SkillManager(skills_dir=tmp_path)
-    m3._SEED_DIR = seed_dir
     m3.scan_skills()
     assert m3.get_skill("log-error-triage") is not None
 

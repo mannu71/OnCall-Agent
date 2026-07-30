@@ -14,6 +14,7 @@ import logging
 import os
 import os.path
 import glob
+import traceback
 from contextlib import AsyncExitStack
 from typing import Dict, List, Any, Optional
 from mcp import ClientSession, StdioServerParameters
@@ -366,8 +367,28 @@ class MCPClientManager:
             return True
                 
         except Exception as e:
-            self.last_errors[server_id] = f"{type(e).__name__}: {e}"
-            logger.error("Failed to connect to MCP server %s: %s", server_id, e, exc_info=True)
+            # Redact at the point of capture, not at each read. This string is
+            # surfaced three ways beyond the log — the reconnect RuntimeError in
+            # _ensure_connected (which is raised OUTSIDE execute_tool's try, so it
+            # propagates to the model as a tool error), the degrade notes in the
+            # node handlers, and the UI failure detail. A connection failure
+            # commonly carries the credential that failed (an auth error, or a
+            # ``postgres://user:pass@host`` DSN that redact() has a pattern for).
+            #
+            # Credentials only, deliberately: PII pseudonymization needs a bound
+            # session vault, and connects happen in the MCP barrier BEFORE
+            # privacy.bind_session — routing this through the vault would file the
+            # values under the shared "__anon__" session that no run ever drops.
+            self.last_errors[server_id] = _redact_credentials(f"{type(e).__name__}: {e}")
+            # Format the traceback rather than passing exc_info=True: the logging
+            # module would render the ORIGINAL exception, undoing the redaction
+            # above on the one surface most likely to be shipped off-box. Redacting
+            # the formatted text keeps every frame — no debuggability is traded.
+            logger.error(
+                "Failed to connect to MCP server %s: %s\n%s",
+                server_id, self.last_errors[server_id],
+                _redact_credentials(traceback.format_exc()),
+            )
             logger.error("Config was - command: %s, args: %s", config.get('command'), config.get('args'))
             # Clean up the exit stack if connection failed
             if server_id in self._exit_stacks:
@@ -515,10 +536,18 @@ class MCPClientManager:
                 'terminal': True,
             }
         except Exception as e:
-            logger.error("Tool '%s' execution failed: %s", tool_name, e)
+            # Sanitize like any other tool output. This branch returns the SERVER's
+            # own message, and the adapter hands it straight to the model as
+            # "[Tool Error] …" — so it reaches Bedrock on exactly the same path as
+            # a successful result, but used to skip the sanitizer that path applies.
+            # A strict-schema server typically echoes the offending value back
+            # ("invalid email: ada@example.com"), which is precisely the shape that
+            # leaked: neither credentials nor PII were scrubbed, here or in the log.
+            safe_error = _sanitize_credential(str(e))
+            logger.error("Tool '%s' execution failed: %s", tool_name, safe_error)
             return {
                 'success': False,
-                'error': str(e),
+                'error': safe_error,
                 'isError': True,
                 'terminal': False,  # application error — return to agent for self-correction
             }

@@ -126,6 +126,23 @@ char *cg_pipeline_fqn_module(const char *project, const char *rel_path) {
     return cg_pipeline_fqn_compute(project, rel_path, NULL);
 }
 
+const char *cg_pipeline_parent_qn(const char *qn, char *buf, size_t cap) {
+    if (!qn || !buf || cap == 0) {
+        return NULL;
+    }
+    const char *dot = strrchr(qn, '.');
+    if (!dot || dot == qn) {
+        return NULL;
+    }
+    size_t len = (size_t)(dot - qn);
+    if (len >= cap) {
+        return NULL;
+    }
+    memcpy(buf, qn, len);
+    buf[len] = '\0';
+    return buf;
+}
+
 enum {
     FQN_PATH_BUF = 1024,
     FQN_SEP_LEN = 1, /* one byte for the '/' separator */

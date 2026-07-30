@@ -585,21 +585,23 @@ def format_recall_block(results: List[Dict[str, Any]], max_chars: Optional[int] 
 def format_pinned_block(results: List[Dict[str, Any]], max_tokens: Optional[int] = None) -> str:
     """Render pinned facts as an always-injected block, bounded by a token budget.
 
-    Token estimate is the chars/4 heuristic used elsewhere. Facts are emitted in
-    priority order (the caller sorts by importance) and dropped once the budget
-    is reached, so the per-turn discipline holds.
+    Sizing uses the shared calibrated estimator (see
+    :mod:`app.core.llm.token_estimate`). Facts are emitted in priority order (the
+    caller sorts by importance) and dropped once the budget is reached, so the
+    per-turn discipline holds.
     """
     if not results:
         return ""
+    from app.core.llm.token_estimate import estimate_tokens
     budget = settings.pinned_facts_max_tokens if max_tokens is None else max_tokens
     lines = ["## Pinned facts (always apply)"]
-    used = len(lines[0]) // 4
+    used = estimate_tokens(lines[0])
     for r in results:
         fact = (r.get("content") or "").strip().replace("\n", " ")
         if not fact:
             continue
         line = f"- {fact}"
-        cost = len(line) // 4 + 1
+        cost = estimate_tokens(line) + 1
         if budget and used + cost > budget:
             break
         lines.append(line)

@@ -91,7 +91,7 @@ python -m venv .venv
 .venv\Scripts\activate          # Windows
 pip install -r requirements.txt
 
-# Set DATABASE_URL and related env vars (see app/config.py / .env.example)
+# Set DATABASE_URL and related env vars (see app/config/ / .env.example)
 uvicorn app.main:app --reload --host 0.0.0.0 --port 48000
 ```
 
@@ -122,7 +122,10 @@ setup, which applies any tracked-as-unapplied files in filename order.
 
 ## Configuration
 
-Settings live in `app/config.py` (Pydantic `Settings`, env-prefix friendly).
+Settings live in `app/config/` (Pydantic `Settings`, env-prefix friendly). The
+class is assembled from one mixin per domain — `server.py`, `aws.py`,
+`cloudwatch.py`, `agent.py`, `memory.py`, `tools.py`, `governance.py` — and
+`settings.<field>` reaches every one of them regardless of which file it is in.
 Common variables:
 
 | Variable | Purpose |
@@ -135,7 +138,8 @@ Common variables:
 | `SUPERVISOR_TOKEN_BUDGET` | Cap LLM tokens across supervisor retries |
 | `AWS_REGION` / Bedrock keys | LLM and CloudWatch access |
 
-See `app/config.py` for the full list.
+See `app/config/` for the full list — each field keeps its rationale in a
+comment above it, in the mixin that owns its domain.
 
 ---
 

@@ -17,6 +17,12 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from app.core.llm.token_estimate import (
+    estimate_messages_tokens,
+    estimate_request_tokens,
+    estimate_tokens,
+)
+
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -237,10 +243,10 @@ def window_size_for_model(
 
 
 def estimate_tokens_rough(text: str) -> int:
-    """Rough token estimate (~4 chars/token) for pre-flight checks.
+    """Rough token estimate for pre-flight checks.
 
-    Uses ceiling division so short texts (1-3 chars) never estimate as
-    0 tokens, which would cause systematic undercounting.
+    Thin alias for :func:`app.core.llm.token_estimate.estimate_tokens` — kept
+    so existing callers keep working; new code should use that directly.
 
     Args:
         text: The text to estimate
@@ -248,9 +254,7 @@ def estimate_tokens_rough(text: str) -> int:
     Returns:
         Estimated token count
     """
-    if not text:
-        return 0
-    return (len(text) + 3) // 4
+    return estimate_tokens(text)
 
 
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
@@ -262,8 +266,7 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     Returns:
         Estimated token count
     """
-    total_chars = sum(len(str(msg)) for msg in messages)
-    return (total_chars + 3) // 4
+    return estimate_messages_tokens(messages)
 
 
 def estimate_request_tokens_rough(
@@ -285,14 +288,7 @@ def estimate_request_tokens_rough(
     Returns:
         Estimated token count
     """
-    total_chars = 0
-    if system_prompt:
-        total_chars += len(system_prompt)
-    if messages:
-        total_chars += sum(len(str(msg)) for msg in messages)
-    if tools:
-        total_chars += len(str(tools))
-    return (total_chars + 3) // 4
+    return estimate_request_tokens(messages, system_prompt=system_prompt, tools=tools)
 
 
 def get_next_probe_tier(current_length: int) -> Optional[int]:

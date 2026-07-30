@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Call-graph accuracy eval for codegraph.
 
-Indexes the ambiguity fixture and checks the resolved CALLS edges against the
-ground truth: each save() must call its OWN class's validate(), never the other
-class's. Reports precision/recall. Informational — scope-aware (self/this)
-resolution accuracy depends on the grammar versions in the dlopen'd
-languages.so, so this script always exits 0 and lets the caller decide.
+Indexes the ambiguity fixture and checks the resolved CALLS edges against a
+FIXED ground truth: each save() must call its OWN class's validate(), and both
+must be present. Reports precision and recall and exits non-zero when either
+falls below threshold.
+
+Ground truth is hardcoded on purpose. The previous version computed
+`expected = len(got)` — the number of edges the engine happened to return —
+which made recall identical to precision by construction and meant a resolver
+that emitted only ONE of the two correct edges scored a perfect 1.0/1.0. A
+recall metric that cannot observe a missing edge measures nothing.
 
 Run inside the codegraph builder image (has the binary + python + grammars):
   docker run --rm -v <repo>/codegraph/test:/test:ro codegraph:builder \
@@ -14,16 +19,25 @@ Run inside the codegraph builder image (has the binary + python + grammars):
 import json
 import os
 import subprocess
+import sys
 
 BIN = "/build/build/codegraph"
 ENV = dict(os.environ, CODEGRAPH_DB="/tmp/ev.db", CODEGRAPH_TS_SO="/languages.so",
            CG_TS_SO="/languages.so")
 
+# Both thresholds must hold. Anything less means the resolver is either wiring
+# save() to the wrong class's validate() (precision) or dropping an edge
+# outright (recall).
+MIN_PRECISION = 1.0
+MIN_RECALL = 1.0
 
-def cls(qname):
-    """Class component of a dotted qualified name (…pkg.Class.method)."""
-    parts = qname.split(".")
-    return parts[-2] if len(parts) >= 2 else ""
+
+def ground_truth(project):
+    """The only two CALLS->validate edges that svc.py can legitimately produce."""
+    return {
+        (f"{project}.svc.UserService.save", f"{project}.svc.UserService.validate"),
+        (f"{project}.svc.OrderService.save", f"{project}.svc.OrderService.validate"),
+    }
 
 
 def main():
@@ -53,26 +67,30 @@ def main():
     payload = json.loads(r["result"]["content"][0]["text"])
     got = set((row[0], row[1]) for row in payload.get("rows", []))
 
-    correct = sum(1 for f, t in got if cls(f) and cls(f) == cls(t))
-    precision = correct / len(got) if got else 0.0
-    expected = len(got)  # one CALLS->validate edge per save()
-    recall = correct / expected if expected else 0.0
+    expected = ground_truth(project)
+    hits = got & expected
 
+    precision = len(hits) / len(got) if got else 0.0
+    recall = len(hits) / len(expected)
+
+    ok = precision >= MIN_PRECISION and recall >= MIN_RECALL
     print(json.dumps({
         "project": project,
         "edges_to_validate": len(got),
-        "correct": correct,
+        "correct": len(hits),
         "precision": round(precision, 4),
         "recall": round(recall, 4),
-        "got": sorted(got),
+        "missing": sorted(expected - got),
+        "spurious": sorted(got - expected),
     }, indent=2))
 
-    if precision >= 1.0 and recall >= 1.0:
-        print("ACCURACY PASS precision=recall=1.0")
-    else:
-        print("ACCURACY precision=%.2f recall=%.2f (scope resolution limited by "
-              "dlopen grammar versions)" % (precision, recall))
+    if ok:
+        print("ACCURACY PASS precision=%.2f recall=%.2f" % (precision, recall))
+        return 0
+    print("ACCURACY FAIL precision=%.2f (min %.2f) recall=%.2f (min %.2f)"
+          % (precision, MIN_PRECISION, recall, MIN_RECALL), file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

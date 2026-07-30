@@ -37,7 +37,19 @@ SUMMARY_PATH = "/context_summary.txt"
 # truncates it, line-aligned, so the injected compaction block stays close to
 # the ~1200-token budget from the plan (summary already ≤500 tokens; this
 # leaves headroom for milestones without the pair growing unbounded).
-_MILESTONES_INJECT_MAX_CHARS = 2400
+# Operator-configurable (settings.metamemory_inject_max_chars, ``0`` = inject
+# in full) rather than a hardcoded cap — resolved at call time below.
+_MILESTONES_INJECT_MAX_CHARS_DEFAULT = 2400
+
+
+def _milestones_inject_cap() -> int:
+    """Injection cap for milestones.txt, read from settings at call time."""
+    try:
+        from app.config import settings
+        return int(getattr(settings, "metamemory_inject_max_chars",
+                           _MILESTONES_INJECT_MAX_CHARS_DEFAULT))
+    except Exception:  # noqa: BLE001 — config miss must never break injection
+        return _MILESTONES_INJECT_MAX_CHARS_DEFAULT
 
 _PLAN_TEMPLATE = "# PLAN v1 | objective: {objective}\n"
 _MILESTONES_TEMPLATE = "# MILESTONES v1\n"
@@ -231,7 +243,8 @@ async def read_context_block(session_id: Optional[str]) -> Optional[str]:
 
     milestones.txt is append-only and uncapped at the VFS layer, so it is
     tail-truncated here to keep the injected block within the plan's
-    ~1200-token budget (see :data:`_MILESTONES_INJECT_MAX_CHARS`).
+    ~1200-token budget. The size is operator-configurable via
+    ``settings.metamemory_inject_max_chars`` (``0`` = inject in full).
     """
     if not session_id:
         return None
@@ -247,7 +260,9 @@ async def read_context_block(session_id: Optional[str]) -> Optional[str]:
         if not content:
             continue
         if path == MILESTONES_PATH:
-            content = _tail_truncate_lines(content, _MILESTONES_INJECT_MAX_CHARS)
+            _cap = _milestones_inject_cap()  # 0 = inject in full
+            if _cap > 0:
+                content = _tail_truncate_lines(content, _cap)
         parts.append(content)
     return "\n\n".join(parts) if parts else None
 

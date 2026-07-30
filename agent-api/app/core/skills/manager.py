@@ -50,10 +50,6 @@ class Skill:
     disable_model_invocation: bool = False
     # Optional hint about the arguments the skill expects (shown to authors).
     argument_hint: str = ""
-    # 'bundled' for a git-shipped seed skill, 'user' for a user-authored one.
-    # Stamped once at load time (from the source directory) so the per-turn map
-    # and the REST list can sort/label by origin without a filesystem stat.
-    origin: str = "user"
 
 
 class SkillManager:
@@ -83,75 +79,28 @@ class SkillManager:
         # cheaply detect out-of-band file changes without a full re-parse.
         self._signature: Optional[tuple] = None
     
-    # Bundled seed skills shipped with the app (tracked in git, unlike
-    # ``data/`` which is gitignored/dockerignored) — a starter cookbook so a
-    # fresh deployment has useful auto-selectable skills before any are
-    # learned/authored. User-authored skills under ``skills_dir`` with the
-    # same name take precedence (see ``scan_skills``).
-    _SEED_DIR = Path(__file__).resolve().parent / "seed"
-
-    # Marker file (in the writable skills_dir volume) listing skill names the
-    # operator has hidden. Used to "delete" a bundled seed skill — whose source
-    # lives read-only inside the app package and would otherwise reappear on
-    # restart. One name per line.
-    _DISABLED_FILE = ".disabled_skills"
-
-    def _disabled_path(self) -> Path:
-        return self.skills_dir / self._DISABLED_FILE
-
-    def _load_disabled(self) -> Set[str]:
-        """Names of persistently-hidden skills (best-effort; empty on any error)."""
-        try:
-            path = self._disabled_path()
-            if not path.exists():
-                return set()
-            return {
-                ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()
-                if ln.strip()
-            }
-        except Exception as exc:  # noqa: BLE001 — a bad marker file must not break scanning
-            logger.warning("SkillManager: could not read disabled-skills file: %s", exc)
-            return set()
-
-    def _write_disabled(self, names: Set[str]) -> None:
-        """Persist the hidden-skill set to the marker file (created if absent)."""
-        path = self._disabled_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if names:
-            path.write_text("\n".join(sorted(names)) + "\n", encoding="utf-8")
-        elif path.exists():
-            path.unlink(missing_ok=True)
-
     def scan_skills(self) -> Dict[str, Skill]:
-        """Scan skills directory for SKILL.md files.
+        """Scan the skills directory for SKILL.md files.
 
-        Merges the bundled seed skills (``_SEED_DIR``) with any user-authored
-        skills under ``self.skills_dir`` — a user skill with the same name
-        overrides the bundled default.
+        Skills are entirely user-authored under ``self.skills_dir`` — nothing
+        ships with the app, so this is the single source. (An earlier bundled
+        "seed cookbook" and its hide-a-packaged-skill marker file were removed:
+        every skill now lives in a writable directory and is deleted by simply
+        removing it.)
 
         Returns:
             Dict mapping skill names to Skill objects
         """
         self._skills.clear()
-        disabled = self._load_disabled()
 
-        for source_dir in (self._SEED_DIR, self.skills_dir):
-            if not source_dir.exists():
-                if source_dir is self.skills_dir:
-                    logger.warning(f"Skills directory does not exist: {source_dir}")
-                continue
-
-            origin = "bundled" if source_dir is self._SEED_DIR else "user"
+        source_dir = self.skills_dir
+        if not source_dir.exists():
+            logger.warning(f"Skills directory does not exist: {source_dir}")
+        else:
             for skill_file in source_dir.rglob("SKILL.md"):
                 try:
-                    skill = self._load_skill_file(skill_file, origin=origin)
+                    skill = self._load_skill_file(skill_file)
                     if skill:
-                        # Persistently-hidden skills (a bundled seed the operator
-                        # "deleted") stay gone across restarts. A user-authored
-                        # override re-enables the name (see write_skill).
-                        if skill.name in disabled:
-                            logger.info(f"Skipping disabled skill: {skill.name}")
-                            continue
                         self._skills[skill.name] = skill
                         logger.info(f"Loaded skill: {skill.name} (from {source_dir})")
                 except Exception as e:
@@ -159,36 +108,29 @@ class SkillManager:
 
         self._loaded = True
         self._signature = self._dir_signature()
-        logger.info(f"Loaded {len(self._skills)} skills (seed + {self.skills_dir})")
+        logger.info(f"Loaded {len(self._skills)} skills (from {self.skills_dir})")
         return self._skills
 
     def _dir_signature(self) -> tuple:
         """A cheap fingerprint of the on-disk skill set (paths + mtimes).
 
         Walks the same ``SKILL.md`` files ``scan_skills`` would, recording each
-        path and mtime plus the disabled-marker mtime. Comparing two signatures
-        detects added/removed/edited skills without re-reading or re-parsing any
-        file — used by :meth:`maybe_rescan`. Best-effort: any stat error is
-        folded into the signature so it simply forces a rescan.
+        path and mtime. Comparing two signatures detects added/removed/edited
+        skills without re-reading or re-parsing any file — used by
+        :meth:`maybe_rescan`. Best-effort: any stat error is folded into the
+        signature so it simply forces a rescan.
         """
         parts: List[tuple] = []
-        for source_dir in (self._SEED_DIR, self.skills_dir):
-            try:
-                if not source_dir.exists():
-                    continue
+        source_dir = self.skills_dir
+        try:
+            if source_dir.exists():
                 for skill_file in sorted(source_dir.rglob("SKILL.md")):
                     try:
                         parts.append((str(skill_file), skill_file.stat().st_mtime_ns))
                     except OSError as exc:
                         parts.append((str(skill_file), repr(exc)))
-            except OSError as exc:
-                parts.append((str(source_dir), repr(exc)))
-        try:
-            dp = self._disabled_path()
-            if dp.exists():
-                parts.append((str(dp), dp.stat().st_mtime_ns))
         except OSError as exc:
-            parts.append(("<disabled>", repr(exc)))
+            parts.append((str(source_dir), repr(exc)))
         return tuple(parts)
 
     def maybe_rescan(self) -> bool:
@@ -208,16 +150,11 @@ class SkillManager:
             return True
         return False
 
-    def _load_skill_file(
-        self, skill_file: Path, origin: str = "user",
-    ) -> Optional[Skill]:
+    def _load_skill_file(self, skill_file: Path) -> Optional[Skill]:
         """Load a single SKILL.md file.
 
         Args:
             skill_file: Path to SKILL.md file
-            origin: 'bundled' (git-shipped seed) or 'user' (authored under
-                skills_dir). Stamped onto the Skill so origin sorting/labelling
-                never needs a filesystem stat later.
 
         Returns:
             Skill object or None if invalid
@@ -280,7 +217,6 @@ class SkillManager:
             when_to_use=when_to_use,
             disable_model_invocation=disable_model_invocation,
             argument_hint=argument_hint,
-            origin=origin,
         )
     
     def select_for_query(
@@ -493,32 +429,23 @@ class SkillManager:
         if not skills:
             return ""
 
-        # Bundled seed skills first, then alphabetical — a stable order so the
-        # block doesn't churn between turns.
-        skills.sort(key=lambda s: (s.origin != "bundled", s.name))
+        # Alphabetical — a stable order so the block doesn't churn between turns.
+        skills.sort(key=lambda s: s.name)
 
         names = ", ".join(s.name for s in skills)
         if len(names) > char_budget:
             return f"{len(skills)} skills available"
         return names
 
-    def _skill_origin(self, skill: "Skill") -> str:
-        """'bundled' for a git-shipped seed skill, 'user' for a user-authored one.
-
-        Stamped onto the Skill at load time (from its source directory), so this
-        is a pure field read — no filesystem stat on the per-turn map / REST-list
-        paths. Lets the UI show only custom skills in the per-agent picker while
-        bundled skills auto-select globally.
-        """
-        return skill.origin
-
     def list_skills(self) -> List[Dict[str, Any]]:
         """List available skills with descriptions.
 
+        Every skill is user-authored (nothing ships with the app), so there is
+        no origin/bundled distinction to report.
+
         Returns:
-            List of dicts with 'name', 'description', 'origin'
-            ('bundled' | 'user'), 'when_to_use', 'argument_hint' and
-            'disable_model_invocation' keys.
+            List of dicts with 'name', 'description', 'when_to_use',
+            'argument_hint' and 'disable_model_invocation' keys.
         """
         # Ensure skills are loaded (first use). NB: no maybe_rescan() here — this
         # is called on the agent's conversational fast-path too, so it must stay
@@ -531,7 +458,6 @@ class SkillManager:
             {
                 "name": skill.name,
                 "description": skill.description,
-                "origin": self._skill_origin(skill),
                 "when_to_use": skill.when_to_use,
                 "argument_hint": skill.argument_hint,
                 "disable_model_invocation": skill.disable_model_invocation,
@@ -556,10 +482,10 @@ class SkillManager:
     def get_skill_source(self, name: str) -> Optional[Dict[str, Any]]:
         """Return the raw SKILL.md source for *name*, for viewing/editing.
 
-        ``editable`` is False for bundled seed skills (their file lives inside
-        the app package, under ``_SEED_DIR``) — the UI should offer "save as
-        override" instead of in-place edit, since :meth:`write_skill` always
-        writes to ``skills_dir`` anyway (which shadows a same-named seed skill).
+        ``editable`` is always True: every skill is user-authored under the
+        writable ``skills_dir`` (nothing ships read-only inside the package),
+        so the UI can always edit in place. The key is kept in the payload so
+        existing callers/UI don't need to special-case its absence.
         """
         if not self._loaded:
             self.scan_skills()
@@ -578,16 +504,14 @@ class SkillManager:
         return {
             "name": skill.name,
             "content": content,
-            "editable": not skill.skill_dir.is_relative_to(self._SEED_DIR),
+            "editable": True,
         }
 
     def write_skill(self, name: str, content: str) -> Skill:
         """Create or overwrite a user-authored SKILL.md file under ``skills_dir``.
 
-        Always writes to ``self.skills_dir`` (never ``_SEED_DIR``) — a
-        user-authored skill here shadows a bundled seed skill of the same
-        name (see ``scan_skills``), so this doubles as "override a seed
-        skill". Raises ``ValueError`` if *content* has no valid YAML
+        Always writes under ``self.skills_dir`` — the single, writable skill
+        source. Raises ``ValueError`` if *content* has no valid YAML
         frontmatter or is missing the required ``name`` field.
         """
         slug = re.sub(r"[^\w-]", "_", name.strip().lower()) or "unnamed_skill"
@@ -627,13 +551,6 @@ class SkillManager:
                 "to improve the agent's selection accuracy.", loaded.name,
             )
 
-        # Authoring a skill re-enables its name if it was previously hidden
-        # (e.g. a bundled seed the operator deleted then chose to recreate).
-        disabled = self._load_disabled()
-        if loaded.name in disabled:
-            disabled.discard(loaded.name)
-            self._write_disabled(disabled)
-
         # Rename guard: an edit that changes the frontmatter ``name`` writes the
         # SAME directory but loads under a NEW name. Drop any other cached entry
         # backed by this directory, or the old name lingers in the map as a ghost
@@ -656,12 +573,9 @@ class SkillManager:
     def delete_skill(self, name: str) -> bool:
         """Delete a skill. Returns True if found and removed, False otherwise.
 
-        Never raises — logs errors instead. A user-authored skill under
-        ``skills_dir`` is removed from disk. A bundled seed skill (whose source
-        lives read-only inside the app package) cannot be removed from disk, so
-        it is instead persistently HIDDEN via the disabled-skills marker file
-        so it stays gone across restarts. Either way the skill disappears from
-        the listing, which is what "delete" means to the operator.
+        Never raises — logs errors instead. Every skill is user-authored under
+        the writable ``skills_dir``, so delete simply removes its directory —
+        no packaged/read-only case to hide around.
         """
         if not self._loaded:
             self.scan_skills()
@@ -671,32 +585,11 @@ class SkillManager:
             return False
 
         try:
-            is_seed = skill.skill_dir.is_relative_to(self._SEED_DIR)
-        except Exception:  # noqa: BLE001
-            is_seed = False
-
-        try:
-            if is_seed:
-                # Can't delete the packaged file — hide it persistently instead.
-                disabled = self._load_disabled()
-                disabled.add(name)
-                self._write_disabled(disabled)
-                del self._skills[name]
-                logger.info("SkillManager: hid bundled skill '%s' (persisted)", name)
-                return True
-
             import shutil
             skill_dir = skill.skill_dir
             if skill_dir.exists():
                 shutil.rmtree(skill_dir)
             del self._skills[name]
-            # If a same-named bundled seed sits underneath the just-removed user
-            # skill, hide it too so "delete" fully removes the entry rather than
-            # revealing the seed on the next scan.
-            if (self._SEED_DIR / name / "SKILL.md").exists():
-                disabled = self._load_disabled()
-                disabled.add(name)
-                self._write_disabled(disabled)
             logger.info("SkillManager: deleted filesystem skill '%s' from %s", name, skill_dir)
             return True
         except Exception as exc:

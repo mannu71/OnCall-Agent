@@ -262,11 +262,27 @@ async def call_llm(
     tokens_in  = response.input_tokens
     tokens_out = response.output_tokens
 
+    _cache_read = getattr(response, "cache_read_input_tokens", 0) or 0
+    _cache_write = getattr(response, "cache_creation_input_tokens", 0) or 0
+
     logger.info(
         "call_llm: live tier=%s model=%s in=%d out=%d cache_read=%d cache_write=%d",
-        tier, model, tokens_in, tokens_out,
-        getattr(response, "cache_read_input_tokens", 0) or 0,
-        getattr(response, "cache_creation_input_tokens", 0) or 0,
+        tier, model, tokens_in, tokens_out, _cache_read, _cache_write,
+    )
+
+    # Book it against the run ledger. This is the single choke point for every
+    # non-agent LLM helper — grader, fact extractor, action supervisor, semantic
+    # memory, improvement analyzer, session titles — none of which the agent's
+    # TokenUsageCallback can see. A cache HIT returns above and is deliberately
+    # not recorded: it costs nothing.
+    from app.harness.usage_ledger import record_auxiliary_usage
+    record_auxiliary_usage(
+        input_tokens=tokens_in,
+        output_tokens=tokens_out,
+        cache_read_tokens=_cache_read,
+        cache_creation_tokens=_cache_write,
+        source=f"call_llm:{tier}",
+        exclusive=True,   # TransportResponse carries Bedrock's RAW exclusive counters
     )
 
     if use_cache:

@@ -9,10 +9,11 @@ production LLM call — never hardcoded).
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
+
+from app.core.llm.json_extract import extract_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +31,9 @@ _GRADER_SYSTEM = (
 
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
-    m = re.search(r"\{.*\}", text or "", re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            pass
+    obj = extract_json_object(text)
+    if obj is not None:
+        return obj
     score_m = re.search(r'"score"\s*:\s*([01](?:\.\d+)?)', text or "")
     if score_m:
         verdict_m = re.search(r'"verdict"\s*:\s*"([a-z]+)"', text or "")
@@ -47,15 +45,54 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+_SEP = "\n---\n"
+_EVIDENCE_ELIDED = "[... earlier tool output omitted ...]"
+
+
 def build_evidence(messages: List[Dict[str, Any]], max_chars: int = 8000) -> str:
-    """Compact tool-output messages into an evidence string for the grader."""
-    parts = []
+    """Compact tool-output messages into an evidence string for the grader.
+
+    Keeps the MOST RECENT outputs. This used to join oldest-first and slice
+    ``[:max_chars]``, which handed the judge the opening broad searches and cut
+    off everything after — but an investigation narrows down, so the findings
+    the answer actually rests on are the last few calls. The judge then scored a
+    well-grounded answer as unfaithful because the evidence for it was the part
+    that got dropped. That is expensive as well as wrong: the supervisor blends
+    this into its composite, and a flipped verdict costs a whole extra run.
+
+    A single output larger than the budget is itself tail-truncated, for the
+    same reason.
+    """
+    parts: List[str] = []
     for msg in messages:
         if isinstance(msg, dict) and msg.get("role") == "tool":
             content = str(msg.get("content", ""))
             if content:
                 parts.append(content)
-    return "\n---\n".join(parts)[:max_chars]
+    if not parts:
+        return ""
+
+    kept: List[str] = []
+    remaining = max_chars
+    for content in reversed(parts):
+        if remaining <= 0:
+            break
+        cost = len(content) + (len(_SEP) if kept else 0)
+        if cost <= remaining:
+            kept.append(content)
+            remaining -= cost
+            continue
+        # Partial fit: keep this output's tail so the newest lines survive.
+        room = remaining - (len(_SEP) if kept else 0)
+        if room > len(_EVIDENCE_ELIDED):
+            kept.append(_EVIDENCE_ELIDED + content[-(room - len(_EVIDENCE_ELIDED)):])
+        remaining = 0
+
+    dropped = len(parts) - len(kept)
+    kept.reverse()
+    if dropped > 0:
+        kept.insert(0, f"[... {dropped} earlier tool output(s) omitted ...]")
+    return _SEP.join(kept)
 
 
 async def grade_answer(
@@ -80,7 +117,10 @@ async def grade_answer(
 
         human = (
             "EVIDENCE the agent was given:\n```\n"
-            + (evidence or "")[:8000]
+            # Tail, not head — same reasoning as build_evidence, and a head
+            # slice here would have re-trimmed exactly the newest evidence that
+            # build_evidence just worked to preserve.
+            + (evidence or "")[-8000:]
             + "\n```\n\n"
             "REQUIREMENTS for a faithful answer:\n"
             + (requirements or "(general faithfulness and completeness)")
@@ -94,12 +134,27 @@ async def grade_answer(
         text, _in, _out, _cached = await call_llm(
             full_prompt, tier="search", max_tokens=400
         )
-        parsed = _extract_json(text) or {}
-        score = parsed.get("score")
+        # An unparseable verdict is NO SIGNAL, not a mediocre one. This used to
+        # fall back to score=0.5, which is not neutral: the supervisor blends the
+        # grader 80/20 into its composite (quality/supervisor.py), so a fabricated
+        # 0.5 silently dragged a good answer down or propped a bad one up — and a
+        # flipped verdict costs a whole extra agent run on RETRY. Callers already
+        # treat None as "no grader signal" and fall back to heuristics.
+        parsed = _extract_json(text)
+        if parsed is None:
+            logger.warning(
+                "grader: could not parse a verdict from the judge response "
+                "(%d chars) — returning no signal", len(text or ""),
+            )
+            return None
         try:
-            score = float(score)
+            score = float(parsed.get("score"))
         except (TypeError, ValueError):
-            score = 0.5
+            logger.warning(
+                "grader: judge returned a non-numeric score (%r) — returning no signal",
+                parsed.get("score"),
+            )
+            return None
         score = max(0.0, min(1.0, score))
         return {
             "score": score,

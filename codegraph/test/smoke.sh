@@ -105,14 +105,20 @@ m7=$(printf '%s\n' \
 echo "$m7" | grep -q 'main.c' || { echo "FAIL: C function not found via tree-sitter" >&2; exit 1; }
 echo "PASS: M7 tree-sitter multi-language" >&2
 
-# ── ACCURACY (informational): call-graph scope resolution ──────────────────
-# Scope-aware (self/this) resolution accuracy depends on the grammar versions in
-# the dlopen'd languages.so; reported here, not a hard gate.
-echo "=== ACCURACY (informational) ===" >&2
+# ── ACCURACY (gated): call-graph scope resolution ──────────────────────────
+# Scope-aware (self/this) resolution is a hard gate. It used to be marked
+# informational on the theory that it depended on the dlopen'd grammar
+# versions; it did not — the resolver simply discarded the enclosing-type
+# scope. Now that it consumes it, a regression here is a real regression and
+# must fail the build rather than scroll past in the log.
+echo "=== ACCURACY (gated) ===" >&2
 docker build --target builder -t codegraph:builder "$here" >&2 2>/dev/null || true
+acc_rc=0
 acc=$(docker run --rm -v "$here/test:/test:ro" codegraph:builder \
-        python3 /test/accuracy/eval.py 2>&1) || true
+        python3 /test/accuracy/eval.py 2>&1) || acc_rc=$?
 echo "$acc" >&2
+[ "$acc_rc" -eq 0 ] || { echo "FAIL: call-graph accuracy regression" >&2; exit 1; }
+echo "PASS: call-graph scope resolution" >&2
 
 # ── RETRIEVAL (informational): hybrid search_graph vs legacy BM25-only ──────
 echo "=== RETRIEVAL (informational) ===" >&2

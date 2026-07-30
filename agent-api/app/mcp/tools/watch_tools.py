@@ -1043,9 +1043,16 @@ async def analyze_log_patterns(
                     "first_seen": first_seen,
                     "last_seen": last_seen,
                 }
+        # Count-descending is the candidate ordering, not the final selection.
+        # summarise_patterns re-ranks these by severity × rarity × volume when
+        # cloudwatch_pattern_ranking is on, so the pool has to be wide enough
+        # that a rare high-severity pattern is still in it — cutting at 15 here
+        # drops the one-off FATAL before the ranker ever sees it. These are
+        # small dicts and the summariser caps the agent-facing output anyway.
+        _pool = settings.cloudwatch_pattern_candidates if settings.cloudwatch_pattern_ranking else 15
         unique_patterns = sorted(
             grouped.values(), key=lambda x: x["occurrence_count"], reverse=True
-        )[:15]
+        )[:_pool]
     except Exception as e:
         logger.warning("analyze_log_patterns: unique_patterns query failed: %s", e)
 

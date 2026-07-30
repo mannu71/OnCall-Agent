@@ -270,20 +270,16 @@ class ContextCompactionManager:
         Used by the reactive-compact rung: reached only after
         a genuine context-overflow error from the model, so waiting for
         ``compact_if_needed``'s threshold check (which the overflowing
-        request already exceeded) would be pointless. The recent tail is
-        chosen via :func:`app.harness.engine.compression.split_preserved_tail`
-        so ``compact()``'s own tail-walk lands on the same pairing-safe
-        boundary — this call exists specifically to make the RETRY succeed,
-        and a tail that splits a tool_use/tool_result pair would make Bedrock
-        reject that retry too.
+        request already exceeded) would be pointless.
+
+        This used to pre-compute a pairing-safe tail and hand its token count
+        to ``compact()`` as ``keep_recent_tokens``, because ``compact()``'s own
+        walk could otherwise split a tool_use/tool_result pair and make the
+        retry fail the same way. ``compact()`` now lands on that boundary
+        itself, for every caller — so this is a plain forced compaction.
         """
         if not messages:
             return messages
-
-        from app.harness.engine.compression import split_preserved_tail
-        _, safe_tail = split_preserved_tail(messages, self._keep_recent_tokens)
-        safe_keep_tokens = self.estimate_tokens(safe_tail) if safe_tail else self._keep_recent_tokens
-        safe_keep_tokens = max(1, safe_keep_tokens)
 
         prior_summary = await self._load_summary()
         compacted, new_summary = await compact(
@@ -291,7 +287,7 @@ class ContextCompactionManager:
             transport=self._transport,
             window_size=self._window_size,
             reserve_tokens=self._reserve_tokens,
-            keep_recent_tokens=safe_keep_tokens,
+            keep_recent_tokens=self._keep_recent_tokens,
             prior_summary=prior_summary,
             summarization_model=await self._resolve_summarization_model(),
         )

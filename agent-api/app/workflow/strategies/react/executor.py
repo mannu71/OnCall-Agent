@@ -13,7 +13,6 @@ from typing import Any, Dict, Optional, Tuple
 
 from app.config import settings
 from app.core.quality.supervisor import InvestigationSupervisor, SupervisorConfig
-from app.harness import build_agent_from_spec
 from app.harness.engine import run_agent_once
 from app.harness.spec_factory import _as_bool
 from app.harness.supervisor_loop import run_supervised
@@ -28,6 +27,32 @@ from app.workflow.llm_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def attempt_thread_id(execution_id: Optional[str], attempt: int) -> Optional[str]:
+    """LangGraph thread id for supervisor attempt *attempt* (1-based).
+
+    Attempt 1 keeps the bare ``execution_id`` so existing traces, checkpoint
+    rows and the ``aget_state`` recovery paths are unchanged for the
+    overwhelmingly common single-attempt run. Every RETRY gets its own thread.
+
+    Why a retry needs its own thread: ``make_checkpointer`` ALWAYS returns a
+    checkpointer (Postgres, or InMemorySaver as fallback), so re-running a
+    thread RESUMES its persisted state, and ``MessagesState``'s ``add_messages``
+    reducer APPENDS. Reusing the id therefore fed the supervisor's corrective
+    guidance into the transcript of the very attempt it just rejected — the
+    model saw its own rejected answer as context and tended to restate it,
+    while input tokens, the saved trajectory and the accumulated token totals
+    all compounded across attempts. Measured before this fix: attempt 2's first
+    model call received 6 messages instead of 2, and returned 8 result messages
+    instead of 4.
+
+    ``None`` in / ``None`` out: a run with no execution id has no thread to
+    key on and stays unthreaded, exactly as before.
+    """
+    if not execution_id:
+        return execution_id
+    return execution_id if attempt <= 1 else f"{execution_id}:retry{attempt - 1}"
 
 
 async def run_plan(
@@ -53,13 +78,20 @@ async def run_plan(
     agent_config = plan.agent_config
     llm_config = plan.llm_config
 
+    # ``_run_agent`` below rebuilds the agent for each fallback-chain candidate
+    # — it has to, since every candidate carries a different LLM — so it ignores
+    # the agent handle the supervisor loop threads through it. Eagerly building
+    # one here compiled a whole create_react_agent graph (compose_system_prompt +
+    # policy engine + bind_tools) on every run purely to discard it, and again on
+    # every RETRY. The handle is therefore vestigial for this strategy; the loop
+    # treats it as an opaque pass-through (its selftests pass plain strings).
+    #
+    # If a future change makes _run_agent honour its first argument, restore a
+    # real build_agent_from_spec call in _rebuild_agent.
     def _rebuild_agent():
-        return build_agent_from_spec(
-            spec, llm, tools, checkpointer=checkpointer,
-            execution_port=execution_port,
-        )
+        return None
 
-    agent = _rebuild_agent()
+    agent = None
 
     # Per-workflow autonomy: turning the supervisor OFF on the agent node
     # runs the agent fully autonomously (no scoring / HITL pause). Coerce
@@ -110,6 +142,11 @@ async def run_plan(
         if len(_fallback_chain) > 1 else None
     )
 
+    # Which supervisor attempt we are on. Drives the per-attempt thread_id
+    # below; incremented on entry to _run_agent, which the supervisor loop
+    # calls exactly once per iteration.
+    _attempt = 0
+
     async def _run_agent(_agent, _query):
         # plan.conversation_history is the tool-inclusive replay built in
         # preflight (app.harness.chat_history) — None for non-chat runs or
@@ -120,6 +157,9 @@ async def run_plan(
             if plan.conversation_history is not None
             else ((context.get("inputs") or {}).get("history") if isinstance(context, dict) else None)
         )
+        nonlocal _attempt
+        _attempt += 1
+        _thread_id = attempt_thread_id(execution_id, _attempt)
         last_exc: Optional[Exception] = None
         for _idx, _candidate in enumerate(_fallback_chain):
             if _idx == 0:
@@ -146,13 +186,14 @@ async def run_plan(
                     logger_instance=logger_instance,
                     execution_id=execution_id,
                     stream_callback=stream_callback,
-                    thread_id=execution_id,
+                    thread_id=_thread_id,
                     execution_port=execution_port,
                     conversation_history=_history,
                     retry_predicate=_retry_predicate,
                     model_name=llm_config.get("model"),
                     checkpointer=checkpointer,
                     preloaded_skills=plan.slash_preloaded_skills,
+                    chat_session_id=plan.chat_session_id,
                 )
             except Exception as _exc:  # noqa: BLE001 — decide failover vs raise
                 from app.core.llm.error_classifier import classify_error as _classify

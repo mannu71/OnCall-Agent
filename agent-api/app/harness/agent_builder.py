@@ -7,8 +7,11 @@ all agent builds.
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def compose_system_prompt(
@@ -24,6 +27,7 @@ def compose_system_prompt(
     sandbox: bool = False,
     verify: bool = False,
     subagents: Optional[List[Dict[str, Any]]] = None,
+    auto_learn: bool = False,
 ) -> str:
     """Assemble the deterministic system prompt (the Bedrock cachePoint prefix).
 
@@ -45,14 +49,58 @@ def compose_system_prompt(
     # be steered with SQL guidance; its behavior is driven entirely by the
     # agent's own instructions and the tools the user wired. This keeps the
     # platform capability-agnostic rather than assuming "any MCP tool = a DB".
-    has_db_tools = any(
-        getattr(t, "name", "").startswith("db_") for t in tools
-    )
+    tool_names = [str(getattr(t, "name", "") or "") for t in tools]
+    has_db_tools = any(n.startswith("db_") for n in tool_names)
     # Deterministic given the bound tools (same cache-safety basis as
     # has_db_tools) — drives the static "# Skills" section below. No skill
     # NAMES appear in the prompt; the per-turn listing (in the user query)
     # carries those, so the cachePoint prefix stays stable.
-    has_skill_tool = any(getattr(t, "name", "") == "skill" for t in tools)
+    has_skill_tool = "skill" in tool_names
+
+    # ── NEVER name a tool the agent does not actually have ──────────────
+    # Every section below that names a tool is gated on that tool really being
+    # bound, not on the operator's intent to enable it. The two differ more
+    # often than the flag names suggest, and the failure is silent: the model
+    # emits a call for a tool that isn't in its schema list, burns the turn, and
+    # (for run_verify) can never satisfy a completion criterion the prompt sets.
+    #
+    # tool_assembler runs disclosure + all the profile-gated builders BEFORE
+    # build_agent, so `tools` here is the final bound list — checking a name is
+    # as deterministic as has_db_tools above, and keeps the cachePoint prefix
+    # stable.
+    #
+    # search_tools: exists only when progressive disclosure actually fired.
+    # apply_tool_disclosure returns the list UNCHANGED below the count/token
+    # threshold (and tool_exposure_mode defaults to "legacy"), so the common
+    # small-toolset workflow has no bridge. Pointing at it unconditionally
+    # misfires at the worst moment — that sentence is read exactly when the
+    # model is unsure which domain owns the question.
+    has_search_tools = "search_tools" in tool_names
+    # run_command / run_verify: the caller passes operator INTENT (a sandbox
+    # toggle, a configured verify_command), but tool_assembler additionally
+    # requires a sandbox backend — with no SANDBOX_BACKEND it logs "skipping
+    # run_command tool" / "skipping run_verify tool" and binds nothing.
+    has_sandbox_tool = bool(sandbox) and "run_command" in tool_names
+    # The verify section prescribes an edit→verify→fix LOOP, so it needs the edit
+    # tools too — those bind only alongside a code analyzer (add_extension_tools),
+    # and without them the loop it describes cannot be run at all.
+    has_verify_tool = (
+        bool(verify) and "run_verify" in tool_names and "edit_file" in tool_names
+    )
+    # cloudwatch / code_analyzer: the callers pass ``bool(<node>_config)`` — the
+    # operator WIRED the node — but tool_assembler binds nothing on three live
+    # paths: expired AWS credentials, a codegraph build that raises, and
+    # build_codegraph_tools returning an empty list when the engine won't start.
+    # Each left up to 2,369 tokens of capability text (cloudwatch + rds + code)
+    # describing tools absent from the schema, precisely on a run that is already
+    # degraded. AND the intent flag with the tools actually bound, the same basis
+    # has_db_tools has always used.
+    has_cloudwatch_tools = bool(has_cloudwatch) and any(
+        n.startswith("cloudwatch_") for n in tool_names
+    )
+    has_code_tools = bool(has_code_analyzer) and any(
+        n.startswith(("codegraph__", "repo_")) for n in tool_names
+    )
 
     # ── Resolve active capabilities (composable; see app.harness.capabilities) ──
     # The investigation trio is derived from the runtime flags so existing
@@ -62,10 +110,24 @@ def compose_system_prompt(
     _active_ids: List[str] = []
     if has_db_tools:
         _active_ids.append("database")
-        _active_ids.append("rds_performance")
-    if has_cloudwatch:
+        # rds_performance is ~942 tokens of pg_stat_statements runbook (five
+        # embedded SQL examples) — the second-largest block in this prompt. It
+        # used to ride along with EVERY db_* binding, so an agent doing plain
+        # business-data lookups paid for a performance protocol it could never
+        # use (the stored "test case generator" workflow is exactly that: a
+        # database node with no CloudWatch).
+        #
+        # Requiring CloudWatch too is not a guess about intent: in this system a
+        # database *performance* investigation starts from a CloudWatch alarm and
+        # drills into Postgres, so the perf population always has both. A profile
+        # can still request it explicitly via `capabilities=["rds_performance"]`
+        # (handled by the loop below), which is the escape hatch for a perf
+        # workflow that somehow has no CloudWatch node.
+        if has_cloudwatch_tools:
+            _active_ids.append("rds_performance")
+    if has_cloudwatch_tools:
         _active_ids.append("cloudwatch")
-    if has_code_analyzer:
+    if has_code_tools:
         _active_ids.append("code_analyzer")
     for _cid in (capabilities or []):
         if _cid not in _active_ids:
@@ -118,12 +180,22 @@ def compose_system_prompt(
     # § Plan → execute → verify. Multi-step only, so trivial
     # single-tool runs are not bloated. Gated on a stable config flag + agent_mode
     # so the cache prefix stays deterministic per run (re-baseline evals on change).
+    #
+    # ONE planning mechanism per prompt: when the deep-agent planning tools are
+    # bound (planning=True) the "# Planning" section below owns this, and the
+    # todo list IS the plan. Emitting both — which is what happened for every
+    # planning profile with agentMode=="multi" — put two competing procedures
+    # (a markdown checklist and write_todos) in one prompt. This block is the
+    # fallback for multi-mode agents that have no todo tools.
     try:
         from app.config import settings as _settings
         _planning_on = bool(getattr(_settings, "agent_planning_enabled", True))
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "agent_planning_enabled unreadable – defaulting to on", exc_info=True
+        )
         _planning_on = True
-    if _planning_on and agent_mode == "multi":
+    if _planning_on and not planning and agent_mode == "multi":
         system_parts.append(
             "# Plan, then execute, then verify\n"
             "- For a multi-step task, FIRST write a short markdown task list "
@@ -157,11 +229,20 @@ def compose_system_prompt(
         "or current state is answered by querying the DATA SOURCE that holds it (e.g. a connected "
         "database) — not by reading the code that writes it. A question about how the system is "
         "BUILT or where logic lives is answered by the code tools. Logs, metrics, and alarms are "
-        "answered by the observability tools. If the tool you need is not directly visible in your "
-        "tool list, use search_tools to find it before falling back to a different domain's tools.",
-        "- When you reach a useful conclusion or resolution worth reusing, call save_playbook to "
-        "record it so future runs can benefit from it.",
+        "answered by the observability tools."
+        # Only when the disclosure bridge is really bound — see has_search_tools.
+        + (" If the tool you need is not directly visible in your tool list, use search_tools "
+           "to find it before falling back to a different domain's tools."
+           if has_search_tools else ""),
     ]
+    # Gated on the same Auto-learn toggle that binds save_playbook (see
+    # react_agent._auto_learn_enabled). Naming it unconditionally told agents on
+    # auto-learn-OFF workflows to call a tool they no longer have.
+    if auto_learn:
+        _tool_bullets.append(
+            "- When you reach a useful conclusion or resolution worth reusing, call "
+            "save_playbook to record it so future runs can benefit from it."
+        )
     system_parts.append("\n".join(_tool_bullets))
 
     # ── Capability sections (registry-driven; stable order) ──────────────
@@ -178,11 +259,13 @@ def compose_system_prompt(
     # dependency the role sentence/capability sections above already have.
     try:
         from app.core.governance import slice_rules
-        _gov_text = slice_rules([getattr(t, "name", "") for t in tools])
+        _gov_text = slice_rules(tool_names)
         if _gov_text:
             system_parts.append(f"# Governance\n{_gov_text}")
     except Exception:  # noqa: BLE001 — governance must never break prompt build
-        pass
+        # Silence here was indistinguishable from "no rule matched": a broken
+        # policy doc dropped every governance rule with no trace.
+        logger.warning("Governance slice failed – continuing without it", exc_info=True)
 
     # ── Deep-agent capability instructions (profile-gated, config-stable) ──────
     if planning:
@@ -193,18 +276,24 @@ def compose_system_prompt(
             "calling update_todo to mark each item in_progress then completed as the tool "
             "evidence supports it. Skip the plan for a single-lookup question."
         )
-    system_parts.append(
-        "# Scratch filesystem\n"
-        "You have a session-scoped virtual filesystem (fs_write, fs_read, fs_ls, fs_grep). "
-        "When a tool returns a large result you only partly need, fs_write it to a file and "
-        "keep working from a short note, then fs_read/fs_grep just the part you need later. "
-        "This keeps your context lean. The files vanish when the run ends."
-    )
+    # Gated on `filesystem`: tool_assembler binds the fs_* tools on exactly this
+    # flag (AgentSpec.filesystem, default False). Unconditionally, this section
+    # described four tools that most agents do not have.
     if filesystem:
-        from app.harness.metamemory import is_active as _metamemory_active, METAMEMORY_SECTION
-        if _metamemory_active(filesystem):
-            system_parts.append(METAMEMORY_SECTION)
-    if sandbox:
+        system_parts.append(
+            "# Scratch filesystem\n"
+            "You have a session-scoped virtual filesystem (fs_write, fs_read, fs_ls, fs_grep). "
+            "When a tool returns a large result you only partly need, fs_write it to a file and "
+            "keep working from a short note, then fs_read/fs_grep just the part you need later. "
+            "This keeps your context lean. The files vanish when the run ends."
+        )
+        try:
+            from app.harness.metamemory import is_active as _metamemory_active, METAMEMORY_SECTION
+            if _metamemory_active(filesystem):
+                system_parts.append(METAMEMORY_SECTION)
+        except Exception:  # noqa: BLE001 — an additive section must not kill the run
+            logger.warning("Metamemory section skipped", exc_info=True)
+    if has_sandbox_tool:
         system_parts.append(
             "# Sandboxed shell\n"
             "You have run_command, which executes a shell command inside an isolated "
@@ -212,7 +301,7 @@ def compose_system_prompt(
             "directory). Use it for safe, self-contained commands; it returns "
             "stdout/stderr/exit_code. It requires operator approval before each run."
         )
-    if verify:
+    if has_verify_tool:
         system_parts.append(
             "# Verify your changes\n"
             "After you edit_file or create_file, call run_verify(repo) to run the project's "
@@ -223,9 +312,23 @@ def compose_system_prompt(
             "of attempts, report the remaining failure and what you tried."
         )
     if subagents:
+        # Reuse subagent_factory's own slug so the advertised names are the ones
+        # it actually registers (the local copy of this transform had already
+        # drifted: no "subagent" fallback for an all-punctuation name), then keep
+        # only the delegates that really got built — build_subagent_tools is
+        # wrapped in a try/except in tool_assembler, so a failure there left this
+        # section advertising delegates that do not exist.
+        try:
+            from app.harness.subagent_factory import _slug as _subagent_slug
+        except Exception:  # noqa: BLE001 — fall back to the equivalent transform
+            def _subagent_slug(_n: str) -> str:  # type: ignore[misc]
+                return re.sub(r"[^a-z0-9]+", "_", (_n or "").strip().lower()).strip("_") or "subagent"
+        _bound = {n for n in tool_names if n.startswith("delegate_to_")}
         _names = ", ".join(
-            f"delegate_to_{re.sub(r'[^a-z0-9]+', '_', str(s.get('name', '')).lower()).strip('_')}"
-            for s in subagents if isinstance(s, dict) and s.get("name")
+            _t for _t in (
+                f"delegate_to_{_subagent_slug(str(s.get('name', '')))}"
+                for s in subagents if isinstance(s, dict) and s.get("name")
+            ) if _t in _bound
         )
         if _names:
             system_parts.append(
@@ -242,9 +345,11 @@ def compose_system_prompt(
     # symbol"), which directly competes with "load the matching skill first",
     # and recency is what was measured to win — when Skills came before the
     # capability text the agent skipped the runbook for the obvious one-shot
-    # tool, and when later default-on sections (scratch-fs/planning) slid in
-    # after it the same regression came back. Keep every other section above
-    # this one. (Static order: the cache prefix stays deterministic.)
+    # tool, and when later sections (scratch-fs/planning) slid in after it the
+    # same regression came back. Those two are profile-gated now, so they no
+    # longer reach every prompt, but the constraint is unchanged: keep every
+    # other section above this one, gated or not.
+    # (Static order: the cache prefix stays deterministic.)
     if has_skill_tool:
         system_parts.append(
             "# Skills\n"
@@ -293,6 +398,6 @@ def compose_system_prompt(
         if preamble:
             system_prompt = "\n\n".join(preamble) + "\n\n" + system_prompt
     except Exception:  # noqa: BLE001 — persona is additive; never break prompt build
-        pass
+        logger.warning("Persona/context doc skipped", exc_info=True)
 
     return system_prompt

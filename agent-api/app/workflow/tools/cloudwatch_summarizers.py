@@ -7,6 +7,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from app.config import settings
+from app.workflow.tools.cloudwatch_scoring import (
+    grade_weight,
+    pattern_score,
+    severity_label,
+)
+
 # Triage caps — tuned for ~800–1200 tokens per structured tool response.
 TOP_UNIQUE_PATTERNS = 12
 TOP_ANOMALIES = 15
@@ -73,6 +80,30 @@ def compact_pattern_buckets(patterns: Any) -> tuple[Dict[str, Any], bool, float]
     return summary, partial, min_ratio
 
 
+def _rank_unique_patterns(
+    patterns: List[Any], grade_w: float,
+) -> List[Dict[str, Any]]:
+    """Order pattern candidates by severity × rarity-aware volume × grade.
+
+    The upstream list arrives sorted count-descending, so a plain head slice
+    keeps the loudest patterns and drops every rare one — exactly backwards for
+    a one-off ``OutOfMemoryError``. Ranking first lets a singleton FATAL
+    survive the cut without giving up the high-volume burst.
+
+    Ties break on the normalized pattern text so ordering stays deterministic.
+    """
+    scored = []
+    for p in patterns:
+        if not isinstance(p, dict):
+            continue
+        key = p.get("normalized_pattern", "") or ""
+        sev = severity_label(key, p.get("example_message", "") or "")
+        score = pattern_score(sev, p.get("occurrence_count") or 0.0, grade_w)
+        scored.append((score, key, p, sev))
+    scored.sort(key=lambda s: (-s[0], s[1]))
+    return [{**p, "severity": sev} for _s, _k, p, sev in scored]
+
+
 def summarise_patterns(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Compact analyze_log_patterns output for the agent."""
     if not isinstance(raw, dict):
@@ -81,11 +112,23 @@ def summarise_patterns(raw: Dict[str, Any]) -> Dict[str, Any]:
     pattern_summary, partial, min_ratio = compact_pattern_buckets(raw.get("patterns"))
     dq = merge_data_quality(raw.get("data_quality") or {}, partial, min_ratio)
 
+    candidates: List[Any] = raw.get("unique_patterns") or []
+    ranked = settings.cloudwatch_pattern_ranking
+    grade: str | None = None
+    if ranked:
+        # Grade the *unranked* corpus: evidence_grade answers "how solid is the
+        # evidence base", which is a property of the whole candidate set, not of
+        # whichever pattern ranking floated to the top. Computing it after the
+        # sort would let a promoted singleton read as grade=low and spuriously
+        # trip should_auto_drill_down.
+        grade = _evidence_grade(dq, [p for p in candidates if isinstance(p, dict)])
+        candidates = _rank_unique_patterns(candidates, grade_weight(grade))
+
     compact: List[Dict[str, Any]] = []
-    for p in (raw.get("unique_patterns") or [])[:TOP_UNIQUE_PATTERNS]:
+    for p in candidates[:TOP_UNIQUE_PATTERNS]:
         if not isinstance(p, dict):
             continue
-        compact.append({
+        entry = {
             "normalized_pattern": _truncate(p.get("normalized_pattern", ""), PATTERN_CHARS),
             "occurrence_count": p.get("occurrence_count"),
             "affected_streams": p.get("affected_streams"),
@@ -94,7 +137,13 @@ def summarise_patterns(raw: Dict[str, Any]) -> Dict[str, Any]:
             ),
             "first_seen": p.get("first_seen"),
             "last_seen": p.get("last_seen"),
-        })
+        }
+        if ranked:
+            # Carry severity through so select_drill_targets scores patterns on
+            # it too — it reads this summary, and without the field every
+            # pattern silently fell back to the default weight.
+            entry["severity"] = p.get("severity")
+        compact.append(entry)
 
     total = len(raw.get("unique_patterns") or [])
     out: Dict[str, Any] = {
@@ -109,7 +158,7 @@ def summarise_patterns(raw: Dict[str, Any]) -> Dict[str, Any]:
         out["data_quality"] = dq
     if total > len(compact):
         out["unique_patterns_truncated"] = True
-    out["evidence_grade"] = _evidence_grade(dq, compact)
+    out["evidence_grade"] = grade if grade is not None else _evidence_grade(dq, compact)
     return out
 
 

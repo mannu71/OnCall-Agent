@@ -103,6 +103,10 @@ async def _persist_assistant_turn(session_id: str, result_dict: Dict[str, Any]) 
         "total_tokens": result_dict.get("total_tokens", 0) or 0,
         "cache_read_tokens": result_dict.get("cache_read_tokens", 0) or 0,
         "cache_creation_tokens": result_dict.get("cache_creation_tokens", 0) or 0,
+        # Per-turn cache efficiency (build_result computes it). The session's
+        # lifetime rate is derived separately on read from the accumulated
+        # totals — see session_repository._session_to_dict.
+        "cache_hit_rate": result_dict.get("cache_hit_rate", 0.0) or 0.0,
         "context_window_size": result_dict.get("context_window_size", 0) or 0,
         "context_used_tokens": result_dict.get("context_used_tokens", 0) or 0,
         "context_used_pct": result_dict.get("context_used_pct", 0) or 0,

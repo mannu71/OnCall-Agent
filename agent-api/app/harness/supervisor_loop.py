@@ -28,9 +28,12 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
+from app.core.context.tool_output import get_stats as get_compression_stats
+from app.core.context.tool_output import start_stats as start_compression_stats
 from app.core.quality.supervisor import SupervisorAction
 from app.harness.helpers import estimate_confidence
 from app.harness.hitl import emit_hitl_pause
+from app.harness.usage_ledger import drain_usage, open_ledger
 
 
 async def _record_supervisor_reward(execution_id: Optional[str], score: Any) -> None:
@@ -74,8 +77,14 @@ async def run_supervised(
 
     Returns ``(result, accum_input_tokens, accum_output_tokens,
     accum_cache_read_tokens, accum_cache_creation_tokens)``. ``input_tokens`` is
-    already the non-cached portion — cache_read/cache_creation are additional,
-    not a subset of it (see ``TokenUsageCallback`` in ``core/streaming/callbacks.py``).
+    the WHOLE prompt — cache_read/cache_creation are a breakdown OF it, not
+    counters to add to it (see ``TokenUsageCallback`` in
+    ``core/streaming/callbacks.py`` and ``core/observability/cache_metrics.py``).
+
+    The totals cover the WHOLE agent tree: each turn's own counters plus the
+    usage banked by any delegated subagents (``app.harness.usage_ledger``).
+    Children run under their own execution_id and callback, so they used to be
+    absent from both the returned totals and the budget below.
     """
     supervisor_retry_count = 0
     current_query = base_query
@@ -84,6 +93,15 @@ async def run_supervised(
     accum_output_tokens = 0
     accum_cache_read_tokens = 0
     accum_cache_creation_tokens = 0
+    # Install the subagent usage ledger for this run. Opened here because this
+    # frame is an ancestor context of every delegated child (children mutate the
+    # ledger in place, so their writes are visible across the task boundary).
+    open_ledger()
+    # Same frame, same reason: compression happens inside tool calls made by the
+    # agent and by every child, and the accumulator is mutated in place.
+    start_compression_stats()
+    _breakdown: list = []
+    _aux: list = []
     _cfg = getattr(supervisor, "_cfg", None) if supervisor else None
     token_budget = getattr(_cfg, "token_budget", 0) or 0
 
@@ -127,6 +145,32 @@ async def run_supervised(
         accum_cache_read_tokens += result.get("cache_read_tokens", 0) or 0
         accum_cache_creation_tokens += result.get("cache_creation_tokens", 0) or 0
 
+        # Fold in everything this turn spent outside the parent's own callback:
+        # delegated children AND auxiliary LLM calls (compaction, grader,
+        # extractors). Drained — not just read — so each iteration banks only
+        # its own.
+        extra_usage = drain_usage()
+        if not extra_usage.empty():
+            accum_input_tokens += extra_usage.input_tokens
+            accum_output_tokens += extra_usage.output_tokens
+            accum_cache_read_tokens += extra_usage.cache_read_tokens
+            accum_cache_creation_tokens += extra_usage.cache_creation_tokens
+            logger_instance.info(
+                "supervisor_loop: folded in %d subagent run(s) + %d auxiliary LLM "
+                "call(s) — input=%d output=%d (turn own input=%s); "
+                "run total input=%d output=%d",
+                extra_usage.runs, extra_usage.aux_calls,
+                extra_usage.input_tokens, extra_usage.output_tokens,
+                result.get("input_tokens", 0) or 0,
+                accum_input_tokens, accum_output_tokens,
+                extra={"execution_id": execution_id},
+            )
+            # Attribution: which child cost what. The aggregate hides a wide
+            # spread (execution 240: 24,137 to 302,527 across seven children),
+            # and that spread is the actionable part.
+            _breakdown.extend(extra_usage.breakdown())
+            _aux.extend(extra_usage.aux_breakdown())
+
         final_answer = result.get("final_answer") or ""
         confidence = estimate_confidence(final_answer, result.get("tool_calls", []))
 
@@ -157,6 +201,19 @@ async def run_supervised(
 
         if verdict.action == SupervisorAction.RETRY:
             supervisor_retry_count += 1
+            # A RETRY re-runs the ENTIRE ReAct loop — by far the largest single
+            # token multiplier in a run (roughly 2x). Logged at WARNING with the
+            # score and its breakdown so the retry RATE and what triggered it are
+            # visible in production; the threshold should not be tuned without
+            # that number.
+            logger_instance.warning(
+                "supervisor_loop: RETRY %d/%d — re-running the full agent loop "
+                "(score=%.3f, reason=%s, breakdown=%s)",
+                supervisor_retry_count, max_iterations - 1, verdict.score,
+                verdict.reason, getattr(verdict, "score_breakdown", None),
+                extra={"execution_id": execution_id},
+            )
+            result["supervisor_retried"] = True
             current_query = (
                 f"{verdict.retry_guidance}\n\n---\n\nOriginal query:\n{base_query}"
             )
@@ -183,6 +240,45 @@ async def run_supervised(
             result["supervisor_reason"] = verdict.reason
             break
         break
+
+    # Compression accounting for the run. Logged (not just accumulated) because
+    # the sidecar fails SILENTLY useful: it answers 200 OK and hands the text
+    # straight back for content it cannot shrink, so "compression is enabled"
+    # tells you nothing about whether it did anything.
+    if _breakdown:
+        result["subagent_usage"] = sorted(
+            _breakdown, key=lambda c: c["input_tokens"], reverse=True,
+        )
+    if _aux:
+        merged: dict = {}
+        for row in _aux:
+            acc = merged.setdefault(
+                row["source"],
+                {"source": row["source"], "calls": 0, "input_tokens": 0, "output_tokens": 0},
+            )
+            acc["calls"] += row["calls"]
+            acc["input_tokens"] += row["input_tokens"]
+            acc["output_tokens"] += row["output_tokens"]
+        result["auxiliary_usage"] = sorted(
+            merged.values(), key=lambda r: r["input_tokens"], reverse=True,
+        )
+
+    _stats = get_compression_stats()
+    if _stats is not None and (_stats.calls or _stats.skipped_uncompressible):
+        logger_instance.info(
+            "compression: %s", _stats.summary(),
+            extra={"execution_id": execution_id},
+        )
+        result["compression_stats"] = {
+            "calls": _stats.calls,
+            "chars_before": _stats.chars_before,
+            "chars_after": _stats.chars_after,
+            "saved_pct": _stats.saved_pct(),
+            "unchanged": _stats.unchanged,
+            "skipped_uncompressible": _stats.skipped_uncompressible,
+            "discarded": _stats.discarded,
+            "errors": _stats.errors,
+        }
 
     return (
         result, accum_input_tokens, accum_output_tokens,

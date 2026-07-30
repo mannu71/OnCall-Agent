@@ -26,14 +26,22 @@ from pydantic import BaseModel, Field as PydanticField
 
 logger = logging.getLogger(__name__)
 
-# Ceiling for a single tool's serialized JSON output. Grep/list/read are already
-# bounded (max_results / limit / max_lines), so this is a backstop against a
-# pathological single line; kept generous.
-_OUTPUT_MAX_CHARS = 60_000
+def _cap(text: str, max_chars: Optional[int] = None) -> str:
+    """Boundary-aware char cap so a tool result can't blow up the context.
 
-
-def _cap(text: str, max_chars: int = _OUTPUT_MAX_CHARS) -> str:
-    """Boundary-aware char cap so a tool result can't blow up the context."""
+    ``max_chars`` defaults to ``settings.tool_output_max_chars`` — the SAME
+    universal ceiling the policy engine applies to every other native tool
+    (``app.core.policy.apply_to_tools``). This used to be a hardcoded 60_000
+    with no config or env key, which was *above* the universal net and so had
+    no effect: the policy wrapper truncated to the smaller value moments later,
+    and the "…[truncated; narrow the query]" hint this function appends was cut
+    off with it. Reading the setting keeps the two in step and restores the
+    hint, so lowering TOOL_OUTPUT_MAX_CHARS actually reaches the repo tools.
+    Resolved per call, not at import, so an env override still applies.
+    """
+    if max_chars is None:
+        from app.config import settings
+        max_chars = settings.tool_output_max_chars
     if max_chars <= 0 or len(text) <= max_chars:
         return text
     total = len(text)
@@ -221,9 +229,12 @@ def build_repo_file_tools(
             coroutine=_list_files_tool,
             name="repo_list_files",
             description=(
-                "List repository file paths (optionally filtered by a glob), across one repo "
-                "or ALL connected repos. WHEN TO USE: orient in unfamiliar layout or find "
-                "config/infra files (e.g. glob '**/*.tf', '*Controller.cs', 'appsettings*.json')."
+                "List repository file paths, across one repo or ALL connected repos. "
+                "WHEN TO USE: orient in an unfamiliar layout or find config/infra files. "
+                "ALWAYS pass a glob (e.g. '**/*.tf', '*Controller.cs', 'appsettings*.json') "
+                "— NEVER call this without one: unfiltered it walks the entire repo and the "
+                "file list is too long to reason over. If you do not yet know the extension "
+                "or directory you want, use repo_grep instead."
                 + repo_hint
             ),
             args_schema=_ListFilesInput,

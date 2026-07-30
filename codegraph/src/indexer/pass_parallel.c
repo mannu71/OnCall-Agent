@@ -1582,7 +1582,13 @@ static void emit_trpc_edge(cg_gbuf_t *gbuf, const cg_gbuf_node_t *source, const 
     cg_gbuf_insert_edge(gbuf, source->id, route_id, "TRPC_CALLS", props);
 }
 
-static void emit_service_edge(cg_gbuf_t *gbuf, const cg_gbuf_node_t *source,
+/* Classify a resolved call and emit the right edge kind (CALLS / HTTP_CALLS /
+ * ASYNC_CALLS / GRPC_CALLS / GraphQL / tRPC / CONFIGURES / route registration).
+ * Shared by BOTH the parallel and the sequential resolve passes: the sequential
+ * pass used to carry its own reduced copy of this logic, so a small incremental
+ * re-index (<= 50 changed files, which is the common case) silently produced a
+ * graph missing gRPC/GraphQL/tRPC edges and used a narrower route-path rule. */
+void cg_pp_emit_service_edge(cg_gbuf_t *gbuf, const cg_gbuf_node_t *source,
                               const cg_gbuf_node_t *target, const CGCall *call,
                               const cg_resolution_t *res, const char *module_qn,
                               const cg_registry_t *registry, const cg_gbuf_t *main_gbuf,
@@ -1656,8 +1662,11 @@ static const cg_gbuf_node_t *find_source_node(const cg_gbuf_t *gbuf, const char 
 
 /* Field type hint resolution for obj.Method() with multiple candidates.
  * Strips C# field prefixes (_ / m_), capitalizes to get type name, and
- * checks if TypeName.Method or ITypeName.Method exists among candidates. */
-static void try_field_type_hint(resolve_ctx_t *rc, cg_resolution_t *res, const char *callee_name,
+ * checks if TypeName.Method or ITypeName.Method exists among candidates.
+ * Takes registry+gbuf rather than resolve_ctx_t so the sequential pass can
+ * apply the identical hint — the two paths must not diverge. */
+void cg_pp_try_field_type_hint(const cg_registry_t *registry, const cg_gbuf_t *gbuf,
+                                cg_resolution_t *res, const char *callee_name,
                                 int64_t source_id) {
     if (!res->qualified_name || res->candidate_count <= SKIP_ONE) {
         return;
@@ -1694,10 +1703,10 @@ static void try_field_type_hint(resolve_ctx_t *rc, cg_resolution_t *res, const c
     const char *method = dot + SKIP_ONE;
     const char **cands = NULL;
     int cand_count = 0;
-    cg_registry_find_by_name(rc->registry, method, &cands, &cand_count);
+    cg_registry_find_by_name(registry, method, &cands, &cand_count);
     for (int ci = 0; ci < cand_count; ci++) {
         if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
-            const cg_gbuf_node_t *better = cg_gbuf_find_by_qn(rc->main_gbuf, cands[ci]);
+            const cg_gbuf_node_t *better = cg_gbuf_find_by_qn(gbuf, cands[ci]);
             if (better && better->id != source_id) {
                 res->qualified_name = cands[ci];
                 res->confidence = PP_FIELD_HINT_CONF;
@@ -1817,14 +1826,23 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CG
                 ws->lsp_overrides++;
             }
         } else {
-            res = cg_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
-                                       imp_vals, imp_count);
+            /* Enclosing-type scope lets `self.m()` / bare `m()` bind to THIS
+             * class's member instead of collapsing onto whichever same-named
+             * definition was registered first. */
+            char class_buf[CG_SZ_512];
+            const char *class_qn =
+                call->enclosing_func_qn
+                    ? cg_pipeline_parent_qn(call->enclosing_func_qn, class_buf, sizeof(class_buf))
+                    : NULL;
+            res = cg_registry_resolve_scoped(rc->registry, call->callee_name, module_qn, class_qn,
+                                              imp_keys, imp_vals, imp_count);
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
 
         _rc_t0 = extract_now_ns();
-        try_field_type_hint(rc, &res, call->callee_name, source_node->id);
+        cg_pp_try_field_type_hint(rc->registry, rc->main_gbuf, &res, call->callee_name,
+                                   source_node->id);
         atomic_fetch_add_explicit(&rc->time_ns_rc_hint, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
 
@@ -1846,9 +1864,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CG
                 cg_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,
                                              .strategy = "callee_suffix"};
-                emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
-                                  module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count);
+                cg_pp_emit_service_edge(ws->local_edge_buf, source_node, source_node, call,
+                                         &fake_res, module_qn, rc->registry, rc->main_gbuf,
+                                         imp_keys, imp_vals, imp_count);
             }
             continue;
         }
@@ -1869,8 +1887,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CG
             continue;
         }
         _rc_t0 = extract_now_ns();
-        emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
-                          rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count);
+        cg_pp_emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
+                                 rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;

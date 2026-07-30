@@ -10,6 +10,26 @@ from . import register
 logger = logging.getLogger(__name__)
 
 
+def _sole_picked_skill(node: Dict[str, Any]) -> str:
+    """Return the one skill name on the node's Skills picker, else ``''``.
+
+    A node with exactly one picked skill and no instructions is unambiguous —
+    the operator wired this agent to run that runbook. Two or more stays
+    ambiguous (skill selection is query-driven: ``select_for_query`` has nothing
+    to rank an empty query against), so the caller keeps skipping.
+    """
+    try:
+        from app.harness.spec_factory import resolve_profile_fields
+        from app.workflow.strategies.react.workflow_config import extract_agent_config
+
+        cfg = extract_agent_config({'nodes': [{**node, 'type': 'agent'}]})
+        skills = resolve_profile_fields(cfg).get('skills') or []
+    except Exception as exc:  # noqa: BLE001 — a config read must never break a run
+        logger.warning("Agent node: skills-picker read failed (%s)", exc)
+        return ''
+    return skills[0] if len(skills) == 1 else ''
+
+
 @register("agent")
 async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -45,6 +65,43 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
         or node_data.get('description')
         or ''
     )
+
+    # No instruction anywhere (a scheduled/manual run carries no chat message, and
+    # this node has no Instructions text) — but a single picked skill IS the
+    # instruction. Synthesise the slash command so ReactStrategy's existing
+    # expansion runs it, instead of skipping a run the operator plainly intended.
+    if not user_query:
+        _skill_name = _sole_picked_skill(node)
+        if _skill_name:
+            from app.core.skills import get_default_skill_manager
+            try:
+                _mgr = get_default_skill_manager()
+                # Safe here (unlike the agent hot path): this runs at most once
+                # per execution, and only when no query was supplied at all — so
+                # a SKILL.md dropped on the volume works without an API restart.
+                _mgr.maybe_rescan()
+                _resolved = _mgr.resolve_command(_skill_name)
+            except Exception as _skill_err:  # noqa: BLE001
+                logger.warning("Agent node: skill resolution failed (%s)", _skill_err)
+                _resolved = None
+            if _resolved is None:
+                # Naming the skill beats the generic message: the usual cause is
+                # a SKILL.md dropped on the volume that the cached manager has
+                # not re-scanned (GET /api/v1/skills triggers maybe_rescan).
+                return {
+                    'status': 'skipped',
+                    'output': (
+                        f"Agent node has no instructions, and its only picked skill "
+                        f"'{_skill_name}' could not be resolved — check the skill "
+                        f"exists and has been re-scanned."
+                    ),
+                    'agent_data': node_data,
+                }
+            user_query = f"/{_resolved.name}"
+            logger.info(
+                "Agent node: no instructions — running sole picked skill /%s",
+                _resolved.name,
+            )
 
     if not user_query:
         return {
@@ -172,11 +229,15 @@ async def execute(executor, node: Dict[str, Any], context: Dict[str, Any]) -> Di
             'input_tokens':  result.get('input_tokens',  0) or 0,
             'output_tokens': result.get('output_tokens', 0) or 0,
             'total_tokens':  result.get('total_tokens',  0) or 0,
-            # cache_read / cache_creation are ADDITIONAL to input_tokens, not a
-            # subset of it (Bedrock/Anthropic report them as separate counters).
+            # cache_read / cache_creation are a SUBSET of input_tokens, not
+            # additional to it. Bedrock's raw counters ARE exclusive, but
+            # langchain_aws folds them back in when it builds usage_metadata and
+            # callbacks._parse_llm_output normalizes the raw branches to match,
+            # so everything downstream of the callback is inclusive. (This
+            # comment previously said the opposite; verified against live
+            # Bedrock 2026-07-21 — see app.core.observability.cache_metrics.)
             # cache_read bills at ~10% of fresh input; cache_creation at a
-            # premium for the write. Carried through so the UI can show real
-            # cache savings instead of misreading input_tokens as inclusive.
+            # premium for the write.
             'cache_read_tokens': result.get('cache_read_tokens', 0) or 0,
             'cache_creation_tokens': result.get('cache_creation_tokens', 0) or 0,
             # Context-window fullness for this turn (Chat UI context bar).

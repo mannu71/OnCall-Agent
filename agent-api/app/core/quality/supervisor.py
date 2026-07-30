@@ -118,8 +118,11 @@ class SupervisorConfig:
     # Whether to run an LLM quality check in addition to heuristics.
     llm_scoring_enabled: bool = False
 
-    # Total input+output tokens allowed across supervisor retry loops.
-    token_budget: int = 100_000
+    # Total input+output tokens allowed across supervisor retry loops, counting
+    # the whole agent tree (delegated subagents included — see
+    # app.harness.usage_ledger). Keep in step with
+    # settings.supervisor_token_budget, which documents the calibration.
+    token_budget: int = 1_200_000
 
     @classmethod
     def from_settings(cls) -> "SupervisorConfig":

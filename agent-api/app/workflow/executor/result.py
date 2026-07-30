@@ -10,6 +10,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from app.core.observability.cache_metrics import annotate_cache_metrics
+
 logger = logging.getLogger(__name__)
 
 
@@ -88,6 +90,15 @@ def build_result(
     result["total_tokens"] = totals["input_tokens"] + totals["output_tokens"]
     result["cache_read_tokens"] = totals["cache_read_tokens"]
     result["cache_creation_tokens"] = totals["cache_creation_tokens"]
+    # Prompt-cache efficiency. The raw counters have always been here; the
+    # ratio is what makes a busted cached prefix visible (and it WARNs when the
+    # rate collapses). See app.core.observability.cache_metrics.
+    annotate_cache_metrics(
+        result,
+        totals["input_tokens"],
+        totals["cache_read_tokens"],
+        context=f"execution_id={execution_id}",
+    )
     result.update(_context_usage(sanitized_results))
 
     # Set only when this execution was triggered by a chat turn (migration
@@ -133,9 +144,10 @@ async def persist_execution(
     # onto the top level (see _sum_node_tokens) — prefer that single
     # source of truth. Fall back to re-summing here only for a result
     # dict that didn't go through build_result. cache_read / cache_creation
-    # are SEPARATE, ADDITIVE counters — input_tokens is already the
-    # non-cached (full-price) portion, not inclusive of them (see
-    # TokenUsageCallback).
+    # are a BREAKDOWN of input_tokens, not counters to add to it (see
+    # TokenUsageCallback and app.core.observability.cache_metrics — this
+    # comment asserted the opposite until it was checked against live Bedrock
+    # on 2026-07-21).
     try:
         if "input_tokens" in result:
             input_tokens = result.get("input_tokens", 0) or 0

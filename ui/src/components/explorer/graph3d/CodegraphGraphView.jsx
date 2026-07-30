@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { Loader2 } from 'lucide-react';
 import { agentApiClient } from '../../../services/agentApiClient';
 import { GraphScene } from './GraphScene';
-import { computeCameraTarget } from './sceneUtils';
+import { useGalaxy } from './useGalaxy';
 import { Sidebar } from './Sidebar';
 import { FilterPanel } from './FilterPanel';
 import { NodeDetailPanel } from './NodeDetailPanel';
@@ -35,6 +35,10 @@ export default function CodegraphGraphView({ repo, sidebarContainer = null }) {
   const [selectedNode, setSelectedNode] = useState(null);
   const [cameraTarget, setCameraTarget] = useState(null);
   const [showLabels, setShowLabels] = useState(true);
+  // Ambient connections default OFF. Drawn across the whole galaxy at once
+  // they form a web that hides the spiral entirely; selection still reveals a
+  // node's own connections.
+  const [showLinks, setShowLinks] = useState(false);
   const [leftWidth, setLeftWidth] = useState(() => loadWidth('cbm-left-w', 260));
   const [rightWidth, setRightWidth] = useState(() => loadWidth('cbm-right-w', 280));
 
@@ -64,24 +68,44 @@ export default function CodegraphGraphView({ repo, sidebarContainer = null }) {
     }
   }, [repo, fetchOverview]);
 
-  // Initialize filters when data loads
+  // Initialize filters when data loads — everything enabled.
+  //
+  // These filters control which relationships EXIST for hover, selection and
+  // the detail panel; whether they are DRAWN across the whole galaxy is a
+  // separate switch (`showLinks`, off by default). Those were conflated
+  // earlier: defaulting the filter to calls/imports only stripped DEFINES,
+  // WRITES and USAGE, which for a DTO class are all of its relationships — so
+  // hovering one lit up nothing at all. Keeping the data complete is what
+  // makes the graph explorable; keeping ambient edges off is what keeps it
+  // looking like a galaxy.
   useEffect(() => {
     if (!data) return;
-    const labels = new Set(data.nodes.map((n) => n.label));
-    const types = new Set(data.edges.map((e) => e.type));
-    setEnabledLabels(labels);
-    setEnabledEdgeTypes(types);
+    setEnabledLabels(new Set(data.nodes.map((n) => n.label)));
+    setEnabledEdgeTypes(new Set(data.edges.map((e) => e.type)));
   }, [data]);
 
+  // Spiral layout is computed once per fetch (see useGalaxy); filtering then
+  // runs over the already-positioned nodes so toggling a chip never moves a
+  // star.
+  const galaxy = useGalaxy(data);
+
   const filteredData = useMemo(() => {
-    if (!data) return null;
-    const nodes = data.nodes.filter((n) => enabledLabels.has(n.label));
+    if (!galaxy) return null;
+    const nodes = galaxy.nodes.filter((n) => enabledLabels.has(n.label));
     const nodeIds = new Set(nodes.map((n) => n.id));
     const edges = data.edges.filter(
       (e) => enabledEdgeTypes.has(e.type) && nodeIds.has(e.source) && nodeIds.has(e.target)
     );
     return { nodes, edges, total_nodes: data.total_nodes };
-  }, [data, enabledLabels, enabledEdgeTypes]);
+  }, [galaxy, data, enabledLabels, enabledEdgeTypes]);
+
+  // The camera target is a set of ids rather than a resolved position: node
+  // coordinates are disc-local and the galaxy is always turning, so CameraRig
+  // resolves them against the live world matrix at fly-to time. The nonce
+  // forces a re-fly when the same set is selected twice.
+  const flyTo = useCallback((ids) => {
+    setCameraTarget(ids && ids.size > 0 ? { ids, nonce: Date.now() } : null);
+  }, []);
 
   const handleSelectPath = useCallback(
     (path, nodeIds) => {
@@ -93,9 +117,9 @@ export default function CodegraphGraphView({ repo, sidebarContainer = null }) {
       }
       setSelectedPath(path);
       setHighlightedIds(nodeIds);
-      setCameraTarget(computeCameraTarget(filteredData.nodes, nodeIds));
+      flyTo(nodeIds);
     },
-    [filteredData]
+    [filteredData, flyTo]
   );
 
   const handleNodeClick = useCallback(
@@ -110,9 +134,9 @@ export default function CodegraphGraphView({ repo, sidebarContainer = null }) {
       }
       setHighlightedIds(connectedIds);
       setSelectedPath(node.file_path ?? null);
-      setCameraTarget(computeCameraTarget(filteredData.nodes, connectedIds));
+      flyTo(connectedIds);
     },
-    [filteredData]
+    [filteredData, flyTo]
   );
 
   const toggleLabel = useCallback((label) => {
@@ -212,9 +236,11 @@ export default function CodegraphGraphView({ repo, sidebarContainer = null }) {
           enabledLabels={enabledLabels}
           enabledEdgeTypes={enabledEdgeTypes}
           showLabels={showLabels}
+          showLinks={showLinks}
           onToggleLabel={toggleLabel}
           onToggleEdgeType={toggleEdgeType}
           onToggleShowLabels={() => setShowLabels((v) => !v)}
+          onToggleShowLinks={() => setShowLinks((v) => !v)}
           onEnableAll={enableAll}
           onDisableAll={disableAll}
         />
@@ -250,12 +276,14 @@ export default function CodegraphGraphView({ repo, sidebarContainer = null }) {
 
       {/* Graph area */}
       <div className="flex-1 relative overflow-hidden">
-        <ErrorBoundary>
+        <ErrorBoundary resetKey={repo}>
           <GraphScene
             data={filteredData}
+            galaxy={galaxy}
             highlightedIds={highlightedIds}
             cameraTarget={cameraTarget}
             showLabels={showLabels}
+            showLinks={showLinks}
             onNodeClick={handleNodeClick}
           />
         </ErrorBoundary>

@@ -162,16 +162,6 @@ export const NODE_TYPES = {
       { kind: 'port-out', id: 'result',  label: 'Result',    portType: 'data' },
     ],
   },
-  router: {
-    category: 'Logic', label: 'Semantic Router', icon: 'funnel',
-    desc: 'Classify user query using LLM and route to selected agent node',
-    slots: [
-      { kind: 'port-in',  id: 'trigger', label: 'Trigger', portType: 'trigger', optional: true },
-      { kind: 'port-in',  id: 'model', label: 'Language Model', portType: 'model' },
-      { kind: 'routes-editor', id: 'routes', label: 'Category Routes' },
-      { kind: 'port-out', id: 'route-output', label: 'Route Output', portType: 'message' },
-    ],
-  },
 
   // ── Agents ───────────────────────────────────────────────────
   // Legacy JSON-textarea subagent editor — superseded by `subagent_window`
@@ -276,6 +266,5 @@ export const NODE_DEFAULTS = {
   if:          { condition: '' },
   wiki:        { format: 'Summary', writeMode: 'Append', platform: 'Azure DevOps Wiki', organization: '', project: '', wikiUrl: '', pagePath: '', pat: '', tokenVar: 'ADO_WIKI_PAT' },
   orchestrator: { sqlFile: '' },
-  router:      { routes: {}, routes_description: {} },
   code_search_tool: { repos: '', backend: 'codegraph' },
 };

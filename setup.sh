@@ -23,18 +23,30 @@ REPOS_PATH="$(dirname "${ROOT}")"
 SKIP_DOCKER=0
 SKIP_MIGRATIONS=0
 DEV_SETUP=0
+CHECK_ONLY=0
 
 for arg in "$@"; do
   case "$arg" in
     --skip-docker) SKIP_DOCKER=1 ;;
     --skip-migrations) SKIP_MIGRATIONS=1 ;;
     --dev) DEV_SETUP=1 ;;
+    --check) CHECK_ONLY=1 ;;
     -h|--help)
-      echo "Usage: ./setup.sh [--skip-docker] [--skip-migrations] [--dev]"
+      cat <<'USAGE'
+Usage: ./setup.sh [options]
+
+  (no options)        Build and run the whole stack in Docker. Needs ONLY Docker.
+  --check             Diagnose the environment and exit. Changes nothing.
+  --dev               Also install host dev deps (Python venv + npm) for hot reload.
+                      Only this mode needs Node.js and Python 3.12+.
+  --skip-docker       You manage PostgreSQL yourself.
+  --skip-migrations   Do not apply agent-api/migrations/*.sql.
+USAGE
       exit 0
       ;;
     *)
       echo "Unknown option: $arg"
+      echo "Run './setup.sh --help' for usage."
       exit 1
       ;;
   esac
@@ -83,8 +95,85 @@ resolve_python() {
   fail "Python 3.12+ is required"
 }
 
+# Resolved once by require_compose(); every compose call goes through run_compose.
+COMPOSE=()
+
+require_compose() {
+  # Compose v2 ONLY, deliberately: agent-api/Dockerfile is a BuildKit Dockerfile
+  # (14 `RUN --mount=type=cache` directives). Legacy docker-compose v1 drives the
+  # classic builder, which cannot parse those, so a v1 "fallback" does not
+  # degrade — it fails mid-build with an error that looks nothing like the real
+  # cause. Better to say so here than to let someone burn a build on it.
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE=(docker compose)
+    ok "Docker Compose $(docker compose version --short 2>/dev/null || echo v2)"
+    return
+  fi
+
+  if command -v docker-compose >/dev/null 2>&1; then
+    local v
+    v="$(docker-compose version --short 2>/dev/null || echo unknown)"
+    case "$v" in
+      2.*|v2.*|[3-9].*|v[3-9].*)
+        # Standalone binary that is really v2+ — supports BuildKit, so allow it.
+        COMPOSE=(docker-compose)
+        ok "Docker Compose ${v} (standalone)"
+        return
+        ;;
+    esac
+    fail "Docker Compose v1 (${v}) cannot build this project — it needs BuildKit.
+    Install Compose v2, then re-run:  https://docs.docker.com/compose/install/
+    On most systems the Docker Desktop / docker-compose-plugin package provides it,
+    and the command becomes 'docker compose' (a space, not a hyphen)."
+  fi
+
+  fail "Docker Compose not found. Install Compose v2: https://docs.docker.com/compose/install/"
+}
+
 run_compose() {
-  (cd "$ROOT" && docker compose -f docker-compose.yml "$@")
+  (cd "$ROOT" && "${COMPOSE[@]}" -f docker-compose.yml "$@")
+}
+
+port_prober() {
+  for tool in ss lsof netstat; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      echo "$tool"
+      return 0
+    fi
+  done
+  return 1
+}
+
+port_in_use() {
+  local port="$1"
+  case "$2" in
+    ss)      ss -ltn 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" ;;
+    lsof)    lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 ;;
+    netstat) netstat -an 2>/dev/null | grep -qE "[:.]${port}[[:space:]]+.*LISTEN" ;;
+    *)       return 1 ;;
+  esac
+}
+
+check_ports() {
+  # A busy host port is the most common first-run failure, and compose only
+  # reports it AFTER the build. Warn (never fail) — every port is overridable in
+  # .env, and ours being "busy" is expected when the stack is already running.
+  local prober busy=0 p name
+  if ! prober="$(port_prober)"; then
+    warn "no ss/lsof/netstat available — skipping the host-port check"
+    return 0
+  fi
+  for entry in "${UI_HOST_PORT:-43000}:UI_HOST_PORT" \
+               "${API_HOST_PORT:-48000}:API_HOST_PORT" \
+               "${POSTGRES_HOST_PORT:-45432}:POSTGRES_HOST_PORT"; do
+    p="${entry%%:*}"; name="${entry##*:}"
+    if port_in_use "$p" "$prober"; then
+      warn "port ${p} is already in use — set ${name} in .env to something free (or it may be this stack already running)"
+      busy=1
+    fi
+  done
+  [[ "$busy" -eq 0 ]] && ok "Host ports ${UI_HOST_PORT:-43000}, ${API_HOST_PORT:-48000}, ${POSTGRES_HOST_PORT:-45432} are free"
+  return 0
 }
 
 create_env_file() {
@@ -203,22 +292,50 @@ echo ""
 echo "OnCall Agent - initial setup"
 
 step "Checking prerequisites"
-require_cmd node
-require_cmd npm
-ok "Node.js $(node --version)"
-ok "npm $(npm --version)"
 
-PYTHON_BIN="$(resolve_python)"
-ok "Python available via: ${PYTHON_BIN}"
+# The default path builds and runs everything INSIDE Docker: the UI is compiled
+# in ui/Dockerfile and the backend in agent-api/Dockerfile. So Node, npm and a
+# local Python are NOT prerequisites for it — they are only needed for --dev,
+# which creates a host venv and runs `npm install` for the Vite dev server.
+# Requiring them up front turned "I only have Docker" into a hard failure for a
+# toolchain the install never invoked.
+PYTHON_BIN=""
 
 if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   require_cmd docker
-  ok "Docker CLI available"
+  ok "Docker $(docker --version | sed 's/^Docker version //; s/,.*//')"
   # A present CLI doesn't mean the daemon is up — check before we depend on it.
   if ! docker info >/dev/null 2>&1; then
-    fail "Docker is not running. Start Docker and re-run ./setup.sh."
+    fail "Docker is not running. Start Docker Desktop (or 'sudo systemctl start docker') and re-run ./setup.sh."
   fi
   ok "Docker daemon is running"
+  require_compose
+fi
+
+if [[ "$DEV_SETUP" -eq 1 ]]; then
+  require_cmd node
+  require_cmd npm
+  ok "Node.js $(node --version)"
+  ok "npm $(npm --version)"
+
+  PYTHON_BIN="$(resolve_python)"
+  ok "Python available via: ${PYTHON_BIN}"
+fi
+
+if [[ "$SKIP_DOCKER" -eq 1 && "$DEV_SETUP" -eq 0 ]]; then
+  warn "--skip-docker without --dev leaves nothing to install; you probably want --dev too."
+fi
+
+# Load .env so the port check honours any overrides already set there.
+if [[ -f "${ROOT}/.env" ]]; then
+  set -a; . "${ROOT}/.env"; set +a
+fi
+check_ports
+
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+  echo ""
+  echo "Environment looks good. Run ./setup.sh to install."
+  exit 0
 fi
 
 step "Creating local configuration"
@@ -237,13 +354,7 @@ ok "Ensured agent-api/data directories exist"
 
 if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   step "Starting PostgreSQL (Docker)"
-  if docker compose version >/dev/null 2>&1; then
-    run_compose up -d postgres
-  elif command -v docker-compose >/dev/null 2>&1; then
-    (cd "$ROOT" && docker-compose -f docker-compose.yml up -d postgres)
-  else
-    fail "Docker Compose not found"
-  fi
+  run_compose up -d postgres
   wait_for_postgres
 fi
 
@@ -261,11 +372,8 @@ fi
 
 if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   step "Building and starting the full Docker stack (agent-api, headroom, ui)"
-  if docker compose version >/dev/null 2>&1; then
-    run_compose up --build -d
-  else
-    (cd "$ROOT" && docker-compose -f docker-compose.yml up --build -d)
-  fi
+  echo "    First run compiles the codegraph engine and the UI — expect several minutes."
+  run_compose up --build -d
   ok "Full stack is running"
 
   step "Waiting for the API to become healthy"

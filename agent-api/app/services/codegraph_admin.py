@@ -26,6 +26,20 @@ logger = logging.getLogger(__name__)
 # Labels that represent structural/meta graph nodes, not source-code entities.
 _META_LABELS = {"File", "Folder", "Project", "Branch", "Module", "Section", "Resource"}
 
+# Layout response cache.
+#
+# get_layout is by far the most expensive read path: it spawns an ephemeral MCP
+# subprocess and runs the engine's Barnes-Hut layout plus 40 local-optimise
+# iterations, which measured ~1.5s per call for a 2000-node project. The UI hits
+# it on every repo switch and every Refresh, so that cost was the single largest
+# contributor to the Explorer feeling slow.
+#
+# The result is deterministic for a given index, so the cache key includes the
+# project DB's mtime and size — a reindex changes the file and invalidates the
+# entry automatically, with no explicit purge needed.
+_LAYOUT_CACHE: "Dict[Tuple[Any, ...], Dict[str, Any]]" = {}
+_LAYOUT_CACHE_MAX = 6
+
 
 def _cache_dir() -> str:
     return settings.codegraph_cache_dir
@@ -407,6 +421,22 @@ async def get_layout(
         return {"error": f"project '{project}' not indexed"}
     _db_path, internal_name = found
 
+    # Cache lookup keyed on the index file's identity, so a reindex busts it.
+    try:
+        st = os.stat(_db_path)
+        cache_key: Optional[Tuple[Any, ...]] = (
+            internal_name, level, center_node, radius, max_nodes,
+            st.st_mtime_ns, st.st_size,
+        )
+    except OSError:
+        cache_key = None
+
+    if cache_key is not None:
+        hit = _LAYOUT_CACHE.get(cache_key)
+        if hit is not None:
+            logger.debug("codegraph_admin: get_layout cache hit for %s", project)
+            return hit
+
     manager = MCPClientManager()
     connected = False
     try:
@@ -445,9 +475,16 @@ async def get_layout(
         if not text:
             return {"error": "empty layout response"}
         try:
-            return json.loads(text)
+            payload = json.loads(text)
         except json.JSONDecodeError:
             return {"error": f"malformed layout response: {text[:200]}"}
+
+        # Only successful payloads are cached — never errors.
+        if cache_key is not None and "error" not in payload:
+            if len(_LAYOUT_CACHE) >= _LAYOUT_CACHE_MAX:
+                _LAYOUT_CACHE.pop(next(iter(_LAYOUT_CACHE)))
+            _LAYOUT_CACHE[cache_key] = payload
+        return payload
     except Exception as exc:  # noqa: BLE001
         logger.exception("codegraph_admin: get_layout failed for project=%s", project)
         return {"error": str(exc)}

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -33,6 +32,9 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from app.core.llm.json_extract import extract_json_object
+from app.core.llm.token_estimate import estimate_tokens
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -40,23 +42,49 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _estimate_tokens(text: str) -> int:
-    """Estimate token count using the project-wide chars/4 heuristic, optionally
-    scaled by a learned per-model calibration factor. The factor is 1.0 (exact
-    no-op) unless token-estimate calibration is enabled AND a real observation
-    has been recorded, so default behavior is byte-identical to raw chars/4."""
-    base = max(1, len(text) // 4)
-    try:
-        from app.core.llm.token_calibration import current_factor
-        factor = current_factor()
-        if factor != 1.0:
-            return max(1, int(base * factor))
-    except Exception:  # noqa: BLE001 — calibration must never break estimation
-        pass
-    return base
+    """Calibrated chars/4 estimate — see :mod:`app.core.llm.token_estimate`.
+
+    Kept as a module-local alias because it is called per message part in the
+    compaction hot path and is referenced by name across this module.
+    """
+    return estimate_tokens(text)
+
+
+# Per-message estimate memo. The estimate is recomputed on EVERY model call:
+# the pre_model_hook walks the whole history to decide whether to compact, and
+# that history is append-only, so an N-turn run re-serialized the same messages
+# N times — O(N^2) in `str(part)` and `json.dumps(tool_call)` over a transcript
+# that only grows. Keyed by the provider-assigned ``msg.id``, which is stable
+# and unique per message; messages built locally (no id) simply aren't cached.
+#
+# ``_CACHE_MAX`` bounds a long-lived process; the whole map is dropped on
+# overflow rather than evicted one-by-one, since a cold rebuild is one cheap
+# walk and the alternative is tracking recency for a pure hit-rate nicety.
+_ESTIMATE_CACHE: Dict[str, Tuple[int, int]] = {}
+_CACHE_MAX = 4096
+
+
+def _content_signature(content: Any) -> int:
+    """O(1) discriminator that changes if a cached message is mutated in place.
+
+    ``sanitize_messages_for_model`` can, as a last resort, assign to
+    ``msg.content`` without changing ``msg.id``. Pairing the id with a cheap
+    size keeps such a message from serving a stale estimate.
+    """
+    if isinstance(content, (str, list)):
+        return len(content)
+    return -1
 
 
 def _msg_token_estimate(msg: BaseMessage) -> int:
     """Estimate the token cost of a single message."""
+    key = getattr(msg, "id", None)
+    sig = _content_signature(msg.content)
+    if key:
+        hit = _ESTIMATE_CACHE.get(key)
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+
     content = msg.content
     if isinstance(content, str):
         base = _estimate_tokens(content)
@@ -72,7 +100,140 @@ def _msg_token_estimate(msg: BaseMessage) -> int:
     if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
         overhead += sum(_estimate_tokens(json.dumps(tc)) for tc in msg.tool_calls)
 
-    return base + overhead
+    total = base + overhead
+    if key:
+        if len(_ESTIMATE_CACHE) >= _CACHE_MAX:
+            _ESTIMATE_CACHE.clear()
+        _ESTIMATE_CACHE[key] = (sig, total)
+    return total
+
+
+def reset_estimate_cache() -> None:
+    """Drop the memo. For tests, and for any deliberate re-estimate — e.g. after
+    token calibration updates the scaling factor, which changes every result."""
+    _ESTIMATE_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# Pairing-safe tail boundary
+# ---------------------------------------------------------------------------
+
+def _is_safe_tail_start(messages: List[BaseMessage], idx: int) -> bool:
+    """True when ``messages[idx:]`` is a structurally valid standalone suffix.
+
+    Bedrock (and the Anthropic Messages API) reject a ``tool_result`` with no
+    matching ``tool_use`` in the same request. Two ways a tail can violate that:
+
+    * it starts ON a ``ToolMessage`` — the parent ``AIMessage`` that requested
+      it was left behind in the summarized head, so the result is an orphan;
+    * it starts on an ``AIMessage`` whose ``tool_calls`` are not all answered
+      within the tail — only reachable when the run was cut short mid-round,
+      but the request is just as invalid.
+
+    Index 0 is always safe: nothing precedes it to orphan.
+    """
+    if idx <= 0:
+        return True
+    candidate = messages[idx]
+    if isinstance(candidate, ToolMessage):
+        return False
+    if isinstance(candidate, AIMessage) and getattr(candidate, "tool_calls", None):
+        ids_needed = {
+            tc.get("id") for tc in candidate.tool_calls if isinstance(tc, dict)
+        }
+        ids_in_tail = {
+            getattr(m, "tool_call_id", None)
+            for m in messages[idx:]
+            if isinstance(m, ToolMessage)
+        }
+        if not ids_needed.issubset(ids_in_tail):
+            return False
+    return True
+
+
+def split_preserved_tail(
+    messages: List[BaseMessage], keep_recent_tokens: int
+) -> Tuple[List[BaseMessage], List[BaseMessage]]:
+    """Split into (head-to-summarize, preserved-tail) on a pairing-safe boundary.
+
+    Walks backward accumulating token estimates until ``keep_recent_tokens`` is
+    reached, then moves the boundary until :func:`_is_safe_tail_start` holds.
+
+    Backward first, because growing the tail only ever preserves more context.
+    But a long unbroken tool-call chain can push that walk all the way to 0,
+    which would leave nothing to summarize and silently turn compaction into a
+    no-op — the caller then sends the oversized history anyway and overflows.
+    So when backward runs out, search FORWARD from the estimated boundary
+    instead: that yields a smaller tail but guarantees the head is non-empty and
+    compaction actually makes progress.
+    """
+    if not messages:
+        return [], []
+
+    accumulated = 0
+    boundary = 0
+    for i in range(len(messages) - 1, -1, -1):
+        accumulated += _msg_token_estimate(messages[i])
+        if accumulated >= keep_recent_tokens:
+            boundary = i
+            break
+
+    idx = boundary
+    while idx > 0 and not _is_safe_tail_start(messages, idx):
+        idx -= 1
+
+    if idx == 0 and boundary > 0:
+        # Backward found no safe boundary above 0. Give up preserving the full
+        # recent window and take the first safe boundary after the estimate.
+        for fwd in range(boundary + 1, len(messages)):
+            if _is_safe_tail_start(messages, fwd):
+                idx = fwd
+                break
+
+    return messages[:idx], messages[idx:]
+
+
+def _enforce_budget(
+    tail: List[BaseMessage], budget: int
+) -> List[BaseMessage]:
+    """Trim *tail* from the front, at safe boundaries, until it fits *budget*.
+
+    ``compact()`` had no post-condition: it summarized the head and returned
+    ``[summary, *tail]`` without ever checking that the result fits. The tail is
+    whatever the keep-recent walk produced, so ONE oversized tool result inside
+    it makes compaction a no-op that reports success — the caller then sends the
+    same too-large history and the model rejects it for context length. That is
+    the case compaction exists to prevent.
+
+    Dropping the oldest tail messages loses content that was never summarized,
+    so this only ever fires as a last resort and says so loudly. The last safe
+    chunk is always kept: returning an empty tail would strip the live turn.
+    """
+    if budget <= 0 or not tail:
+        return tail
+    total = sum(_msg_token_estimate(m) for m in tail)
+    if total <= budget:
+        return tail
+
+    idx = 0
+    while idx < len(tail) and total > budget:
+        nxt = idx + 1
+        while nxt < len(tail) and not _is_safe_tail_start(tail, nxt):
+            nxt += 1
+        if nxt >= len(tail):
+            break  # no further safe cut — keep the last chunk whole
+        total -= sum(_msg_token_estimate(m) for m in tail[idx:nxt])
+        idx = nxt
+
+    if idx == 0:
+        return tail
+    logger.warning(
+        "compact(): recent tail still exceeded the budget after summarizing — "
+        "dropped %d of %d tail message(s) to fit (%d tokens remain, budget %d). "
+        "Their content was neither summarized nor kept.",
+        idx, len(tail), total, budget,
+    )
+    return tail[idx:]
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +521,24 @@ async def _call_llm_for_summary(
             messages=[{"role": "user", "content": prompt}],
         )
 
+    # Book the summarisation call against the run ledger. Compaction runs off
+    # the agent graph (transport.complete directly), so no TokenUsageCallback
+    # ever sees it — and it is the LARGEST uncounted call in the system: it
+    # summarises up to ~20,000 tokens of history, and fires precisely on the
+    # long runs where the cost is being questioned. A transport that returns a
+    # bare string carries no counters; nothing is recorded then.
+    if not isinstance(response_text, str):
+        from app.harness.usage_ledger import record_auxiliary_usage
+        record_auxiliary_usage(
+            input_tokens=getattr(response_text, "input_tokens", 0) or 0,
+            output_tokens=getattr(response_text, "output_tokens", 0) or 0,
+            cache_read_tokens=getattr(response_text, "cache_read_input_tokens", 0) or 0,
+            cache_creation_tokens=getattr(
+                response_text, "cache_creation_input_tokens", 0) or 0,
+            source="compaction",
+            exclusive=True,  # raw Bedrock counters, exclusive of the cache fields
+        )
+
     # Extract the string payload regardless of what the transport returns
     if isinstance(response_text, str):
         raw = response_text
@@ -368,19 +547,24 @@ async def _call_llm_for_summary(
     else:
         raw = str(response_text)
 
-    # Parse JSON from the response (strip markdown fences if present)
+    # Parse JSON from the response (tolerates markdown fences and prose).
     raw = raw.strip()
-    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if json_match:
-        raw = json_match.group(0)
-
-    try:
-        result = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        logger.warning("LLM summary response was not valid JSON; using fallback")
+    result = extract_json_object(raw)
+    if result is None:
+        # The fallback is deliberately NON-destructive. Summaries are cumulative
+        # — the caller merges this into prior_summary and the result becomes the
+        # input to every later compaction — so writing the unparsed response
+        # into `goals` (as this used to) permanently replaced the run's real
+        # goal with a fragment of a malformed reply. Returning empty fields
+        # instead lets the merge keep the prior summary's values.
+        logger.warning(
+            "LLM summary response was not valid JSON (%d chars) — keeping the "
+            "prior summary's fields rather than overwriting them",
+            len(raw),
+        )
         result = {
-            "goals": raw[:500],
-            "progress": "(parse error — raw response stored in goals)",
+            "goals": "",
+            "progress": "",
             "decisions": [],
             "symbols_resolved": [],
             "files_touched": [],
@@ -495,28 +679,17 @@ async def compact(
     # ------------------------------------------------------------------
     # Step 3: walk backwards to find the "recent tail"
     # ------------------------------------------------------------------
-    accumulated = 0
-    tail_start_idx = len(messages)  # exclusive start of tail (from end)
-
-    for i in range(len(messages) - 1, -1, -1):
-        msg_tokens = _msg_token_estimate(messages[i])
-        accumulated += msg_tokens
-        if accumulated >= keep_recent_tokens:
-            tail_start_idx = i
-            break
-    else:
-        # Never reached keep_recent_tokens: entire list is "recent"
-        tail_start_idx = 0
-
-    recent_tail = messages[tail_start_idx:]
-    to_summarize = messages[:tail_start_idx]
+    # The boundary must not split a tool_use/tool_result pair: a tail starting
+    # on an orphaned ToolMessage makes the very next model call fail Bedrock's
+    # INVALID_CHAT_HISTORY check, turning a routine compaction into a dead run.
+    to_summarize, recent_tail = split_preserved_tail(messages, keep_recent_tokens)
 
     logger.info(
         "compact(): summarizing %d messages, keeping %d recent messages "
-        "(accumulated_recent_tokens=%d)",
+        "(recent_tokens=%d)",
         len(to_summarize),
         len(recent_tail),
-        accumulated,
+        sum(_msg_token_estimate(m) for m in recent_tail),
     )
 
     if not to_summarize:
@@ -560,12 +733,13 @@ async def compact(
 
     # Merge decisions (deduplicate, keep prior ones too)
     llm_decisions: List[str] = summary_dict.get("decisions") or []
-    decision_set = set(prior_decisions) | set(llm_decisions)
     # Preserve order: prior first, then new
     merged_decisions: List[str] = list(prior_decisions)
+    _seen_decisions = set(merged_decisions)
     for d in llm_decisions:
-        if d not in set(merged_decisions):
+        if d not in _seen_decisions:
             merged_decisions.append(d)
+            _seen_decisions.add(d)
 
     # Merge cumulative symbols/files from LLM response too
     llm_symbols: List[str] = summary_dict.get("symbols_resolved") or []
@@ -576,13 +750,23 @@ async def compact(
     # ------------------------------------------------------------------
     # Step 6: build StructuredSummary
     # ------------------------------------------------------------------
+    # Every scalar field falls back to the prior summary. A summarization call
+    # that came back empty or unparseable must not erase what earlier
+    # compactions established — these values are the only surviving record of
+    # the messages they replaced.
     new_summary = StructuredSummary(
         goals=summary_dict.get("goals") or (prior_summary.goals if prior_summary else ""),
-        progress=summary_dict.get("progress") or "",
+        progress=(
+            summary_dict.get("progress")
+            or (prior_summary.progress if prior_summary else "")
+        ),
         decisions=merged_decisions,
         symbols_resolved=merged_symbols,
         files_touched=merged_files,
-        open_questions=summary_dict.get("open_questions") or [],
+        open_questions=(
+            summary_dict.get("open_questions")
+            or (list(prior_summary.open_questions) if prior_summary else [])
+        ),
         generated_at=datetime.now(timezone.utc),
         previous_summary_id=prior_summary.summary_id if prior_summary else None,
         token_count_at_summarization=total_tokens,
@@ -592,7 +776,11 @@ async def compact(
     # Step 7: build compacted message list
     # ------------------------------------------------------------------
     summary_text = new_summary.to_system_message_text()
-    compacted: List[BaseMessage] = [SystemMessage(content=summary_text), *recent_tail]
+    summary_msg = SystemMessage(content=summary_text)
+    recent_tail = _enforce_budget(
+        recent_tail, budget - _msg_token_estimate(summary_msg)
+    )
+    compacted: List[BaseMessage] = [summary_msg, *recent_tail]
 
     logger.info(
         "compact(): produced %d-message compacted list (was %d). "

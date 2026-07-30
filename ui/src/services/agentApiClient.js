@@ -453,9 +453,14 @@ export const agentApiClient = {
      * Get all execution history
      */
     async listAllExecutions(limit = 100, opts = {}) {
+        const { excludeChat, ...rest } = opts;
         const response = await client.get('/api/v1/executions', {
-            params: { limit },
-            ...requestConfig(opts),
+            // `exclude_chat` filters chat turns out in SQL. Filtering them
+            // client-side instead means `limit` is spent on rows you then throw
+            // away, so a 100-row request can yield a handful of workflow runs
+            // and any time-window stat computed over them is wrong.
+            params: { limit, ...(excludeChat ? { exclude_chat: true } : {}) },
+            ...requestConfig(rest),
         });
         return response.data;
     },
@@ -881,6 +886,49 @@ export const agentApiClient = {
     async deleteCodegraphIndex(repo) {
         const response = await client.delete(
             `/api/v1/codegraph/index/${encodeURIComponent(repo)}`
+        );
+        return response.data;
+    },
+
+    /**
+     * List git branches for a repo on disk (the source the codegraph index is
+     * built from). Returns { is_git, current, detached, dirty, local, remote }.
+     * Non-git dirs come back with is_git=false rather than an error.
+     */
+    async getRepoBranches(repo) {
+        const response = await client.get(
+            `/api/v1/codegraph/repos/${encodeURIComponent(repo)}/branches`
+        );
+        return response.data;
+    },
+
+    /**
+     * git fetch --prune, then return the refreshed branch listing. A fetch
+     * failure (no creds / offline) comes back as { ok: false, error, ... } with
+     * the still-usable local list — not a thrown error. Can reach the network,
+     * so give it a generous timeout.
+     */
+    async fetchRepoBranches(repo) {
+        const response = await client.post(
+            `/api/v1/codegraph/repos/${encodeURIComponent(repo)}/fetch`,
+            null,
+            { timeout: 0 }
+        );
+        return response.data;
+    },
+
+    /**
+     * Switch a repo to another branch. git guards against data loss: a switch
+     * that would overwrite uncommitted edits is refused server-side and surfaces
+     * as a 409 (with the conflicting files). Does not reindex; the caller chains
+     * reindexCodegraphRepo after a successful switch. Rewriting the working tree
+     * can be slow on a bind mount, so disable the timeout.
+     */
+    async checkoutRepoBranch(repo, branch) {
+        const response = await client.post(
+            `/api/v1/codegraph/repos/${encodeURIComponent(repo)}/checkout`,
+            { branch },
+            { timeout: 0 }
         );
         return response.data;
     },

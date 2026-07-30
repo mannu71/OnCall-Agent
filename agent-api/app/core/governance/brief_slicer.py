@@ -59,9 +59,18 @@ def _parse_rules(text: str) -> Tuple[Tuple[str, Tuple[str, ...], str], ...]:
 
 
 @functools.lru_cache(maxsize=1)
-def _cached_rules(path: str, mtime: float) -> Tuple[Tuple[str, Tuple[str, ...], str], ...]:
-    """mtime-keyed cache — re-parses only when AGENT_POLICY.md actually
-    changes, so a normal run pays no repeated file-read/regex cost."""
+def _cached_rules(
+    path: str, mtime_ns: int, size: int,
+) -> Tuple[Tuple[str, Tuple[str, ...], str], ...]:
+    """Stat-keyed cache — re-parses only when AGENT_POLICY.md actually changes,
+    so a normal run pays no repeated file-read/regex cost.
+
+    Keyed on ``st_mtime_ns`` rather than the float ``st_mtime``, and on size as
+    well: two writes inside one filesystem mtime tick produce an identical float
+    timestamp, which silently served a stale parse (and made the self-test flake
+    non-deterministically). Nanoseconds plus size closes that window, and both
+    come from the single stat below at no extra cost.
+    """
     try:
         with open(path, encoding="utf-8") as f:
             return _parse_rules(f.read())
@@ -72,10 +81,10 @@ def _cached_rules(path: str, mtime: float) -> Tuple[Tuple[str, Tuple[str, ...], 
 def _load_rules() -> Tuple[Tuple[str, Tuple[str, ...], str], ...]:
     path = _policy_path()
     try:
-        mtime = os.path.getmtime(path)
+        st = os.stat(path)
     except OSError:
         return ()
-    return _cached_rules(path, mtime)
+    return _cached_rules(path, st.st_mtime_ns, st.st_size)
 
 
 def slice_rules(

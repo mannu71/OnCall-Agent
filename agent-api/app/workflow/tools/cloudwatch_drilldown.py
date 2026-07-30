@@ -7,11 +7,16 @@ so triage + drill fit in ~3000 tokens total.
 from __future__ import annotations
 
 import logging
-import math
 import re
 from typing import Any, Dict, List, Optional
 
 from app.config import settings
+from app.workflow.tools.cloudwatch_scoring import (
+    GRADE_WEIGHT,
+    grade_weight as _grade_weight_for,
+    pattern_score,
+    severity_weight,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -186,8 +191,7 @@ def cap_drill_preview(text: str) -> str:
     return text[: _PREVIEW_CHAR_CAP - 1] + "…"
 
 
-_SEV_WEIGHT = {"critical": 4.0, "high": 3.0, "medium": 2.0, "low": 1.0, "none": 0.5}
-_GRADE_WEIGHT = {"high": 1.0, "medium": 0.85, "low": 0.7, "none": 0.6}
+_GRADE_WEIGHT = GRADE_WEIGHT  # re-exported for callers importing it from here
 
 
 def score_drill_target(target: Dict[str, Any], grade_weight: float = 1.0) -> float:
@@ -198,15 +202,21 @@ def score_drill_target(target: Dict[str, Any], grade_weight: float = 1.0) -> flo
     z-score as the spike term (a volume spike is a strong lead); patterns use a
     log-scaled occurrence count (diminishing returns on sheer volume). Pure and
     deterministic — same input always yields the same score.
+
+    With ``cloudwatch_pattern_ranking`` on, the pattern spike term also carries
+    a rarity factor so a one-off FATAL isn't ranked below routine chatter.
     """
-    sev = _SEV_WEIGHT.get(str(target.get("severity", "")).lower(), 1.5)
+    sev = severity_weight(target.get("severity"))
     if target.get("kind") == "anomaly":
         z = float(target.get("z_score") or 0.0)
         spike = 1.0 + min(max(z, 0.0), 20.0) / 2.0
-    else:
-        occ = float(target.get("occurrence_count") or 0.0)
-        spike = 1.0 + math.log10(max(occ, 1.0))
-    return round(sev * spike * grade_weight, 6)
+        return round(sev * spike * grade_weight, 6)
+    return pattern_score(
+        target.get("severity"),
+        target.get("occurrence_count") or 0.0,
+        grade_weight,
+        rarity_aware=settings.cloudwatch_pattern_ranking,
+    )
 
 
 def select_drill_targets(
@@ -261,9 +271,7 @@ def select_drill_targets(
         pattern_targets.sort(key=lambda x: (x.get("occurrence_count") or 0), reverse=True)
         return (anomaly_targets + pattern_targets)[: max(0, top_n)]
 
-    grade_w = _GRADE_WEIGHT.get(
-        str((patterns_summary or {}).get("evidence_grade", "")).lower(), 0.8
-    )
+    grade_w = _grade_weight_for((patterns_summary or {}).get("evidence_grade"))
     scored = [(score_drill_target(t, grade_w), t) for t in (anomaly_targets + pattern_targets)]
     # Sort by score desc; tie-break on label for stable, deterministic ordering.
     scored.sort(key=lambda st: (-st[0], st[1].get("label", "")))

@@ -227,16 +227,6 @@
   100% { transform: translate(0,0) rotate(0); }
 }
 .chat-send-launch { animation: chat-send-launch 0.45s ease-out; }
-@keyframes chat-siren {
-  0%,100% { transform: scale(1); opacity: 1; }
-  50%     { transform: scale(0.82); opacity: 0.7; }
-}
-.chat-siren { animation: chat-siren 0.9s ease-in-out infinite; }
-@keyframes chat-quarter-turn {
-  0%   { transform: rotate(0); }
-  100% { transform: rotate(360deg); }
-}
-.chat-quarter-turn { animation: chat-quarter-turn 1s steps(4) infinite; }
 
 /* Thinking ellipsis */
 @keyframes chat-thinking-dots {

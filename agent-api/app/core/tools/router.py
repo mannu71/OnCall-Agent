@@ -33,9 +33,71 @@ logger = logging.getLogger(__name__)
 # Crude tokenizer good enough for keyword ranking — fast, no deps.
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{1,}")
 
+# BM25 parameters, at the standard Lucene defaults. k1 bounds term-frequency
+# saturation; b controls how strongly length normalization applies.
+#
+# Both terms are load-bearing here, and the previous scorer had neither:
+# `(1 + log(tf)) * idf` grows without bound in tf and ignores length entirely,
+# so a verbose tool whose description merely REPEATS a query word outscored the
+# short, precisely-named tool that word came from. Measured on a 4-tool probe,
+# the old scorer ranked a padded `describe_alarms` above `get_log_events` for
+# both "get log events" and "log group name"; with k1+b it ranks below for both,
+# and b is what does that work (at b=0 the decoy still wins "log group name").
+#
+# Tuning note — evals/accuracy/tool_selection.py: lexical (13 cases) and synonym
+# (2) sit at a perfect mean rank of 1.0, synonym having improved from 1.5. The 2
+# TRUE-paraphrase cases move 5 -> 7, which drags the headline mean 1.53 -> 1.71
+# at unchanged hit@3 (88.2%) and hit@8 (100%). Those two share NO tokens with
+# their target by construction, so their rank is decided by incidental stopword
+# matches, and the suite documents them as the gap that gates the deferred
+# synonym/embedding work — not something ranker tuning is meant to close. A
+# sweep found configurations that score them better (b=0, or pruning query terms
+# above a 0.20 document-frequency ratio), but each helps only at a cliff and
+# each gives back the verbose-decoy fix, so both were rejected as overfitting to
+# two noisy cases.
+_BM25_K1 = 1.2
+_BM25_B = 0.75
+
 
 def _tokens(text: str) -> List[str]:
-    return [t.lower() for t in _WORD_RE.findall(text or "")]
+    """Lowercased word tokens, with snake_case and camelCase names ALSO split.
+
+    Tool names and parameter names are the highest-signal text in a schema and
+    they are overwhelmingly compound: ``get_log_events``, ``logGroupName``.
+    Matching them only as whole tokens meant a natural query ("get log events")
+    scored zero against the very tool it names, because "log" never equals
+    "get_log_events". Both forms are emitted — the compound token is kept so an
+    exact-name query still gets its full weight, and the parts are added so
+    prose queries can reach it.
+    """
+    return _tokens_with_length(text)[0]
+
+
+def _tokens_with_length(text: str) -> Tuple[List[str], int]:
+    """``(_tokens(text), original_word_count)``.
+
+    The second value is the document length BM25 normalizes by. It counts words
+    as written, NOT the expanded token list: splitting emits 2-4 tokens for
+    every compound name, so a schema full of ``snake_case`` parameters would
+    otherwise look several times longer than a prose-heavy one of the same real
+    size and be penalized for it — an artifact of the tokenizer rather than
+    anything about the document.
+    """
+    out: List[str] = []
+    raws = _WORD_RE.findall(text or "")
+    for raw in raws:
+        token = raw.lower()
+        out.append(token)
+        parts = [p for p in token.split("_") if len(p) > 1]
+        if len(parts) > 1:
+            out.extend(parts)
+            continue
+        # camelCase / PascalCase — only worth splitting when there is a
+        # lowercase→uppercase boundary in the original.
+        camel = [p.lower() for p in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])", raw)]
+        if len(camel) > 1:
+            out.extend(p for p in camel if len(p) > 1)
+    return out, len(raws)
 
 
 def schema_token_estimate(schema: Dict[str, Any]) -> int:
@@ -46,10 +108,47 @@ def schema_token_estimate(schema: Dict[str, Any]) -> int:
     agrees with what the model actually sees.
     """
     import json
+    from app.core.llm.token_estimate import estimate_tokens
     try:
-        return max(1, len(json.dumps(schema)) // 4)
+        return estimate_tokens(json.dumps(schema))
     except Exception:  # noqa: BLE001
         return 0
+
+
+_TOKEN_MEMO: Dict[Tuple[str, int, int], Tuple[List[str], int]] = {}
+_TOKEN_MEMO_MAX = 2048
+
+
+def _schema_tokens(schema: Dict[str, Any]) -> Tuple[List[str], int]:
+    """Tokenized schema text, memoized across calls.
+
+    ``rank_tools`` re-tokenizes the ENTIRE catalog on every call in order to
+    build the document-frequency table, and the catalog is the same object for
+    the whole run — so each ``search_tools`` invocation was re-flattening and
+    re-splitting every tool's full description from scratch. The catalog is
+    static within a run; the tokens are not worth recomputing.
+
+    Keyed by name plus the sizes of the two variable-length inputs, so an
+    enriched or edited catalog entry gets a fresh key rather than a stale hit.
+    """
+    name = (
+        schema.get("name")
+        or (schema.get("function") or {}).get("name")
+        or "<anonymous>"
+    )
+    desc = schema.get("description") or (schema.get("function") or {}).get("description") or ""
+    params = schema.get("parameters") or (schema.get("function") or {}).get("parameters") or {}
+    props = params.get("properties") if isinstance(params, dict) else None
+    key = (str(name), len(str(desc)), len(props) if isinstance(props, dict) else 0)
+
+    hit = _TOKEN_MEMO.get(key)
+    if hit is not None:
+        return hit
+    entry = _tokens_with_length(_schema_text(schema))
+    if len(_TOKEN_MEMO) >= _TOKEN_MEMO_MAX:
+        _TOKEN_MEMO.clear()
+    _TOKEN_MEMO[key] = entry
+    return entry
 
 
 def _schema_text(schema: Dict[str, Any]) -> str:
@@ -85,9 +184,14 @@ def rank_tools(
 ) -> List[Tuple[Dict[str, Any], float]]:
     """Return [(schema, score), ...] sorted by descending relevance.
 
-    Scoring: log-tf weighted keyword overlap between query tokens and the
-    flattened schema text. Pinned tools always score ``+inf`` and sort
-    first.
+    Scoring: Okapi BM25 over the flattened schema text. Pinned tools always
+    score ``+inf`` and sort first.
+
+    The length normalization matters more here than in general retrieval: tool
+    schemas differ in size by an order of magnitude, and without the ``|d|/avgdl``
+    term a verbose MCP tool that merely *mentions* a query word several times in
+    a long description outranked the short, precisely-named tool the user
+    actually meant.
     """
     pinned = pinned or set()
     q_tokens = _tokens(query)
@@ -97,16 +201,17 @@ def rank_tools(
 
     # Document frequency for IDF (within the catalog, cheap).
     df: Dict[str, int] = {}
-    docs: List[List[str]] = []
+    docs: List[Tuple[List[str], int]] = []
     for s in schemas:
-        toks = _tokens(_schema_text(s))
-        docs.append(toks)
-        for t in set(toks):
+        entry = _schema_tokens(s)
+        docs.append(entry)
+        for t in set(entry[0]):
             df[t] = df.get(t, 0) + 1
     n_docs = max(1, len(schemas))
+    avgdl = (sum(dl for _, dl in docs) / n_docs) or 1.0
 
     ranked: List[_Ranked] = []
-    for s, toks in zip(schemas, docs):
+    for s, (toks, dl) in zip(schemas, docs):
         name = (
             s.get("name")
             or (s.get("function") or {}).get("name")
@@ -121,11 +226,14 @@ def rank_tools(
         tf: Dict[str, int] = {}
         for t in toks:
             tf[t] = tf.get(t, 0) + 1
+        norm = _BM25_K1 * (1 - _BM25_B + _BM25_B * (dl / avgdl))
         score = 0.0
         for qt in q_tokens:
-            if qt in tf:
-                idf = math.log(1 + n_docs / (1 + df.get(qt, 0)))
-                score += (1 + math.log(tf[qt])) * idf
+            f = tf.get(qt)
+            if not f:
+                continue
+            idf = math.log(1 + (n_docs - df.get(qt, 0) + 0.5) / (df.get(qt, 0) + 0.5))
+            score += idf * (f * (_BM25_K1 + 1)) / (f + norm)
         ranked.append(_Ranked(s, name, score, pinned=False))
 
     ranked.sort(key=lambda r: (-r.score, r.name))
