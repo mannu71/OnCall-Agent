@@ -130,6 +130,29 @@ require_compose() {
   fail "Docker Compose not found. Install Compose v2: https://docs.docker.com/compose/install/"
 }
 
+enable_buildkit() {
+  # Compose v2 alone is NOT enough. agent-api/Dockerfile uses
+  # `RUN --mount=type=cache`, and if the build is routed through the CLASSIC
+  # builder it dies with "the --mount option requires BuildKit" — which is what
+  # happens on a Docker 20.10-era engine that has the docker-compose-plugin but
+  # not the docker-buildx-plugin: compose silently falls back to the legacy path.
+  #
+  # These two exports make the docker CLI use the daemon's built-in BuildKit,
+  # present in every engine since 18.09, so the build works without buildx.
+  export DOCKER_BUILDKIT=1
+  export COMPOSE_DOCKER_CLI_BUILD=1
+
+  if docker buildx version >/dev/null 2>&1; then
+    ok "BuildKit available ($(docker buildx version 2>/dev/null | awk '{print $2}'))"
+    return
+  fi
+
+  warn "docker buildx not found — forcing DOCKER_BUILDKIT=1 instead."
+  echo "    If the build still reports 'the --mount option requires BuildKit', install"
+  echo "    the buildx plugin (Linux: 'docker-buildx-plugin'; Mac/Windows: update Docker"
+  echo "    Desktop) — see https://docs.docker.com/go/buildkit/"
+}
+
 run_compose() {
   (cd "$ROOT" && "${COMPOSE[@]}" -f docker-compose.yml "$@")
 }
@@ -310,6 +333,7 @@ if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   fi
   ok "Docker daemon is running"
   require_compose
+  enable_buildkit
 fi
 
 if [[ "$DEV_SETUP" -eq 1 ]]; then
@@ -373,7 +397,41 @@ fi
 if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   step "Building and starting the full Docker stack (agent-api, headroom, ui)"
   echo "    First run compiles the codegraph engine and the UI — expect several minutes."
-  run_compose up --build -d
+
+  # Tee the log so the failure can be DIAGNOSED rather than guessed at. Without
+  # this, `set -e` aborted here with no explanation at all.
+  BUILD_LOG="$(mktemp)"
+  set +e
+  run_compose up --build -d 2>&1 | tee "$BUILD_LOG"
+  build_rc=${PIPESTATUS[0]}
+  set -e
+
+  if [[ "$build_rc" -ne 0 ]]; then
+    echo ""
+    if grep -qiE 'mount option requires BuildKit|requires BuildKit|buildkit is not' "$BUILD_LOG"; then
+      warn "The build ran WITHOUT BuildKit, which this project requires."
+      echo "    agent-api/Dockerfile uses 'RUN --mount=type=cache'. The classic builder"
+      echo "    cannot parse that, so the build stops at the first such line."
+      echo ""
+      echo "    Setup already exported DOCKER_BUILDKIT=1, so your Docker is overriding it"
+      echo "    or is too old to honour it. Fix one of these:"
+      echo "      1. Install the buildx plugin:  sudo apt-get install docker-buildx-plugin"
+      echo "         (Mac/Windows: update Docker Desktop to a current version)"
+      echo "      2. Check ~/.docker/config.json and the daemon config for 'buildkit: false',"
+      echo "         or a DOCKER_BUILDKIT=0 in your environment."
+      echo "      3. Verify with:  docker buildx version"
+      rm -f "$BUILD_LOG"
+      fail "Docker build failed: BuildKit is required but was not used."
+    fi
+    echo "    The Docker build failed. Most often this is a corporate proxy blocking npm/pip."
+    echo "    To see the real error:"
+    echo "       docker compose build ui --progress=plain --no-cache"
+    echo "    Then set HTTP_PROXY / HTTPS_PROXY / NO_PROXY (and NPM_REGISTRY for an internal"
+    echo "    mirror) in the root .env, or configure Docker's proxy, and re-run."
+    rm -f "$BUILD_LOG"
+    fail "Docker build failed."
+  fi
+  rm -f "$BUILD_LOG"
   ok "Full stack is running"
 
   step "Waiting for the API to become healthy"

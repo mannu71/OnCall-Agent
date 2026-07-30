@@ -208,6 +208,38 @@ Docker Compose v2 is required and no working Compose was found.
 "@
 }
 
+function Enable-BuildKit {
+    <#
+      Force BuildKit on for this process, and warn early if it looks unavailable.
+
+      Compose v2 alone is NOT enough. agent-api/Dockerfile uses
+      'RUN --mount=type=cache', and if the build is routed through the CLASSIC
+      builder it dies with "the --mount option requires BuildKit" - which is what
+      happens on a Docker 20.10-era engine where the docker-compose-plugin was
+      installed but the docker-buildx-plugin was not. Compose then silently falls
+      back to the legacy path.
+
+      Setting these two variables makes the docker CLI use the daemon's built-in
+      BuildKit, which every engine since 18.09 ships, so the build works even
+      without the buildx plugin present.
+    #>
+    $env:DOCKER_BUILDKIT = "1"
+    $env:COMPOSE_DOCKER_CLI_BUILD = "1"
+
+    $buildx = Invoke-NativeProbe -Exe "docker" -Arguments @("buildx", "version")
+    if ($buildx.Ok) {
+        Write-Ok ("BuildKit available (" + (($buildx.Output -split '\s+')[1]) + ")")
+        return
+    }
+
+    # No buildx. DOCKER_BUILDKIT=1 above usually carries the build anyway, so this
+    # is a warning rather than a hard stop - but say what to install if it fails.
+    Write-Warn "docker buildx not found - forcing DOCKER_BUILDKIT=1 instead."
+    Write-Host "    If the build still reports 'the --mount option requires BuildKit', install" -ForegroundColor Yellow
+    Write-Host "    the buildx plugin (Linux: 'docker-buildx-plugin'; Windows/Mac: update" -ForegroundColor Yellow
+    Write-Host "    Docker Desktop) - see https://docs.docker.com/go/buildkit/" -ForegroundColor Yellow
+}
+
 function Test-CommandExists {
     param([string]$Name)
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
@@ -585,6 +617,7 @@ Docker is installed but the daemon is not reachable. Start Docker Desktop and re
     # without Compose v2 got as far as writing .env files and data directories
     # before failing. Fail before touching the disk.
     Require-DockerCompose | Out-Null
+    Enable-BuildKit
 
     if (Test-ExistingInstall) {
         Write-Ok "Existing installation detected - updating in place (database volume preserved)"
@@ -696,15 +729,44 @@ if (-not $SkipDocker) {
     $buildCmd = @(Get-DockerComposeCommand) + @("-f", $RootComposeFile, "up", "--build", "-d")
     Write-Host ("    > " + ($buildCmd -join " "))
     Push-Location $Root
+    # Tee the output so the diagnosis below can read the ACTUAL failure instead of
+    # guessing. EAP is relaxed for the same reason as in Invoke-NativeProbe: the
+    # 2>&1 needed to capture the build log would otherwise become a terminating
+    # NativeCommandError the moment docker writes a single line to stderr.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    $buildLog = @()
     try {
-        & $buildCmd[0] @($buildCmd[1..($buildCmd.Length - 1)])
+        & $buildCmd[0] @($buildCmd[1..($buildCmd.Length - 1)]) 2>&1 | Tee-Object -Variable buildLog
         $buildExit = $LASTEXITCODE
     }
     finally {
+        $ErrorActionPreference = $prevEAP
+        $Error.Clear()
         Pop-Location
     }
+
     if ($buildExit -ne 0) {
+        $buildText = ($buildLog | Out-String)
         Write-Host ""
+
+        if ($buildText -match '(?i)--mount option requires BuildKit|requires BuildKit|buildkit is not') {
+            # Do NOT blame the proxy for this one: the cause is stated in the log.
+            Write-Warn "The build ran WITHOUT BuildKit, which this project requires."
+            Write-Host "    agent-api/Dockerfile uses 'RUN --mount=type=cache'. The classic builder" -ForegroundColor Yellow
+            Write-Host "    cannot parse that, so the build stops at the first such line." -ForegroundColor Yellow
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "    Setup already exported DOCKER_BUILDKIT=1, so your Docker is overriding it" -ForegroundColor Yellow
+            Write-Host "    or is too old to honour it. Fix one of these:" -ForegroundColor Yellow
+            Write-Host "      1. Install the buildx plugin:" -ForegroundColor Yellow
+            Write-Host "           Linux:  sudo apt-get install docker-buildx-plugin" -ForegroundColor Yellow
+            Write-Host "           Win/Mac: update Docker Desktop to a current version" -ForegroundColor Yellow
+            Write-Host "      2. Check ~/.docker/config.json and Docker Desktop settings for" -ForegroundColor Yellow
+            Write-Host "         'buildkit: false' or a DOCKER_BUILDKIT=0 environment variable." -ForegroundColor Yellow
+            Write-Host "      3. Verify with:  docker buildx version" -ForegroundColor Yellow
+            Write-Fail "Docker build failed: BuildKit is required but was not used."
+        }
+
         Write-Warn "The Docker build failed. Most often this is the corporate proxy blocking npm/pip."
         Write-Host "    To see the real error (npm/pip message is above the 'exit code: 1' line):" -ForegroundColor Yellow
         Write-Host "       docker compose build ui --progress=plain --no-cache" -ForegroundColor Yellow

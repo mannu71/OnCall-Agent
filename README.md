@@ -36,15 +36,25 @@ is installed on your machine.
 |------|---------|-----|
 | **Docker Engine** | 23+ (or Docker Desktop) | Builds and runs the whole stack |
 | **Docker Compose** | **v2** (`docker compose`, with a space) | See the note below |
+| **BuildKit** | enabled (`docker buildx`) | See the note below |
 | **Git** | Latest | Clone the repository |
 
-> **Compose v2 is required, not just preferred.** `agent-api/Dockerfile` is a
-> BuildKit Dockerfile — it uses `RUN --mount=type=cache` to keep rebuilds fast.
-> The legacy `docker-compose` v1 binary drives the old builder, which cannot
-> parse that syntax, so it fails part-way through the build with an error that
-> does not mention the real cause. Check yours with `docker compose version`; if
-> that command is not found but `docker-compose --version` reports 1.x, install
-> Compose v2: <https://docs.docker.com/compose/install/>.
+> **`agent-api/Dockerfile` is a BuildKit Dockerfile** — it uses
+> `RUN --mount=type=cache` to keep rebuilds fast. That means two separate
+> requirements, and having the first without the second is the most common way
+> this install fails:
+>
+> 1. **Compose v2.** The legacy `docker-compose` v1 binary drives the old
+>    builder. If `docker compose version` is not found but
+>    `docker-compose --version` reports 1.x, install v2:
+>    <https://docs.docker.com/compose/install/>
+> 2. **BuildKit actually in use.** Compose v2 normally builds via `buildx`. On
+>    Docker 20.10-era engines where `docker-compose-plugin` was installed but
+>    `docker-buildx-plugin` was not, Compose quietly falls back to the classic
+>    builder and the build dies with `the --mount option requires BuildKit`.
+>    Setup exports `DOCKER_BUILDKIT=1` to work around this, but the reliable fix
+>    is the plugin: `sudo apt-get install docker-buildx-plugin` on Linux, or
+>    updating Docker Desktop. Verify with `docker buildx version`.
 >
 > Not sure? Diagnose it in a few seconds — this changes nothing on disk:
 >
@@ -419,6 +429,9 @@ Useful Docker commands (from repo root):
 
 | Problem | What to check |
 |---------|---------------|
+| **`docker: unknown command: docker compose`** | You have Compose v1 or no Compose plugin. Install Compose v2 — see **Prerequisites**. Run `./setup.sh --check` / `.\setup.ps1 -Check` to confirm. |
+| **`the --mount option requires BuildKit`** | Compose fell back to the classic builder. Install the buildx plugin (`docker-buildx-plugin`, or update Docker Desktop), then `docker buildx version` should work. Not a proxy problem. |
+| Setup fails and you're not sure why | `./setup.sh --check` (Linux/macOS) or `.\setup.ps1 -Check` (Windows) — diagnoses Docker, Compose, BuildKit and ports without changing anything |
 | UI cannot reach API | Backend running on port 48000? Check http://localhost:48000/api/v1/health |
 | Database errors on startup | Migrations applied? Postgres container healthy? `DATABASE_URL` correct? |
 | MCP server connection fails | Node.js installed? `npx` works? Connection string and SSL certs correct? |
