@@ -29,13 +29,18 @@
 .PARAMETER WipeData
   DESTRUCTIVE. Delete the Postgres volume so the database starts empty. This is
   the ONLY option that erases data, and it prompts for typed confirmation.
+
+.PARAMETER Check
+  Diagnose the environment (Docker, daemon, Compose version, host ports) and
+  exit. Changes nothing on disk. Run this first when setup fails.
 #>
 param(
     [switch]$SkipDocker,
     [switch]$SkipMigrations,
     [switch]$DevSetup,
     [switch]$Reset,
-    [switch]$WipeData
+    [switch]$WipeData,
+    [switch]$Check
 )
 
 Set-StrictMode -Version Latest
@@ -79,31 +84,128 @@ function Write-Fail {
     exit 1
 }
 
+function Invoke-NativeProbe {
+    <#
+      Run a native command, swallow BOTH streams, and report exit code + output.
+
+      Windows PowerShell 5.1 turns a native command's redirected stderr into a
+      NativeCommandError ErrorRecord and PRINTS it, so a bare
+      `docker compose version *> $null` dumped a PowerShell stack trace on every
+      machine whose docker has no `compose` subcommand - burying the actual
+      diagnosis. Silencing ErrorActionPreference for the duration keeps the probe
+      quiet, which is the whole point of a probe.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [string[]]$Arguments = @()
+    )
+
+    if (-not (Get-Command $Exe -ErrorAction SilentlyContinue)) {
+        return [pscustomobject]@{ Ok = $false; Code = -1; Output = "$Exe not found" }
+    }
+
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    $global:LASTEXITCODE = 0
+    $out = ""
+    try {
+        # Merge stderr into stdout inside cmd.exe, BEFORE PowerShell sees either.
+        # Doing the redirect in PowerShell instead (`2>&1` or `*> $null`) makes 5.1
+        # wrap each stderr line in a NativeCommandError; with the
+        # $ErrorActionPreference="Stop" this script sets, that error is TERMINATING
+        # and killed the run outright. Silencing the preference alone is not enough:
+        # it stops the abort but also drops the stderr text, and that text is the
+        # single most useful thing to show someone whose docker lacks the plugin.
+        $quoted = ($Arguments | ForEach-Object {
+            if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+        }) -join ' '
+        $out = (& cmd.exe /c "$Exe $quoted 2>&1" | Out-String)
+    }
+    catch {
+        return [pscustomobject]@{ Ok = $false; Code = -1; Output = $_.Exception.Message }
+    }
+    finally {
+        $ErrorActionPreference = $prevEAP
+        $Error.Clear()
+    }
+
+    return [pscustomobject]@{
+        Ok     = ($LASTEXITCODE -eq 0)
+        Code   = $LASTEXITCODE
+        Output = $out.Trim()
+    }
+}
+
+# Resolved once by Require-DockerCompose; every compose call reads this.
+$script:ComposeCommand = $null
+
 function Get-DockerComposeCommand {
-    # Compose v2 ONLY, deliberately: agent-api/Dockerfile is a BuildKit Dockerfile
-    # (14 `RUN --mount=type=cache` directives). Legacy docker-compose v1 drives
-    # the classic builder, which cannot parse those, so falling back to v1 does
-    # not degrade - it fails mid-build with an error that looks nothing like the
-    # real cause. Say so here instead.
-    docker compose version *> $null
-    if ($LASTEXITCODE -eq 0) {
-        return @("docker", "compose")
+    if ($script:ComposeCommand) { return $script:ComposeCommand }
+    return (Require-DockerCompose)
+}
+
+function Require-DockerCompose {
+    <#
+      Compose v2 ONLY, deliberately: agent-api/Dockerfile is a BuildKit Dockerfile
+      (14 `RUN --mount=type=cache` directives). Legacy docker-compose v1 drives
+      the classic builder, which cannot parse those, so falling back to v1 does
+      not degrade - it fails mid-build with an error that looks nothing like the
+      real cause. Say so here instead, BEFORE anything is created on disk.
+    #>
+    if ($script:ComposeCommand) { return $script:ComposeCommand }
+
+    $v2 = Invoke-NativeProbe -Exe "docker" -Arguments @("compose", "version", "--short")
+    if ($v2.Ok) {
+        $script:ComposeCommand = @("docker", "compose")
+        Write-Ok ("Docker Compose " + $v2.Output + " (docker compose plugin)")
+        return $script:ComposeCommand
     }
 
+    $standaloneReport = "not installed"
     if (Test-CommandExists "docker-compose") {
-        $composeVersion = (docker-compose version --short 2>$null)
-        if ($LASTEXITCODE -eq 0 -and $composeVersion -match '^v?([2-9]|\d{2,})\.') {
+        $standalone = Invoke-NativeProbe -Exe "docker-compose" -Arguments @("version", "--short")
+        $standaloneReport = $standalone.Output
+
+        if ($standalone.Ok -and $standalone.Output -match '^v?([2-9]|\d{2,})\.') {
             # Standalone binary that is really v2+, supports BuildKit, so allow it.
-            return @("docker-compose")
+            $script:ComposeCommand = @("docker-compose")
+            Write-Ok ("Docker Compose " + $standalone.Output + " (standalone)")
+            return $script:ComposeCommand
         }
-        Write-Fail @"
-Docker Compose v1 ($composeVersion) cannot build this project - it needs BuildKit.
-    Install Compose v2, then re-run: https://docs.docker.com/compose/install/
-    Docker Desktop ships it; the command becomes 'docker compose' (a space, not a hyphen).
+
+        # Only call it v1 when a 1.x version was actually PARSED. A binary that
+        # merely failed to run is not evidence of v1, and mislabelling it sends
+        # the reader off to fix the wrong problem.
+        if ($standalone.Ok -and $standalone.Output -match '^v?1\.') {
+            Write-Fail @"
+Docker Compose v1 ($($standalone.Output)) cannot build this project - it needs BuildKit.
+    agent-api/Dockerfile uses 'RUN --mount=type=cache', which the v1 builder cannot parse.
+
+    Install Compose v2: https://docs.docker.com/compose/install/
+    Then 'docker compose version' should work (a space, not a hyphen).
 "@
+        }
     }
 
-    Write-Fail "Docker Compose not found. Install Docker Desktop (it includes Compose v2) and ensure it is running."
+    # No usable Compose. Show exactly what each form reported - a shim such as
+    # Rancher Desktop, Podman or Colima's docker often lacks the compose plugin
+    # entirely, and the raw messages are the fastest way to recognise that.
+    $dockerVer = Invoke-NativeProbe -Exe "docker" -Arguments @("--version")
+    Write-Fail @"
+Docker Compose v2 is required and no working Compose was found.
+
+    docker --version   : $($dockerVer.Output)
+    'docker compose'   : $($v2.Output)
+    'docker-compose'   : $standaloneReport
+
+    This project needs Compose V2 (the 'docker compose' subcommand) because
+    agent-api/Dockerfile uses BuildKit cache mounts.
+    - Docker Desktop (Windows/Mac): included - update to a recent version.
+    - Other runtimes (Rancher, Podman, Colima) or Linux: install the plugin per
+      https://docs.docker.com/compose/install/linux/
+
+    Verify with:  docker compose version
+"@
 }
 
 function Test-CommandExists {
@@ -209,11 +311,16 @@ function New-EnvFile {
 }
 
 function Wait-PostgresHealthy {
-    param([string[]]$ComposeCommand)
-
     Write-Host "    Waiting for PostgreSQL to become healthy..."
     for ($attempt = 1; $attempt -le 30; $attempt++) {
-        $status = docker inspect --format='{{.State.Health.Status}}' $DbContainer 2>$null
+        # Probe, not a redirect: `docker inspect ... 2>$null` writes a
+        # NativeCommandError under this script's $ErrorActionPreference="Stop",
+        # which would abort the whole run from inside a retry loop the moment the
+        # container is briefly absent.
+        $probe = Invoke-NativeProbe -Exe "docker" -Arguments @(
+            "inspect", "--format={{.State.Health.Status}}", $DbContainer
+        )
+        $status = $probe.Output
         if ($status -eq "healthy") {
             Write-Ok "PostgreSQL is healthy"
             return
@@ -250,8 +357,22 @@ function Wait-ApiHealthy {
 
 function Get-AppliedMigrations {
     # Applied filenames as a string array; empty if the table is absent or empty.
-    $out = "SELECT filename FROM schema_migrations;" |
-        docker exec -i $DbContainer psql -tA -U kycuser -d kycagent 2>$null
+    #
+    # The stderr redirect has to stay (this query legitimately fails before the
+    # tracking table exists), but under $ErrorActionPreference="Stop" a redirected
+    # native stderr becomes a TERMINATING NativeCommandError - so psql printing a
+    # single notice here would kill setup instead of returning "nothing applied".
+    # Relaxing the preference for the call keeps the $LASTEXITCODE check working.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    try {
+        $out = "SELECT filename FROM schema_migrations;" |
+            docker exec -i $DbContainer psql -tA -U kycuser -d kycagent 2>$null
+    }
+    finally {
+        $ErrorActionPreference = $prevEAP
+        $Error.Clear()
+    }
     if ($LASTEXITCODE -ne 0 -or -not $out) {
         return @()
     }
@@ -283,8 +404,17 @@ function Invoke-MigrationsViaDocker {
     # stamp 001_schema.sql as applied WITHOUT executing it (the objects already
     # exist). A fresh volume has no core table, so it falls through and runs it.
     if ($applied -notcontains '001_schema.sql') {
-        $coreExists = "SELECT to_regclass('public.workflows') IS NOT NULL;" |
-            docker exec -i $DbContainer psql -tA -U kycuser -d kycagent 2>$null
+        # Same stderr-abort guard as Get-AppliedMigrations above.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "SilentlyContinue"
+        try {
+            $coreExists = "SELECT to_regclass('public.workflows') IS NOT NULL;" |
+                docker exec -i $DbContainer psql -tA -U kycuser -d kycagent 2>$null
+        }
+        finally {
+            $ErrorActionPreference = $prevEAP
+            $Error.Clear()
+        }
         if ($LASTEXITCODE -eq 0 -and (($coreExists -join '').Trim() -eq 't')) {
             Write-Warn "Existing schema found - stamping 001_schema.sql as applied (not replaying it)."
             "INSERT INTO schema_migrations (filename) VALUES ('001_schema.sql') ON CONFLICT DO NOTHING;" |
@@ -348,10 +478,13 @@ function Get-EffectivePort {
 
 function Test-ExistingInstall {
     # True if a previous install is present (db volume or db container exists).
-    $vol = docker volume ls --format '{{.Name}}' 2>$null | Where-Object { $_ -eq $DbVolume }
-    if ($vol) { return $true }
-    $ctr = docker ps -a --format '{{.Names}}' 2>$null | Where-Object { $_ -eq $DbContainer }
-    return [bool]$ctr
+    # Probes, not redirects - see the note in Invoke-NativeProbe.
+    $vols = Invoke-NativeProbe -Exe "docker" -Arguments @("volume", "ls", "--format", "{{.Name}}")
+    if ($vols.Ok -and ($vols.Output -split "`r?`n" | Where-Object { $_.Trim() -eq $DbVolume })) {
+        return $true
+    }
+    $ctrs = Invoke-NativeProbe -Exe "docker" -Arguments @("ps", "-a", "--format", "{{.Names}}")
+    return [bool]($ctrs.Ok -and ($ctrs.Output -split "`r?`n" | Where-Object { $_.Trim() -eq $DbContainer }))
 }
 
 function Test-HostPorts {
@@ -433,14 +566,25 @@ if (-not $SkipDocker) {
     if (-not (Test-CommandExists "docker")) {
         Write-Fail "Docker is not installed. Install Docker Desktop or rerun with -SkipDocker."
     }
-    Write-Ok "Docker CLI available"
+    $dockerVersion = Invoke-NativeProbe -Exe "docker" -Arguments @("--version")
+    Write-Ok ($dockerVersion.Output -replace '^Docker version ', 'Docker ' -replace ',.*$', '')
 
     # A present CLI doesn't mean the daemon is up - check before we depend on it.
-    docker info *> $null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Fail "Docker Desktop is not running. Start it and re-run setup.bat."
+    $dockerInfo = Invoke-NativeProbe -Exe "docker" -Arguments @("info", "--format", "{{.ServerVersion}}")
+    if (-not $dockerInfo.Ok) {
+        Write-Fail @"
+Docker is installed but the daemon is not reachable. Start Docker Desktop and re-run setup.bat.
+
+    docker info said: $($dockerInfo.Output)
+"@
     }
     Write-Ok "Docker daemon is running"
+
+    # Resolve Compose HERE, during prerequisites - not lazily at first use. This
+    # check used to happen inside the "Starting PostgreSQL" step, so a machine
+    # without Compose v2 got as far as writing .env files and data directories
+    # before failing. Fail before touching the disk.
+    Require-DockerCompose | Out-Null
 
     if (Test-ExistingInstall) {
         Write-Ok "Existing installation detected - updating in place (database volume preserved)"
@@ -448,6 +592,21 @@ if (-not $SkipDocker) {
     else {
         Write-Ok "First-time setup"
     }
+}
+
+if ($Check) {
+    # Diagnose-only: report the ports too, then stop before anything is written.
+    if (-not $SkipDocker) {
+        Write-Step "Checking host ports"
+        Test-HostPorts
+        Write-Ok "Host ports available"
+    }
+    Write-Host ""
+    Write-Host "Environment looks good. Run .\setup.bat to install." -ForegroundColor Green
+    exit 0
+}
+
+if (-not $SkipDocker) {
 
     $composeFile = Join-Path $Root "docker-compose.yml"
 
@@ -458,14 +617,14 @@ if (-not $SkipDocker) {
         if ($answer -ne "wipe") {
             Write-Fail "Wipe cancelled - nothing was deleted."
         }
-        $compose = Get-DockerComposeCommand
+        $compose = @(Get-DockerComposeCommand)
         Invoke-External -ExeAndArgs ($compose + @("-f", $composeFile, "down", "-v")) -WorkingDirectory $Root
         Write-Ok "Stack torn down and database volume removed"
     }
     elseif ($Reset) {
         # Recreate containers WITHOUT -v, so the postgres data volume survives.
         Write-Step "Reset requested - recreating containers (database preserved)"
-        $compose = Get-DockerComposeCommand
+        $compose = @(Get-DockerComposeCommand)
         Invoke-External -ExeAndArgs ($compose + @("-f", $composeFile, "down")) -WorkingDirectory $Root
         Write-Ok "Containers removed; database volume preserved"
     }
@@ -510,9 +669,9 @@ if (-not $SkipDocker) {
     Write-Ok "Host ports available"
 
     Write-Step "Starting PostgreSQL (Docker)"
-    $compose = Get-DockerComposeCommand
+    $compose = @(Get-DockerComposeCommand)
     Invoke-External -ExeAndArgs ($compose + @("-f", $RootComposeFile, "up", "-d", "postgres")) -WorkingDirectory $Root
-    Wait-PostgresHealthy -ComposeCommand $compose
+    Wait-PostgresHealthy
 }
 
 if (-not $SkipMigrations) {
@@ -530,7 +689,11 @@ if (-not $SkipMigrations) {
 
 if (-not $SkipDocker) {
     Write-Step "Building and starting the full Docker stack (agent-api, headroom, ui)"
-    $buildCmd = $compose + @("-f", $RootComposeFile, "up", "--build", "-d")
+    Write-Host "    First run compiles the codegraph engine and the UI - expect several minutes."
+    # Re-resolve rather than reuse $compose from the earlier block: the result is
+    # cached, so this costs nothing, and it keeps this step working under
+    # Set-StrictMode if the block order ever changes.
+    $buildCmd = @(Get-DockerComposeCommand) + @("-f", $RootComposeFile, "up", "--build", "-d")
     Write-Host ("    > " + ($buildCmd -join " "))
     Push-Location $Root
     try {

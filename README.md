@@ -46,8 +46,15 @@ is installed on your machine.
 > that command is not found but `docker-compose --version` reports 1.x, install
 > Compose v2: <https://docs.docker.com/compose/install/>.
 >
-> Not sure? Run `./setup.sh --check` (Linux/macOS) — it diagnoses Docker, the
-> daemon, your Compose version and host-port conflicts, and changes nothing.
+> Not sure? Diagnose it in a few seconds — this changes nothing on disk:
+>
+> ```bash
+> ./setup.sh --check          # Linux / macOS
+> .\setup.ps1 -Check          # Windows
+> ```
+>
+> It reports your Docker version, whether the daemon is reachable, which Compose
+> form you have, and any host-port conflicts.
 
 Only needed if you want **local hot-reload development** (`--dev` / `-DevSetup`);
 skip them otherwise:
@@ -99,7 +106,7 @@ chmod +x setup.sh
 
 | Flag | Windows | Linux / macOS | Description |
 |------|---------|---------------|-------------|
-| Diagnose only | _(n/a)_ | `--check` | Check Docker, Compose version and host ports, then exit. Changes nothing — run this first if setup fails. |
+| Diagnose only | `-Check` | `--check` | Check Docker, Compose version and host ports, then exit. Changes nothing — **run this first if setup fails.** |
 | Skip Docker | `-SkipDocker` | `--skip-docker` | Use your own PostgreSQL instance (apply `migrations/001_schema.sql` yourself) |
 | Skip migrations | `-SkipMigrations` | `--skip-migrations` | Skip the SQL migration |
 | Dev setup | `-DevSetup` | `--dev` | Also set up local dev: create the Python venv, `pip install`, and UI `npm install`. Off by default. |
