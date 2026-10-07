@@ -1,6 +1,6 @@
 # OnCall Agent
 
-A web application for building and running AI-powered on-call investigation workflows. The UI is a React app served via nginx in Docker (or Vite during local dev); the backend is a Python FastAPI service that orchestrates agents, MCP tool servers, scheduled runs, and real-time execution streaming.
+A web application for building and running AI-powered on-call investigation workflows. The UI is a Python [Streamlit](https://streamlit.io) app (`streamlit-ui/`); the backend is a Python FastAPI service that orchestrates agents, MCP tool servers, scheduled runs, and real-time execution streaming.
 
 ## Project structure
 
@@ -11,10 +11,12 @@ kyc-protect-oncall-agent/
 │   ├── app/                # Application code (see "Repository layout" below)
 │   ├── migrations/         # PostgreSQL schema: 001_schema.sql, 002_fts_only_retrieval.sql
 │   └── requirements.txt    # Python dependencies
-├── ui/                     # React frontend (Docker nginx or Vite dev)
-│   ├── src/                # React app (workflow builder, scheduler, settings)
-│   ├── Dockerfile          # UI container
-│   └── package.json
+├── streamlit-ui/           # Streamlit UI (dashboard, workflow builder, chat, scheduler, settings)
+│   ├── app.py              # Entry point
+│   ├── views/              # One module per page
+│   ├── oncall_ui/          # API client, run manager, workflow model
+│   └── Dockerfile          # UI container
+├── ui/                     # Previous React UI — kept until the Streamlit port is signed off
 ├── docs/                   # Architecture and harness docs
 ├── setup.ps1               # One-command setup (Windows PowerShell)
 ├── setup.sh                # One-command setup (Linux / macOS)
@@ -29,8 +31,8 @@ compose files.
 ## Prerequisites
 
 **To run the app, you need Docker and Git. That is the whole list.** The UI and
-the backend are each compiled inside their own container, so no Node or Python
-is installed on your machine.
+the backend each build inside their own container, so no Python or Node needs
+to be installed on your machine.
 
 | Tool | Version | Why |
 |------|---------|-----|
@@ -71,9 +73,8 @@ skip them otherwise:
 
 | Tool | Version | Why |
 |------|---------|-----|
-| **Node.js** | 18+ | Vite dev server, and `npx`-based MCP servers |
-| **npm** | 9+ | Frontend package management |
-| **Python** | 3.12+ | Running the backend outside its container |
+| **Python** | 3.12+ | Running the backend and the Streamlit UI outside their containers |
+| **Node.js** | 18+ | Only for `npx`-based MCP servers when the backend runs on the host |
 
 Optional but recommended:
 
@@ -87,7 +88,7 @@ Optional but recommended:
 
 ## Quick setup (recommended)
 
-After cloning the repo, run the setup script from the repository root — one command takes a fresh clone to a running stack. It checks prerequisites, creates `.env` files, starts PostgreSQL in Docker, applies the migration, builds and starts the full container stack, and waits for the API health check. A local Python venv and UI `npm install` are only done when you pass `-DevSetup` / `--dev` (a container-only user needs neither).
+After cloning the repo, run the setup script from the repository root — one command takes a fresh clone to a running stack. It checks prerequisites, creates `.env` files, starts PostgreSQL in Docker, applies the migration, builds and starts the full container stack, and waits for the API health check. Local Python venvs for the backend and the UI are only created when you pass `-DevSetup` / `--dev` (a container-only user needs neither).
 
 **Windows:**
 
@@ -119,7 +120,7 @@ chmod +x setup.sh
 | Diagnose only | `-Check` | `--check` | Check Docker, Compose version and host ports, then exit. Changes nothing — **run this first if setup fails.** |
 | Skip Docker | `-SkipDocker` | `--skip-docker` | Use your own PostgreSQL instance (apply `migrations/001_schema.sql` yourself) |
 | Skip migrations | `-SkipMigrations` | `--skip-migrations` | Skip the SQL migration |
-| Dev setup | `-DevSetup` | `--dev` | Also set up local dev: create the Python venv, `pip install`, and UI `npm install`. Off by default. |
+| Dev setup | `-DevSetup` | `--dev` | Also set up local dev: create the Python venvs for `agent-api/` and `streamlit-ui/` and `pip install` both. Off by default. |
 | Reset containers | `-Reset` | _(n/a)_ | Recreate containers from scratch (down + up --build). **Database is preserved.** |
 | Wipe database | `-WipeData` | _(n/a)_ | DESTRUCTIVE — delete the Postgres volume so the DB starts empty (prompts for typed confirmation). The only option that erases data. |
 
@@ -130,7 +131,7 @@ docker compose up --build -d
 # Open http://localhost:43000
 ```
 
-**Local development** (requires `-DevSetup` / `--dev` first, to create the venv and install UI deps):
+**Local development** (requires `-DevSetup` / `--dev` first, to create the venvs):
 
 ```bash
 # Terminal 1 — backend
@@ -140,8 +141,10 @@ cd agent-api
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000
 
 # Terminal 2 — UI
-cd ui
-npm run dev
+cd streamlit-ui
+# Windows: .\.venv\Scripts\activate
+# Linux/macOS: source .venv/bin/activate
+streamlit run app.py --server.port 45173 --server.runOnSave true
 # Open http://localhost:45173
 ```
 
@@ -240,20 +243,14 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**Option B — Via UI postinstall** (installs into the active Python environment):
+### Step 6 — Install UI dependencies
 
 ```bash
-cd ui
-npm install
-```
-
-The `postinstall` script runs `pip install -r requirements.txt` in `agent-api/`.
-
-### Step 6 — Install frontend dependencies
-
-```bash
-cd ui
-npm install
+cd streamlit-ui
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# Linux / macOS: source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ### Step 7 — Start the backend API
@@ -290,29 +287,22 @@ Verify the API is running:
 docker compose up --build
 ```
 
-Open **http://localhost:43000** in your browser. The UI container (`kyc-agent-ui`) proxies `/api` to the backend container (`kyc-agent-api`) over the shared Docker network. (The code-intel engine is built inside `agent-api/Dockerfile`; there is no separate build step.)
+Open **http://localhost:43000** in your browser. The UI container (`kyc-agent-ui`) calls the backend container (`kyc-agent-api`) server-side at `http://agent-api:8000` over the shared Docker network, so the browser only talks to the UI. (The code-intel engine is built inside `agent-api/Dockerfile`; there is no separate build step.)
 
 **Local UI development (hot reload):**
 
 In a **separate terminal** (with backend running from Step 7 or Docker):
 
 ```bash
-cd ui
-npm run dev
+cd streamlit-ui
+streamlit run app.py --server.port 45173 --server.runOnSave true
 ```
 
-This starts the Vite dev server on **http://localhost:45173**. Vite proxies `/api` to `http://localhost:48000`.
-
-Optional frontend env file `ui/.env`:
-
-```env
-VITE_AGENT_API_URL=http://localhost:48000
-VITE_API_URL=http://localhost:48000
-```
+This serves the UI on **http://localhost:45173** and reloads on save. It calls the backend at `AGENT_API_URL` (default `http://localhost:48000`); set `AGENT_API_KEY` too if the API has `API_AUTH_ENABLED=true`. See [streamlit-ui/README.md](streamlit-ui/README.md).
 
 ### Step 9 — Verify the installation
 
-1. Open http://localhost:43000 (Docker) or http://localhost:45173 (Vite dev).
+1. Open http://localhost:43000 (Docker) or http://localhost:45173 (local Streamlit).
 2. Confirm **Settings** loads and the backend health check succeeds.
 3. Open http://localhost:48000/docs and confirm the API responds.
 
@@ -385,9 +375,9 @@ For local UI development against the Docker backend:
 # From repo root — start just the backend services
 docker compose up -d postgres agent-api
 
-# Then the Vite dev server (needs `--dev` deps installed first)
-cd ui
-npm run dev
+# Then the Streamlit UI (needs `--dev` deps installed first)
+cd streamlit-ui
+.venv/bin/streamlit run app.py --server.port 45173 --server.runOnSave true
 ```
 
 Useful Docker commands (from repo root):
@@ -395,7 +385,7 @@ Useful Docker commands (from repo root):
 | Command | Description |
 |---------|-------------|
 | `docker compose logs -f agent-api` | Follow backend logs |
-| `docker compose logs -f ui` | Follow UI/nginx logs |
+| `docker compose logs -f ui` | Follow UI (Streamlit) logs |
 | `docker compose down` | Stop all containers |
 | `../rebuild-docker.bat` | Rebuild backend + UI without losing DB data (Windows) |
 | `../rebuild-docker.sh` | Same on Linux/macOS |
@@ -404,15 +394,12 @@ Useful Docker commands (from repo root):
 
 ## Development commands
 
-### UI (`ui/`)
+### UI (`streamlit-ui/`)
 
 | Command | Description |
 |---------|-------------|
-| `npm run dev` | Vite dev server on port 45173 (browser) |
-| `npm run dev:vite` | Same as `npm run dev` |
-| `npm run build` | Build React frontend for production |
-| `npm run preview` | Preview production build locally |
-| `npm run lint` | Run ESLint |
+| `streamlit run app.py --server.port 45173 --server.runOnSave true` | Dev server on port 45173 with reload on save |
+| `pip install -r requirements-dev.txt && pytest` | Run the UI unit tests |
 
 ### Backend (`agent-api/`)
 
@@ -438,7 +425,7 @@ Useful Docker commands (from repo root):
 | Bedrock / AWS errors | `AWS_PROFILE` or credentials configured? `PROVIDER_TRANSPORT=bedrock` set? |
 | Code analyzer cannot see repos | `REPOS_BASE_PATH` (local) or docker-compose volume mount points at your repos |
 | UI shows API errors in Docker | Check `docker compose logs ui agent-api`; confirm http://localhost:43000/api/v1/health |
-| Docker build fails at `npm ci` / pip | Corporate proxy? See **Setup on a locked-down / corporate machine** below |
+| Docker build fails at `pip install` | Corporate proxy? See **Setup on a locked-down / corporate machine** below |
 | A host port is already in use | Override `POSTGRES_HOST_PORT` / `API_HOST_PORT` / `UI_HOST_PORT` / `HEADROOM_HOST_PORT` in the root `.env` |
 
 ---
@@ -453,7 +440,7 @@ The stack publishes on uncommon host ports so it doesn't collide with anything a
 | API | http://localhost:48000 | `API_HOST_PORT` |
 | Postgres | localhost:45432 | `POSTGRES_HOST_PORT` |
 | headroom (loopback) | 127.0.0.1:48787 | `HEADROOM_HOST_PORT` |
-| Vite dev server | http://localhost:45173 | `PORT` env |
+| Local Streamlit dev server | http://localhost:45173 | `--server.port` flag |
 
 If a default is taken, set the matching variable in the repo-root `.env` (copy `.env.example` first) and re-run — no file edits needed. `setup.bat` / `setup.sh` check these ports up front and tell you exactly which variable to set.
 
@@ -463,16 +450,15 @@ If a default is taken, set the matching variable in the repo-root `.env` (copy `
 
 Two things commonly bite fresh setups behind a corporate network:
 
-1. **Checkout** — use the `feature/v3-optimized-version` branch. `main` predates the UI Dockerfile and committed lockfile.
-2. **Docker build fails at `npm ci` or `pip install`** — almost always the corporate proxy / SSL inspection blocking the registries from inside the build. To see the real error (it's printed *above* the `exit code: 1` line, which the summary hides):
+1. **Checkout** — use the `feature/v3-optimized-version` branch. `main` predates the UI Dockerfile.
+2. **Docker build fails at `pip install`** (or `npm` in the backend image) — almost always the corporate proxy / SSL inspection blocking the registries from inside the build. To see the real error (it's printed *above* the `exit code: 1` line, which the summary hides):
 
    ```bash
    docker compose build ui --progress=plain --no-cache
    ```
 
-   - `ETIMEDOUT` / `ECONNREFUSED` / `EAI_AGAIN` → proxy not reachable from the build. Set `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` in the root `.env` (they're forwarded to the build), or configure Docker Desktop → Settings → Resources → Proxies. If your org runs an internal npm mirror, set `NPM_REGISTRY` too.
-   - `SELF_SIGNED_CERT` / `UNABLE_TO_VERIFY_LEAF_SIGNATURE` → SSL-inspection cert. The UI build already sets `strict-ssl false` and trusts the inspected cert; if it still fails, confirm the proxy vars above are set so npm reaches the registry at all.
-   - `EUSAGE: ... lock file ... not in sync` → your checkout has local edits to `ui/package.json` or a stale `ui/package-lock.json`. Run `git status ui/` and discard the drift.
+   - `ProxyError` / `Connection refused` / `Temporary failure in name resolution` → proxy not reachable from the build. Set `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` in the root `.env` (they're forwarded to the build), or configure Docker Desktop → Settings → Resources → Proxies.
+   - `SSLError` / `CERTIFICATE_VERIFY_FAILED` → SSL-inspection cert. The UI build already passes `--trusted-host` for PyPI (as the backend build does); if it still fails, confirm the proxy vars above are set so pip reaches the index at all.
 
 ---
 
@@ -483,7 +469,8 @@ Top level:
 | Path | What it is |
 |------|-----------|
 | `agent-api/` | Python FastAPI backend (see the package map below) |
-| `ui/` | React frontend (workflow builder, scheduler, settings) |
+| `streamlit-ui/` | Streamlit UI — see [streamlit-ui/README.md](streamlit-ui/README.md) |
+| `ui/` | Previous React UI (no longer built by compose; kept until the Streamlit port is signed off) |
 | `docs/` | Architecture and agent-harness documentation |
 | `docker-compose.yml` | The single full-stack definition |
 | `setup.ps1` / `setup.sh` | One-command setup |
@@ -521,4 +508,5 @@ Foundational modules (`database`, `exceptions`, `dependencies`, `logging`, `feat
 
 - [Agent API README](agent-api/README.md) — API details, the migration file, and Docker deployment
 - [Eval harness](agent-api/evals/README.md) — `pytest -m eval` regression gate
-- [UI developer guide](ui/AGENTS.md) — frontend architecture and conventions
+- [Streamlit UI README](streamlit-ui/README.md) — pages, workflow editor, configuration, differences from the React UI
+- [React UI developer guide](ui/AGENTS.md) — the previous frontend (retired from compose)

@@ -1,0 +1,15 @@
+[server]
+headless = true
+runOnSave = false
+# Large SQL / skill uploads stay small; keep the default cap explicit.
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "stacktrace"
+
+[theme]
+primaryColor = "#dc2626"

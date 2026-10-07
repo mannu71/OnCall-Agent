@@ -1,0 +1,7 @@
+# Streamlit UI for the OnCall Agent platform (talks to agent-api over HTTP).
+streamlit==1.65.0
+# React Flow canvas for the workflow editor. Pin it: the editor relies on its
+# timestamp/echo protocol (see oncall_ui/canvas.py and views/workflows.py).
+streamlit-flow-component==1.6.1
+requests>=2.32,<3
+plotly>=5.24,<8

@@ -138,21 +138,26 @@ services:
       - oncall-agent
 
   ui:
+    # Streamlit UI (streamlit-ui/). It calls agent-api server-side over the
+    # compose network, so there is no nginx /api proxy any more. The previous
+    # React UI still lives in ui/ until the Streamlit port is signed off.
     build:
-      context: ./ui
+      context: ./streamlit-ui
       dockerfile: Dockerfile
       args:
-        # Forwarded so `npm ci` can reach the registry through a corporate proxy.
-        # Empty by default (no-op); set in .env on locked-down machines. Set
-        # NPM_REGISTRY to point at an internal mirror if required.
+        # Forwarded so pip can reach the index through a corporate proxy.
+        # Empty by default (no-op); set in .env on locked-down machines.
         HTTP_PROXY: ${HTTP_PROXY:-}
         HTTPS_PROXY: ${HTTPS_PROXY:-}
         NO_PROXY: ${NO_PROXY:-}
-        NPM_REGISTRY: ${NPM_REGISTRY:-}
     container_name: kyc-agent-ui
+    environment:
+      - AGENT_API_URL=http://agent-api:8000
+      # Set when agent-api runs with API_AUTH_ENABLED=true.
+      - AGENT_API_KEY=${AGENT_API_KEY:-}
     ports:
       # Override UI_HOST_PORT in .env if 43000 is taken.
-      - "${UI_HOST_PORT:-43000}:80"
+      - "${UI_HOST_PORT:-43000}:8501"
     depends_on:
       - agent-api
     restart: unless-stopped

@@ -3,19 +3,20 @@
 #
 # One command takes a fresh clone to a running stack: prerequisites, .env files,
 # PostgreSQL, the migration, the full container stack, and an API health wait.
-# A local Python venv and UI npm install are only done with --dev.
+# Local Python venvs (backend + Streamlit UI) are only created with --dev.
 #
 # Usage:
 #   ./setup.sh
 #   ./setup.sh --skip-docker      # you manage the database yourself
 #   ./setup.sh --skip-migrations
-#   ./setup.sh --dev              # also set up local dev deps (venv + npm)
+#   ./setup.sh --dev              # also set up local dev deps (Python venvs)
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_API="${ROOT}/agent-api"
-UI="${ROOT}/ui"
+UI="${ROOT}/streamlit-ui"
+UI_VENV_DIR="${UI}/.venv"
 VENV_DIR="${AGENT_API}/venv"
 DB_CONTAINER="kyc-agent-db"
 REPOS_PATH="$(dirname "${ROOT}")"
@@ -37,8 +38,8 @@ Usage: ./setup.sh [options]
 
   (no options)        Build and run the whole stack in Docker. Needs ONLY Docker.
   --check             Diagnose the environment and exit. Changes nothing.
-  --dev               Also install host dev deps (Python venv + npm) for hot reload.
-                      Only this mode needs Node.js and Python 3.12+.
+  --dev               Also install host dev deps (Python venvs for agent-api and the
+                      Streamlit UI) for hot reload. Only this mode needs Python 3.12+.
   --skip-docker       You manage PostgreSQL yourself.
   --skip-migrations   Do not apply agent-api/migrations/*.sql.
 USAGE
@@ -316,12 +317,12 @@ echo "OnCall Agent - initial setup"
 
 step "Checking prerequisites"
 
-# The default path builds and runs everything INSIDE Docker: the UI is compiled
-# in ui/Dockerfile and the backend in agent-api/Dockerfile. So Node, npm and a
-# local Python are NOT prerequisites for it — they are only needed for --dev,
-# which creates a host venv and runs `npm install` for the Vite dev server.
-# Requiring them up front turned "I only have Docker" into a hard failure for a
-# toolchain the install never invoked.
+# The default path builds and runs everything INSIDE Docker: the Streamlit UI
+# in streamlit-ui/Dockerfile and the backend in agent-api/Dockerfile. So a local
+# Python is NOT a prerequisite for it — it is only needed for --dev, which
+# creates host venvs for the backend and the UI. Requiring it up front turned
+# "I only have Docker" into a hard failure for a toolchain the install never
+# invoked.
 PYTHON_BIN=""
 
 if [[ "$SKIP_DOCKER" -eq 0 ]]; then
@@ -337,10 +338,13 @@ if [[ "$SKIP_DOCKER" -eq 0 ]]; then
 fi
 
 if [[ "$DEV_SETUP" -eq 1 ]]; then
-  require_cmd node
-  require_cmd npm
-  ok "Node.js $(node --version)"
-  ok "npm $(npm --version)"
+  # Node is no longer needed for the UI; it is only used by npx-based MCP
+  # servers when the backend runs on the host, so warn rather than fail.
+  if command -v node >/dev/null 2>&1; then
+    ok "Node.js $(node --version) (for npx-based MCP servers)"
+  else
+    warn "Node.js not found — only needed for npx-based MCP servers when agent-api runs on the host."
+  fi
 
   PYTHON_BIN="$(resolve_python)"
   ok "Python available via: ${PYTHON_BIN}"
@@ -367,7 +371,6 @@ REPOS_FOR_ENV="${REPOS_PATH//\\//}"
 # Root .env holds port/proxy overrides — create it if missing.
 create_env_file "${ROOT}/.env.example" "${ROOT}/.env" "$REPOS_FOR_ENV"
 create_env_file "${AGENT_API}/.env.example" "${AGENT_API}/.env" "$REPOS_FOR_ENV"
-create_env_file "${UI}/.env.example" "${UI}/.env" ""
 
 mkdir -p \
   "${AGENT_API}/data/storage" \
@@ -396,7 +399,7 @@ fi
 
 if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   step "Building and starting the full Docker stack (agent-api, headroom, ui)"
-  echo "    First run compiles the codegraph engine and the UI — expect several minutes."
+  echo "    First run compiles the codegraph engine — expect several minutes."
 
   # Tee the log so the failure can be DIAGNOSED rather than guessed at. Without
   # this, `set -e` aborted here with no explanation at all.
@@ -423,11 +426,11 @@ if [[ "$SKIP_DOCKER" -eq 0 ]]; then
       rm -f "$BUILD_LOG"
       fail "Docker build failed: BuildKit is required but was not used."
     fi
-    echo "    The Docker build failed. Most often this is a corporate proxy blocking npm/pip."
+    echo "    The Docker build failed. Most often this is a corporate proxy blocking pip/npm."
     echo "    To see the real error:"
     echo "       docker compose build ui --progress=plain --no-cache"
-    echo "    Then set HTTP_PROXY / HTTPS_PROXY / NO_PROXY (and NPM_REGISTRY for an internal"
-    echo "    mirror) in the root .env, or configure Docker's proxy, and re-run."
+    echo "    Then set HTTP_PROXY / HTTPS_PROXY / NO_PROXY in the root .env, or configure"
+    echo "    Docker's proxy, and re-run."
     rm -f "$BUILD_LOG"
     fail "Docker build failed."
   fi
@@ -447,8 +450,11 @@ if [[ "$DEV_SETUP" -eq 1 ]]; then
   fi
   (cd "$AGENT_API" && "${VENV_DIR}/bin/pip" install -r requirements.txt)
 
-  step "Installing UI dependencies"
-  (cd "$UI" && npm install --ignore-scripts)
+  step "Installing Streamlit UI dependencies"
+  if [[ ! -d "$UI_VENV_DIR" ]]; then
+    "$PYTHON_BIN" -m venv "$UI_VENV_DIR"
+  fi
+  "${UI_VENV_DIR}/bin/pip" install -r "${UI}/requirements.txt"
 fi
 
 echo ""
@@ -464,8 +470,8 @@ if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   echo "       UI:            http://localhost:${UI_PORT}"
   echo "       API health:    http://localhost:${API_PORT}/api/v1/health"
   echo ""
-  echo "  Prefer local dev instead (backend + Vite UI, with hot reload)?"
-  echo "  1. Install local dev deps (venv + npm), if you haven't: ./setup.sh --dev"
+  echo "  Prefer local dev instead (backend + Streamlit UI, with hot reload)?"
+  echo "  1. Install local dev deps (Python venvs), if you haven't: ./setup.sh --dev"
   echo "  2. Stop the containerized agent-api/ui: docker compose stop agent-api ui"
   echo "  3. Edit agent-api/.env if you need AWS profile or provider settings"
   echo "  4. Start the backend:"
@@ -473,23 +479,23 @@ if [[ "$SKIP_DOCKER" -eq 0 ]]; then
   echo "       source venv/bin/activate"
   echo "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000"
   echo "  5. Start the UI (new terminal):"
-  echo "       cd ui"
-  echo "       npm run dev   # http://localhost:45173"
+  echo "       cd streamlit-ui"
+  echo "       .venv/bin/streamlit run app.py --server.port 45173 --server.runOnSave true   # http://localhost:45173"
 else
   echo "Next steps (Docker was skipped):"
   echo "  Option A — Full Docker stack (from repo root):"
   echo "       docker compose up --build -d"
   echo "       Open http://localhost:${UI_PORT}"
-  echo "  Option B — Local dev (backend + Vite UI):"
-  echo "  1. Install local dev deps (venv + npm), if you haven't: ./setup.sh --dev"
+  echo "  Option B — Local dev (backend + Streamlit UI):"
+  echo "  1. Install local dev deps (Python venvs), if you haven't: ./setup.sh --dev"
   echo "  2. Edit agent-api/.env if you need AWS profile or provider settings"
   echo "  3. Start the backend:"
   echo "       cd agent-api"
   echo "       source venv/bin/activate"
   echo "       python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 48000"
   echo "  4. Start the UI (new terminal):"
-  echo "       cd ui"
-  echo "       npm run dev   # http://localhost:45173"
+  echo "       cd streamlit-ui"
+  echo "       .venv/bin/streamlit run app.py --server.port 45173 --server.runOnSave true   # http://localhost:45173"
   echo ""
   echo "API health check: http://localhost:48000/api/v1/health"
 fi
