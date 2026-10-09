@@ -46,8 +46,8 @@ dependencies = [
 # ONNX code-embedding semantic search (app/core/code_semantic) — CPU-only
 # sentence-transformer inference that fills codegraph's search_semantic.
 semantic = [
-    "onnxruntime>=1.20.0",
-    "tokenizers>=0.20.0",
+    "onnxruntime==1.31.0",
+    "tokenizers==0.23.3",
 ]
 dev = [
     "pytest>=7.0",

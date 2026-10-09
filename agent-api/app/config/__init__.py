@@ -80,6 +80,8 @@ class Settings(
         "action_supervisor_enabled",
         "action_supervisor_shadow_mode",
         "wiki_publish_approval_enabled",
+        "model_download_insecure",
+        "mini_models_enabled",
         mode="before",
     )
     @classmethod

@@ -263,8 +263,8 @@ def build_synthesis_payload(evidence: Dict[str, Any]) -> Dict[str, Any]:
     This is an internal root-cause-analysis tool, so correlation / profile /
     trace IDs and raw error text are preserved verbatim (they are exactly what
     RCA needs). We only keep the payload *compact* (top-N + per-field char caps,
-    tunable via settings) for token budget — no PII masking. Genuine secrets are
-    still stripped later by ``redact()``.
+    tunable via settings) for token budget. The caller strips secrets with
+    ``redact()`` and pseudonymizes PII before the payload reaches the model.
     """
     if not isinstance(evidence, dict):
         return evidence
@@ -648,6 +648,13 @@ async def analyze_cloudwatch_with_llm(
     focus: Optional[str] = None,
 ) -> tuple:
     """Use the workflow's LLM node to produce a structured CloudWatch analysis."""
+    from app.core import privacy
+
+    # PII (emails, IPs, account ids, ...) is pseudonymized before the payload
+    # crosses the Bedrock boundary and rehydrated in the returned analysis, so
+    # the engineer still sees real values. Correlation/request/trace ids are
+    # not PII types and stay verbatim. The vault lives only for this call.
+    pii_key = f"cw-synthesis:{execution_id}"
     try:
         from langchain_core.messages import SystemMessage, HumanMessage
         from pydantic import BaseModel as _PydanticBase, Field as _Field
@@ -728,7 +735,7 @@ async def analyze_cloudwatch_with_llm(
         # keys written once) instead of pretty JSON — ~30–60% fewer tokens on the
         # error_patterns/anomalies/drilldown tables. redact() still strips secrets.
         synthesis_evidence = build_synthesis_payload(raw_result)
-        data_str = redact(encode_toon(synthesis_evidence))
+        data_str = privacy.pseudonymize(redact(encode_toon(synthesis_evidence)), pii_key)
         _syn_cap = settings.cloudwatch_synthesis_max_chars
         if len(data_str) > _syn_cap:
             data_str = data_str[:_syn_cap] + "\n... [truncated]"
@@ -737,7 +744,7 @@ async def analyze_cloudwatch_with_llm(
         if alerts:
             alert_section = (
                 "\n\nAlerts triggered:\n"
-                + redact(json.dumps(alerts, default=str))
+                + privacy.pseudonymize(redact(json.dumps(alerts, default=str)), pii_key)
             )
 
         system_prompt = (
@@ -917,8 +924,12 @@ async def analyze_cloudwatch_with_llm(
                     len(analysis_text), _GUARDRAIL_REFUSALS, execution_id,
                 )
 
+        analysis_text = privacy.rehydrate(analysis_text, pii_key)
+        structured_analysis = privacy.rehydrate_obj(structured_analysis, pii_key)
         return analysis_text, model_name, structured_analysis, input_tokens, output_tokens
 
     except Exception as e:
         logger.warning("CloudWatch LLM analysis failed (falling back to static): %s", e)
         return None, None, None, 0, 0
+    finally:
+        privacy.drop_vault(pii_key)

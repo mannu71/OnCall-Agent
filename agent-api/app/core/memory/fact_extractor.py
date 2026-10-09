@@ -68,6 +68,11 @@ async def extract_facts(
     excerpt = f"user: {user_content}\nassistant: {assistant_content}".strip()
     if not excerpt:
         return []
+    # Facts are stored pseudonymized: the raw user turn must not reach the
+    # model or the memory store. The run's active vault keeps placeholders
+    # consistent with the (already pseudonymized) assistant answer.
+    from app.core import privacy
+    excerpt = privacy.pseudonymize_active(excerpt)
     max_facts = max(1, settings.memory_fact_max_per_turn)
 
     facts = await _llm_extract(excerpt, max_facts, llm_fn)
@@ -80,9 +85,10 @@ async def _llm_extract(
     excerpt: str, max_facts: int, llm_fn: Optional[Any]
 ) -> List[Dict[str, str]]:
     prompt = (
-        _EXTRACT_SYSTEM.format(max_facts=max_facts)
+        # .replace, not .format: the template contains literal JSON braces.
+        _EXTRACT_SYSTEM.replace("{max_facts}", str(max_facts))
         + "\n\n"
-        + _EXTRACT_USER.format(excerpt=excerpt[:6000])
+        + _EXTRACT_USER.replace("{excerpt}", excerpt[:6000])
     )
     try:
         if llm_fn is not None:

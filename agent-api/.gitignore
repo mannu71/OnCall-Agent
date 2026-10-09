@@ -52,3 +52,6 @@ storage/logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Mini-model bake-off output (python -m evals.mini.run --out evals/mini/reports)
+evals/mini/reports/

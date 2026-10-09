@@ -17,7 +17,7 @@ from typing import List, Optional, Sequence
 
 from app.core.code_semantic.embedding_cache import EmbeddingCache
 from app.core.code_semantic.models import EmbeddingModelSpec, get_model_spec
-from app.core.code_semantic.provision import ensure_model
+from app.core.code_semantic.provision import ensure_model, verify_model_files
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,8 @@ class CodeEmbedder:
             mdir = ensure_model(
                 self.models_root, self.spec.key, allow_download=self.allow_download
             )
+            # Refuse to load a vendored/mounted file that differs from its pin.
+            verify_model_files(self.models_root, self.spec)
             tok = Tokenizer.from_file(os.path.join(mdir, "tokenizer.json"))
             tok.enable_truncation(max_length=self.spec.max_length)
             self._tok = tok

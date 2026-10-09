@@ -166,20 +166,29 @@ async def compact_session(
 
     to_summarize = messages[:-keep] if keep > 0 else messages
     transcript = "\n".join(f"{m['role']}: {m['content']}" for m in to_summarize)
-    prompt = (
-        "Summarize the following conversation excerpt into a concise note that "
-        "preserves decisions, findings, identifiers, and open questions. Write "
-        "3-8 bullet points, no preamble.\n\n" + transcript[:20000]
-    )
+    # The transcript holds rehydrated (real) values; pseudonymize it for the
+    # model and rehydrate the summary, which is stored like any other message.
+    from app.core import privacy
+    pii_key = f"compact:{session_id}"
     try:
-        from app.core.llm.call_llm import call_llm
-        summary, _, _, _ = await call_llm(prompt, tier="search", use_cache=False)
-    except Exception as exc:  # noqa: BLE001 — degrade gracefully, never 500 the UI
-        logger.warning("compact_session: LLM summarize failed (%s)", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Summarization model unavailable",
+        prompt = (
+            "Summarize the following conversation excerpt into a concise note that "
+            "preserves decisions, findings, identifiers, and open questions. Write "
+            "3-8 bullet points, no preamble.\n\n"
+            + privacy.pseudonymize(transcript[:20000], pii_key)
         )
+        try:
+            from app.core.llm.call_llm import call_llm
+            summary, _, _, _ = await call_llm(prompt, tier="search", use_cache=False)
+        except Exception as exc:  # noqa: BLE001 — degrade gracefully, never 500 the UI
+            logger.warning("compact_session: LLM summarize failed (%s)", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Summarization model unavailable",
+            )
+        summary = privacy.rehydrate(summary or "", pii_key)
+    finally:
+        privacy.drop_vault(pii_key)
 
     result = await repo.replace_with_summary(
         session_id, summary=f"[Earlier conversation summary]\n{summary.strip()}", keep_recent=keep

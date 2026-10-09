@@ -586,17 +586,26 @@ async def resolve_llm_config_by_name(config_name: str) -> Dict[str, Any]:
     return resolved.to_dict()
 
 
+# Roles tried, in order, when a role has no assignment of its own.
+ROLE_FALLBACKS: Dict[str, Tuple[str, ...]] = {"auxiliary": ("crawler",)}
+
+
 async def resolve_llm_config_for_role(role: str) -> Dict[str, Any]:
     """Resolve the LLM config assigned to a gateway *role*, with fallback.
 
-    Priority: role assignment → first DB config row. Used by non-workflow
-    consumers (crawler, subagent) that have no LLM node to read.
+    Priority: role assignment → its fallback roles (``ROLE_FALLBACKS``) → first
+    DB config row. Used by non-workflow consumers (crawler, subagent, auxiliary)
+    that have no LLM node to read.
 
     Raises:
         ValueError: if neither the role nor a default DB config resolves.
     """
     cfg = LLMNodeConfig()
-    resolved = await _resolve_role(cfg, role)
+    resolved = None
+    for candidate in (role, *ROLE_FALLBACKS.get(role, ())):
+        resolved = await _resolve_role(cfg, candidate)
+        if resolved:
+            break
     if not resolved:
         resolved = await _resolve_default(cfg)
     if not resolved:

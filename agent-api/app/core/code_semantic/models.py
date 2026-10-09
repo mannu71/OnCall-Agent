@@ -45,6 +45,12 @@ class EmbeddingModelSpec:
     doc_prefix: str = ""
     #: Extra notes (provenance / caveats).
     notes: str = ""
+    #: HuggingFace revision to download from: a commit SHA or tag. ``main`` is a
+    #: moving target, so a spec without a SHA must at least pin ``sha256``.
+    revision: str = "main"
+    #: Expected sha256 per remote file. A downloaded or vendored file whose hash
+    #: differs is rejected (see ``provision.verify_model_files``).
+    sha256: Dict[str, str] = field(default_factory=dict)
 
     def flat_files(self) -> Dict[str, str]:
         """Map each remote file to its flattened local basename."""
@@ -114,6 +120,15 @@ _ARCTIC_S = EmbeddingModelSpec(
     query_prefix="Represent this sentence for searching relevant passages: ",
     doc_prefix="",
     notes="Recommended accuracy upgrade at bge-small speed/size (34MB, 384d, CLS).",
+    # Hashes of the files vendored in agent-api/vendor/models (the shipped copy).
+    sha256={
+        "onnx/model_quantized.onnx":
+            "f93ff225320628d2e88baf2a395cae791b0e3b27edf5c70bf7b312a4d3260c14",
+        "tokenizer.json":
+            "91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854",
+        "config.json":
+            "4e519aa92ec40943356032afe458c8829d70c5766b109e4a57490b82f72dcfb7",
+    },
 )
 
 #: jina-embeddings-v2-base-code — CODE-SPECIFIC (trained on 30 programming

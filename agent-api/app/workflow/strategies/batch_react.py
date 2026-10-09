@@ -421,13 +421,24 @@ class BatchReactStrategy(BaseStrategy):
             extra={"execution_id": execution_id},
         )
 
-        messages = [
-            SystemMessage(content=_DECOMPOSE_SYSTEM_PROMPT),
-            HumanMessage(content=f"Query to decompose:\n{query}"),
-        ]
+        from app.core import privacy
+        from app.harness.agent_runner import extract_text_content  # local: import cycle
 
-        response = await llm.ainvoke(messages)
-        raw = (response.content or "").strip()
+        # PII stays on this side of the Bedrock boundary: the model sees
+        # placeholders and the sub-queries are rehydrated before each
+        # sub-investigation (which pseudonymizes again with its own vault).
+        pii_key = f"batch-decompose:{execution_id}"
+        try:
+            messages = [
+                SystemMessage(content=_DECOMPOSE_SYSTEM_PROMPT),
+                HumanMessage(
+                    content=f"Query to decompose:\n{privacy.pseudonymize(query, pii_key)}"
+                ),
+            ]
+            response = await llm.ainvoke(messages)
+            raw = privacy.rehydrate(extract_text_content(response.content).strip(), pii_key)
+        finally:
+            privacy.drop_vault(pii_key)
 
         # Strip optional markdown code fences
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -588,18 +599,31 @@ class BatchReactStrategy(BaseStrategy):
 
         sub_results_text = "\n\n".join(blocks)
 
-        messages = [
-            SystemMessage(content=_REDUCE_SYSTEM_PROMPT),
-            HumanMessage(
-                content=_REDUCE_USER_TEMPLATE.format(
-                    original_query=original_query,
-                    sub_results=sub_results_text,
-                )
-            ),
-        ]
+        from app.core import privacy
+        from app.harness.agent_runner import extract_text_content  # local: import cycle
 
-        response = await llm.ainvoke(messages)
-        synthesis = (response.content or "").strip()
+        # Sub-answers arrive rehydrated; pseudonymize the reduce prompt and
+        # rehydrate the synthesis so raw PII never reaches the model.
+        pii_key = f"batch-reduce:{execution_id}"
+        try:
+            messages = [
+                SystemMessage(content=_REDUCE_SYSTEM_PROMPT),
+                HumanMessage(
+                    content=privacy.pseudonymize(
+                        _REDUCE_USER_TEMPLATE.format(
+                            original_query=original_query,
+                            sub_results=sub_results_text,
+                        ),
+                        pii_key,
+                    )
+                ),
+            ]
+            response = await llm.ainvoke(messages)
+            synthesis = privacy.rehydrate(
+                extract_text_content(response.content).strip(), pii_key
+            )
+        finally:
+            privacy.drop_vault(pii_key)
 
         logger_instance.info(
             "BatchReactStrategy: reduce synthesis complete (%d chars)",

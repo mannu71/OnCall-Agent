@@ -115,6 +115,12 @@ class ToolSettings(BaseSettings):
     code_semantic_allow_download: bool = Field(
         default=False, validation_alias="CODE_SEMANTIC_ALLOW_DOWNLOAD"
     )
+    # Model downloads verify TLS against the configured CA bundle
+    # (MODEL_DOWNLOAD_CA_BUNDLE / REQUESTS_CA_BUNDLE / SSL_CERT_FILE). Set true
+    # only as a last resort when no proxy CA is available; sha256 pins still apply.
+    model_download_insecure: bool = Field(
+        default=False, validation_alias="MODEL_DOWNLOAD_INSECURE"
+    )
 
     code_semantic_batch_size: int = Field(
         default=32, validation_alias="CODE_SEMANTIC_BATCH_SIZE"
@@ -244,6 +250,31 @@ class ToolSettings(BaseSettings):
     skills_dir: str = Field(
         default="data/knowledge/skills", validation_alias="SKILLS_DIR"
     )
+
+    # ── Mini models (small local models; see app/core/mini) ─────────────────
+    # Master switch. Off by default: every role then uses today's regex /
+    # lexical / Bedrock path. A role turns on only when this is true AND its
+    # MINI_<ROLE>_MODEL names a registered, pinned spec.
+    mini_models_enabled: bool = Field(default=False, validation_alias="MINI_MODELS_ENABLED")
+    # Where pinned model files live (baked into the image, never /app/data,
+    # which the data bind mount would shadow).
+    mini_models_root: str = Field(default="/opt/models", validation_alias="MINI_MODELS_ROOT")
+    # Spawned inference processes; the CPU budget is split between them.
+    mini_pool_workers: int = Field(default=2, validation_alias="MINI_POOL_WORKERS")
+    # Calls allowed in flight before new ones take their fallback immediately.
+    mini_pool_queue_limit: int = Field(default=32, validation_alias="MINI_POOL_QUEUE_LIMIT")
+    # Per-call budget; on expiry the caller gets its fallback.
+    mini_call_timeout_seconds: float = Field(
+        default=2.0, validation_alias="MINI_CALL_TIMEOUT_SECONDS"
+    )
+    # Cores kept free for the API event loop when sizing inference threads.
+    mini_reserved_cpus: int = Field(default=1, validation_alias="MINI_RESERVED_CPUS")
+    mini_router_model: str = Field(default="", validation_alias="MINI_ROUTER_MODEL")
+    mini_pii_model: str = Field(default="", validation_alias="MINI_PII_MODEL")
+    mini_injection_model: str = Field(default="", validation_alias="MINI_INJECTION_MODEL")
+    mini_code_embed_model: str = Field(default="", validation_alias="MINI_CODE_EMBED_MODEL")
+    mini_recall_embed_model: str = Field(default="", validation_alias="MINI_RECALL_EMBED_MODEL")
+    mini_rerank_model: str = Field(default="", validation_alias="MINI_RERANK_MODEL")
 
     # ── Tool execution sandbox ───────────────────────────────────────────────
     # Isolate shell/code-execution tools. Backends:

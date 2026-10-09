@@ -1,0 +1,97 @@
+{"text": "hi", "label": "chat"}
+{"text": "hello there", "label": "chat"}
+{"text": "thanks!", "label": "chat"}
+{"text": "thank you, that helped", "label": "chat"}
+{"text": "good morning", "label": "chat"}
+{"text": "who are you?", "label": "chat"}
+{"text": "what can you do?", "label": "chat"}
+{"text": "what tools do you have?", "label": "chat"}
+{"text": "list your capabilities", "label": "chat"}
+{"text": "ok cool", "label": "chat"}
+{"text": "bye", "label": "chat"}
+{"text": "how are you?", "label": "chat"}
+{"text": "great, got it", "label": "chat"}
+{"text": "cheers", "label": "chat"}
+{"text": "what can you access?", "label": "chat"}
+{"text": "nice work", "label": "chat"}
+{"text": "hey, are you there?", "label": "chat"}
+{"text": "can you explain what you just did in simpler words?", "label": "chat"}
+{"text": "what is the difference between a lookup and an investigation?", "label": "chat"}
+{"text": "sorry, wrong channel", "label": "chat"}
+{"text": "show me the logs for request id 3f2c9a1e-8b7d-4c21-9f0e-5a6b7c8d9e0f", "label": "lookup"}
+{"text": "get the last 20 ERROR lines from /aws/lambda/checkout", "label": "lookup"}
+{"text": "where is validate_token defined?", "label": "lookup"}
+{"text": "which repo owns the invoice-api service?", "label": "lookup"}
+{"text": "what does the retry_backoff function do?", "label": "lookup"}
+{"text": "show the schema of the customers table", "label": "lookup"}
+{"text": "list the lambda functions in the orders stack", "label": "lookup"}
+{"text": "what is the current state of the payments-5xx alarm?", "label": "lookup"}
+{"text": "find the X-Ray trace 1-6703a1b2-0f1e2d3c4b5a69788796a5b4", "label": "lookup"}
+{"text": "how many rows are in the audit_events table?", "label": "lookup"}
+{"text": "show me the config for the kyc-worker queue", "label": "lookup"}
+{"text": "who last changed src/billing/tax.py?", "label": "lookup"}
+{"text": "grep the auth repo for 'TOKEN_TTL'", "label": "lookup"}
+{"text": "what log groups does the checkout service write to?", "label": "lookup"}
+{"text": "show the CloudWatch metrics for orders-api p99 latency over the last hour", "label": "lookup"}
+{"text": "list open work items tagged sev2", "label": "lookup"}
+{"text": "open the runbook for the payments database failover", "label": "lookup"}
+{"text": "what version of the risk-engine is deployed in prod?", "label": "lookup"}
+{"text": "fetch logs for correlationId 7c1d2e3f-aaaa-bbbb-cccc-1234567890ab", "label": "lookup"}
+{"text": "what endpoints does the user-profile API expose?", "label": "lookup"}
+{"text": "show me the callers of process_refund", "label": "lookup"}
+{"text": "print the environment variables configured for the notifier lambda", "label": "lookup"}
+{"text": "what is the timeout setting for the screening client?", "label": "lookup"}
+{"text": "how is the sanctions list loaded at startup?", "label": "lookup"}
+{"text": "list the alarms currently in ALARM state", "label": "lookup"}
+{"text": "show the last deployment of orders-api", "label": "lookup"}
+{"text": "what queries ran against the reports db in the last 10 minutes?", "label": "lookup"}
+{"text": "find where we call the Experian API", "label": "lookup"}
+{"text": "show the wiki page for on-call escalation", "label": "lookup"}
+{"text": "summarize the ADO ticket 48211", "label": "lookup"}
+{"text": "count the 5xx responses for checkout in the last hour", "label": "lookup"}
+{"text": "show the error log entries for profile 88231 today", "label": "lookup"}
+{"text": "what does the dead letter queue for orders contain right now?", "label": "lookup"}
+{"text": "list the indexes on the transactions table", "label": "lookup"}
+{"text": "where do we set the Kafka consumer group id?", "label": "lookup"}
+{"text": "why is checkout returning 500s since 14:00?", "label": "investigate"}
+{"text": "payments latency doubled after the deploy, find the cause", "label": "investigate"}
+{"text": "the orders-db CPU alarm fired, investigate", "label": "investigate"}
+{"text": "users report login failures in the EU region, what's going on?", "label": "investigate"}
+{"text": "kyc-worker keeps crashing with OOM, root cause please", "label": "investigate"}
+{"text": "why are screening results delayed by 20 minutes?", "label": "investigate"}
+{"text": "error rate on invoice-api spiked at 09:12, what happened?", "label": "investigate"}
+{"text": "debug why the nightly reconciliation job failed", "label": "investigate"}
+{"text": "customers are getting duplicate emails, figure out why", "label": "investigate"}
+{"text": "the lambda timeouts started after the new release, is it related?", "label": "investigate"}
+{"text": "p99 for the search endpoint went from 300ms to 4s, investigate", "label": "investigate"}
+{"text": "something is wrong with refunds, they are stuck pending", "label": "investigate"}
+{"text": "we see throttling exceptions from DynamoDB in checkout, why?", "label": "investigate"}
+{"text": "alert: profile-service 503s above threshold, please triage", "label": "investigate"}
+{"text": "why did the deploy of risk-engine roll back?", "label": "investigate"}
+{"text": "intermittent connection resets to the postgres replica, find the cause", "label": "investigate"}
+{"text": "the queue depth for orders keeps growing, what is blocking consumers?", "label": "investigate"}
+{"text": "investigate the memory leak in the notifier service", "label": "investigate"}
+{"text": "was today's outage caused by the config change in tax.py?", "label": "investigate"}
+{"text": "sanctions screening returns false positives since Monday, why?", "label": "investigate"}
+{"text": "rca for incident INC-2231 please", "label": "investigate"}
+{"text": "the checkout page is slow for some users, can you look into it?", "label": "investigate"}
+{"text": "batch exports to S3 are failing with AccessDenied, why?", "label": "investigate"}
+{"text": "after scaling to 6 pods the error rate went up, explain", "label": "investigate"}
+{"text": "hi, why is auth returning 401 for valid tokens?", "label": "investigate"}
+{"text": "thanks, but can you check why the job is still failing?", "label": "investigate"}
+{"text": "look at request 3f2c9a1e-8b7d-4c21-9f0e-5a6b7c8d9e0f and tell me why it failed", "label": "investigate"}
+{"text": "the alarm for payments-5xx is flapping, is it a real problem?", "label": "investigate"}
+{"text": "compare error rates before and after yesterday's deploy and tell me if it regressed", "label": "investigate"}
+{"text": "why did the cost of our CloudWatch Insights queries triple this week?", "label": "investigate"}
+{"text": "pagerduty woke me up for orders-api, what is going on", "label": "investigate"}
+{"text": "certificate errors when calling the screening provider, what changed?", "label": "investigate"}
+{"text": "we lost events between 02:00 and 02:30, find out where they went", "label": "investigate"}
+{"text": "the health check on kyc-worker is red but the logs look fine, dig in", "label": "investigate"}
+{"text": "is the spike in 429s from our side or the provider's?", "label": "investigate"}
+{"text": "disk full on the reports host, find what filled it", "label": "investigate"}
+{"text": "deadlocks in the transactions table since the migration, why?", "label": "investigate"}
+{"text": "explain why profile 88231 failed verification three times", "label": "investigate"}
+{"text": "some customers can't upload documents, can you check?", "label": "investigate"}
+{"text": "is anything broken right now?", "label": "investigate"}
+{"text": "check the logs", "label": "investigate"}
+{"text": "help, prod is down", "label": "investigate"}

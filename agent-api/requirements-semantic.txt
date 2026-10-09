@@ -7,5 +7,5 @@
 # itself is provisioned separately (vendored or downloaded at runtime).
 # ─────────────────────────────────────────────────────────────────────────────
 
-onnxruntime>=1.20.0
-tokenizers>=0.20.0
+onnxruntime==1.31.0
+tokenizers==0.23.3

@@ -91,6 +91,14 @@ services:
       # 31%. Failure is a byte-identical fallback to the plain cap, so the only
       # cost of being wrong is sidecar latency.
       - COMPRESSION_ALL_TOOLS=true
+    # Resource caps. Local inference (app/core/mini) sizes its threads from the
+    # cgroup quota, so a CPU cap here also keeps the API event loop responsive.
+    # AGENT_API_CPUS=0 means no CPU cap (the default, so small Docker Desktop
+    # VMs still start); set it to e.g. 4 on shared hosts. The memory cap only
+    # bounds the container; on Docker Desktop the WSL2 VM (.wslconfig) is the
+    # real ceiling.
+    cpus: ${AGENT_API_CPUS:-0}
+    mem_limit: ${AGENT_API_MEMORY:-8g}
     depends_on:
       postgres:
         condition: service_healthy

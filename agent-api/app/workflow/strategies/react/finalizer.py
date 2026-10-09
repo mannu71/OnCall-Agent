@@ -25,17 +25,6 @@ from app.workflow.strategies.react.preflight import RunPlan
 logger = logging.getLogger(__name__)
 
 
-def _rehydrate_structured(obj: Any, session_id: Optional[str]) -> Any:
-    """Deep-rehydrate placeholder strings in a structured-output value."""
-    if isinstance(obj, str):
-        return privacy.rehydrate(obj, session_id)
-    if isinstance(obj, dict):
-        return {k: _rehydrate_structured(v, session_id) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_rehydrate_structured(v, session_id) for v in obj]
-    return obj
-
-
 async def finalize(
     plan: RunPlan,
     result: Dict[str, Any],
@@ -231,7 +220,7 @@ async def finalize(
     _privacy_redactions = privacy.redaction_summary(execution_id)
     final_answer = privacy.rehydrate(result.get("final_answer"), execution_id)
     if structured_output:
-        structured_output = _rehydrate_structured(structured_output, execution_id)
+        structured_output = privacy.rehydrate_obj(structured_output, execution_id)
     privacy.drop_vault(execution_id)
 
     # Deep-agent session scratch (todos + virtual FS). ``_todos`` was already

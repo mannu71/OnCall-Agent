@@ -218,6 +218,12 @@ async def lifespan(app: FastAPI):
         await close_compressor_client()
     except Exception:
         pass
+    try:
+        from app.core.mini import shutdown_pool
+
+        shutdown_pool()
+    except Exception:
+        pass
 
 
 # Create FastAPI application

@@ -15,8 +15,9 @@ from app.models.db_models import ModelRoleAssignmentModel
 
 logger = logging.getLogger(__name__)
 
-# Valid gateway roles for model assignments.
-VALID_ROLES = {"agent", "crawler", "subagent"}
+# Valid gateway roles for model assignments. "auxiliary" is the model used for
+# background distillation (auto-learn); unassigned, it falls back to "crawler".
+VALID_ROLES = {"agent", "auxiliary", "crawler", "subagent"}
 
 
 class ModelRoleRepository(BaseAsyncRepository):

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from threading import Lock
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .classifier import ALL_ENTITY_TYPES, Span, detect
 from .vault import PseudonymVault
@@ -29,6 +29,7 @@ __all__ = [
     "drop_vault",
     "pseudonymize",
     "rehydrate",
+    "rehydrate_obj",
     "redaction_summary",
     "is_enabled",
     "bind_session",
@@ -114,6 +115,17 @@ def rehydrate(text: str, session_id: Optional[str]) -> str:
     if not text or not is_enabled():
         return text
     return get_vault(session_id).rehydrate(text)
+
+
+def rehydrate_obj(obj: Any, session_id: Optional[str]) -> Any:
+    """Deep-rehydrate placeholder strings inside dicts/lists (e.g. structured output)."""
+    if isinstance(obj, str):
+        return rehydrate(obj, session_id)
+    if isinstance(obj, dict):
+        return {k: rehydrate_obj(v, session_id) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [rehydrate_obj(v, session_id) for v in obj]
+    return obj
 
 
 def redaction_summary(session_id: Optional[str]) -> List[Dict[str, str]]:

@@ -129,9 +129,15 @@ def _build_onnx_semantic_tool(repo_names: List[str]) -> Optional[Any]:
                 "error": "specify 'project' — multiple repos are wired",
                 "available": repo_names,
             })
+        import asyncio
+
         svc = get_code_semantic_search()
         try:
-            hits = svc.search(proj, query, top_k=top_k, include_tests=include_tests)
+            # Query embedding (ONNX) and the index scan are CPU-bound; keep them
+            # off the event loop so concurrent runs and SSE are not stalled.
+            hits = await asyncio.to_thread(
+                svc.search, proj, query, top_k=top_k, include_tests=include_tests
+            )
         except FileNotFoundError as exc:
             return json.dumps({"error": f"embedding model not provisioned: {exc}"})
         except Exception as exc:  # noqa: BLE001
